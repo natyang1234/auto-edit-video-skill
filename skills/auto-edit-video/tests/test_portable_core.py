@@ -72,6 +72,11 @@ class PortableCoreIntegrationTests(unittest.TestCase):
             self.assertTrue(payload["ready"])
             self.assertEqual(payload["mode"], "standalone")
             self.assertEqual(payload["missing_required"], [])
+            self.assertIn("local_transcription", payload["capabilities"])
+            self.assertEqual(
+                payload["capabilities"]["local_transcription"],
+                bool(shutil.which("whisper") or shutil.which("whisper-cli")),
+            )
 
     def test_approved_cut_and_qa(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

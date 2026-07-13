@@ -397,7 +397,16 @@ def configured_env_names(path: Path) -> set[str]:
 def preflight_payload() -> dict[str, Any]:
     commands = {
         name: shutil.which(name)
-        for name in ("ffmpeg", "ffprobe", "python3", "node", "npx", "edge-tts")
+        for name in (
+            "ffmpeg",
+            "ffprobe",
+            "python3",
+            "whisper",
+            "whisper-cli",
+            "node",
+            "npx",
+            "edge-tts",
+        )
     }
     files = {name: path.is_file() for name, path in PATHS.items() if name != "video_autopilot_repo"}
     files["video_autopilot_repo"] = PATHS["video_autopilot_repo"].is_dir()
@@ -442,6 +451,7 @@ def preflight_payload() -> dict[str, Any]:
             "programmatic_render_qa": files["video_autopilot_cli"]
             and files["video_autopilot_repo"],
             "bundled_render_qa": files["qa_runner"] and bool(commands["ffmpeg"]),
+            "local_transcription": bool(commands["whisper"] or commands["whisper-cli"]),
             "visual_cards": files["talking_head_recut"] and bool(commands["node"]),
             "premium_captions": files["embedded_captions"],
             "voice_rumi_system": files["rumi_voice_system"],

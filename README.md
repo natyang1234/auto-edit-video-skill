@@ -1,8 +1,25 @@
 # Auto Edit Video Skill
 
-A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic video editing. It turns a local source video plus word-timed Whisper JSON into an editable project with cut proposals, subtitles, emphasis, title/cards, animations, social canvases, deterministic FFmpeg export, and delivery QA.
+A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. Subtitles, emphasis, title/cards, animations, and social canvases remain optional advanced capabilities.
 
 [繁體中文](README.zh-TW.md)
+
+[Agent-first phase specification (Traditional Chinese)](skills/auto-edit-video/references/AGENT_FIRST.zh-TW.md)
+
+## Current phase: give the agent one video
+
+No user interface is required. Give a local coding agent one readable video:
+
+```text
+Use auto-edit-video to automatically edit ./input.mp4 and return the MP4.
+```
+
+The agent owns project setup, local transcription, conservative edit decisions,
+rendering, and QA. The user does not need to prepare Whisper JSON, SRT, a
+manifest, or a preview page. Without a requested duration, the default is a
+conservative full-length cleanup; the 25–35-second target applies only when the
+user asks for an approximately 30-second highlight. UI, LINE delivery, uploads,
+and social publishing are outside the current phase.
 
 ## What ships in the standalone core
 
@@ -36,7 +53,7 @@ This is designed for local coding agents with filesystem, Python, and FFmpeg acc
 - Python 3.10 or newer.
 - `ffmpeg` and `ffprobe` on `PATH`.
 - A CJK-capable font for Chinese subtitles. Set `AUTO_EDIT_FONT=/absolute/font/path` when auto-discovery is insufficient.
-- A local Whisper-compatible transcript with word timestamps. The skill accepts the JSON rather than silently uploading source audio.
+- A local Whisper-compatible transcription engine that can produce word timestamps. The agent creates the transcript from the input video rather than asking the user for JSON or silently uploading source audio.
 
 Optional: `edge-tts`, Node.js/HyperFrames, or separately installed visual/caption skills. Cloud narration always requires explicit consent.
 
@@ -81,7 +98,9 @@ python3 ~/.agents/skills/auto-edit-video/scripts/auto_edit.py preflight
 
 A working standalone installation reports `"ready": true` and `"mode": "standalone"` or `"extended"`. Missing optional integrations do not block the bundled core.
 
-## Minimal workflow
+## Internal / advanced workflow
+
+These commands are for the agent or developer, not additional required user inputs:
 
 ```bash
 SKILL=/absolute/path/to/auto-edit-video

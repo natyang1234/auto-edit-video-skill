@@ -1,8 +1,22 @@
 # Auto Edit Video 自動剪輯 Skill
 
-這是一個可攜式 [Agent Skill](https://agentskills.io/)，把本機影片與含單字時間碼的 Whisper JSON 轉成可審核、非破壞式的自動剪輯專案。它能提出刪剪建議、建立字幕與重點字、加入標題／字卡／動畫、切換社群尺寸，並用 FFmpeg 確定性輸出與執行交付 QA。
+這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。字幕、重點字、標題／字卡／動畫與社群尺寸保留為進階選配。
 
 [English](README.md)
+
+[第一階段 Agent-first 完整規格](skills/auto-edit-video/references/AGENT_FIRST.zh-TW.md)
+
+## 現階段用法：只交給 Agent 一個影片檔
+
+目前不需要操作介面。使用者只要把 Agent 能讀取的本機影片檔交給它：
+
+```text
+請用 auto-edit-video 自動剪輯 ./input.mp4
+```
+
+Agent 應自行建立工作專案、在本機轉錄、提出並套用保守剪輯、輸出新的 MP4、執行 QA，再回報成品。使用者不必另外準備 Whisper JSON、SRT、manifest，也不必打開預覽網頁。
+
+若沒有指定長度，預設做保守的全長清理；只有明示「約 30 秒精華」時才以 25–35 秒為目標。LINE、雲端上傳、社群發佈與 UI 都不在第一階段範圍。
 
 ## 內建核心
 
@@ -36,7 +50,7 @@
 - Python 3.10 以上。
 - `ffmpeg`、`ffprobe` 已在 `PATH`。
 - 可顯示中文的字型；自動偵測失敗時設定 `AUTO_EDIT_FONT=/字型/絕對路徑`。
-- 本機產生、含 word timestamps 的 Whisper JSON。本 Skill 接受轉錄結果，不會暗中上傳原始音訊。
+- 本機 Whisper 相容轉錄引擎，可產生 word timestamps。Agent 負責從輸入影片建立轉錄，不會要求使用者先準備 JSON，也不會暗中上傳原始音訊。
 
 `edge-tts`、Node.js／HyperFrames 與其他視覺技能都是選配；任何雲端配音都要先取得明確同意。
 
@@ -79,7 +93,9 @@ python3 ~/.agents/skills/auto-edit-video/scripts/auto_edit.py preflight
 
 可用的安裝會回傳 `"ready": true`，模式為 `"standalone"` 或 `"extended"`；缺少選配整合不會阻擋內建核心。
 
-## 最小工作流
+## 內部／進階工作流
+
+以下命令供 Agent 或開發者執行；不是要求一般使用者逐項輸入：
 
 ```bash
 SKILL=/auto-edit-video/實際安裝路徑

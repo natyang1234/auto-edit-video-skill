@@ -1,17 +1,14 @@
 ---
 name: auto-edit-video
 description: >-
-  Build and run a reviewed AI video-editing core for local source videos: remove
-  silence, filler words, stutters, repetitions and false starts; re-transcribe
-  the cut; create Chinese, English or bilingual subtitles; emphasize keywords;
-  plan and place content-matched assets, title cards and animations; and
-  optionally generate Chinese or English male/female voiceover with installed
-  Edge, Rumi/Fish, HyperFrames, or other providers. Use for automatic talking-head editing,
-  long-video-to-short preparation, subtitle-driven cuts, visual enrichment,
-  bilingual captioning, selectable narration, or preparing the core project
-  that the bundled local page editor can open for live preview, social-format
-  adaptation, cover/copy drafting, approval, and deterministic export. Never
-  uses CapCut.
+  Automatically edit a local video file supplied by the user. In the current
+  agent-first phase, read the video, create the internal project and local
+  transcript, apply conservative reviewed cuts, export a new MP4, run QA, and
+  return the result without requiring a UI or user-supplied Whisper files. Use
+  when the user gives a video path and asks to auto edit, clean up speech,
+  remove silence/fillers/stutters/repetitions/false starts, or make a short
+  highlight. Advanced subtitles, cards, animations, social formats, and
+  voiceover remain optional. Never uploads by default and never uses CapCut.
 ---
 
 # Auto Edit Video
@@ -21,7 +18,35 @@ FFmpeg cut, page-editor, timeline-render, and QA core. Discover optional install
 skills for premium captions, visual packages, creator profiles, or cloud voices;
 their absence must not block the standalone core.
 
-## Quick start
+## Agent-first mode (current phase)
+
+Read [references/AGENT_FIRST.zh-TW.md](references/AGENT_FIRST.zh-TW.md). The
+user-facing contract has one required input: a local video file that the agent
+can read. The agent owns every internal artifact and must return an edited MP4,
+not instructions asking the user to prepare Whisper JSON, SRT, a manifest, or a
+browser preview.
+
+Example user request:
+
+```text
+Use $auto-edit-video to automatically edit /path/to/input.mp4 and return the MP4.
+```
+
+Do not launch the page editor in this mode unless the user explicitly asks for
+an interface. Do not upload or deliver the result to another service unless that
+is a separate authorized request.
+
+Internally, run preflight, initialize a project, generate a local word-timed
+transcript with an installed Whisper-compatible engine, import it, analyze
+edits, write conservative decisions, record the user's auto-edit request as the
+low-risk destructive-edit authorization, render, and run QA. High-risk cuts
+default to keep.
+
+If no length is requested, clean the full video conservatively. Apply the
+25–35-second highlight target only when the user asks for an approximately
+30-second edit.
+
+## Internal quick start
 
 ```bash
 SKILL="/absolute/path/to/the/installed/auto-edit-video"
@@ -59,8 +84,14 @@ python3 "$SKILL/scripts/auto_edit.py" editor \
 ```
 
 Omit every `--voice-*` flag to keep the original voice. Voiceover is opt-in.
+The `editor` command is optional and is not part of the current agent-first
+acceptance path.
 
-## Required workflow
+## Advanced reviewed workflow
+
+The sections below define the full captions/cards/voice/editor workflow. The
+current agent-first cut-only path uses sections 1–4, re-checks the rendered MP4,
+then runs the QA step in section 8 without opening the page editor.
 
 ### 1. Preflight and creator context
 
@@ -288,7 +319,12 @@ Read [references/ROUTING.md](references/ROUTING.md) before selecting a renderer.
 
 ## Gates and boundaries
 
-- Require explicit approval for `destructive_edit`, `timeline`, and `final`.
+- In agent-first cut-only mode, the user's explicit request to auto-edit the
+  supplied file may authorize conservative low-risk decisions when that request
+  is recorded in `destructive_edit`; high-risk decisions still default to keep.
+- Require `timeline` and `final` approvals when the optional visual timeline,
+  page editor, captions/cards, or publishing workflow is used. They may be
+  marked not applicable for a cut-only output that is not externally delivered.
 - Treat all AI outputs as editable proposals.
 - Use only owned/licensed media, fonts, music, and voices; store provenance.
 - Do not fabricate B-roll evidence, quotes, product screens, or numerical cards.
@@ -306,6 +342,10 @@ Read [references/ROUTING.md](references/ROUTING.md) before selecting a renderer.
 
 - Output a filesystem project and report its paths, verification, and remaining
   risks in the conversation.
-- Require `project.json`, stage states, all three human approval gates, selected
-  renderer, voice provider/ID or explicit voice-disabled state, asset provenance,
-  final QA report, and contact sheet.
+- In agent-first mode, the only required user input is the readable source
+  video. Return a real edited MP4 after QA; do not return only a plan or preview.
+- Agent-first cut-only output requires `project.json`, edit decisions, recorded
+  low-risk authorization, an immutable source, the edited MP4, and a QA report.
+- The advanced visual workflow additionally requires all three human approval
+  gates, selected renderer, voice provider/ID or explicit voice-disabled state,
+  asset provenance, and contact-sheet inspection.

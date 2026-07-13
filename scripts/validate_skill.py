@@ -61,6 +61,7 @@ def validate(skill: Path) -> list[str]:
         "scripts/render_editor_timeline.py",
         "scripts/render_cut.py",
         "scripts/qa_video.py",
+        "references/AGENT_FIRST.zh-TW.md",
         "editor/index.html",
         "agents/openai.yaml",
     ]
