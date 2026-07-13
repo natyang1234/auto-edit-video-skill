@@ -49,6 +49,49 @@ def ffmpeg_path() -> str:
     return command
 
 
+def source_has_audible_signal(source: Path, start: float, duration: float) -> bool:
+    """Return true only when the selected source range has a usable audio peak."""
+    command = [
+        ffmpeg_path(),
+        "-hide_banner",
+        "-nostats",
+    ]
+    if start > 0:
+        command.extend(["-ss", f"{start:.3f}"])
+    command.extend(
+        [
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(source),
+            "-vn",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    match = re.findall(r"max_volume:\s*(-?(?:inf|[0-9.]+))\s+dB", result.stderr or "")
+    if not match or match[-1] == "-inf":
+        return False
+    try:
+        return float(match[-1]) > -70.0
+    except ValueError:
+        return False
+
+
 def font_path() -> Path:
     override = str(os.environ.get("AUTO_EDIT_FONT", "")).strip()
     if override:
@@ -356,6 +399,18 @@ def build_render_command(
             f"[{current}]",
             "-map",
             "0:a?",
+        ]
+    )
+    normalize_audio = (
+        manifest.get("source", {}).get("has_audio") is not False
+        and source_has_audible_signal(source, clip_start, duration)
+    )
+    if normalize_audio:
+        command.extend(
+            ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"]
+        )
+    command.extend(
+        [
             "-t",
             f"{duration:.3f}",
             "-r",

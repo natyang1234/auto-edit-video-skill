@@ -38,6 +38,7 @@ from local_http_security import (
 SKILL_DIR = Path(__file__).resolve().parents[1]
 EDITOR_DIR = SKILL_DIR / "editor"
 STATE_REL = Path("working/editor_state.json")
+LATEST_DELIVERY_QA_REL = Path("working/latest_final_qa.json")
 ALLOWED_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov"}
 ALLOWED_ASSET_MIME_TYPES = {
     ".png": {"image/png"},
@@ -306,8 +307,16 @@ def gate_revision(
                 "highlights": current_state.get("highlights", []),
             }
         )
-    if gate in {"timeline", "final"}:
+    if gate == "timeline":
         return editor_state_revision(current_state)
+    if gate == "final":
+        receipt = read_json(project_dir / LATEST_DELIVERY_QA_REL, None)
+        return canonical_revision(
+            {
+                "editor_state_revision": editor_state_revision(current_state),
+                "delivery_qa": receipt if isinstance(receipt, dict) else None,
+            }
+        )
     raise ValueError(f"unsupported approval gate: {gate}")
 
 
@@ -318,11 +327,17 @@ def approval_is_current(
     state: dict[str, Any] | None = None,
 ) -> bool:
     approval = manifest.get("approvals", {}).get(gate, {})
-    return bool(
+    current = bool(
         isinstance(approval, dict)
         and approval.get("approved")
         and approval.get("state_revision") == gate_revision(project_dir, gate, state)
     )
+    if current and gate == "final":
+        current = not delivery_qa_errors(
+            project_dir,
+            state if state is not None else read_json(project_dir / STATE_REL, {}) or {},
+        )
+    return current
 
 
 def approval_prerequisite_errors(
@@ -385,10 +400,15 @@ def approval_prerequisite_errors(
         errors.append("highlight_selection must be approved for its current revision first")
     if gate == "timeline":
         return errors
-    if gate == "final" and not approval_is_current(
-        project_dir, manifest, "timeline", state
-    ):
-        errors.append("timeline must be approved for its current revision first")
+    if gate == "final":
+        if not approval_is_current(project_dir, manifest, "timeline", state):
+            errors.append("timeline must be approved for its current revision first")
+        if approved_destructive_deletes(project_dir):
+            errors.append(
+                "reviewed delete decisions are not applied by the page-editor renderer; "
+                "set them to keep or use the destructive cut renderer first"
+            )
+        errors.extend(delivery_qa_errors(project_dir, state))
     return errors
 
 
@@ -397,6 +417,79 @@ def approval_revisions(project_dir: Path, state: dict[str, Any] | None = None) -
         gate: gate_revision(project_dir, gate, state)
         for gate in sorted(GATES)
     }
+
+
+def approved_destructive_deletes(project_dir: Path) -> list[str]:
+    decisions = read_json(
+        project_dir / "working/edit_decisions.json",
+        {"items": []},
+    ) or {"items": []}
+    return [
+        str(item.get("candidate_id"))
+        for item in decisions.get("items", [])
+        if isinstance(item, dict)
+        and item.get("review_status") == "approved"
+        and item.get("action") == "delete"
+    ]
+
+
+def delivery_qa_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
+    """Verify that the final gate is tied to current, untampered delivery artifacts."""
+    receipt = read_json(project_dir / LATEST_DELIVERY_QA_REL, None)
+    if not isinstance(receipt, dict):
+        return ["a successful delivery QA receipt is required before final approval"]
+    errors: list[str] = []
+    if receipt.get("schema_version") != 1 or receipt.get("status") != "pass":
+        errors.append("delivery QA must pass before final approval")
+    state_revision = editor_state_revision(state)
+    if receipt.get("state_revision") != state_revision:
+        errors.append("delivery QA does not match the current editor revision")
+
+    artifact_contracts = (
+        ("output", "output_sha256", "renders"),
+        ("report", "report_sha256", "qa"),
+        ("contact_sheet", "contact_sheet_sha256", "qa"),
+        ("render_receipt", "render_receipt_sha256", "working/render_receipts"),
+    )
+    resolved: dict[str, Path] = {}
+    for path_key, digest_key, scope in artifact_contracts:
+        relative = str(receipt.get(path_key) or "")
+        declared = str(receipt.get(digest_key) or "")
+        if not relative or not re.fullmatch(r"[0-9a-f]{64}", declared):
+            errors.append(f"delivery QA {path_key} contract is incomplete")
+            continue
+        try:
+            entry = project_dir / Path(relative)
+            if entry.is_symlink():
+                raise ValueError(f"{path_key} must not be a symlink")
+            path = scoped_project_path(project_dir, relative, scope)
+        except ValueError:
+            errors.append(f"delivery QA {path_key} escapes its project scope")
+            continue
+        if not path.is_file():
+            errors.append(f"delivery QA {path_key} is missing")
+            continue
+        if file_sha256(path) != declared:
+            errors.append(f"delivery QA {path_key} changed after verification")
+            continue
+        resolved[path_key] = path
+
+    report = read_json(resolved.get("report", Path("/nonexistent")), None)
+    if not isinstance(report, dict) or report.get("status") != "pass":
+        errors.append("delivery QA report is missing a passing status")
+    render_receipt = read_json(resolved.get("render_receipt", Path("/nonexistent")), None)
+    if not isinstance(render_receipt, dict):
+        errors.append("render receipt is unreadable")
+    else:
+        if render_receipt.get("render_id") != receipt.get("render_id"):
+            errors.append("delivery QA and render receipt identities differ")
+        if render_receipt.get("quality") != "final":
+            errors.append("delivery QA is not attached to a final render")
+        if render_receipt.get("state_revision") != state_revision:
+            errors.append("render receipt does not match the current editor revision")
+        if render_receipt.get("output_sha256") != receipt.get("output_sha256"):
+            errors.append("delivery QA and render receipt output digests differ")
+    return errors
 
 
 def project_path(project_dir: Path, relative: str) -> Path:
@@ -1114,7 +1207,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                     },
                 ),
                 "approval_revisions": approval_revisions(project, state),
+                "approval_current": {
+                    gate: approval_is_current(project, manifest, gate, state)
+                    for gate in sorted(GATES)
+                },
                 "qa": read_json(project / "qa/source-qa.json", {}),
+                "delivery_qa": read_json(project / LATEST_DELIVERY_QA_REL, {}),
                 "media_url": "/media/source" if source_rel else None,
                 "render_status": self.server.render_status,
             }
@@ -1125,7 +1223,17 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/approval-revisions":
             state = read_json(project / STATE_REL, {}) or {}
-            self.send_json({"ok": True, "revisions": approval_revisions(project, state)})
+            manifest = read_json(project / "project.json", {}) or {}
+            self.send_json(
+                {
+                    "ok": True,
+                    "revisions": approval_revisions(project, state),
+                    "current": {
+                        gate: approval_is_current(project, manifest, gate, state)
+                        for gate in sorted(GATES)
+                    },
+                }
+            )
             return
         if path == "/api/pipeline-status":
             self.send_json(
@@ -1166,6 +1274,18 @@ class EditorHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self.serve_file(render, allow_range=render.suffix.lower() == ".mp4")
+            return
+        if path.startswith("/qa/"):
+            relative = urllib.parse.unquote(path.removeprefix("/"))
+            try:
+                artifact = scoped_project_path(project, relative, "qa")
+            except ValueError:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            if artifact.suffix.lower() not in {".json", ".png", ".jpg", ".jpeg", ".webp"}:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            self.serve_file(artifact)
             return
         static_name = "index.html" if path in {"/", "/index.html"} else path.removeprefix("/")
         if "/" in static_name or static_name.startswith("."):
@@ -1225,6 +1345,14 @@ class EditorHandler(BaseHTTPRequestHandler):
                     }
                     invalidated_gates.append(gate)
                 if invalidated_gates:
+                    stages = manifest.setdefault("stages", {})
+                    if "highlight_selection" in invalidated_gates:
+                        stages["highlight_plan"] = "needs_review"
+                    if "timeline" in invalidated_gates:
+                        stages["timeline_review"] = "needs_review"
+                    if "final" in invalidated_gates:
+                        stages["render"] = "pending"
+                        stages["qa"] = "pending"
                     manifest["updated_at"] = now_utc()
                     atomic_write_json(self.server.project_dir / "project.json", manifest)
         except (ValueError, TypeError) as exc:
@@ -1376,9 +1504,15 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "invalidated_at": now_utc(),
                 }
                 invalidated.append(gate)
+            stages = manifest.setdefault("stages", {})
+            stages["edit_review"] = "needs_review"
             if invalidated:
-                manifest["updated_at"] = now_utc()
-                atomic_write_json(manifest_path, manifest)
+                stages["highlight_plan"] = "needs_review"
+                stages["timeline_review"] = "needs_review"
+                stages["render"] = "pending"
+                stages["qa"] = "pending"
+            manifest["updated_at"] = now_utc()
+            atomic_write_json(manifest_path, manifest)
             revision = gate_revision(self.server.project_dir, "destructive_edit")
         self.send_json(
             {
@@ -1614,6 +1748,33 @@ class EditorHandler(BaseHTTPRequestHandler):
             if gate == "highlight_selection":
                 approval["plan_revision"] = state.get("highlight_plan_revision")
             manifest.setdefault("approvals", {})[gate] = approval
+            stages = manifest.setdefault("stages", {})
+            if gate == "destructive_edit":
+                stages["edit_review"] = "complete"
+            elif gate == "highlight_selection":
+                stages["highlight_plan"] = "complete"
+            elif gate == "timeline":
+                stages["timeline_review"] = "complete"
+            elif gate == "final":
+                stages["edit_review"] = "complete"
+                stages["cut"] = "skipped"
+                stages["retranscribe"] = "skipped"
+                if state.get("highlights"):
+                    stages["highlight_plan"] = "complete"
+                stages["timeline_review"] = "complete"
+                overlay_types = {
+                    str(item.get("type"))
+                    for item in state.get("overlays", [])
+                    if isinstance(item, dict) and item.get("visible", True)
+                }
+                if "caption" in overlay_types:
+                    stages["subtitles"] = "complete"
+                if "emphasis" in overlay_types:
+                    stages["emphasis"] = "complete"
+                if overlay_types & {"title", "card", "image", "gif", "video", "animation"}:
+                    stages["visual_plan"] = "complete"
+                stages["render"] = "complete"
+                stages["qa"] = "complete"
             manifest["updated_at"] = now_utc()
             atomic_write_json(manifest_path, manifest)
             revisions = approval_revisions(self.server.project_dir, state)
@@ -1623,6 +1784,15 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "gate": gate,
                 "approval": approval,
                 "approval_revisions": revisions,
+                "approval_current": {
+                    name: approval_is_current(
+                        self.server.project_dir,
+                        manifest,
+                        name,
+                        state,
+                    )
+                    for name in sorted(GATES)
+                },
             }
         )
 
@@ -1682,6 +1852,18 @@ class EditorHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "selected highlight does not exist"}, status=422)
                 return
             if quality == "final":
+                if approved_destructive_deletes(self.server.project_dir):
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "error": (
+                                "reviewed delete decisions are not applied by the page-editor renderer; "
+                                "set them to keep or use the destructive cut renderer first"
+                            ),
+                        },
+                        status=409,
+                    )
+                    return
                 if highlights and clip is None:
                     self.send_json(
                         {"ok": False, "error": "select an approved highlight before final render"},
@@ -1750,8 +1932,11 @@ class EditorHandler(BaseHTTPRequestHandler):
             )
             atomic_write_json(snapshot_path, snapshot)
             safe_clip = re.sub(r"[^A-Za-z0-9_-]", "-", clip_id)[:80] if clip_id else "source-full"
+            version = render_id.rsplit("_", 1)[-1][:8]
             output_name = (
-                f"{safe_clip}-preview.mp4" if quality == "preview" else f"{safe_clip}-final.mp4"
+                f"{safe_clip}-{version}-preview.mp4"
+                if quality == "preview"
+                else f"{safe_clip}-{version}-final.mp4"
             )
             with self.server.render_lock:
                 if self.server.render_status.get("state") == "running":
@@ -1769,7 +1954,14 @@ class EditorHandler(BaseHTTPRequestHandler):
                 }
         threading.Thread(
             target=self.render_worker,
-            args=(quality, snapshot_path, output_name, render_id, clip_id or None),
+            args=(
+                quality,
+                snapshot_path,
+                output_name,
+                render_id,
+                clip_id or None,
+                current_revision,
+            ),
             daemon=True,
         ).start()
         self.send_json({"ok": True, "status": self.server.render_status}, status=202)
@@ -1781,6 +1973,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         output_name: str,
         render_id: str,
         clip_id: str | None,
+        state_revision: str,
     ) -> None:
         script = SKILL_DIR / "scripts/render_editor_timeline.py"
         output = self.server.project_dir / "renders" / output_name
@@ -1810,31 +2003,166 @@ class EditorHandler(BaseHTTPRequestHandler):
                 result = subprocess.CompletedProcess(command, 124, "", "render timed out")
             if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
                 raise RuntimeError((result.stderr or result.stdout or "render failed").strip()[-1200:])
+            qa_payload: dict[str, Any] | None = None
+            qa_report: Path | None = None
+            qa_contact: Path | None = None
+            if quality == "final":
+                qa_report = self.server.project_dir / "qa" / f"{render_id}-qa-report.json"
+                qa_contact = self.server.project_dir / "qa" / f"{render_id}-contact.png"
+                qa_command = [
+                    sys.executable,
+                    str(SKILL_DIR / "scripts/qa_video.py"),
+                    "--video",
+                    str(temporary),
+                    "--report",
+                    str(qa_report),
+                    "--contact",
+                    str(qa_contact),
+                ]
+                try:
+                    qa_result = subprocess.run(
+                        qa_command,
+                        text=True,
+                        capture_output=True,
+                        timeout=10 * 60,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError("delivery QA timed out; previous output was preserved") from exc
+                qa_payload = read_json(qa_report, {}) or {}
+                if qa_result.returncode != 0 or qa_payload.get("status") != "pass":
+                    failure_receipt = {
+                        "schema_version": 1,
+                        "render_id": render_id,
+                        "quality": quality,
+                        "clip_id": clip_id,
+                        "state_revision": state_revision,
+                        "status": "fail",
+                        "report": str(qa_report.relative_to(self.server.project_dir)),
+                        "contact_sheet": str(qa_contact.relative_to(self.server.project_dir))
+                        if qa_contact.is_file()
+                        else None,
+                        "failures": qa_payload.get("failures", []),
+                        "warnings": qa_payload.get("warnings", []),
+                        "completed_at": now_utc(),
+                    }
+                    atomic_write_json(
+                        self.server.project_dir
+                        / "working/delivery_qa"
+                        / f"{render_id}-failed.json",
+                        failure_receipt,
+                    )
+                    detail = "; ".join(str(item) for item in qa_payload.get("failures", []))
+                    self.server.render_status = {
+                        "state": "qa_failed",
+                        "message": detail
+                        or (qa_result.stderr or qa_result.stdout or "delivery QA failed").strip()[-1200:],
+                        "quality": quality,
+                        "clip_id": clip_id,
+                        "render_id": render_id,
+                        "output": None,
+                        "qa": failure_receipt,
+                        "finished_at": now_utc(),
+                    }
+                    return
+
+            output_sha = file_sha256(temporary)
             os.replace(temporary, output)
             receipt = {
                 "schema_version": 1,
                 "render_id": render_id,
                 "quality": quality,
                 "clip_id": clip_id,
+                "state_revision": state_revision,
                 "snapshot": str(snapshot_path.relative_to(self.server.project_dir)),
+                "snapshot_sha256": file_sha256(snapshot_path),
                 "output": str(output.relative_to(self.server.project_dir)),
-                "output_sha256": file_sha256(output),
+                "output_sha256": output_sha,
                 "bytes": output.stat().st_size,
                 "completed_at": now_utc(),
             }
-            atomic_write_json(
-                self.server.project_dir / "working/render_receipts" / f"{render_id}.json",
-                receipt,
+            render_receipt_path = (
+                self.server.project_dir / "working/render_receipts" / f"{render_id}.json"
             )
+            atomic_write_json(render_receipt_path, receipt)
+            delivery_qa: dict[str, Any] | None = None
+            revisions: dict[str, str] | None = None
+            is_current = True
+            if quality == "final" and qa_payload is not None and qa_report is not None and qa_contact is not None:
+                qa_payload["video"] = str(output)
+                atomic_write_json(qa_report, qa_payload)
+                delivery_qa = {
+                    "schema_version": 1,
+                    "render_id": render_id,
+                    "quality": "final",
+                    "clip_id": clip_id,
+                    "state_revision": state_revision,
+                    "status": "pass",
+                    "output": str(output.relative_to(self.server.project_dir)),
+                    "output_sha256": output_sha,
+                    "report": str(qa_report.relative_to(self.server.project_dir)),
+                    "report_sha256": file_sha256(qa_report),
+                    "contact_sheet": str(qa_contact.relative_to(self.server.project_dir)),
+                    "contact_sheet_sha256": file_sha256(qa_contact),
+                    "render_receipt": str(render_receipt_path.relative_to(self.server.project_dir)),
+                    "render_receipt_sha256": file_sha256(render_receipt_path),
+                    "warnings": qa_payload.get("warnings", []),
+                    "failures": qa_payload.get("failures", []),
+                    "human_review_required": True,
+                    "completed_at": now_utc(),
+                }
+                atomic_write_json(
+                    self.server.project_dir / "working/delivery_qa" / f"{render_id}.json",
+                    delivery_qa,
+                )
+                atomic_write_json(
+                    self.server.project_dir / LATEST_DELIVERY_QA_REL,
+                    delivery_qa,
+                )
+                with self.server.project_lock:
+                    manifest_path = self.server.project_dir / "project.json"
+                    manifest = read_json(manifest_path, {}) or {}
+                    final_approval = manifest.setdefault("approvals", {}).get("final")
+                    if isinstance(final_approval, dict) and final_approval.get("approved"):
+                        manifest["approvals"]["final"] = {
+                            "approved": False,
+                            "confirmed_by": None,
+                            "at": None,
+                            "note": "Invalidated because a new final delivery was rendered",
+                            "invalidated_at": now_utc(),
+                        }
+                    stages = manifest.setdefault("stages", {})
+                    stages["render"] = "complete"
+                    stages["qa"] = "needs_review"
+                    manifest["updated_at"] = now_utc()
+                    atomic_write_json(manifest_path, manifest)
+                    current_state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                    is_current = editor_state_revision(current_state) == state_revision
+                    revisions = approval_revisions(self.server.project_dir, current_state)
             self.server.render_status = {
                 "state": "complete",
-                "message": "預覽已完成" if quality == "preview" else "最終影片已完成",
+                "message": "預覽已完成"
+                if quality == "preview"
+                else (
+                    "最終影片與機械 QA 已完成，請檢查九宮格後核可"
+                    if is_current
+                    else "輸出完成，但時間軸已變更；請重新輸出後再核可"
+                ),
                 "quality": quality,
                 "clip_id": clip_id,
                 "render_id": render_id,
+                "state_revision": state_revision,
+                "current": is_current,
                 "output": f"/renders/{urllib.parse.quote(output_name)}",
                 "download_name": output_name,
                 "output_sha256": receipt["output_sha256"],
+                "qa": delivery_qa,
+                "qa_report": f"/{qa_report.relative_to(self.server.project_dir)}"
+                if qa_report is not None
+                else None,
+                "qa_contact": f"/{qa_contact.relative_to(self.server.project_dir)}"
+                if qa_contact is not None
+                else None,
+                "approval_revisions": revisions,
                 "finished_at": now_utc(),
             }
         except (OSError, RuntimeError) as exc:

@@ -21,8 +21,8 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from editor_server import EditorServer, editor_state_revision  # noqa: E402
-from render_editor_timeline import text_filter  # noqa: E402
+from editor_server import EditorServer, editor_state_revision, gate_revision  # noqa: E402
+from render_editor_timeline import build_render_command, text_filter  # noqa: E402
 
 
 class EditorServerTests(unittest.TestCase):
@@ -133,6 +133,9 @@ class EditorServerTests(unittest.TestCase):
             "timeline-tracks",
             "render-button",
             "download-output",
+            "approve-final",
+            "delivery-qa-status",
+            "qa-contact-link",
         ):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("Hybrid editorial workstation", css)
@@ -473,6 +476,39 @@ class EditorServerTests(unittest.TestCase):
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
         self.assertFalse(manifest["approvals"]["timeline"]["approved"])
 
+    def test_final_render_fails_closed_when_reviewed_deletes_are_unapplied(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        status, decisions = self.json_request(
+            "PUT",
+            "/api/edit-decisions",
+            {
+                "approved": True,
+                "items": [{"candidate_id": "edit-0001", "action": "delete"}],
+            },
+        )
+        self.assertEqual(status, 200, decisions)
+        status, approved = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "destructive_edit",
+                "expected_revision": decisions["approval_revision"],
+            },
+        )
+        self.assertEqual(status, 200, approved)
+        status, blocked = self.json_request(
+            "POST",
+            "/api/render",
+            {
+                "quality": "final",
+                "expected_revision": state["revision"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("not applied", str(blocked["error"]))
+
     def test_highlight_approval_requires_current_plan_review_and_cas(self) -> None:
         plan_revision = "c" * 64
         highlight_id = "highlight-abcdef123456"
@@ -553,6 +589,119 @@ class EditorServerTests(unittest.TestCase):
         status, changed = self.json_request("PUT", "/api/editor-state", state)
         self.assertEqual(status, 200, changed)
         self.assertIn("highlight_selection", changed["invalidated_gates"])
+
+    def test_final_approval_requires_current_untampered_delivery_qa(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        status, decisions = self.json_request(
+            "PUT",
+            "/api/edit-decisions",
+            {
+                "approved": True,
+                "items": [{"candidate_id": "edit-0001", "action": "keep"}],
+            },
+        )
+        self.assertEqual(status, 200, decisions)
+        status, destructive = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "destructive_edit",
+                "expected_revision": decisions["approval_revision"],
+            },
+        )
+        self.assertEqual(status, 200, destructive)
+        status, timeline = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "timeline",
+                "expected_revision": destructive["approval_revisions"]["timeline"],
+            },
+        )
+        self.assertEqual(status, 200, timeline)
+        status, blocked = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "final",
+                "expected_revision": timeline["approval_revisions"]["final"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("delivery QA", str(blocked["error"]))
+
+        render_id = "render_delivery_test"
+        state_revision = editor_state_revision(state)
+        output = self.project / "renders/final-test.mp4"
+        report = self.project / "qa/final-test-report.json"
+        contact = self.project / "qa/final-test-contact.png"
+        render_receipt = self.project / "working/render_receipts/render_delivery_test.json"
+        output.write_bytes(b"verified-final-output")
+        self.write_json("qa/final-test-report.json", {"schema_version": 1, "status": "pass"})
+        contact.write_bytes(b"\x89PNG\r\n\x1a\nverified-contact")
+        self.write_json(
+            "working/render_receipts/render_delivery_test.json",
+            {
+                "schema_version": 1,
+                "render_id": render_id,
+                "quality": "final",
+                "state_revision": state_revision,
+                "output": "renders/final-test.mp4",
+                "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+            },
+        )
+        delivery = {
+            "schema_version": 1,
+            "render_id": render_id,
+            "quality": "final",
+            "state_revision": state_revision,
+            "status": "pass",
+            "output": "renders/final-test.mp4",
+            "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+            "report": "qa/final-test-report.json",
+            "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+            "contact_sheet": "qa/final-test-contact.png",
+            "contact_sheet_sha256": hashlib.sha256(contact.read_bytes()).hexdigest(),
+            "render_receipt": "working/render_receipts/render_delivery_test.json",
+            "render_receipt_sha256": hashlib.sha256(render_receipt.read_bytes()).hexdigest(),
+        }
+        self.write_json("working/latest_final_qa.json", delivery)
+
+        final_revision = gate_revision(self.project, "final", state)
+        self.assertNotEqual(final_revision, state_revision)
+        status, approved = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "final",
+                "expected_revision": final_revision,
+                "confirmed_by": "unit-test",
+            },
+        )
+        self.assertEqual(status, 200, approved)
+        self.assertEqual(approved["approval"]["state_revision"], final_revision)
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["stages"]["render"], "complete")
+        self.assertEqual(manifest["stages"]["qa"], "complete")
+
+        output.write_bytes(b"tampered-after-qa")
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "final",
+                "expected_revision": final_revision,
+                "confirmed_by": "unit-test",
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("changed after verification", str(rejected["error"]))
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        bootstrap = json.loads(body.decode("utf-8"))
+        self.assertFalse(bootstrap["approval_current"]["final"])
 
 
 class EditorRendererTests(unittest.TestCase):
@@ -873,3 +1022,58 @@ class EditorRendererTests(unittest.TestCase):
             Path("/tmp/test-caption.txt"),
         )
         self.assertIn("alpha=", filters)
+
+    def test_renderer_normalizes_audio_for_social_delivery(self) -> None:
+        source = self.project / "source/source.mp4"
+        result = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x3b332d:s=360x640:d=0.45",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.45",
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(source),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        command = build_render_command(
+            self.project,
+            state,
+            manifest,
+            self.project / "renders/loudness-preview.mp4",
+            "preview",
+        )
+        self.assertIn("-af", command)
+        self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000", command)
+
+    def test_renderer_skips_loudnorm_for_silent_audio(self) -> None:
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        command = build_render_command(
+            self.project,
+            state,
+            manifest,
+            self.project / "renders/silent-preview.mp4",
+            "preview",
+        )
+        self.assertNotIn("loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000", command)

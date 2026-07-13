@@ -2333,6 +2333,33 @@ def cmd_approve(args: argparse.Namespace) -> int:
     if args.gate == "highlight_selection":
         approval["plan_revision"] = state.get("highlight_plan_revision")
     approvals[args.gate] = approval
+    stages = manifest.setdefault("stages", {})
+    if args.gate == "destructive_edit":
+        stages["edit_review"] = "complete"
+    elif args.gate == "highlight_selection":
+        stages["highlight_plan"] = "complete"
+    elif args.gate == "timeline":
+        stages["timeline_review"] = "complete"
+    elif args.gate == "final":
+        stages["edit_review"] = "complete"
+        stages["cut"] = "skipped"
+        stages["retranscribe"] = "skipped"
+        if state.get("highlights"):
+            stages["highlight_plan"] = "complete"
+        stages["timeline_review"] = "complete"
+        overlay_types = {
+            str(item.get("type"))
+            for item in state.get("overlays", [])
+            if isinstance(item, dict) and item.get("visible", True)
+        }
+        if "caption" in overlay_types:
+            stages["subtitles"] = "complete"
+        if "emphasis" in overlay_types:
+            stages["emphasis"] = "complete"
+        if overlay_types & {"title", "card", "image", "gif", "video", "animation"}:
+            stages["visual_plan"] = "complete"
+        stages["render"] = "complete"
+        stages["qa"] = "complete"
     manifest["updated_at"] = now_utc()
     write_json(path, manifest)
     emit({"ok": True, "gate": args.gate, "approval": approvals[args.gate]})
@@ -2347,13 +2374,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         return die(str(exc))
     approval_revisions: dict[str, str] = {}
     try:
-        from editor_server import approval_revisions as current_approval_revisions
+        from editor_server import (
+            GATES as EDITOR_GATES,
+            approval_is_current,
+            approval_revisions as current_approval_revisions,
+        )
 
         state_path = path.parent / "working/editor_state.json"
         state = read_json(state_path) if state_path.is_file() else {}
         approval_revisions = current_approval_revisions(path.parent, state)
+        approval_current = {
+            gate: approval_is_current(path.parent, manifest, gate, state)
+            for gate in sorted(EDITOR_GATES)
+        }
     except (ImportError, ValueError):
         approval_revisions = {}
+        approval_current = {}
     emit(
         {
             "manifest": str(path),
@@ -2361,6 +2397,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "stages": manifest.get("stages", {}),
             "approvals": manifest.get("approvals", {}),
             "approval_revisions": approval_revisions,
+            "approval_current": approval_current,
             "output_target": manifest.get("output_target", {}),
             "voiceover": manifest.get("voiceover", {}),
         }

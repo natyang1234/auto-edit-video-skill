@@ -256,6 +256,8 @@ payload = {
             "unit-test",
         )
         self.assertTrue(json.loads(approved.stdout)["approval"]["approved"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["stages"]["edit_review"], "complete")
 
     def test_chinese_male_defaults_to_shared_fish_voice(self) -> None:
         _, manifest = self.init_project("zh-male", "zh-TW", "male")

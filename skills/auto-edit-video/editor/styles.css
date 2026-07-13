@@ -893,6 +893,28 @@ h2 {
   border-left: 3px solid var(--amber);
 }
 
+.delivery-qa {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  color: var(--ink-1);
+  background: color-mix(in oklab, var(--paper-1) 78%, var(--amber) 22%);
+  border-left: 3px solid var(--amber);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.delivery-qa a {
+  width: fit-content;
+  color: var(--blue);
+  font-weight: 760;
+  text-underline-offset: 3px;
+}
+
+.delivery-qa a[hidden] {
+  display: none;
+}
+
 .cover-preview {
   width: min(100%, 230px);
   max-height: 330px;

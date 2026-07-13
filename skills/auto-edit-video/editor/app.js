@@ -43,6 +43,7 @@ function cacheElements() {
     "position-y", "position-y-output", "overlay-animation", "overlay-visible", "generate-copy",
     "publish-title", "publish-body", "publish-hashtags", "cover-text", "cover-time",
     "cover-time-output", "generate-cover", "cover-preview", "approve-timeline", "render-final",
+    "delivery-qa-status", "qa-contact-link", "approve-final",
     "voice-enabled", "voice-language", "voice-gender", "voice-id", "voice-mode",
     "voice-speed", "save-voice", "voice-status",
     "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output"
@@ -197,6 +198,13 @@ async function saveState(showConfirmation = true) {
       }
       elements["approve-timeline"].textContent = "核可時間軸";
       showToast("畫面內容已變更，時間軸核可已失效", "info");
+    }
+    if ((payload.invalidated_gates || []).includes("final")) {
+      if (projectPayload?.manifest?.approvals?.final) {
+        projectPayload.manifest.approvals.final.approved = false;
+      }
+      if (projectPayload?.approval_current) projectPayload.approval_current.final = false;
+      renderDeliveryQa();
     }
     setSaveState("已儲存", "saved");
     if (showConfirmation) showToast("時間軸已儲存", "success");
@@ -1102,6 +1110,87 @@ async function approveTimeline() {
   }
 }
 
+function artifactUrl(relative) {
+  if (!relative) return "";
+  const normalized = String(relative).replace(/^\/+/, "");
+  return `/${normalized.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function renderDeliveryQa(receipt = projectPayload?.delivery_qa || {}) {
+  projectPayload.delivery_qa = receipt || {};
+  const hasReceipt = receipt && receipt.status === "pass";
+  const isCurrent = hasReceipt && receipt.state_revision === state?.revision;
+  const approval = projectPayload?.manifest?.approvals?.final || {};
+  const isApproved = Boolean(
+    approval.approved
+    && approval.state_revision
+    && approval.state_revision === projectPayload?.approval_revisions?.final
+    && projectPayload?.approval_current?.final !== false
+  );
+  const warnings = Array.isArray(receipt?.warnings) ? receipt.warnings : [];
+
+  elements["qa-contact-link"].hidden = !hasReceipt || !receipt.contact_sheet;
+  if (!elements["qa-contact-link"].hidden) {
+    elements["qa-contact-link"].href = artifactUrl(receipt.contact_sheet);
+  }
+  elements["approve-final"].disabled = !isCurrent || isApproved;
+  elements["approve-final"].textContent = isApproved
+    ? "最終成片已核可"
+    : "檢查完成，核可最終成片";
+
+  if (!hasReceipt) {
+    elements["delivery-qa-status"].textContent = "尚未執行最終輸出 QA。";
+  } else if (!isCurrent) {
+    elements["delivery-qa-status"].textContent = "QA 成片對應舊時間軸，請重新輸出。";
+  } else if (isApproved) {
+    elements["delivery-qa-status"].textContent = "機械 QA 與人工檢查均已通過。";
+  } else {
+    elements["delivery-qa-status"].textContent = warnings.length
+      ? `機械 QA 通過；有 ${warnings.length} 項提醒，請查看九宮格與完整播放。`
+      : "機械 QA 通過；請查看九宮格並完整播放後再核可。";
+  }
+
+  if (isApproved && receipt.output) {
+    const outputUrl = artifactUrl(receipt.output);
+    elements["download-output"].href = outputUrl;
+    elements["download-output"].download = String(receipt.output).split("/").pop() || "auto-edit-final.mp4";
+    elements["download-output"].dataset.quality = "final";
+    elements["download-output"].hidden = false;
+  } else if (elements["download-output"].dataset.quality === "final") {
+    elements["download-output"].hidden = true;
+  }
+}
+
+async function approveFinal() {
+  await saveState(false);
+  elements["approve-final"].disabled = true;
+  try {
+    if (stateDirty) throw new Error("目前時間軸尚未成功儲存");
+    const receipt = projectPayload.delivery_qa || {};
+    if (receipt.status !== "pass" || receipt.state_revision !== state.revision) {
+      throw new Error("請先完成目前版本的最終輸出與 QA");
+    }
+    const result = await request("/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        gate: "final",
+        expected_revision: projectPayload.approval_revisions.final,
+        confirmed_by: "local-editor-user",
+        note: "Reviewed final playback and QA contact sheet in Auto Edit Studio",
+      }),
+    });
+    projectPayload.manifest.approvals.final = result.approval;
+    projectPayload.approval_revisions = result.approval_revisions;
+    projectPayload.approval_current = result.approval_current || projectPayload.approval_current || {};
+    renderDeliveryQa();
+    showToast("最終成片已核可，可以下載", "success");
+  } catch (error) {
+    showToast(`最終核可失敗：${error.message}`, "error");
+    renderDeliveryQa();
+  }
+}
+
 async function startRender(quality = "preview") {
   await saveState(false);
   const button = quality === "preview" ? elements["render-button"] : elements["render-final"];
@@ -1143,11 +1232,33 @@ function pollRenderStatus(button) {
         video.load();
         showingRenderedMedia = true;
         elements["overlay-layer"].hidden = true;
-        elements["download-output"].href = status.output;
-        elements["download-output"].download = status.download_name || "auto-edit-output.mp4";
-        elements["download-output"].hidden = false;
+        if (status.quality === "final") {
+          projectPayload.delivery_qa = status.qa || {};
+          projectPayload.approval_revisions = status.approval_revisions || projectPayload.approval_revisions;
+          if (projectPayload?.manifest?.approvals?.final) {
+            projectPayload.manifest.approvals.final.approved = false;
+          }
+          projectPayload.approval_current = projectPayload.approval_current || {};
+          projectPayload.approval_current.final = false;
+          elements["download-output"].dataset.quality = "final";
+          elements["download-output"].hidden = true;
+          renderDeliveryQa(projectPayload.delivery_qa);
+        } else {
+          elements["download-output"].href = status.output;
+          elements["download-output"].download = status.download_name || "auto-edit-preview.mp4";
+          elements["download-output"].dataset.quality = "preview";
+          elements["download-output"].hidden = false;
+        }
         setSaveState("輸出完成", "saved");
         showToast(status.message, "success");
+      } else if (status.state === "qa_failed") {
+        const failures = status.qa?.failures || [];
+        elements["delivery-qa-status"].textContent = failures.length
+          ? `機械 QA 未通過：${failures.join("、")}`
+          : `機械 QA 未通過：${status.message}`;
+        elements["approve-final"].disabled = true;
+        setSaveState("QA 未通過", "error");
+        showToast(`最終輸出未取代上一版：${status.message}`, "error");
       } else if (status.state === "failed") {
         setSaveState("輸出失敗", "error");
         showToast(`輸出失敗：${status.message}`, "error");
@@ -1250,6 +1361,7 @@ function renderAll() {
   renderTimeline();
   renderPreviewOverlays(true);
   renderSourceWarning();
+  renderDeliveryQa();
 }
 
 function bindEvents() {
@@ -1275,6 +1387,7 @@ function bindEvents() {
     elements[id].addEventListener("change", updateActiveHighlightFields);
   });
   elements["approve-timeline"].addEventListener("click", approveTimeline);
+  elements["approve-final"].addEventListener("click", approveFinal);
   elements["platform-select"].addEventListener("change", () => {
     pushHistory();
     const preset = projectPayload.platform_presets[elements["platform-select"].value];
@@ -1423,7 +1536,13 @@ async function initialize() {
     renderAll();
     updateScrubberBounds();
     renderVoicePanel();
-    if (projectPayload.render_status?.state === "running") pollRenderStatus(elements["render-button"]);
+    if (projectPayload.render_status?.state === "running") {
+      const runningButton = projectPayload.render_status.quality === "final"
+        ? elements["render-final"]
+        : elements["render-button"];
+      runningButton.disabled = true;
+      pollRenderStatus(runningButton);
+    }
     if (["pending", "running"].includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();
   } catch (error) {
     elements["stage-empty"].innerHTML = "";
