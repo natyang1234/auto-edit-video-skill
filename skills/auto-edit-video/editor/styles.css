@@ -1708,6 +1708,34 @@ body {
   border-left-color: var(--blue);
 }
 
+.highlight-row.is-approved { box-shadow: inset -3px 0 var(--green); }
+.highlight-row.is-rejected { opacity: 0.54; }
+
+.highlight-editor {
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  background: var(--paper-1);
+}
+
+.highlight-editor[hidden] { display: none; }
+.highlight-editor label { display: grid; gap: 4px; }
+.highlight-editor label > span { color: var(--ink-2); font-size: 0.62rem; font-weight: 760; }
+.highlight-editor input { width: 100%; min-height: 34px; }
+.highlight-time-fields,
+.highlight-review-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.highlight-review-actions .button { min-height: 44px; padding-inline: 8px; }
+.highlight-section > .full-width { margin-top: 10px; }
+.replan-button { margin-top: 10px; }
+.download-output { justify-content: center; margin-top: 8px; text-decoration: none; }
+.download-output[hidden] { display: none; }
+
+@media (pointer: coarse) {
+  .highlight-editor input,
+  .highlight-review-actions .button { min-height: 48px; }
+}
+
 .highlight-number {
   color: var(--ink-2);
   font-size: 0.62rem;

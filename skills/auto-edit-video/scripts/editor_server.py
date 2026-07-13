@@ -254,7 +254,6 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         "director_style": state.get("director_style"),
         "source_sha256": state.get("source_sha256"),
         "highlight_plan_revision": state.get("highlight_plan_revision"),
-        "active_highlight_id": state.get("active_highlight_id"),
         "highlights": state.get("highlights"),
         "asset_digests": state.get("asset_digests"),
         "caption_defaults": state.get("caption_defaults"),
@@ -267,6 +266,137 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def canonical_revision(payload: Any) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def gate_revision(
+    project_dir: Path,
+    gate: str,
+    state: dict[str, Any] | None = None,
+) -> str:
+    if gate == "destructive_edit":
+        return canonical_revision(
+            {
+                "candidates": read_json(
+                    project_dir / "working/edit_candidates.json", {"items": []}
+                ),
+                "decisions": read_json(
+                    project_dir / "working/edit_decisions.json", {"items": []}
+                ),
+            }
+        )
+    current_state = state
+    if current_state is None:
+        current_state = read_json(project_dir / STATE_REL, {}) or {}
+    if gate == "highlight_selection":
+        return canonical_revision(
+            {
+                "source_sha256": current_state.get("source_sha256"),
+                "highlight_plan_revision": current_state.get("highlight_plan_revision"),
+                "highlights": current_state.get("highlights", []),
+            }
+        )
+    if gate in {"timeline", "final"}:
+        return editor_state_revision(current_state)
+    raise ValueError(f"unsupported approval gate: {gate}")
+
+
+def approval_is_current(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    gate: str,
+    state: dict[str, Any] | None = None,
+) -> bool:
+    approval = manifest.get("approvals", {}).get(gate, {})
+    return bool(
+        isinstance(approval, dict)
+        and approval.get("approved")
+        and approval.get("state_revision") == gate_revision(project_dir, gate, state)
+    )
+
+
+def approval_prerequisite_errors(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+    gate: str,
+) -> list[str]:
+    errors: list[str] = []
+    if gate == "destructive_edit":
+        candidates = read_json(
+            project_dir / "working/edit_candidates.json", {"items": []}
+        ) or {"items": []}
+        decisions = read_json(
+            project_dir / "working/edit_decisions.json", {"items": []}
+        ) or {"items": []}
+        candidate_ids = {
+            str(item.get("id"))
+            for item in candidates.get("items", [])
+            if isinstance(item, dict)
+        }
+        approved_decisions = {
+            str(item.get("candidate_id"))
+            for item in decisions.get("items", [])
+            if isinstance(item, dict) and item.get("review_status") == "approved"
+        }
+        if candidate_ids != approved_decisions:
+            errors.append("every edit candidate must have an explicit approved keep/delete decision")
+        return errors
+
+    if not approval_is_current(project_dir, manifest, "destructive_edit", state):
+        errors.append("destructive_edit must be approved for its current revision first")
+
+    highlights = state.get("highlights", []) if isinstance(state.get("highlights"), list) else []
+    if gate == "highlight_selection":
+        plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
+        if not highlights:
+            errors.append("at least one transcript-grounded highlight is required")
+        if state.get("highlight_plan_revision") != plan.get("plan_revision"):
+            errors.append("highlight plan revision is stale")
+        plan_ids = {
+            str(item.get("id"))
+            for item in plan.get("items", [])
+            if isinstance(item, dict)
+        }
+        for item in highlights:
+            if not isinstance(item, dict) or str(item.get("plan_item_id")) not in plan_ids:
+                errors.append("every reviewed highlight must reference the current highlight plan")
+                break
+        if not any(
+            isinstance(item, dict) and item.get("review_status") == "approved"
+            for item in highlights
+        ):
+            errors.append("at least one highlight must be marked approved")
+        return errors
+
+    if highlights and not approval_is_current(
+        project_dir, manifest, "highlight_selection", state
+    ):
+        errors.append("highlight_selection must be approved for its current revision first")
+    if gate == "timeline":
+        return errors
+    if gate == "final" and not approval_is_current(
+        project_dir, manifest, "timeline", state
+    ):
+        errors.append("timeline must be approved for its current revision first")
+    return errors
+
+
+def approval_revisions(project_dir: Path, state: dict[str, Any] | None = None) -> dict[str, str]:
+    return {
+        gate: gate_revision(project_dir, gate, state)
+        for gate in sorted(GATES)
+    }
 
 
 def project_path(project_dir: Path, relative: str) -> Path:
@@ -321,6 +451,14 @@ def referenced_asset_digests(project_dir: Path, state: dict[str, Any]) -> dict[s
                 digest.update(chunk)
         digests[source] = digest.hexdigest()
     return dict(sorted(digests.items()))
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def asset_magic_matches(data: bytes, suffix: str) -> bool:
@@ -802,6 +940,7 @@ class EditorServer(ThreadingHTTPServer):
         super().__init__(address, EditorHandler)
         self.project_dir = project_dir.resolve()
         self.voice_catalog = load_voice_catalog()
+        self.project_lock = threading.RLock()
         self.render_lock = threading.Lock()
         self.render_status: dict[str, Any] = {
             "state": "idle",
@@ -974,6 +1113,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "message": "這個專案尚未啟動本機自動處理。",
                     },
                 ),
+                "approval_revisions": approval_revisions(project, state),
                 "qa": read_json(project / "qa/source-qa.json", {}),
                 "media_url": "/media/source" if source_rel else None,
                 "render_status": self.server.render_status,
@@ -982,6 +1122,10 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/render-status":
             self.send_json(self.server.render_status)
+            return
+        if path == "/api/approval-revisions":
+            state = read_json(project / STATE_REL, {}) or {}
+            self.send_json({"ok": True, "revisions": approval_revisions(project, state)})
             return
         if path == "/api/pipeline-status":
             self.send_json(
@@ -1044,43 +1188,45 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         try:
             state = self.read_json_body()
-            manifest = read_json(self.server.project_dir / "project.json", {}) or {}
-            duration = float(manifest.get("source", {}).get("duration_s", 0.0))
-            plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
-            state["source_sha256"] = manifest.get("source", {}).get("sha256")
-            state["highlight_plan_revision"] = plan.get("plan_revision")
-            state["project_dir"] = str(self.server.project_dir)
-            errors = validate_editor_state(state, duration)
-            state.pop("project_dir", None)
-            try:
-                state["asset_digests"] = referenced_asset_digests(self.server.project_dir, state)
-            except ValueError as exc:
-                errors.append(str(exc))
-            if errors:
-                self.send_json({"ok": False, "errors": errors}, status=422)
-                return
-            state["updated_at"] = now_utc()
-            state["revision"] = editor_state_revision(state)
-            atomic_write_json(self.server.project_dir / STATE_REL, state)
-            invalidated_gates: list[str] = []
-            approvals = manifest.setdefault("approvals", {})
-            for gate in ("timeline", "final"):
-                approval = approvals.get(gate)
-                if not isinstance(approval, dict) or not approval.get("approved"):
-                    continue
-                if approval.get("state_revision") == state["revision"]:
-                    continue
-                approvals[gate] = {
-                    "approved": False,
-                    "confirmed_by": None,
-                    "at": None,
-                    "note": "Invalidated because render-affecting editor state changed",
-                    "invalidated_at": now_utc(),
-                }
-                invalidated_gates.append(gate)
-            if invalidated_gates:
-                manifest["updated_at"] = now_utc()
-                atomic_write_json(self.server.project_dir / "project.json", manifest)
+            with self.server.project_lock:
+                manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+                duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+                plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
+                state["source_sha256"] = manifest.get("source", {}).get("sha256")
+                state["highlight_plan_revision"] = plan.get("plan_revision")
+                state["project_dir"] = str(self.server.project_dir)
+                errors = validate_editor_state(state, duration)
+                state.pop("project_dir", None)
+                try:
+                    state["asset_digests"] = referenced_asset_digests(self.server.project_dir, state)
+                except ValueError as exc:
+                    errors.append(str(exc))
+                if errors:
+                    self.send_json({"ok": False, "errors": errors}, status=422)
+                    return
+                state["updated_at"] = now_utc()
+                state["revision"] = editor_state_revision(state)
+                atomic_write_json(self.server.project_dir / STATE_REL, state)
+                current_revisions = approval_revisions(self.server.project_dir, state)
+                invalidated_gates: list[str] = []
+                approvals = manifest.setdefault("approvals", {})
+                for gate in ("highlight_selection", "timeline", "final"):
+                    approval = approvals.get(gate)
+                    if not isinstance(approval, dict) or not approval.get("approved"):
+                        continue
+                    if approval.get("state_revision") == current_revisions[gate]:
+                        continue
+                    approvals[gate] = {
+                        "approved": False,
+                        "confirmed_by": None,
+                        "at": None,
+                        "note": f"Invalidated because the {gate} revision changed",
+                        "invalidated_at": now_utc(),
+                    }
+                    invalidated_gates.append(gate)
+                if invalidated_gates:
+                    manifest["updated_at"] = now_utc()
+                    atomic_write_json(self.server.project_dir / "project.json", manifest)
         except (ValueError, TypeError) as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
@@ -1090,6 +1236,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "updated_at": state["updated_at"],
                 "revision": state["revision"],
                 "invalidated_gates": invalidated_gates,
+                "approval_revisions": current_revisions,
             }
         )
 
@@ -1211,8 +1358,36 @@ class EditorHandler(BaseHTTPRequestHandler):
             "approved_from": now_utc() if body.get("approved") else None,
             "items": normalized,
         }
-        atomic_write_json(self.server.project_dir / "working/edit_decisions.json", payload)
-        self.send_json({"ok": True, "items": len(normalized)})
+        with self.server.project_lock:
+            atomic_write_json(self.server.project_dir / "working/edit_decisions.json", payload)
+            manifest_path = self.server.project_dir / "project.json"
+            manifest = read_json(manifest_path, {}) or {}
+            invalidated: list[str] = []
+            approvals = manifest.setdefault("approvals", {})
+            for gate in ("destructive_edit", "highlight_selection", "timeline", "final"):
+                approval = approvals.get(gate)
+                if not isinstance(approval, dict) or not approval.get("approved"):
+                    continue
+                approvals[gate] = {
+                    "approved": False,
+                    "confirmed_by": None,
+                    "at": None,
+                    "note": "Invalidated because edit decisions changed",
+                    "invalidated_at": now_utc(),
+                }
+                invalidated.append(gate)
+            if invalidated:
+                manifest["updated_at"] = now_utc()
+                atomic_write_json(manifest_path, manifest)
+            revision = gate_revision(self.server.project_dir, "destructive_edit")
+        self.send_json(
+            {
+                "ok": True,
+                "items": len(normalized),
+                "approval_revision": revision,
+                "invalidated_gates": invalidated,
+            }
+        )
 
     def do_POST(self) -> None:
         if not self.allow_request(mutation=True):
@@ -1223,6 +1398,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/copy-draft":
             self.handle_copy_draft()
+            return
+        if path == "/api/plan-highlights":
+            self.handle_plan_highlights()
             return
         if path == "/api/approve":
             self.handle_approval()
@@ -1308,6 +1486,82 @@ class EditorHandler(BaseHTTPRequestHandler):
         draft = copy_draft(platform_id, transcript_text(self.server.project_dir))
         self.send_json({"ok": True, "draft": draft})
 
+    def handle_plan_highlights(self) -> None:
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        director = str(body.get("director", ""))
+        brief = str(body.get("brief", "")).strip()
+        count = body.get("count", 10)
+        expected_revision = str(body.get("expected_revision", ""))
+        if director not in DIRECTOR_PRESETS:
+            self.send_json({"ok": False, "error": "unsupported director profile"}, status=422)
+            return
+        if len(brief) > 2000 or isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 10:
+            self.send_json({"ok": False, "error": "invalid highlight planning settings"}, status=422)
+            return
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            self.send_json({"ok": False, "error": "expected_revision is required"}, status=409)
+            return
+        with self.server.project_lock:
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+            current_revision = editor_state_revision(state)
+            if expected_revision != current_revision:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "editor state changed before highlight planning",
+                        "current_revision": current_revision,
+                    },
+                    status=409,
+                )
+                return
+            command = [
+                sys.executable,
+                str(SKILL_DIR / "scripts/auto_edit.py"),
+                "plan-highlights",
+                "--manifest",
+                str(self.server.project_dir / "project.json"),
+                "--director",
+                director,
+                "--count",
+                str(count),
+                "--brief",
+                brief,
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                self.send_json({"ok": False, "error": "highlight planning timed out"}, status=504)
+                return
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout or "highlight planning failed").strip()[-600:]
+                self.send_json(
+                    {"ok": False, "error": message},
+                    status=422 if result.returncode == 3 else 500,
+                )
+                return
+            manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+            plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
+            revisions = approval_revisions(self.server.project_dir, state)
+        self.send_json(
+            {
+                "ok": True,
+                "manifest": manifest,
+                "state": state,
+                "highlight_plan": plan,
+                "approval_revisions": revisions,
+            }
+        )
+
     def handle_approval(self) -> None:
         try:
             body = self.read_json_body()
@@ -1318,21 +1572,59 @@ class EditorHandler(BaseHTTPRequestHandler):
         if gate not in GATES:
             self.send_json({"ok": False, "error": "unsupported approval gate"}, status=422)
             return
+        expected_revision = str(body.get("expected_revision", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            self.send_json(
+                {"ok": False, "error": "expected_revision is required for approval"},
+                status=409,
+            )
+            return
         manifest_path = self.server.project_dir / "project.json"
-        manifest = read_json(manifest_path, {}) or {}
-        approval = {
-            "approved": True,
-            "confirmed_by": str(body.get("confirmed_by") or "local-editor-user")[:120],
-            "at": now_utc(),
-            "note": str(body.get("note") or "Approved in local editor")[:500],
-        }
-        if gate in {"timeline", "final"}:
+        with self.server.project_lock:
+            manifest = read_json(manifest_path, {}) or {}
             state = read_json(self.server.project_dir / STATE_REL, {}) or {}
-            approval["state_revision"] = editor_state_revision(state)
-        manifest.setdefault("approvals", {})[gate] = approval
-        manifest["updated_at"] = now_utc()
-        atomic_write_json(manifest_path, manifest)
-        self.send_json({"ok": True, "gate": gate, "approval": manifest["approvals"][gate]})
+            current_revision = gate_revision(self.server.project_dir, gate, state)
+            if expected_revision != current_revision:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "approval revision is stale; reload the current project state",
+                        "current_revision": current_revision,
+                    },
+                    status=409,
+                )
+                return
+            errors = approval_prerequisite_errors(
+                self.server.project_dir,
+                manifest,
+                state,
+                gate,
+            )
+            if errors:
+                self.send_json({"ok": False, "error": "; ".join(errors)}, status=409)
+                return
+            approval = {
+                "approved": True,
+                "confirmed_by": str(body.get("confirmed_by") or "local-editor-user")[:120],
+                "at": now_utc(),
+                "note": str(body.get("note") or "Approved in local editor")[:500],
+                "state_revision": current_revision,
+                "revision_kind": gate,
+            }
+            if gate == "highlight_selection":
+                approval["plan_revision"] = state.get("highlight_plan_revision")
+            manifest.setdefault("approvals", {})[gate] = approval
+            manifest["updated_at"] = now_utc()
+            atomic_write_json(manifest_path, manifest)
+            revisions = approval_revisions(self.server.project_dir, state)
+        self.send_json(
+            {
+                "ok": True,
+                "gate": gate,
+                "approval": approval,
+                "approval_revisions": revisions,
+            }
+        )
 
     def handle_render(self) -> None:
         try:
@@ -1344,68 +1636,219 @@ class EditorHandler(BaseHTTPRequestHandler):
         if quality not in {"preview", "final"}:
             self.send_json({"ok": False, "error": "quality must be preview or final"}, status=422)
             return
-        if quality == "final":
+        expected_revision = str(body.get("expected_revision", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            self.send_json(
+                {"ok": False, "error": "expected_revision is required for render"},
+                status=409,
+            )
+            return
+        with self.server.project_lock:
             manifest = read_json(self.server.project_dir / "project.json", {}) or {}
             state = read_json(self.server.project_dir / STATE_REL, {}) or {}
-            approval = manifest.get("approvals", {}).get("timeline", {})
-            if (
-                not approval.get("approved")
-                or approval.get("state_revision") != editor_state_revision(state)
-            ):
+            current_revision = editor_state_revision(state)
+            if expected_revision != current_revision:
                 self.send_json(
                     {
                         "ok": False,
-                        "error": "current timeline revision must be approved before final render",
+                        "error": "render revision is stale; save and reload before rendering",
+                        "current_revision": current_revision,
                     },
                     status=409,
                 )
                 return
-        with self.server.render_lock:
-            if self.server.render_status.get("state") == "running":
-                self.send_json({"ok": False, "error": "a render is already running"}, status=409)
+            try:
+                actual_assets = referenced_asset_digests(self.server.project_dir, state)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=409)
                 return
-            self.server.render_status = {
-                "state": "running",
-                "message": "正在輸出預覽…" if quality == "preview" else "正在輸出最終影片…",
+            if actual_assets != (state.get("asset_digests") or {}):
+                self.send_json(
+                    {"ok": False, "error": "a referenced asset changed after the editor state was saved"},
+                    status=409,
+                )
+                return
+            highlights = state.get("highlights", []) if isinstance(state.get("highlights"), list) else []
+            clip_id = str(body.get("clip_id") or state.get("active_highlight_id") or "")
+            clip = next(
+                (
+                    item
+                    for item in highlights
+                    if isinstance(item, dict) and str(item.get("id")) == clip_id
+                ),
+                None,
+            )
+            if clip_id and clip is None:
+                self.send_json({"ok": False, "error": "selected highlight does not exist"}, status=422)
+                return
+            if quality == "final":
+                if highlights and clip is None:
+                    self.send_json(
+                        {"ok": False, "error": "select an approved highlight before final render"},
+                        status=409,
+                    )
+                    return
+                if clip is not None and clip.get("review_status") != "approved":
+                    self.send_json(
+                        {"ok": False, "error": "selected highlight must be approved before final render"},
+                        status=409,
+                    )
+                    return
+                prerequisite_errors = approval_prerequisite_errors(
+                    self.server.project_dir,
+                    manifest,
+                    state,
+                    "timeline",
+                )
+                if prerequisite_errors or not approval_is_current(
+                    self.server.project_dir,
+                    manifest,
+                    "timeline",
+                    state,
+                ):
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "error": "; ".join(prerequisite_errors)
+                            or "current timeline revision must be approved before final render",
+                        },
+                        status=409,
+                    )
+                    return
+            render_id = f"render_{uuid.uuid4().hex}"
+            clip_snapshot = None
+            if clip is not None:
+                clip_snapshot = {
+                    key: clip.get(key)
+                    for key in (
+                        "id",
+                        "plan_item_id",
+                        "start",
+                        "end",
+                        "title",
+                        "review_status",
+                    )
+                }
+            snapshot = {
+                "schema_version": 1,
+                "render_id": render_id,
+                "created_at": now_utc(),
                 "quality": quality,
-                "output": None,
-                "started_at": now_utc(),
+                "project_id": manifest.get("project_id"),
+                "state_revision": current_revision,
+                "approval_revisions": approval_revisions(self.server.project_dir, state),
+                "clip": clip_snapshot,
+                "manifest": manifest,
+                "state": state,
+                "authorization": {
+                    gate: manifest.get("approvals", {}).get(gate, {})
+                    for gate in GATES
+                },
             }
-        threading.Thread(target=self.render_worker, args=(quality,), daemon=True).start()
+            snapshot_path = (
+                self.server.project_dir / "working/render_snapshots" / f"{render_id}.json"
+            )
+            atomic_write_json(snapshot_path, snapshot)
+            safe_clip = re.sub(r"[^A-Za-z0-9_-]", "-", clip_id)[:80] if clip_id else "source-full"
+            output_name = (
+                f"{safe_clip}-preview.mp4" if quality == "preview" else f"{safe_clip}-final.mp4"
+            )
+            with self.server.render_lock:
+                if self.server.render_status.get("state") == "running":
+                    self.send_json({"ok": False, "error": "a render is already running"}, status=409)
+                    return
+                self.server.render_status = {
+                    "state": "running",
+                    "message": "正在輸出預覽…" if quality == "preview" else "正在輸出最終影片…",
+                    "quality": quality,
+                    "clip_id": clip_id or None,
+                    "render_id": render_id,
+                    "state_revision": current_revision,
+                    "output": None,
+                    "started_at": now_utc(),
+                }
+        threading.Thread(
+            target=self.render_worker,
+            args=(quality, snapshot_path, output_name, render_id, clip_id or None),
+            daemon=True,
+        ).start()
         self.send_json({"ok": True, "status": self.server.render_status}, status=202)
 
-    def render_worker(self, quality: str) -> None:
+    def render_worker(
+        self,
+        quality: str,
+        snapshot_path: Path,
+        output_name: str,
+        render_id: str,
+        clip_id: str | None,
+    ) -> None:
         script = SKILL_DIR / "scripts/render_editor_timeline.py"
-        output_name = "editor-preview.mp4" if quality == "preview" else "final.mp4"
         output = self.server.project_dir / "renders" / output_name
+        temporary = output.parent / f".{output.stem}.{render_id}.part.mp4"
         command = [
             sys.executable,
             str(script),
             "--project-dir",
             str(self.server.project_dir),
+            "--snapshot",
+            str(snapshot_path),
             "--quality",
             quality,
             "--output",
-            str(output),
+            str(temporary),
         ]
-        result = subprocess.run(command, text=True, capture_output=True)
-        if result.returncode == 0 and output.is_file():
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            try:
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=2 * 60 * 60,
+                )
+            except subprocess.TimeoutExpired:
+                result = subprocess.CompletedProcess(command, 124, "", "render timed out")
+            if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
+                raise RuntimeError((result.stderr or result.stdout or "render failed").strip()[-1200:])
+            os.replace(temporary, output)
+            receipt = {
+                "schema_version": 1,
+                "render_id": render_id,
+                "quality": quality,
+                "clip_id": clip_id,
+                "snapshot": str(snapshot_path.relative_to(self.server.project_dir)),
+                "output": str(output.relative_to(self.server.project_dir)),
+                "output_sha256": file_sha256(output),
+                "bytes": output.stat().st_size,
+                "completed_at": now_utc(),
+            }
+            atomic_write_json(
+                self.server.project_dir / "working/render_receipts" / f"{render_id}.json",
+                receipt,
+            )
             self.server.render_status = {
                 "state": "complete",
                 "message": "預覽已完成" if quality == "preview" else "最終影片已完成",
                 "quality": quality,
-                "output": f"/renders/{output_name}",
+                "clip_id": clip_id,
+                "render_id": render_id,
+                "output": f"/renders/{urllib.parse.quote(output_name)}",
+                "download_name": output_name,
+                "output_sha256": receipt["output_sha256"],
                 "finished_at": now_utc(),
             }
-        else:
-            message = (result.stderr or result.stdout or "render failed").strip()[-1200:]
+        except (OSError, RuntimeError) as exc:
             self.server.render_status = {
                 "state": "failed",
-                "message": message,
+                "message": str(exc)[-1200:],
                 "quality": quality,
+                "clip_id": clip_id,
+                "render_id": render_id,
                 "output": None,
                 "finished_at": now_utc(),
             }
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def handle_cover(self) -> None:
         try:

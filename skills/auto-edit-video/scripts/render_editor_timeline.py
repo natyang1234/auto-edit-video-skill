@@ -12,10 +12,18 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 from typing import Any
 
-from editor_server import PLATFORM_PRESETS, editor_state_revision, read_json
+from editor_server import (
+    PLATFORM_PRESETS,
+    editor_state_revision,
+    ffprobe_has_visual_stream,
+    file_sha256,
+    read_json,
+    referenced_asset_digests,
+)
 
 
 FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
@@ -222,6 +230,7 @@ def build_render_command(
     manifest: dict[str, Any],
     output: Path,
     quality: str,
+    clip: dict[str, Any] | None = None,
 ) -> list[str]:
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -231,7 +240,24 @@ def build_render_command(
     else:
         width, height = even(target_width), even(target_height)
     render_scale = width / max(target_width, 1)
-    duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+    source_duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+    clip_start = 0.0
+    clip_end = source_duration
+    if clip is not None:
+        try:
+            clip_start = float(clip.get("start"))
+            clip_end = float(clip.get("end"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("render clip timing must be numeric") from exc
+        if (
+            not math.isfinite(clip_start)
+            or not math.isfinite(clip_end)
+            or clip_start < 0
+            or clip_end <= clip_start
+            or clip_end > source_duration + 0.05
+        ):
+            raise ValueError("render clip timing is outside the source")
+    duration = clip_end - clip_start
     source_rel = str(manifest.get("source", {}).get("staged_path", ""))
     source = project_dir / source_rel
     if not source.is_file():
@@ -240,21 +266,32 @@ def build_render_command(
     if fit == "contain":
         base_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x171512,setsar=1"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x171512,setsar=1,setpts=PTS-STARTPTS"
         )
     else:
         base_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},setsar=1"
+            f"crop={width}:{height},setsar=1,setpts=PTS-STARTPTS"
         )
 
-    command = [ffmpeg_path(), "-y", "-i", str(source)]
-    overlays = [
-        overlay
-        for overlay in state.get("overlays", [])
-        if overlay.get("visible", True)
-        and float(overlay.get("end", 0.0)) > float(overlay.get("start", 0.0))
-    ]
+    command = [ffmpeg_path(), "-y"]
+    if clip_start > 0:
+        command.extend(["-ss", f"{clip_start:.3f}"])
+    command.extend(["-i", str(source)])
+    overlays: list[dict[str, Any]] = []
+    for source_overlay in state.get("overlays", []):
+        if not isinstance(source_overlay, dict) or not source_overlay.get("visible", True):
+            continue
+        raw_start = float(source_overlay.get("start", 0.0))
+        raw_end = float(source_overlay.get("end", 0.0))
+        if raw_end <= clip_start or raw_start >= clip_end:
+            continue
+        overlay = dict(source_overlay)
+        overlay["style"] = dict(source_overlay.get("style") or {})
+        overlay["start"] = max(raw_start, clip_start) - clip_start
+        overlay["end"] = min(raw_end, clip_end) - clip_start
+        if float(overlay["end"]) > float(overlay["start"]):
+            overlays.append(overlay)
     overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
     asset_inputs: dict[str, int] = {}
     for overlay in overlays:
@@ -343,20 +380,126 @@ def build_render_command(
     return command
 
 
-def render_project(project_dir: Path, output: Path, quality: str) -> None:
-    manifest = read_json(project_dir / "project.json", {}) or {}
-    state = read_json(project_dir / "working/editor_state.json", {}) or {}
-    if quality == "final":
-        approval = manifest.get("approvals", {}).get("timeline", {})
-        if (
-            not approval.get("approved")
-            or approval.get("state_revision") != editor_state_revision(state)
+def load_render_snapshot(
+    project_dir: Path,
+    snapshot_path: Path,
+    quality: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    root = project_dir.resolve()
+    snapshot_root = (root / "working/render_snapshots").resolve()
+    entry = snapshot_path.expanduser()
+    if not entry.is_absolute():
+        entry = root / entry
+    if entry.is_symlink():
+        raise ValueError("render snapshot must be an owned regular file")
+    resolved = entry.resolve()
+    if snapshot_root not in resolved.parents or not resolved.is_file():
+        raise ValueError("render snapshot must be under working/render_snapshots")
+    snapshot = read_json(resolved, {}) or {}
+    if snapshot.get("schema_version") != 1 or snapshot.get("quality") != quality:
+        raise ValueError("render snapshot schema or quality is invalid")
+    state = snapshot.get("state") if isinstance(snapshot.get("state"), dict) else {}
+    manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), dict) else {}
+    revision = editor_state_revision(state)
+    if snapshot.get("state_revision") != revision:
+        raise ValueError("render snapshot state revision does not match its payload")
+    if snapshot.get("project_id") != manifest.get("project_id"):
+        raise ValueError("render snapshot project identity does not match")
+    actual_assets = referenced_asset_digests(root, state)
+    if actual_assets != (state.get("asset_digests") or {}):
+        raise ValueError("render snapshot asset digest does not match current owned assets")
+    source_rel = str(manifest.get("source", {}).get("staged_path", ""))
+    source_entry = root / source_rel
+    if source_entry.is_symlink():
+        raise ValueError("render source must be an owned regular file")
+    source = source_entry.resolve()
+    if root not in source.parents or not source.is_file():
+        raise ValueError("render source is missing or outside the project")
+    declared_source_sha = str(manifest.get("source", {}).get("sha256") or "")
+    if declared_source_sha:
+        if state.get("source_sha256") != declared_source_sha:
+            raise ValueError("render snapshot source digest contract is inconsistent")
+        if file_sha256(source) != declared_source_sha:
+            raise ValueError("render source changed after import")
+    clip = snapshot.get("clip") if isinstance(snapshot.get("clip"), dict) else None
+    if clip is not None:
+        matching = next(
+            (
+                item
+                for item in state.get("highlights", [])
+                if isinstance(item, dict) and str(item.get("id")) == str(clip.get("id"))
+            ),
+            None,
+        )
+        if matching is None or any(
+            matching.get(key) != clip.get(key)
+            for key in ("plan_item_id", "start", "end", "title", "review_status")
         ):
-            raise ValueError("current timeline revision must be approved before final render")
-    command = build_render_command(project_dir, state, manifest, output, quality)
-    result = subprocess.run(command, text=True, capture_output=True)
-    if result.returncode != 0 or not output.is_file():
-        raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
+            raise ValueError("render clip does not match the frozen editor state")
+    if quality == "final":
+        authorization = (
+            snapshot.get("authorization")
+            if isinstance(snapshot.get("authorization"), dict)
+            else {}
+        )
+        revisions = (
+            snapshot.get("approval_revisions")
+            if isinstance(snapshot.get("approval_revisions"), dict)
+            else {}
+        )
+        required = ["destructive_edit", "timeline"]
+        if state.get("highlights"):
+            required.append("highlight_selection")
+        for gate in required:
+            approval = authorization.get(gate, {})
+            if (
+                not isinstance(approval, dict)
+                or not approval.get("approved")
+                or approval.get("state_revision") != revisions.get(gate)
+            ):
+                raise ValueError(f"current {gate} revision must be approved before final render")
+        if clip is not None and clip.get("review_status") != "approved":
+            raise ValueError("final render clip must be approved")
+    return manifest, state, clip
+
+
+def render_project(
+    project_dir: Path,
+    output: Path,
+    quality: str,
+    snapshot_path: Path | None = None,
+) -> None:
+    if snapshot_path is None:
+        manifest = read_json(project_dir / "project.json", {}) or {}
+        state = read_json(project_dir / "working/editor_state.json", {}) or {}
+        clip = None
+        if quality == "final":
+            approval = manifest.get("approvals", {}).get("timeline", {})
+            if (
+                not approval.get("approved")
+                or approval.get("state_revision") != editor_state_revision(state)
+            ):
+                raise ValueError("current timeline revision must be approved before final render")
+    else:
+        manifest, state, clip = load_render_snapshot(project_dir, snapshot_path, quality)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
+    try:
+        command = build_render_command(project_dir, state, manifest, temporary, quality, clip)
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=2 * 60 * 60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("ffmpeg render timed out") from exc
+        if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
+            raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def render_cover(
@@ -433,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--quality", choices=("preview", "final"), default="preview")
+    parser.add_argument("--snapshot", help="Frozen render snapshot under working/render_snapshots")
     parser.add_argument("--cover", action="store_true")
     parser.add_argument("--platform", choices=tuple(PLATFORM_PRESETS), default="instagram-reels")
     parser.add_argument("--cover-time", type=float, default=0.0)
@@ -448,7 +592,12 @@ def main() -> int:
         if args.cover:
             render_cover(project_dir, output, args.platform, args.cover_time, args.cover_text)
         else:
-            render_project(project_dir, output, args.quality)
+            render_project(
+                project_dir,
+                output,
+                args.quality,
+                Path(args.snapshot) if args.snapshot else None,
+            )
     except (ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

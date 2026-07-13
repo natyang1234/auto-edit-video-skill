@@ -11,6 +11,7 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from editor_server import editor_state_revision, validate_editor_state  # noqa: E402
+from auto_edit import analyze_edit_candidates  # noqa: E402
 from highlight_planner import (  # noqa: E402
     DIRECTOR_PROFILES,
     build_highlight_plan,
@@ -220,6 +221,27 @@ class HighlightPlannerTests(unittest.TestCase):
         state["highlights"] = []
         state["canvas"]["fps"] = 1_000_000_000
         self.assertTrue(validate_editor_state(state, 45.0))
+
+    def test_segment_only_transcript_never_becomes_a_full_source_silence_cut(self) -> None:
+        candidates = analyze_edit_candidates(
+            {
+                "segments": [
+                    {"id": "segment-1", "start": 0.2, "end": 2.0, "text": "有語音內容"}
+                ],
+                "words": [],
+            },
+            [
+                {
+                    "id": "gap-1",
+                    "start": 0.0,
+                    "end": 30.0,
+                    "isGap": True,
+                    "reason": "no word timestamps",
+                }
+            ],
+            0.3,
+        )
+        self.assertEqual(candidates, [])
 
 
 if __name__ == "__main__":

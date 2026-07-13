@@ -1718,6 +1718,9 @@ def analyze_edit_candidates(
     silence_threshold_s: float,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    words = [item for item in transcript.get("words", []) if isinstance(item, dict)]
+    if not words:
+        return candidates
     for item in compatibility:
         if item.get("isGap") and float(item["end"]) - float(item["start"]) >= silence_threshold_s:
             reason = str(item.get("reason") or "pause above preset threshold")
@@ -1732,7 +1735,6 @@ def analyze_edit_candidates(
                 [str(item.get("id"))],
             )
 
-    words = list(transcript.get("words", []))
     for index, word in enumerate(words):
         token = normalized_token(str(word.get("text", "")))
         if token in FILLER_TOKENS:
@@ -1780,11 +1782,15 @@ def cmd_analyze_edits(args: argparse.Namespace) -> int:
         return die("working/subtitles_words.json must be a JSON array")
     threshold = float(manifest.get("editing", {}).get("silence_threshold_s", 0.3))
     candidates = analyze_edit_candidates(transcript, raw_compatibility, threshold)
+    has_word_timestamps = bool(transcript.get("words"))
     payload = {
         "schema_version": SCHEMA_VERSION,
         "source": "working/transcript_words.json",
         "generated_at": now_utc(),
         "detector": "deterministic-low-risk-v1",
+        "warning": None
+        if has_word_timestamps
+        else "word timestamps unavailable; destructive edit proposals were skipped",
         "items": candidates,
     }
     decisions = {
@@ -1820,6 +1826,7 @@ def cmd_analyze_edits(args: argparse.Namespace) -> int:
             "candidates": len(candidates),
             "counts": counts,
             "review_required": True,
+            "warning": payload["warning"],
             "output": str(project_dir / "working/edit_candidates.json"),
         }
     )
@@ -2292,21 +2299,39 @@ def cmd_approve(args: argparse.Namespace) -> int:
         manifest = read_json(path)
     except ValueError as exc:
         return die(str(exc))
+    try:
+        from editor_server import approval_prerequisite_errors, gate_revision
+    except ImportError as exc:
+        return die(f"cannot load approval contract: {exc}")
+    editor_state_path = path.parent / "working/editor_state.json"
+    try:
+        state = read_json(editor_state_path) if editor_state_path.is_file() else {}
+        current_revision = gate_revision(path.parent, args.gate, state)
+    except ValueError as exc:
+        return die(str(exc))
+    if args.expected_revision != current_revision:
+        return die(
+            f"approval revision is stale; current revision is {current_revision}"
+        )
+    errors = approval_prerequisite_errors(
+        path.parent,
+        manifest,
+        state,
+        args.gate,
+    )
+    if errors:
+        return die("; ".join(errors))
     approvals = manifest.setdefault("approvals", {})
     approval = {
         "approved": True,
         "confirmed_by": args.confirmed_by,
         "at": now_utc(),
         "note": args.note,
+        "state_revision": current_revision,
+        "revision_kind": args.gate,
     }
-    editor_state_path = path.parent / "working/editor_state.json"
-    if args.gate in {"timeline", "final"} and editor_state_path.is_file():
-        try:
-            from editor_server import editor_state_revision
-
-            approval["state_revision"] = editor_state_revision(read_json(editor_state_path))
-        except (ImportError, ValueError) as exc:
-            return die(f"cannot bind approval to editor state: {exc}")
+    if args.gate == "highlight_selection":
+        approval["plan_revision"] = state.get("highlight_plan_revision")
     approvals[args.gate] = approval
     manifest["updated_at"] = now_utc()
     write_json(path, manifest)
@@ -2320,12 +2345,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         manifest = read_json(path)
     except ValueError as exc:
         return die(str(exc))
+    approval_revisions: dict[str, str] = {}
+    try:
+        from editor_server import approval_revisions as current_approval_revisions
+
+        state_path = path.parent / "working/editor_state.json"
+        state = read_json(state_path) if state_path.is_file() else {}
+        approval_revisions = current_approval_revisions(path.parent, state)
+    except (ImportError, ValueError):
+        approval_revisions = {}
     emit(
         {
             "manifest": str(path),
             "project_id": manifest.get("project_id"),
             "stages": manifest.get("stages", {}),
             "approvals": manifest.get("approvals", {}),
+            "approval_revisions": approval_revisions,
             "output_target": manifest.get("output_target", {}),
             "voiceover": manifest.get("voiceover", {}),
         }
@@ -2526,6 +2561,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve = sub.add_parser("approve", help="Record an explicit human gate approval")
     approve.add_argument("--manifest", required=True)
     approve.add_argument("--gate", choices=GATES, required=True)
+    approve.add_argument("--expected-revision", required=True)
     approve.add_argument("--confirmed-by", required=True)
     approve.add_argument("--note")
     approve.set_defaults(func=cmd_approve)

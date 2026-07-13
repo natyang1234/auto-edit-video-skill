@@ -215,6 +215,48 @@ payload = {
         self.assertEqual(voice["voice_id"], "rumi")
         self.run_cli("validate", "--manifest", str(manifest_path))
 
+    def test_cli_approval_requires_current_revision_and_gate_order(self) -> None:
+        manifest_path, _manifest = self.init_project("approval-cas", "zh-TW", "female")
+        status = json.loads(
+            self.run_cli("status", "--manifest", str(manifest_path)).stdout
+        )
+        self.run_cli(
+            "approve",
+            "--manifest",
+            str(manifest_path),
+            "--gate",
+            "timeline",
+            "--expected-revision",
+            status["approval_revisions"]["timeline"],
+            "--confirmed-by",
+            "unit-test",
+            expected=2,
+        )
+        self.run_cli(
+            "approve",
+            "--manifest",
+            str(manifest_path),
+            "--gate",
+            "destructive_edit",
+            "--expected-revision",
+            "0" * 64,
+            "--confirmed-by",
+            "unit-test",
+            expected=2,
+        )
+        approved = self.run_cli(
+            "approve",
+            "--manifest",
+            str(manifest_path),
+            "--gate",
+            "destructive_edit",
+            "--expected-revision",
+            status["approval_revisions"]["destructive_edit"],
+            "--confirmed-by",
+            "unit-test",
+        )
+        self.assertTrue(json.loads(approved.stdout)["approval"]["approved"])
+
     def test_chinese_male_defaults_to_shared_fish_voice(self) -> None:
         _, manifest = self.init_project("zh-male", "zh-TW", "male")
         voice = manifest["voiceover"]

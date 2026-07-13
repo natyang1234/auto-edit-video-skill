@@ -30,6 +30,8 @@ function cacheElements() {
     "project-name", "platform-select", "director-select", "save-state", "save-button",
     "render-button", "source-file-name", "source-file-detail", "source-preview-button",
     "highlight-count", "highlight-list", "editing-brief", "director-grid", "candidate-count",
+    "highlight-editor", "highlight-title", "highlight-start", "highlight-end", "replan-highlights",
+    "keep-highlight", "reject-highlight", "approve-highlights",
     "candidate-list", "approve-cuts", "layer-list", "layer-count",
     "asset-upload-button", "asset-input", "canvas-resolution", "source-meta", "stage-frame",
     "preview-video", "overlay-layer", "safe-zone", "stage-empty", "warning-copy", "jump-start",
@@ -43,7 +45,7 @@ function cacheElements() {
     "cover-time-output", "generate-cover", "cover-preview", "approve-timeline", "render-final",
     "voice-enabled", "voice-language", "voice-gender", "voice-id", "voice-mode",
     "voice-speed", "save-voice", "voice-status",
-    "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast"
+    "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output"
   ].forEach((id) => { elements[id] = byId(id); });
 }
 
@@ -92,6 +94,34 @@ function formatClipTime(seconds) {
 
 function duration() {
   return Number(projectPayload?.manifest?.source?.duration_s || elements["preview-video"].duration || 0);
+}
+
+function activeHighlight() {
+  const activeId = state?.active_highlight_id;
+  if (!activeId || !Array.isArray(state?.highlights)) return null;
+  return state.highlights.find((item) => String(item.id) === String(activeId)) || null;
+}
+
+function timelineBounds() {
+  const active = activeHighlight();
+  return active
+    ? { start: Number(active.start), end: Number(active.end) }
+    : { start: 0, end: duration() };
+}
+
+function timelineDuration() {
+  const bounds = timelineBounds();
+  return Math.max(0.01, bounds.end - bounds.start);
+}
+
+function updateScrubberBounds() {
+  const bounds = timelineBounds();
+  elements.scrubber.min = String(bounds.start);
+  elements.scrubber.max = String(bounds.end);
+  const current = Number(elements["preview-video"].currentTime || 0);
+  if (!showingRenderedMedia && (current < bounds.start || current > bounds.end)) {
+    elements["preview-video"].currentTime = bounds.start;
+  }
 }
 
 function sourcePathToUrl(source) {
@@ -153,7 +183,14 @@ async function saveState(showConfirmation = true) {
     });
     state.updated_at = payload.updated_at;
     state.revision = payload.revision;
+    projectPayload.approval_revisions = payload.approval_revisions || projectPayload.approval_revisions;
     stateDirty = false;
+    if ((payload.invalidated_gates || []).includes("highlight_selection")) {
+      if (projectPayload?.manifest?.approvals?.highlight_selection) {
+        projectPayload.manifest.approvals.highlight_selection.approved = false;
+      }
+      elements["approve-highlights"].textContent = "核可精華選段";
+    }
     if ((payload.invalidated_gates || []).includes("timeline")) {
       if (projectPayload?.manifest?.approvals?.timeline) {
         projectPayload.manifest.approvals.timeline.approved = false;
@@ -287,6 +324,8 @@ function deriveHighlightSegments() {
       start: Number(item.start),
       end: Number(item.end),
       title: String(item.title || item.text || `精華片段 ${index + 1}`),
+      reviewStatus: String(item.review_status || "pending"),
+      score: Number(item.score || 0),
       overlayId: item.overlay_id || null,
       source: "AI 精華",
     }));
@@ -309,6 +348,8 @@ function deriveHighlightSegments() {
       start: first.start,
       end: last.end,
       title: rawTitle || `字幕段落 ${index + 1}`,
+      reviewStatus: "pending",
+      score: 0,
       overlayId: first.id,
       source: "字幕段落",
     });
@@ -334,7 +375,7 @@ function renderHighlightList() {
   highlightSegments.forEach((segment, index) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "highlight-row";
+    button.className = `highlight-row is-${segment.reviewStatus}`;
     button.dataset.highlightIndex = String(index);
     button.style.setProperty("--clip-index", String(index));
     button.setAttribute("aria-label", `片段 ${index + 1}：${segment.title}`);
@@ -350,33 +391,94 @@ function renderHighlightList() {
     const title = document.createElement("strong");
     title.textContent = segment.title;
     const meta = document.createElement("span");
-    meta.textContent = `${segment.source} · ${formatClipTime(segment.start)}–${formatClipTime(segment.end)}`;
+    const reviewLabels = { approved: "已保留", rejected: "已排除", pending: "待確認" };
+    meta.textContent = `${reviewLabels[segment.reviewStatus] || "待確認"} · ${formatClipTime(segment.start)}–${formatClipTime(segment.end)}`;
     copy.append(title, meta);
     const durationLabel = document.createElement("span");
     durationLabel.className = "highlight-duration";
     durationLabel.textContent = `${Math.max(0, segment.end - segment.start).toFixed(0)}s`;
     button.append(number, thumb, copy, durationLabel);
     button.addEventListener("click", () => {
-      if (segment.overlayId) selectOverlay(segment.overlayId, false);
-      elements["preview-video"].currentTime = segment.start;
-      updateActiveHighlight();
+      selectHighlight(segment.id, true);
     });
     elements["highlight-list"].append(button);
   });
   updateActiveHighlight();
+  renderHighlightEditor();
 }
 
 function updateActiveHighlight() {
-  const current = elements["preview-video"].currentTime || 0;
-  const activeIndex = highlightSegments.findIndex((segment, index) =>
-    current >= segment.start && (current < segment.end || (index === highlightSegments.length - 1 && current <= segment.end))
-  );
+  const activeIndex = highlightSegments.findIndex((segment) => segment.id === state.active_highlight_id);
   elements["highlight-list"].querySelectorAll(".highlight-row").forEach((button, index) => {
     const active = index === activeIndex;
     button.classList.toggle("is-active", active);
     if (active) button.setAttribute("aria-current", "true");
     else button.removeAttribute("aria-current");
   });
+}
+
+function selectHighlight(highlightId, seek = true) {
+  const segment = (state.highlights || []).find((item) => String(item.id) === String(highlightId));
+  if (!segment) return;
+  const changed = state.active_highlight_id !== segment.id;
+  state.active_highlight_id = segment.id;
+  const selected = state.overlays.find((overlay) => overlay.id === selectedOverlayId);
+  if (!selected || selected.end <= segment.start || selected.start >= segment.end) {
+    selectedOverlayId = state.overlays.find(
+      (overlay) => overlay.end > segment.start && overlay.start < segment.end
+    )?.id || null;
+    state.review = state.review || {};
+    state.review.selected_overlay_id = selectedOverlayId;
+  }
+  if (seek) {
+    ensureSourcePreview();
+    elements["preview-video"].currentTime = Number(segment.start);
+  }
+  if (changed) markDirty("作用中片段已變更，儲存中…");
+  renderHighlightList();
+  renderTimeline();
+  renderInspector();
+  updateScrubberBounds();
+}
+
+function renderHighlightEditor() {
+  const highlight = activeHighlight();
+  elements["highlight-editor"].hidden = !highlight;
+  if (!highlight) return;
+  elements["highlight-title"].value = highlight.title || "";
+  elements["highlight-start"].value = Number(highlight.start).toFixed(2);
+  elements["highlight-end"].value = Number(highlight.end).toFixed(2);
+  elements["keep-highlight"].classList.toggle("is-selected", highlight.review_status === "approved");
+  elements["reject-highlight"].classList.toggle("is-selected", highlight.review_status === "rejected");
+}
+
+function updateActiveHighlightFields() {
+  const highlight = activeHighlight();
+  if (!highlight) return;
+  const start = Math.max(0, Number(elements["highlight-start"].value));
+  const end = Math.min(duration(), Number(elements["highlight-end"].value));
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start + 0.01) {
+    showToast("片段結束時間必須晚於開始時間", "error");
+    renderHighlightEditor();
+    return;
+  }
+  pushHistory();
+  highlight.title = elements["highlight-title"].value.trim() || highlight.title;
+  highlight.start = Number(start.toFixed(3));
+  highlight.end = Number(end.toFixed(3));
+  markDirty("精華範圍已變更，儲存中…");
+  renderHighlightList();
+  renderTimeline();
+  updateScrubberBounds();
+}
+
+function reviewActiveHighlight(reviewStatus) {
+  const highlight = activeHighlight();
+  if (!highlight) return;
+  pushHistory();
+  highlight.review_status = reviewStatus;
+  markDirty(reviewStatus === "approved" ? "片段已標記保留" : "片段已標記排除");
+  renderHighlightList();
 }
 
 function decisionItems() {
@@ -389,7 +491,7 @@ function decisionItems() {
 async function approveCuts() {
   elements["approve-cuts"].disabled = true;
   try {
-    await request("/api/edit-decisions", {
+    const decisions = await request("/api/edit-decisions", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ items: decisionItems(), approved: true }),
@@ -397,9 +499,15 @@ async function approveCuts() {
     const result = await request("/api/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ gate: "destructive_edit", confirmed_by: "local-editor-user", note: "Reviewed edit decisions in Auto Edit Studio" }),
+      body: JSON.stringify({
+        gate: "destructive_edit",
+        expected_revision: decisions.approval_revision,
+        confirmed_by: "local-editor-user",
+        note: "Reviewed edit decisions in Auto Edit Studio",
+      }),
     });
     projectPayload.manifest.approvals.destructive_edit = result.approval;
+    projectPayload.approval_revisions = result.approval_revisions;
     elements["approve-cuts"].textContent = "刪除決定已核可";
     showToast("刪除決定已核可；尚未執行實際裁切", "success");
   } catch (error) {
@@ -409,22 +517,90 @@ async function approveCuts() {
   }
 }
 
+async function approveHighlights() {
+  elements["approve-highlights"].disabled = true;
+  try {
+    if (!(state.highlights || []).some((item) => item.review_status === "approved")) {
+      throw new Error("請先把至少一個精華片段標記為保留");
+    }
+    await saveState(false);
+    if (stateDirty) throw new Error("精華片段尚未成功儲存");
+    const result = await request("/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        gate: "highlight_selection",
+        expected_revision: projectPayload.approval_revisions.highlight_selection,
+        confirmed_by: "local-editor-user",
+        note: "Reviewed transcript-grounded highlight selection in Auto Edit Studio",
+      }),
+    });
+    projectPayload.manifest.approvals.highlight_selection = result.approval;
+    projectPayload.approval_revisions = result.approval_revisions;
+    elements["approve-highlights"].textContent = "精華選段已核可";
+    showToast("精華選段已核可；接著可校對字幕與時間軸", "success");
+  } catch (error) {
+    showToast(`精華核可失敗：${error.message}`, "error");
+  } finally {
+    elements["approve-highlights"].disabled = false;
+  }
+}
+
+async function replanHighlights() {
+  const button = elements["replan-highlights"];
+  button.disabled = true;
+  try {
+    await saveState(false);
+    if (stateDirty) throw new Error("目前編輯內容尚未成功儲存");
+    const result = await request("/api/plan-highlights", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        director: state.director_style,
+        brief: state.editing_brief || "",
+        count: 10,
+        expected_revision: state.revision,
+      }),
+    });
+    projectPayload.manifest = result.manifest;
+    projectPayload.highlight_plan = result.highlight_plan;
+    projectPayload.approval_revisions = result.approval_revisions;
+    state = result.state;
+    selectedOverlayId = state.review?.selected_overlay_id || state.overlays[0]?.id || null;
+    elements["editing-brief"].value = state.editing_brief || "";
+    elements["approve-highlights"].textContent = "核可精華選段";
+    elements["approve-timeline"].textContent = "核可時間軸";
+    renderAll();
+    updateScrubberBounds();
+    setSaveState("已重新規劃", "saved");
+    showToast(`已依「${projectPayload.director_presets[state.director_style].label}」重新產生 ${state.highlights.length} 段精華`, "success");
+  } catch (error) {
+    showToast(`重新選段失敗：${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function layerLabel(overlay) {
   const typeLabels = { caption: "字幕", emphasis: "特效字", title: "標題卡", card: "字卡", image: "圖片", gif: "GIF", video: "插入影片", animation: "動畫字卡" };
   return typeLabels[overlay.type] || overlay.type;
 }
 
 function renderLayerList() {
+  const bounds = timelineBounds();
+  const visibleOverlays = activeHighlight()
+    ? state.overlays.filter((overlay) => overlay.end > bounds.start && overlay.start < bounds.end)
+    : state.overlays;
   elements["layer-list"].replaceChildren();
-  elements["layer-count"].textContent = String(state.overlays.length);
-  if (!state.overlays.length) {
+  elements["layer-count"].textContent = String(visibleOverlays.length);
+  if (!visibleOverlays.length) {
     const empty = document.createElement("p");
     empty.className = "layer-list-empty";
     empty.textContent = "目前沒有圖層；可從上方加入字幕、動畫或素材。";
     elements["layer-list"].append(empty);
     return;
   }
-  [...state.overlays]
+  [...visibleOverlays]
     .sort((a, b) => a.start - b.start || (a.z_index || 0) - (b.z_index || 0))
     .forEach((overlay) => {
       const button = document.createElement("button");
@@ -608,7 +784,12 @@ function updateOverlayFromForm() {
 }
 
 function timelineWidth() {
-  return Math.max(elements["timeline-scroll"].clientWidth, Math.ceil(duration() * 38));
+  return Math.max(elements["timeline-scroll"].clientWidth, Math.ceil(timelineDuration() * 38));
+}
+
+function timelinePercent(time) {
+  const bounds = timelineBounds();
+  return ((Number(time) - bounds.start) / timelineDuration()) * 100;
 }
 
 function renderTimeline() {
@@ -621,11 +802,13 @@ function renderTimeline() {
   rulerLabel.className = "ruler-label";
   rulerLabel.textContent = "時間";
   elements["timeline-ruler"].append(rulerLabel);
-  const tickStep = duration() > 180 ? 30 : duration() > 70 ? 10 : 5;
-  for (let second = 0; second <= duration(); second += tickStep) {
+  const bounds = timelineBounds();
+  const span = timelineDuration();
+  const tickStep = span > 180 ? 30 : span > 70 ? 10 : span > 25 ? 5 : 2;
+  for (let second = bounds.start; second <= bounds.end + 0.001; second += tickStep) {
     const tick = document.createElement("div");
     tick.className = "ruler-tick";
-    const progress = second / Math.max(duration(), 1);
+    const progress = (second - bounds.start) / span;
     tick.style.left = `${84 + progress * Math.max(0, width - 84)}px`;
     const label = document.createElement("span");
     label.textContent = formatClipTime(second);
@@ -651,7 +834,8 @@ function renderTimeline() {
     lane.className = `track-lane lane-${group.kind || "overlay"}`;
 
     if (group.kind === "source") {
-      const sourceSegments = highlightSegments.length ? highlightSegments : [{
+      const active = activeHighlight();
+      const sourceSegments = active ? [active] : highlightSegments.length ? highlightSegments : [{
         id: "source-full",
         start: 0,
         end: duration(),
@@ -661,22 +845,26 @@ function renderTimeline() {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "timeline-source-item";
-        button.style.left = `${(segment.start / Math.max(duration(), 1)) * 100}%`;
-        button.style.width = `${Math.max(0.2, ((segment.end - segment.start) / Math.max(duration(), 1)) * 100)}%`;
+        button.style.left = `${Math.max(0, timelinePercent(segment.start))}%`;
+        button.style.width = `${Math.max(0.2, ((segment.end - segment.start) / span) * 100)}%`;
         button.textContent = String(index + 1).padStart(2, "0");
         button.title = `${segment.title} · ${formatClipTime(segment.start)}–${formatClipTime(segment.end)}`;
         button.addEventListener("click", () => {
-          elements["preview-video"].currentTime = segment.start;
-          updateActiveHighlight();
+          if (segment.id !== "source-full") selectHighlight(segment.id, true);
+          else elements["preview-video"].currentTime = 0;
         });
         lane.append(button);
       });
       const decisionMap = new Map(decisionItems().map((item) => [item.candidate_id, item.action]));
-      (projectPayload.edit_candidates?.items || []).filter((candidate) => decisionMap.get(candidate.id) === "delete").forEach((candidate) => {
+      (projectPayload.edit_candidates?.items || []).filter((candidate) =>
+        decisionMap.get(candidate.id) === "delete"
+        && candidate.end > bounds.start
+        && candidate.start < bounds.end
+      ).forEach((candidate) => {
         const cut = document.createElement("span");
         cut.className = "cut-item";
-        cut.style.left = `${(candidate.start / Math.max(duration(), 1)) * 100}%`;
-        cut.style.width = `${Math.max(0.12, ((candidate.end - candidate.start) / Math.max(duration(), 1)) * 100)}%`;
+        cut.style.left = `${Math.max(0, timelinePercent(Math.max(candidate.start, bounds.start)))}%`;
+        cut.style.width = `${Math.max(0.12, ((Math.min(candidate.end, bounds.end) - Math.max(candidate.start, bounds.start)) / span) * 100)}%`;
         lane.append(cut);
       });
     } else if (group.kind === "audio") {
@@ -685,12 +873,16 @@ function renderTimeline() {
       audio.textContent = "原始音訊";
       lane.append(audio);
     } else {
-      state.overlays.filter((overlay) => group.types.includes(overlay.type)).forEach((overlay) => {
+      state.overlays.filter((overlay) =>
+        group.types.includes(overlay.type)
+        && overlay.end > bounds.start
+        && overlay.start < bounds.end
+      ).forEach((overlay) => {
         const button = document.createElement("button");
         button.type = "button";
         button.className = `timeline-item type-${overlay.type}${overlay.id === selectedOverlayId ? " is-selected" : ""}`;
-        button.style.left = `${(overlay.start / Math.max(duration(), 1)) * 100}%`;
-        button.style.width = `${Math.max(0.15, ((overlay.end - overlay.start) / Math.max(duration(), 1)) * 100)}%`;
+        button.style.left = `${Math.max(0, timelinePercent(Math.max(overlay.start, bounds.start)))}%`;
+        button.style.width = `${Math.max(0.15, ((Math.min(overlay.end, bounds.end) - Math.max(overlay.start, bounds.start)) / span) * 100)}%`;
         button.textContent = overlay.text || overlay.source?.split("/").pop() || layerLabel(overlay);
         button.title = `${layerLabel(overlay)} ${overlay.start.toFixed(2)}–${overlay.end.toFixed(2)} 秒`;
         button.addEventListener("click", () => selectOverlay(overlay.id, true));
@@ -711,7 +903,8 @@ function renderTimeline() {
 }
 
 function updatePlayhead() {
-  const progress = Math.max(0, Math.min(1, elements["preview-video"].currentTime / Math.max(duration(), 1)));
+  const bounds = timelineBounds();
+  const progress = Math.max(0, Math.min(1, (elements["preview-video"].currentTime - bounds.start) / timelineDuration()));
   const width = timelineWidth();
   elements.playhead.style.left = `${84 + progress * Math.max(0, width - 84)}px`;
 }
@@ -887,12 +1080,19 @@ async function approveTimeline() {
   await saveState(false);
   elements["approve-timeline"].disabled = true;
   try {
+    if (stateDirty) throw new Error("目前時間軸尚未成功儲存");
     const result = await request("/api/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ gate: "timeline", confirmed_by: "local-editor-user", note: "Approved live preview timeline in Auto Edit Studio" }),
+      body: JSON.stringify({
+        gate: "timeline",
+        expected_revision: projectPayload.approval_revisions.timeline,
+        confirmed_by: "local-editor-user",
+        note: "Approved live preview timeline in Auto Edit Studio",
+      }),
     });
     projectPayload.manifest.approvals.timeline = result.approval;
+    projectPayload.approval_revisions = result.approval_revisions;
     elements["approve-timeline"].textContent = "時間軸已核可";
     showToast("時間軸已核可，可以輸出最終影片", "success");
   } catch (error) {
@@ -907,10 +1107,15 @@ async function startRender(quality = "preview") {
   const button = quality === "preview" ? elements["render-button"] : elements["render-final"];
   button.disabled = true;
   try {
+    if (stateDirty) throw new Error("目前時間軸尚未成功儲存");
     const result = await request("/api/render", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quality }),
+      body: JSON.stringify({
+        quality,
+        clip_id: activeHighlight()?.id || null,
+        expected_revision: state.revision,
+      }),
     });
     showToast(result.status.message);
     pollRenderStatus(button);
@@ -938,6 +1143,9 @@ function pollRenderStatus(button) {
         video.load();
         showingRenderedMedia = true;
         elements["overlay-layer"].hidden = true;
+        elements["download-output"].href = status.output;
+        elements["download-output"].download = status.download_name || "auto-edit-output.mp4";
+        elements["download-output"].hidden = false;
         setSaveState("輸出完成", "saved");
         showToast(status.message, "success");
       } else if (status.state === "failed") {
@@ -1049,6 +1257,23 @@ function bindEvents() {
   elements["render-button"].addEventListener("click", () => startRender("preview"));
   elements["render-final"].addEventListener("click", () => startRender("final"));
   elements["approve-cuts"].addEventListener("click", approveCuts);
+  elements["approve-highlights"].addEventListener("click", approveHighlights);
+  elements["replan-highlights"].addEventListener("click", replanHighlights);
+  elements["keep-highlight"].addEventListener("click", () => reviewActiveHighlight("approved"));
+  elements["reject-highlight"].addEventListener("click", () => reviewActiveHighlight("rejected"));
+  elements["highlight-title"].addEventListener("input", () => {
+    const highlight = activeHighlight();
+    if (!highlight) return;
+    highlight.title = elements["highlight-title"].value;
+    const segment = highlightSegments.find((item) => item.id === highlight.id);
+    if (segment) segment.title = highlight.title;
+    const activeTitle = elements["highlight-list"].querySelector(".highlight-row.is-active .highlight-copy strong");
+    if (activeTitle) activeTitle.textContent = highlight.title;
+    markDirty("片段標題變更，儲存中…");
+  });
+  ["highlight-title", "highlight-start", "highlight-end"].forEach((id) => {
+    elements[id].addEventListener("change", updateActiveHighlightFields);
+  });
   elements["approve-timeline"].addEventListener("click", approveTimeline);
   elements["platform-select"].addEventListener("change", () => {
     pushHistory();
@@ -1093,9 +1318,15 @@ function bindEvents() {
   ["voice-language", "voice-gender"].forEach((id) => elements[id].addEventListener("change", () => populateVoiceOptions()));
   elements["voice-id"].addEventListener("change", updateVoiceStatus);
   ["publish-title", "publish-body", "publish-hashtags", "cover-text", "cover-time"].forEach((id) => elements[id].addEventListener("input", syncPublishingFromForm));
-  elements["jump-start"].addEventListener("click", () => { elements["preview-video"].currentTime = 0; });
+  elements["jump-start"].addEventListener("click", () => {
+    elements["preview-video"].currentTime = timelineBounds().start;
+  });
   elements["play-button"].addEventListener("click", () => {
     const video = elements["preview-video"];
+    const bounds = timelineBounds();
+    if (!showingRenderedMedia && (video.currentTime < bounds.start || video.currentTime >= bounds.end)) {
+      video.currentTime = bounds.start;
+    }
     if (video.paused) video.play(); else video.pause();
   });
   elements["toggle-safe-zone"].addEventListener("click", () => {
@@ -1106,7 +1337,7 @@ function bindEvents() {
   });
   elements.scrubber.addEventListener("input", () => { elements["preview-video"].currentTime = Number(elements.scrubber.value); });
   elements["preview-video"].addEventListener("loadedmetadata", () => {
-    elements.scrubber.max = String(duration());
+    updateScrubberBounds();
     elements["cover-time"].max = String(duration());
     elements["total-time"].textContent = formatTime(duration());
     elements["stage-empty"].hidden = true;
@@ -1114,6 +1345,13 @@ function bindEvents() {
   });
   elements["preview-video"].addEventListener("timeupdate", () => {
     const current = elements["preview-video"].currentTime;
+    const active = activeHighlight();
+    if (!showingRenderedMedia && active && current >= Number(active.end)) {
+      elements["preview-video"].pause();
+      if (Math.abs(current - Number(active.end)) > 0.02) {
+        elements["preview-video"].currentTime = Number(active.end);
+      }
+    }
     elements["current-time"].textContent = formatTime(current);
     elements.scrubber.value = String(current);
     updatePlayhead();
@@ -1130,6 +1368,10 @@ function bindEvents() {
   });
   elements["candidate-list"].addEventListener("change", () => renderTimeline());
   elements["source-preview-button"].addEventListener("click", () => {
+    state.active_highlight_id = null;
+    markDirty("已切換為完整來源預覽");
+    renderHighlightList();
+    updateScrubberBounds();
     elements["preview-video"].currentTime = 0;
     elements["preview-video"].play();
   });
@@ -1175,9 +1417,11 @@ async function initialize() {
       elements["preview-video"].load();
     }
     if (projectPayload.manifest.approvals?.destructive_edit?.approved) elements["approve-cuts"].textContent = "刪除決定已核可";
+    if (projectPayload.manifest.approvals?.highlight_selection?.approved) elements["approve-highlights"].textContent = "精華選段已核可";
     if (projectPayload.manifest.approvals?.timeline?.approved) elements["approve-timeline"].textContent = "時間軸已核可";
     setSaveState("已載入", "saved");
     renderAll();
+    updateScrubberBounds();
     renderVoicePanel();
     if (projectPayload.render_status?.state === "running") pollRenderStatus(elements["render-button"]);
     if (["pending", "running"].includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();

@@ -67,6 +67,18 @@
           </div>
           <p class="section-note">最多顯示 10 個段落；點選即可跳到該段字幕與畫面。</p>
           <div class="highlight-list" id="highlight-list" aria-label="精華片段導覽"></div>
+          <div class="highlight-editor" id="highlight-editor" hidden>
+            <label><span>片段標題</span><input id="highlight-title" type="text" maxlength="200"></label>
+            <div class="highlight-time-fields">
+              <label><span>開始秒數</span><input id="highlight-start" type="number" min="0" step="0.01"></label>
+              <label><span>結束秒數</span><input id="highlight-end" type="number" min="0.01" step="0.01"></label>
+            </div>
+            <div class="highlight-review-actions">
+              <button class="button button-secondary" id="keep-highlight" type="button">保留此片段</button>
+              <button class="button button-quiet" id="reject-highlight" type="button">排除此片段</button>
+            </div>
+          </div>
+          <button class="button button-primary full-width" id="approve-highlights" type="button">核可精華選段</button>
         </section>
 
         <details class="rail-section cut-review">
@@ -144,6 +156,7 @@
           </div>
           <select id="director-select" aria-label="選擇剪輯導演風格" hidden></select>
           <div class="director-grid" id="director-grid" role="radiogroup" aria-label="剪輯導演風格"></div>
+          <button class="button button-secondary full-width replan-button" id="replan-highlights" type="button">依目前導演與重點重新選段</button>
 
           <div class="quick-tools" role="group" aria-label="加入時間軸內容">
             <button class="quick-tool" data-add-type="animation" type="button"><i aria-hidden="true">✦</i><span>加入動畫</span></button>
@@ -302,6 +315,7 @@
           <div class="publish-divider"></div>
           <button class="button button-primary full-width" id="approve-timeline" type="button">核可時間軸</button>
           <button class="button button-secondary full-width" id="render-final" type="button">輸出最終影片</button>
+          <a class="button button-secondary full-width download-output" id="download-output" href="#" download hidden>下載輸出 MP4</a>
         </section>
       </aside>
 

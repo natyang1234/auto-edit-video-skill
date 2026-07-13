@@ -124,11 +124,15 @@ class EditorServerTests(unittest.TestCase):
         for element_id in (
             "source-file-name",
             "highlight-list",
+            "highlight-editor",
+            "approve-highlights",
             "editing-brief",
             "director-grid",
+            "replan-highlights",
             "layer-list",
             "timeline-tracks",
             "render-button",
+            "download-output",
         ):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("Hybrid editorial workstation", css)
@@ -246,6 +250,32 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertIn("allowed shared catalog", str(payload["error"]))
 
+    def test_editor_can_replan_highlights_with_selected_director_and_brief(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        bootstrap = json.loads(body.decode("utf-8"))
+        status, planned = self.json_request(
+            "POST",
+            "/api/plan-highlights",
+            {
+                "director": "high-energy",
+                "brief": "保留最明確的差別",
+                "count": 3,
+                "expected_revision": bootstrap["state"]["revision"],
+            },
+        )
+        self.assertEqual(status, 200, planned)
+        self.assertEqual(
+            planned["highlight_plan"]["configuration"]["director_profile"],
+            "high-energy",
+        )
+        self.assertEqual(
+            planned["highlight_plan"]["configuration"]["editing_brief"],
+            "保留最明確的差別",
+        )
+        self.assertEqual(planned["state"]["director_style"], "high-energy")
+        self.assertLessEqual(len(planned["state"]["highlights"]), 3)
+
     def test_media_range_request(self) -> None:
         status, headers, body = self.request(
             "GET",
@@ -356,9 +386,13 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(persisted["asset_digests"][upload["source"]], expected_digest)
 
-        status, payload = self.json_request("POST", "/api/render", {"quality": "final"})
+        status, payload = self.json_request(
+            "POST",
+            "/api/render",
+            {"quality": "final", "expected_revision": persisted["revision"]},
+        )
         self.assertEqual(status, 409)
-        self.assertIn("timeline revision", str(payload["error"]))
+        self.assertIn("approved", str(payload["error"]))
 
     def test_asset_upload_rejects_mime_mismatch_and_fake_video(self) -> None:
         path = "/api/assets?filename=" + urllib.parse.quote("payload.mp4")
@@ -381,11 +415,49 @@ class EditorServerTests(unittest.TestCase):
     def test_timeline_approval_is_bound_to_render_state_revision(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
-        state = json.loads(body.decode("utf-8"))["state"]
-        status, approval = self.json_request(
+        bootstrap = json.loads(body.decode("utf-8"))
+        state = bootstrap["state"]
+
+        status, missing_cas = self.json_request(
             "POST",
             "/api/approve",
             {"gate": "timeline", "confirmed_by": "unit-test"},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("expected_revision", str(missing_cas["error"]))
+
+        status, decisions = self.json_request(
+            "PUT",
+            "/api/edit-decisions",
+            {
+                "approved": True,
+                "items": [
+                    {
+                        "candidate_id": "edit-0001",
+                        "action": "keep",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(status, 200, decisions)
+        status, destructive = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "destructive_edit",
+                "expected_revision": decisions["approval_revision"],
+                "confirmed_by": "unit-test",
+            },
+        )
+        self.assertEqual(status, 200, destructive)
+        status, approval = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "timeline",
+                "expected_revision": destructive["approval_revisions"]["timeline"],
+                "confirmed_by": "unit-test",
+            },
         )
         self.assertEqual(status, 200)
         self.assertTrue(approval["approval"]["state_revision"])
@@ -400,6 +472,87 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("timeline", saved["invalidated_gates"])
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
         self.assertFalse(manifest["approvals"]["timeline"]["approved"])
+
+    def test_highlight_approval_requires_current_plan_review_and_cas(self) -> None:
+        plan_revision = "c" * 64
+        highlight_id = "highlight-abcdef123456"
+        self.write_json(
+            "working/highlight_plan.json",
+            {
+                "schema_version": 1,
+                "plan_revision": plan_revision,
+                "items": [
+                    {
+                        "id": highlight_id,
+                        "start": 0.1,
+                        "end": 1.2,
+                        "title": "雪茄與香菸的差別",
+                        "review_status": "pending",
+                        "score": 0.9,
+                    }
+                ],
+            },
+        )
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["highlights"][0]["review_status"] = "approved"
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+
+        status, blocked = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "highlight_selection",
+                "expected_revision": saved["approval_revisions"]["highlight_selection"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("destructive_edit", str(blocked["error"]))
+
+        status, decisions = self.json_request(
+            "PUT",
+            "/api/edit-decisions",
+            {
+                "approved": True,
+                "items": [{"candidate_id": "edit-0001", "action": "keep"}],
+            },
+        )
+        self.assertEqual(status, 200, decisions)
+        status, destructive = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "destructive_edit",
+                "expected_revision": decisions["approval_revision"],
+            },
+        )
+        self.assertEqual(status, 200, destructive)
+
+        status, stale = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "highlight_selection", "expected_revision": "0" * 64},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("stale", str(stale["error"]))
+
+        status, approved = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "highlight_selection",
+                "expected_revision": destructive["approval_revisions"]["highlight_selection"],
+            },
+        )
+        self.assertEqual(status, 200, approved)
+        self.assertEqual(approved["approval"]["plan_revision"], plan_revision)
+
+        state["highlights"][0]["end"] = 1.1
+        status, changed = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, changed)
+        self.assertIn("highlight_selection", changed["invalidated_gates"])
 
 
 class EditorRendererTests(unittest.TestCase):
@@ -568,6 +721,101 @@ class EditorRendererTests(unittest.TestCase):
             str(cover),
         )
         self.assertTrue(cover.is_file())
+
+    def test_snapshot_render_trims_to_selected_highlight_and_preserves_last_good_output(self) -> None:
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        highlight = {
+            "id": "highlight-abcdef123456",
+            "plan_item_id": "highlight-abcdef123456",
+            "start": 0.10,
+            "end": 0.32,
+            "title": "核心重點",
+            "review_status": "approved",
+            "score": 0.9,
+            "source": "working/highlight_plan.json",
+        }
+        state.update(
+            {
+                "source_sha256": None,
+                "highlight_plan_revision": "c" * 64,
+                "active_highlight_id": highlight["id"],
+                "highlights": [highlight],
+                "asset_digests": {},
+            }
+        )
+        revision = editor_state_revision(state)
+        snapshot = self.project / "working/render_snapshots/render_test.json"
+        self.write_json(
+            "working/render_snapshots/render_test.json",
+            {
+                "schema_version": 1,
+                "render_id": "render_test",
+                "quality": "preview",
+                "project_id": "render-test",
+                "state_revision": revision,
+                "approval_revisions": {},
+                "authorization": {},
+                "clip": {
+                    key: highlight[key]
+                    for key in (
+                        "id",
+                        "plan_item_id",
+                        "start",
+                        "end",
+                        "title",
+                        "review_status",
+                    )
+                },
+                "manifest": manifest,
+                "state": state,
+            },
+        )
+        output = self.project / "renders/highlight-preview.mp4"
+        self.run_renderer(
+            "--quality",
+            "preview",
+            "--snapshot",
+            str(snapshot),
+            "--output",
+            str(output),
+        )
+        rendered_duration = float(
+            subprocess.run(
+                [
+                    self.ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+        )
+        self.assertGreater(rendered_duration, 0.15)
+        self.assertLess(rendered_duration, 0.36)
+        last_good_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+
+        broken = json.loads(snapshot.read_text(encoding="utf-8"))
+        broken["state_revision"] = "0" * 64
+        self.write_json("working/render_snapshots/render_test.json", broken)
+        self.run_renderer(
+            "--quality",
+            "preview",
+            "--snapshot",
+            str(snapshot),
+            "--output",
+            str(output),
+            expected=2,
+        )
+        self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(), last_good_hash)
 
     def test_same_asset_can_be_used_on_multiple_timeline_layers(self) -> None:
         pixel = base64.b64decode(
