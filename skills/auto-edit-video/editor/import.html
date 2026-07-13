@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#211c18">
+  <title>Auto Edit Studio｜導入 A 卷</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/import.js" defer></script>
+</head>
+<body class="studio-import-page">
+  <header class="topbar import-topbar">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
+      <div>
+        <p class="eyebrow">AUTO EDIT STUDIO</p>
+        <div class="project-context">
+          <span>建立新專案</span>
+          <h1>導入 A 卷</h1>
+        </div>
+      </div>
+    </div>
+    <div class="studio-local-badge"><i aria-hidden="true"></i>僅在這台 Mac 處理</div>
+  </header>
+
+  <main class="import-workspace">
+    <section class="import-intro" aria-labelledby="import-title">
+      <p class="eyebrow">NEW PROJECT</p>
+      <h2 id="import-title">把原始影片交給剪輯工作站</h2>
+      <p>影片會串流複製到獨立專案；原檔不會被修改，也不會上傳到外部服務。</p>
+      <ol class="import-steps" aria-label="處理步驟">
+        <li class="is-current"><span>1</span>導入影片</li>
+        <li><span>2</span>本機轉錄</li>
+        <li><span>3</span>精華提案</li>
+        <li><span>4</span>人工確認</li>
+      </ol>
+    </section>
+
+    <section class="import-card" aria-label="影片導入設定">
+      <div class="import-dropzone" id="import-dropzone" tabindex="0" role="button" aria-describedby="dropzone-note">
+        <input id="source-video-input" type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/webm" hidden>
+        <div class="import-reel-icon" aria-hidden="true"><span></span></div>
+        <strong id="dropzone-title">拖入影片，或點一下選檔</strong>
+        <span id="dropzone-note">MP4、MOV、M4V、WEBM</span>
+        <button class="secondary-button import-choose-button" id="choose-video" type="button">選擇影片</button>
+      </div>
+
+      <div class="import-file-summary" id="import-file-summary" hidden>
+        <div class="source-file-icon" aria-hidden="true"></div>
+        <div>
+          <strong id="import-file-name">—</strong>
+          <span id="import-file-size">—</span>
+        </div>
+        <button class="text-button" id="replace-video" type="button">更換</button>
+      </div>
+
+      <div class="import-settings">
+        <label>
+          <span>專案名稱</span>
+          <input id="import-project-name" type="text" maxlength="120" placeholder="例如：Crystal 訪談精華">
+        </label>
+        <div class="import-setting-grid">
+          <label>
+            <span>影片語言</span>
+            <select id="import-language">
+              <option value="auto">自動判斷</option>
+              <option value="zh-TW">繁體中文</option>
+              <option value="zh-CN">簡體中文</option>
+              <option value="en-US">英文</option>
+            </select>
+          </label>
+          <label>
+            <span>主要平台</span>
+            <select id="import-platform">
+              <option value="auto">之後再選</option>
+              <option value="instagram-reels">Instagram Reels</option>
+              <option value="youtube-shorts">YouTube Shorts</option>
+              <option value="tiktok">TikTok</option>
+              <option value="xiaohongshu-full">小紅書 9:16</option>
+              <option value="youtube-landscape">YouTube 16:9</option>
+            </select>
+          </label>
+          <label>
+            <span>精華長度</span>
+            <select id="import-duration">
+              <option value="auto">自動安排</option>
+              <option value="short">短版</option>
+              <option value="medium">中版</option>
+              <option value="long">長版</option>
+              <option value="full">完整清理</option>
+            </select>
+          </label>
+          <label>
+            <span>基礎剪法</span>
+            <select id="import-preset">
+              <option value="balanced">平衡</option>
+              <option value="conservative">保守</option>
+              <option value="aggressive">緊湊</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="import-progress" id="import-progress" hidden aria-live="polite">
+        <div class="import-progress-copy">
+          <strong id="import-progress-title">準備導入…</strong>
+          <span id="import-progress-value">0%</span>
+        </div>
+        <div class="import-progress-track"><span id="import-progress-bar"></span></div>
+        <p id="import-progress-note">請保持這個視窗開啟。</p>
+      </div>
+
+      <p class="import-error" id="import-error" role="alert" hidden></p>
+      <button class="primary-button import-submit" id="start-import" type="button" disabled>建立剪輯專案</button>
+      <p class="import-privacy">Studio 不接受本機路徑，只讀取你在瀏覽器明確選擇的檔案內容。</p>
+    </section>
+  </main>
+</body>
+</html>

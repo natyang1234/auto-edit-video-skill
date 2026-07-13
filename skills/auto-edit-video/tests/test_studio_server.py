@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import hashlib
+import http.client
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.parse
+from pathlib import Path
+
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = SKILL_DIR / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+from auto_edit import validate_manifest  # noqa: E402
+from studio_server import StudioServer  # noqa: E402
+
+
+class StudioServerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ffmpeg = shutil.which("ffmpeg")
+        if not cls.ffmpeg:
+            raise unittest.SkipTest("ffmpeg is unavailable")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="auto-edit-studio-tests-")
+        self.root = Path(self._tmp.name)
+        self.projects_root = self.root / "projects"
+        self.projects_root.mkdir()
+        self.source = self.root / "Crystal source.mp4"
+        result = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=navy:s=320x240:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-shortest",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                str(self.source),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+        self.source_bytes = self.source.read_bytes()
+        self.source_hash = hashlib.sha256(self.source_bytes).hexdigest()
+        self.source_stat = self.source.stat()
+        self.server = StudioServer(
+            ("127.0.0.1", 0),
+            self.projects_root,
+            max_import_bytes=2 * 1024 * 1024,
+            max_duration_s=60,
+            max_source_pixels=1920 * 1080,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.host, self.port = self.server.server_address
+        status, payload = self.json_response("GET", "/api/studio")
+        self.assertEqual(status, 200, payload)
+        self.csrf_token = str(payload["csrf_token"])
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self._tmp.cleanup()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, http.client.HTTPMessage, bytes]:
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        payload = response.read()
+        status = response.status
+        response_headers = response.headers
+        connection.close()
+        return status, response_headers, payload
+
+    def json_response(
+        self,
+        method: str,
+        path: str,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request_headers = {"Content-Type": "application/json"}
+        request_headers.update(headers or {})
+        status, _response_headers, raw = self.request(method, path, body, request_headers)
+        return status, json.loads(raw.decode("utf-8"))
+
+    def create_import(self, *, name: str, size: int) -> dict[str, object]:
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {
+                "project_name": "Crystal 精華",
+                "file": {
+                    "name": name,
+                    "size_bytes": size,
+                    "last_modified_ms": int(self.source_stat.st_mtime * 1000),
+                    "type": "video/mp4",
+                },
+                "settings": {
+                    "source_language": "zh-TW",
+                    "subtitle_mode": "source",
+                    "platform": "youtube-shorts",
+                    "duration_profile": "short",
+                    "edit_preset": "balanced",
+                },
+            },
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 201, payload)
+        return payload["import"]
+
+    def upload(self, import_payload: dict[str, object], body: bytes, mime: str = "video/mp4"):
+        return self.request(
+            "PUT",
+            str(import_payload["upload_url"]),
+            body,
+            {
+                "Content-Type": mime,
+                "X-Auto-Edit-CSRF": self.csrf_token,
+            },
+        )
+
+    def test_import_creates_owned_project_and_launches_scoped_editor(self) -> None:
+        html_status, _headers, html = self.request("GET", "/")
+        self.assertEqual(html_status, 200)
+        self.assertIn("導入影片", html.decode("utf-8"))
+
+        import_payload = self.create_import(
+            name=self.source.name,
+            size=len(self.source_bytes),
+        )
+        status, _headers, body = self.upload(import_payload, self.source_bytes)
+        response = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 201, response)
+        self.assertTrue(response["editor_url"].startswith("http://127.0.0.1:"))
+
+        project_id = response["project"]["id"]
+        self.assertRegex(project_id, r"^[a-z0-9][a-z0-9-]{8,80}$")
+        project = self.projects_root / project_id
+        staged = project / "source/original.mp4"
+        self.assertTrue(staged.is_file())
+        self.assertFalse(staged.is_symlink())
+        self.assertEqual(hashlib.sha256(staged.read_bytes()).hexdigest(), self.source_hash)
+
+        manifest_path = project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertIsNone(manifest["source"]["original_path"])
+        self.assertEqual(manifest["source"]["original_name"], self.source.name)
+        self.assertEqual(manifest["source"]["ingest_method"], "browser_upload")
+        self.assertTrue(manifest["source"]["owned_copy"])
+        self.assertEqual(manifest["source"]["sha256"], self.source_hash)
+        self.assertEqual(manifest["stages"]["ingest"], "complete")
+        self.assertEqual(manifest["stages"]["transcribe"], "pending")
+        self.assertTrue(all(not item["approved"] for item in manifest["approvals"].values()))
+        errors, _warnings = validate_manifest(manifest, manifest_path)
+        self.assertEqual(errors, [])
+
+        parsed = urllib.parse.urlsplit(response["editor_url"])
+        editor = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        editor.request("GET", "/api/project")
+        editor_response = editor.getresponse()
+        editor_payload = json.loads(editor_response.read().decode("utf-8"))
+        editor.close()
+        self.assertEqual(editor_response.status, 200)
+        self.assertEqual(editor_payload["manifest"]["project_id"], project_id)
+
+        after = self.source.stat()
+        self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), self.source_hash)
+        self.assertEqual(after.st_size, self.source_stat.st_size)
+        self.assertEqual(after.st_mtime_ns, self.source_stat.st_mtime_ns)
+
+        second_status, _headers, second_body = self.upload(import_payload, self.source_bytes)
+        self.assertEqual(second_status, 409, second_body)
+
+    def test_import_rejects_bad_metadata_cross_site_and_oversize(self) -> None:
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {"file": {"name": "../escape.mp4", "size_bytes": 12, "type": "video/mp4"}},
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 422, payload)
+
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {"file": {"name": "notes.txt", "size_bytes": 12, "type": "text/plain"}},
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 415, payload)
+
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {"file": {"name": "huge.mp4", "size_bytes": 2 * 1024 * 1024 + 1, "type": "video/mp4"}},
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 413, payload)
+
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {"file": {"name": "clip.mp4", "size_bytes": 12, "type": "video/mp4"}},
+            {
+                "X-Auto-Edit-CSRF": self.csrf_token,
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        self.assertEqual(status, 403, payload)
+
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {"file": {"name": "clip.mp4", "size_bytes": 12, "type": "video/mp4"}},
+        )
+        self.assertEqual(status, 403, payload)
+
+    def test_import_rejects_mime_mismatch_and_fake_video_atomically(self) -> None:
+        import_payload = self.create_import(name="fake.mp4", size=12)
+        status, _headers, _body = self.upload(import_payload, b"not-a-video!", "text/plain")
+        self.assertEqual(status, 415)
+
+        import_payload = self.create_import(name="fake2.mp4", size=12)
+        status, _headers, body = self.upload(import_payload, b"not-a-video!", "video/mp4")
+        self.assertEqual(status, 415, body)
+
+        final_projects = [
+            item for item in self.projects_root.iterdir() if not item.name.startswith(".")
+        ]
+        self.assertEqual(final_projects, [])
+        self.assertFalse(any(self.projects_root.glob(".creating-*")))
+
+
+if __name__ == "__main__":
+    unittest.main()

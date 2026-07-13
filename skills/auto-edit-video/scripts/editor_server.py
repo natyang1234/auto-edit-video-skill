@@ -27,11 +27,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from local_http_security import (
+    host_header_allowed,
+    is_loopback_host,
+    mutation_origin_allowed,
+)
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 EDITOR_DIR = SKILL_DIR / "editor"
 STATE_REL = Path("working/editor_state.json")
 ALLOWED_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov"}
+ALLOWED_ASSET_MIME_TYPES = {
+    ".png": {"image/png"},
+    ".jpg": {"image/jpeg"},
+    ".jpeg": {"image/jpeg"},
+    ".webp": {"image/webp"},
+    ".gif": {"image/gif"},
+    ".mp4": {"video/mp4", "application/mp4"},
+    ".mov": {"video/quicktime"},
+}
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_ASSET_BYTES = 50 * 1024 * 1024
 GATES = {"destructive_edit", "timeline", "final"}
@@ -262,15 +277,70 @@ def scoped_project_path(project_dir: Path, relative: str, scope: str) -> Path:
 
 
 def project_entry_path(project_dir: Path, relative: str) -> Path:
-    """Validate a project-relative directory entry without resolving its symlink target."""
+    """Resolve a regular project entry and reject symlink escapes."""
     relative_path = Path(relative)
     if relative_path.is_absolute():
         raise ValueError("path must be project-relative")
-    root = Path(os.path.abspath(project_dir))
-    candidate = Path(os.path.abspath(project_dir / relative_path))
+    root = project_dir.resolve()
+    entry = project_dir / relative_path
+    if entry.is_symlink():
+        raise ValueError("project entry must not be a symlink")
+    candidate = entry.resolve()
     if root not in candidate.parents and candidate != root:
         raise ValueError("path escapes project directory")
     return candidate
+
+
+def asset_magic_matches(data: bytes, suffix: str) -> bool:
+    if suffix == ".png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if suffix in {".jpg", ".jpeg"}:
+        return data.startswith(b"\xff\xd8\xff")
+    if suffix == ".webp":
+        return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    if suffix == ".gif":
+        return data.startswith((b"GIF87a", b"GIF89a"))
+    return len(data) >= 8 and data[4:8] in {
+        b"ftyp",
+        b"moov",
+        b"wide",
+        b"mdat",
+        b"free",
+        b"skip",
+    }
+
+
+def ffprobe_has_visual_stream(path: Path) -> bool:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except json.JSONDecodeError:
+        return False
+    return bool(streams and streams[0].get("codec_type") == "video")
 
 
 def artifact_plan_overlays(
@@ -618,33 +688,14 @@ class EditorHandler(BaseHTTPRequestHandler):
 
     def request_host_allowed(self) -> bool:
         """Reject DNS-rebinding style Host headers on a loopback server."""
-        bound_host = str(self.server.server_address[0]).lower()
-        if bound_host not in {"127.0.0.1", "localhost", "::1"}:
-            return True
-        host_header = self.headers.get("Host", "")
-        try:
-            requested_host = urllib.parse.urlsplit(f"//{host_header}").hostname
-        except ValueError:
-            return False
-        return (requested_host or "").lower() in {"127.0.0.1", "localhost", "::1"}
+        return host_header_allowed(
+            str(self.server.server_address[0]),
+            self.headers.get("Host", ""),
+        )
 
     def mutation_origin_allowed(self) -> bool:
         """Allow CLI calls without Origin and same-origin browser writes only."""
-        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
-            return False
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        if origin == "null":
-            return False
-        try:
-            parsed = urllib.parse.urlsplit(origin)
-        except ValueError:
-            return False
-        return (
-            parsed.scheme == "http"
-            and parsed.netloc.lower() == self.headers.get("Host", "").lower()
-        )
+        return mutation_origin_allowed(self.headers)
 
     def allow_request(self, mutation: bool = False) -> bool:
         if not self.request_host_allowed():
@@ -664,7 +715,10 @@ class EditorHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid Content-Length") from exc
         if length < 0 or length > maximum:
             raise ValueError(f"request body exceeds {maximum} bytes")
-        return self.rfile.read(length)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("request body was truncated")
+        return body
 
     def read_json_body(self) -> Any:
         raw = self.read_body(MAX_JSON_BYTES)
@@ -1008,6 +1062,11 @@ class EditorHandler(BaseHTTPRequestHandler):
                 status=415,
             )
             return
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type not in ALLOWED_ASSET_MIME_TYPES[suffix]:
+            self.close_connection = True
+            self.send_json({"ok": False, "error": "asset MIME type does not match its extension"}, status=415)
+            return
         try:
             data = self.read_body(MAX_ASSET_BYTES)
         except ValueError as exc:
@@ -1016,11 +1075,22 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not data:
             self.send_json({"ok": False, "error": "asset file is empty"}, status=400)
             return
+        if not asset_magic_matches(data[:64], suffix):
+            self.send_json({"ok": False, "error": "asset content does not match its extension"}, status=415)
+            return
         stem = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(filename).stem).strip("-")[:36] or "asset"
         stored_name = f"{stem}-{uuid.uuid4().hex[:8]}{suffix}"
         output = self.server.project_dir / "assets" / stored_name
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(data)
+        temporary = output.parent / f".upload-{uuid.uuid4().hex}{suffix}"
+        try:
+            temporary.write_bytes(data)
+            if not ffprobe_has_visual_stream(temporary):
+                self.send_json({"ok": False, "error": "asset is not a decodable image or video"}, status=415)
+                return
+            os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
         provenance_path = self.server.project_dir / "assets/provenance.json"
         provenance = read_json(provenance_path, {"items": []}) or {"items": []}
         provenance.setdefault("items", []).append(
@@ -1219,7 +1289,7 @@ def main() -> int:
     if not (project_dir / "project.json").is_file():
         print(f"project.json not found under {project_dir}", file=sys.stderr)
         return 2
-    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.allow_remote:
+    if not is_loopback_host(args.host) and not args.allow_remote:
         print("Refusing non-loopback bind without --allow-remote", file=sys.stderr)
         return 2
     if not EDITOR_DIR.is_dir():

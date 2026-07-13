@@ -108,8 +108,10 @@ PATHS = {
         HOME / ".openclaw/workspace/tools/tts_voices.py",
     ),
     "editor_server": SKILL_DIR / "scripts/editor_server.py",
+    "studio_server": SKILL_DIR / "scripts/studio_server.py",
     "editor_renderer": SKILL_DIR / "scripts/render_editor_timeline.py",
     "editor_index": SKILL_DIR / "editor/index.html",
+    "studio_index": SKILL_DIR / "editor/import.html",
     "cut_renderer": SKILL_DIR / "scripts/render_cut.py",
     "qa_runner": SKILL_DIR / "scripts/qa_video.py",
 }
@@ -402,32 +404,46 @@ def probe_media(path: Path) -> dict[str, Any]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise ValueError("ffprobe is required")
-    result = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
-            "-of",
-            "json",
-            str(path),
-        ],
-        text=True,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+                "-of",
+                "json",
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("ffprobe timed out while inspecting source media") from exc
     if result.returncode != 0:
         raise ValueError(f"ffprobe failed: {result.stderr.strip() or 'unknown error'}")
     data = json.loads(result.stdout)
     streams = data.get("streams", [])
     video = next((item for item in streams if item.get("codec_type") == "video"), {})
     audio = next((item for item in streams if item.get("codec_type") == "audio"), {})
+    try:
+        duration = round(float(data.get("format", {}).get("duration", 0.0)), 3)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source media has an invalid duration") from exc
+    if not video or not video.get("width") or not video.get("height"):
+        raise ValueError("input must contain a valid video stream")
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("source video duration must be positive and finite")
     return {
-        "duration_s": round(float(data.get("format", {}).get("duration", 0.0)), 3),
+        "duration_s": duration,
         "width": video.get("width"),
         "height": video.get("height"),
         "fps": parse_rate(video.get("r_frame_rate")),
         "video_codec": video.get("codec_name"),
+        "stream_count": len(streams),
+        "video_stream_count": sum(1 for item in streams if item.get("codec_type") == "video"),
         "has_audio": bool(audio),
         "audio_codec": audio.get("codec_name"),
         "audio_sample_rate": int(audio["sample_rate"]) if audio.get("sample_rate") else None,
@@ -560,6 +576,7 @@ def preflight_payload() -> dict[str, Any]:
         "ffprobe": bool(commands["ffprobe"]),
         "python3": bool(commands["python3"]),
         "page_editor": files["editor_server"] and files["editor_index"],
+        "studio_import": files["studio_server"] and files["studio_index"],
         "timeline_renderer": files["editor_renderer"],
         "cut_renderer": files["cut_renderer"],
         "qa_runner": files["qa_runner"],
@@ -600,6 +617,7 @@ def preflight_payload() -> dict[str, Any]:
             "page_editor": files["editor_server"]
             and files["editor_renderer"]
             and files["editor_index"],
+            "studio_import": files["studio_server"] and files["studio_index"],
             "capcut": False,
         },
     }
@@ -628,18 +646,7 @@ def make_voice_config(args: argparse.Namespace) -> dict[str, Any]:
     )
     enabled = any(value is not None for value in fields)
     if not enabled:
-        return {
-            "enabled": False,
-            "mode": "off",
-            "engine": None,
-            "provider": None,
-            "language": None,
-            "gender": None,
-            "voice_id": None,
-            "speed": 1.0,
-            "cloud": False,
-            "selection_status": "disabled",
-        }
+        return disabled_voice_config()
     if not args.voice_language or not args.voice_gender:
         raise ValueError("voiceover requires --voice-language and --voice-gender")
     provider = args.voice_provider or (
@@ -674,6 +681,21 @@ def make_voice_config(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def disabled_voice_config() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "mode": "off",
+        "engine": None,
+        "provider": None,
+        "language": None,
+        "gender": None,
+        "voice_id": None,
+        "speed": 1.0,
+        "cloud": False,
+        "selection_status": "disabled",
+    }
+
+
 def ensure_new_project(project_dir: Path) -> None:
     if project_dir.exists() and any(project_dir.iterdir()):
         raise ValueError(f"project directory is not empty: {project_dir}")
@@ -700,75 +722,130 @@ def write_empty_artifacts(project_dir: Path) -> None:
     )
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    source = Path(args.input).expanduser().resolve()
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def initialize_project(
+    source: Path,
+    project_dir: Path,
+    *,
+    source_language: str = "auto",
+    subtitle_mode: str = "source",
+    target_language: str | None = None,
+    platform: str = "auto",
+    duration_profile: str = "full",
+    target_duration: float | None = None,
+    edit_preset: str = "balanced",
+    emphasis: str = "balanced",
+    visual_density: str = "balanced",
+    cards: bool = True,
+    related_assets: bool = True,
+    animations: bool = True,
+    voice: dict[str, Any] | None = None,
+    source_mode: str = "copy",
+    ingest_method: str = "local_owned_copy",
+    original_name: str | None = None,
+    browser_last_modified_ms: int | None = None,
+    source_sha256: str | None = None,
+    project_id: str | None = None,
+    manifest_project_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Create one project around an immutable staged source.
+
+    Browser imports use ``source_mode=move`` from a private incoming file. CLI
+    projects default to an owned copy so the page editor never serves an
+    out-of-project symlink target.
+    """
+    source = source.expanduser().resolve()
+    project_dir = project_dir.expanduser().absolute()
     if not source.is_file():
-        return die(f"input video not found: {source}")
-    project_dir = Path(args.project_dir).expanduser().resolve()
-    try:
-        media = probe_media(source)
-        voice = make_voice_config(args)
-        output_target = resolve_output_target(
-            args.platform,
-            args.duration_profile,
-            args.target_duration,
-        )
-        ensure_new_project(project_dir)
-    except ValueError as exc:
-        return die(str(exc))
+        raise ValueError(f"input video not found: {source}")
+    if subtitle_mode not in SUBTITLE_MODES:
+        raise ValueError(f"unsupported subtitle mode: {subtitle_mode}")
+    if edit_preset not in EDIT_PRESETS:
+        raise ValueError(f"unsupported edit preset: {edit_preset}")
+    if emphasis not in {"off", "sparse", "balanced", "dense"}:
+        raise ValueError(f"unsupported emphasis density: {emphasis}")
+    if visual_density not in {"sparse", "balanced", "dense"}:
+        raise ValueError(f"unsupported visual density: {visual_density}")
+    if source_mode not in {"copy", "move"}:
+        raise ValueError("source_mode must be copy or move")
 
+    media = probe_media(source)
+    source_size = source.stat().st_size
+    output_target = resolve_output_target(platform, duration_profile, target_duration)
+    ensure_new_project(project_dir)
     staged = project_dir / "source" / f"original{source.suffix.lower()}"
-    try:
-        staged.symlink_to(source)
-    except OSError:
+    if source_mode == "move":
+        os.replace(source, staged)
+        original_path: str | None = None
+    else:
         shutil.copy2(source, staged)
+        original_path = str(source)
+    staged.chmod(0o444)
 
-    target_language = args.target_language or default_target(args.source_language)
+    checksum = source_sha256 or sha256_file(staged)
+    if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError("source_sha256 must be a lowercase SHA-256 digest")
+    target_language = target_language or default_target(source_language)
     created = now_utc()
     stage_state = {stage: "pending" for stage in STAGES}
     stage_state["ingest"] = "complete"
-    if not voice["enabled"]:
+    voice_config = dict(voice or disabled_voice_config())
+    if not voice_config.get("enabled"):
         stage_state["voiceover"] = "skipped"
 
+    final_project_dir = (manifest_project_dir or project_dir).expanduser().absolute()
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "project_id": project_dir.name,
+        "project_id": project_id or project_dir.name,
         "created_at": created,
         "updated_at": created,
-        "project_dir": str(project_dir),
+        "project_dir": str(final_project_dir),
         "source": {
-            "original_path": str(source),
+            "original_path": original_path,
+            "original_name": original_name or source.name,
             "staged_path": str(staged.relative_to(project_dir)),
+            "ingest_method": ingest_method,
+            "owned_copy": True,
             "immutable": True,
-            "size_bytes": source.stat().st_size,
+            "sha256": checksum,
+            "size_bytes": source_size,
+            "browser_last_modified_ms": browser_last_modified_ms,
+            "received_at": created if ingest_method == "browser_upload" else None,
             **media,
         },
         "output_target": output_target,
         "editing": {
-            "preset": args.edit_preset,
-            **EDIT_PRESETS[args.edit_preset],
+            "preset": edit_preset,
+            **EDIT_PRESETS[edit_preset],
             "delete_earlier_keep_later": True,
             "destructive_review_required": True,
             "retranscribe_after_cut": True,
         },
         "subtitles": {
-            "mode": args.subtitle_mode,
-            "source_language": args.source_language,
+            "mode": subtitle_mode,
+            "source_language": source_language,
             "target_language": target_language,
-            "translation_variant": "zh-Hant" if args.subtitle_mode in {"zh", "bilingual"} else None,
+            "translation_variant": "zh-Hant" if subtitle_mode in {"zh", "bilingual"} else None,
             "style": "rail",
-            "emphasis_enabled": args.emphasis != "off",
-            "emphasis_density": args.emphasis,
+            "emphasis_enabled": emphasis != "off",
+            "emphasis_density": emphasis,
         },
         "visuals": {
             "content_match_required": True,
-            "cards": not args.no_cards,
-            "related_assets": not args.no_assets,
-            "animations": not args.no_animations,
-            "density": args.visual_density,
+            "cards": cards,
+            "related_assets": related_assets,
+            "animations": animations,
+            "density": visual_density,
             "provenance_required": True,
         },
-        "voiceover": voice,
+        "voiceover": voice_config,
         "render": {
             "primary": "auto-edit-video/page-editor-ffmpeg",
             "cut_review": "auto-edit-video/editor",
@@ -799,13 +876,42 @@ def cmd_init(args: argparse.Namespace) -> int:
     }
     write_json(project_dir / "project.json", manifest)
     write_empty_artifacts(project_dir)
+    return manifest
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    source = Path(args.input).expanduser().resolve()
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    try:
+        voice = make_voice_config(args)
+        manifest = initialize_project(
+            source,
+            project_dir,
+            source_language=args.source_language,
+            subtitle_mode=args.subtitle_mode,
+            target_language=args.target_language,
+            platform=args.platform,
+            duration_profile=args.duration_profile,
+            target_duration=args.target_duration,
+            edit_preset=args.edit_preset,
+            emphasis=args.emphasis,
+            visual_density=args.visual_density,
+            cards=not args.no_cards,
+            related_assets=not args.no_assets,
+            animations=not args.no_animations,
+            voice=voice,
+            source_mode="copy",
+            ingest_method="local_owned_copy",
+        )
+    except ValueError as exc:
+        return die(str(exc))
     emit(
         {
             "ok": True,
             "manifest": str(project_dir / "project.json"),
             "project_dir": str(project_dir),
             "voiceover": voice,
-            "output_target": output_target,
+            "output_target": manifest["output_target"],
             "next": "materialize video-profile-context.md, then transcribe locally",
         }
     )
@@ -866,9 +972,24 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> tuple[li
     warnings: list[str] = []
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"schema_version must be {SCHEMA_VERSION}")
-    source_path = Path(str(manifest.get("source", {}).get("original_path", ""))).expanduser()
-    if not source_path.is_file():
-        errors.append(f"source video missing: {source_path}")
+    source = manifest.get("source", {})
+    original_value = source.get("original_path") if isinstance(source, dict) else None
+    if original_value:
+        source_path = Path(str(original_value)).expanduser()
+        if not source_path.is_file():
+            errors.append(f"source video missing: {source_path}")
+    staged_value = str(source.get("staged_path", "")) if isinstance(source, dict) else ""
+    staged_path = (manifest_path.parent / staged_value).absolute()
+    project_root = manifest_path.parent.absolute()
+    if not staged_value or (project_root not in staged_path.parents and staged_path != project_root):
+        errors.append("staged source must stay inside the project directory")
+    elif not staged_path.is_file():
+        errors.append(f"staged source missing: {staged_path}")
+    elif source.get("owned_copy") and staged_path.is_symlink():
+        errors.append("owned staged source must not be a symlink")
+    checksum = source.get("sha256") if isinstance(source, dict) else None
+    if checksum is not None and not re.fullmatch(r"[0-9a-f]{64}", str(checksum)):
+        errors.append("source sha256 must be a lowercase SHA-256 digest")
     editing = manifest.get("editing", {})
     if not editing.get("destructive_review_required"):
         errors.append("destructive_edit review must remain required")
@@ -1915,6 +2036,32 @@ def cmd_editor(args: argparse.Namespace) -> int:
         return 130
 
 
+def cmd_studio(args: argparse.Namespace) -> int:
+    projects_root = Path(args.projects_root).expanduser().resolve()
+    server = PATHS["studio_server"]
+    if not server.is_file():
+        return die(f"Studio server is missing: {server}")
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        return die("Studio import server is loopback-only")
+    projects_root.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(server),
+        "--projects-root",
+        str(projects_root),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+    ]
+    if args.open_browser:
+        command.append("--open")
+    try:
+        return subprocess.call(command)
+    except KeyboardInterrupt:
+        return 130
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2047,6 +2194,13 @@ def build_parser() -> argparse.ArgumentParser:
     editor.add_argument("--open", action="store_true", dest="open_browser")
     editor.add_argument("--allow-remote", action="store_true")
     editor.set_defaults(func=cmd_editor)
+
+    studio = sub.add_parser("studio", help="Launch the loopback-only new-project importer")
+    studio.add_argument("--projects-root", required=True)
+    studio.add_argument("--host", default="127.0.0.1")
+    studio.add_argument("--port", type=int, default=8765)
+    studio.add_argument("--open", action="store_true", dest="open_browser")
+    studio.set_defaults(func=cmd_studio)
     return parser
 
 

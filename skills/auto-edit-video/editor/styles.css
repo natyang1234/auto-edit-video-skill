@@ -1184,6 +1184,195 @@ h2 {
   }
 }
 
+/* Studio import launcher — owned-copy A-roll ingest */
+.studio-import-page {
+  min-height: 100vh;
+  overflow-x: hidden;
+  color: var(--paper-ink, #2d2722);
+  background:
+    radial-gradient(circle at 14% 12%, oklch(0.94 0.035 72 / 0.72), transparent 34rem),
+    linear-gradient(135deg, oklch(0.965 0.012 76), oklch(0.91 0.018 70));
+}
+
+.import-topbar { position: relative; }
+
+.studio-local-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.58rem 0.82rem;
+  border: 1px solid oklch(0.78 0.025 72 / 0.35);
+  border-radius: 999px;
+  color: oklch(0.9 0.025 74);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
+.studio-local-badge i {
+  width: 0.48rem;
+  height: 0.48rem;
+  border-radius: 50%;
+  background: var(--success, #4f9b70);
+  box-shadow: 0 0 0 0.22rem oklch(0.65 0.12 150 / 0.18);
+}
+
+.import-workspace {
+  width: min(1120px, calc(100% - 2rem));
+  min-height: calc(100vh - 82px);
+  margin: 0 auto;
+  padding: clamp(2rem, 6vw, 5.5rem) 0;
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(430px, 1.15fr);
+  gap: clamp(2rem, 6vw, 5.5rem);
+  align-items: center;
+}
+
+.import-intro h2 {
+  max-width: 12ch;
+  margin: 0.55rem 0 1rem;
+  font-family: var(--display-font, "Iowan Old Style", "Noto Serif TC", serif);
+  font-size: clamp(2.5rem, 5vw, 4.8rem);
+  line-height: 0.98;
+  letter-spacing: -0.045em;
+}
+
+.import-intro > p:not(.eyebrow) {
+  max-width: 34rem;
+  margin: 0;
+  color: oklch(0.43 0.02 63);
+  font-size: 1.02rem;
+  line-height: 1.8;
+}
+
+.import-steps {
+  margin: 2.1rem 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+  list-style: none;
+}
+
+.import-steps li {
+  display: grid;
+  gap: 0.45rem;
+  color: oklch(0.52 0.018 66);
+  font-size: 0.72rem;
+}
+
+.import-steps span {
+  width: 1.75rem;
+  height: 1.75rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid oklch(0.71 0.025 70);
+  border-radius: 50%;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.import-steps .is-current { color: var(--vermilion, #c84a32); font-weight: 800; }
+.import-steps .is-current span { border-color: var(--vermilion, #c84a32); color: oklch(0.98 0.01 75); background: var(--vermilion, #c84a32); }
+
+.import-card {
+  padding: clamp(1.2rem, 3vw, 2rem);
+  border: 1px solid oklch(0.82 0.025 73);
+  border-radius: 1.45rem;
+  background: oklch(0.975 0.01 76 / 0.94);
+  box-shadow: 0 1.8rem 4rem oklch(0.26 0.025 55 / 0.16);
+}
+
+.import-dropzone {
+  min-height: 15rem;
+  padding: 2rem;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 0.6rem;
+  border: 1.5px dashed oklch(0.66 0.055 61);
+  border-radius: 1rem;
+  text-align: center;
+  background: oklch(0.955 0.018 76);
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.import-dropzone:hover,
+.import-dropzone:focus-visible,
+.import-dropzone.is-dragging {
+  border-color: var(--vermilion, #c84a32);
+  background: oklch(0.945 0.035 61);
+  transform: translateY(-2px);
+  outline: none;
+}
+
+.import-reel-icon {
+  width: 3.6rem;
+  height: 3.6rem;
+  margin-bottom: 0.35rem;
+  display: grid;
+  place-items: center;
+  border-radius: 1rem;
+  color: oklch(0.97 0.01 75);
+  background: var(--vermilion, #c84a32);
+  box-shadow: 0 0.75rem 1.4rem oklch(0.52 0.14 37 / 0.2);
+}
+
+.import-reel-icon::before { content: "▶"; font-size: 1.25rem; transform: translateX(0.08rem); }
+.import-dropzone strong { font-size: 1.05rem; }
+.import-dropzone > span { color: oklch(0.53 0.02 65); font-size: 0.8rem; }
+.import-choose-button { margin-top: 0.55rem; pointer-events: auto; }
+
+.import-file-summary {
+  min-height: 5.3rem;
+  padding: 1rem 1.05rem;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.85rem;
+  border: 1px solid oklch(0.82 0.025 73);
+  border-radius: 0.95rem;
+  background: oklch(0.96 0.015 75);
+}
+
+.import-file-summary[hidden] { display: none; }
+.import-file-summary > div:nth-child(2) { min-width: 0; display: grid; gap: 0.25rem; }
+.import-file-summary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-file-summary span { color: oklch(0.53 0.02 65); font-size: 0.78rem; }
+
+.import-settings { margin-top: 1.15rem; display: grid; gap: 1rem; }
+.import-settings label { display: grid; gap: 0.42rem; }
+.import-settings label > span { color: oklch(0.46 0.02 63); font-size: 0.74rem; font-weight: 800; letter-spacing: 0.025em; }
+.import-settings input,
+.import-settings select { width: 100%; min-height: 2.75rem; border-color: oklch(0.8 0.025 72); background: oklch(0.99 0.007 75); }
+.import-setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
+
+.import-progress { margin-top: 1.2rem; padding: 0.9rem 1rem; border-radius: 0.85rem; background: oklch(0.93 0.025 80); }
+.import-progress[hidden] { display: none; }
+.import-progress-copy { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.82rem; }
+.import-progress-track { height: 0.42rem; margin-top: 0.65rem; overflow: hidden; border-radius: 999px; background: oklch(0.82 0.025 72); }
+.import-progress-track span { width: 0; height: 100%; display: block; border-radius: inherit; background: linear-gradient(90deg, var(--vermilion, #c84a32), var(--amber, #d99432)); transition: width 160ms ease; }
+.import-progress p { margin: 0.55rem 0 0; color: oklch(0.51 0.02 65); font-size: 0.75rem; }
+.import-error { margin: 1rem 0 0; padding: 0.75rem 0.85rem; border-radius: 0.7rem; color: oklch(0.39 0.12 30); background: oklch(0.92 0.06 32); font-size: 0.82rem; }
+.import-submit { width: 100%; min-height: 3.2rem; margin-top: 1.2rem; justify-content: center; font-size: 0.92rem; }
+.import-submit:disabled { opacity: 0.45; cursor: not-allowed; }
+.import-privacy { margin: 0.8rem 0 0; color: oklch(0.55 0.018 65); text-align: center; font-size: 0.7rem; line-height: 1.55; }
+
+@media (max-width: 900px) {
+  .import-workspace { grid-template-columns: 1fr; padding-top: 2.5rem; }
+  .import-intro h2 { max-width: 15ch; }
+}
+
+@media (max-width: 600px) {
+  .studio-local-badge { display: none; }
+  .import-workspace { width: min(100% - 1rem, 40rem); padding: 1.25rem 0 2rem; gap: 1.6rem; }
+  .import-intro h2 { font-size: clamp(2.3rem, 13vw, 3.7rem); }
+  .import-steps { grid-template-columns: repeat(2, 1fr); }
+  .import-card { padding: 0.8rem; border-radius: 1rem; }
+  .import-dropzone { min-height: 12.5rem; padding: 1.25rem; }
+  .import-setting-grid { grid-template-columns: 1fr; }
+}
+
 @media (pointer: coarse) {
   .button,
   .tool-button,

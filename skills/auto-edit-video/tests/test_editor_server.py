@@ -261,6 +261,15 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    def test_source_symlink_outside_project_is_rejected(self) -> None:
+        outside = Path(self._tmp.name) / "outside.mp4"
+        outside.write_bytes(b"private-outside-project")
+        source = self.project / "source/source.mp4"
+        source.unlink()
+        source.symlink_to(outside)
+        status, _headers, _body = self.request("GET", "/media/source")
+        self.assertEqual(status, 403)
+
     def test_cross_origin_write_and_rebinding_host_are_rejected(self) -> None:
         status, payload = self.json_request(
             "POST",
@@ -302,7 +311,9 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertIn("under assets", " ".join(payload["errors"]))
 
-        upload_body = b"\x89PNG\r\n\x1a\nlocal-test"
+        upload_body = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
         upload_path = "/api/assets?filename=" + urllib.parse.quote("icon.png")
         status, _headers, body = self.request(
             "POST",
@@ -321,6 +332,24 @@ class EditorServerTests(unittest.TestCase):
         status, payload = self.json_request("POST", "/api/render", {"quality": "final"})
         self.assertEqual(status, 409)
         self.assertIn("timeline revision", str(payload["error"]))
+
+    def test_asset_upload_rejects_mime_mismatch_and_fake_video(self) -> None:
+        path = "/api/assets?filename=" + urllib.parse.quote("payload.mp4")
+        status, _headers, _body = self.request(
+            "POST",
+            path,
+            b"not-a-video",
+            {"Content-Type": "text/plain"},
+        )
+        self.assertEqual(status, 415)
+        status, _headers, _body = self.request(
+            "POST",
+            path,
+            b"not-a-video",
+            {"Content-Type": "video/mp4"},
+        )
+        self.assertEqual(status, 415)
+        self.assertFalse(any(item.name.startswith("payload-") for item in (self.project / "assets").iterdir()))
 
     def test_timeline_approval_is_bound_to_render_state_revision(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
