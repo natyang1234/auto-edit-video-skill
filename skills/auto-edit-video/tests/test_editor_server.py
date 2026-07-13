@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -11,10 +12,12 @@ import threading
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = SKILL_DIR / "scripts"
+RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from editor_server import EditorServer, editor_state_revision  # noqa: E402
@@ -23,6 +26,12 @@ from render_editor_timeline import text_filter  # noqa: E402
 
 class EditorServerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._env_patch = patch.dict(
+            os.environ,
+            {"RUMI_VOICE_SYSTEM": str(RUMI_FIXTURE)},
+        )
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
         self._tmp = tempfile.TemporaryDirectory(prefix="auto-edit-editor-tests-")
         self.project = Path(self._tmp.name) / "project"
         for name in ("source", "working", "assets", "renders", "qa"):

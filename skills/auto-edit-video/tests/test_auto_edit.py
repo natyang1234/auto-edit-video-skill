@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 CLI = SKILL_DIR / "scripts/auto_edit.py"
+RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 
 
 class AutoEditVoiceTests(unittest.TestCase):
@@ -51,10 +53,13 @@ class AutoEditVoiceTests(unittest.TestCase):
         cls._tmp.cleanup()
 
     def run_cli(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["RUMI_VOICE_SYSTEM"] = str(RUMI_FIXTURE)
         result = subprocess.run(
             ["python3", str(CLI), *args],
             text=True,
             capture_output=True,
+            env=env,
         )
         self.assertEqual(result.returncode, expected, result.stderr or result.stdout)
         return result
