@@ -1,16 +1,18 @@
 ---
 name: auto-edit-video
 description: >-
-  Automatically edit a local video file supplied by the user. In the current
-  agent-first phase, read the video, create the internal project and local
+  Automatically edit a local video file supplied by the user. In the default
+  agent-first mode, read the video, create the internal project and local
   transcript, apply conservative reviewed cuts, export a new MP4, run QA, and
   return the result without requiring a UI or user-supplied Whisper files. Use
   when the user gives a video path and asks to auto edit, clean up speech,
   remove silence/fillers/stutters/repetitions/false starts, or make a short
   highlight. Support platform-aware short, medium, long, automatic, full, and
-  custom-second targets without hard-coding 30 seconds. Advanced subtitles,
-  cards, animations, social formats, and voiceover remain optional. Never
-  uploads by default and never uses CapCut.
+  custom-second targets without hard-coding 30 seconds. When the user asks for
+  an interface, launch the loopback Studio for local import, editing intent,
+  five deterministic director profiles, up to ten reviewed highlights,
+  captions/layers, preview, QA-bound final approval, and download. Never uploads
+  externally by default and never uses CapCut.
 ---
 
 # Auto Edit Video
@@ -20,7 +22,7 @@ FFmpeg cut, page-editor, timeline-render, and QA core. Discover optional install
 skills for premium captions, visual packages, creator profiles, or cloud voices;
 their absence must not block the standalone core.
 
-## Agent-first mode (current phase)
+## Agent-first mode (default)
 
 Read [references/AGENT_FIRST.zh-TW.md](references/AGENT_FIRST.zh-TW.md). The
 user-facing contract has one required input: a local video file that the agent
@@ -51,6 +53,39 @@ seconds overrides the profile. Use `auto` only when the user asks the agent to
 choose: after transcription, select the smallest profile that preserves a
 complete idea. Never pad, stretch, or change playback speed merely to hit a
 target.
+
+## Local Studio GUI (only when explicitly requested)
+
+Read [references/PAGE_EDITOR.md](references/PAGE_EDITOR.md), then launch:
+
+```bash
+python3 "$SKILL/scripts/auto_edit.py" studio \
+  --projects-root /absolute/path/to/auto-edit-projects \
+  --host 127.0.0.1 --port 8765 --open
+```
+
+The Studio accepts one browser File stream over loopback, validates its size,
+extension, MIME, container, streams, duration, resolution, and frame rate, then
+atomically creates an immutable project-owned source copy. It runs local
+Whisper, low-risk edit analysis, overlay planning, and transcript-grounded
+highlight planning without setting any human approval.
+
+The GUI supports platform and duration presets, a natural-language editing
+brief, five deterministic strategy profiles, up to ten sourced highlight
+proposals, per-clip keep/reject and timing/title edits, editable captions,
+title/cards/animations and licensed project assets, clip-scoped timeline
+preview, and separate clip rendering. These profiles are tested heuristic
+strategies, not five autonomous LLM agents.
+
+Keep the approval order:
+`destructive_edit` → `highlight_selection` → `timeline` → `final`. Every request
+uses the server-provided current revision. A final render freezes state/source/
+asset/clip/approval hashes, renders to an atomic versioned MP4, normalizes
+audible audio, runs mechanical QA, and creates a contact sheet. The GUI exposes
+the final download only after the current delivery receipt and contact sheet are
+human-approved. If reviewed decisions contain interior `delete` actions, the
+page renderer fails closed; run `render_cut.py` first or change those decisions
+to keep.
 
 ## Internal quick start
 
@@ -87,6 +122,11 @@ python3 "$SKILL/scripts/auto_edit.py" analyze-edits \
 
 python3 "$SKILL/scripts/auto_edit.py" plan-overlays \
   --manifest /absolute/path/project/project.json
+
+python3 "$SKILL/scripts/auto_edit.py" plan-highlights \
+  --manifest /absolute/path/project/project.json \
+  --director teacher-punch --count 10 \
+  --brief "Keep the clearest complete teaching points"
 
 python3 "$SKILL/scripts/auto_edit.py" editor \
   --project-dir /absolute/path/project \
@@ -186,9 +226,13 @@ deletion. Do not call the cut endpoint or simulate the approval click.
 After explicit approval, record it:
 
 ```bash
+python3 "$SKILL/scripts/auto_edit.py" status \
+  --manifest PROJECT/project.json
+
 python3 "$SKILL/scripts/auto_edit.py" approve \
   --manifest PROJECT/project.json \
   --gate destructive_edit \
+  --expected-revision REVISION_FROM_STATUS \
   --confirmed-by user
 ```
 
@@ -248,15 +292,18 @@ Generate the timeline preview and stop at the `timeline` gate before final rende
 ### 6.1 Open the local page editor
 
 Read [references/PAGE_EDITOR.md](references/PAGE_EDITOR.md), then launch `editor`.
-The editor is loopback-only unless the operator explicitly passes
-`--allow-remote`. It supports live video/timeline preview, font/color/size and
-position controls, text motions, PNG/JPG/WEBP/GIF/MP4/MOV layers, platform safe
-zones, local publishing-copy drafts, cover frames, preview render, and final
-render.
+Use `studio` to import a new A-roll or `editor` to reopen an existing project.
+Both are loopback-only by default. The editor supports reviewed semantic
+highlights, clip-scoped video/timeline preview, font/color/size and position
+controls, text motions, PNG/JPG/WEBP/GIF/MP4/MOV layers, platform safe zones,
+local publishing-copy drafts, cover frames, preview render, QA-bound final
+render, contact-sheet review, and approved download.
 
 Treat the HTML preview as an editing surface, then render an MP4 preview for
-truth checking. A timeline approval is bound to the render-affecting state hash;
-changing a caption, layer, canvas, or render style invalidates the old approval.
+truth checking. Highlight, timeline, and final approvals are bound to their
+exact state revisions; changing a clip, caption, layer, canvas, or render style
+invalidates the affected downstream approval. Final approval additionally
+binds the output, render receipt, QA report, and contact-sheet hashes.
 
 ### 7. Add optional voiceover
 
@@ -314,8 +361,11 @@ download or vendor it implicitly.
 ### 8. Render and verify
 
 Render original-resolution assets with the bundled page-editor FFmpeg renderer,
-or choose one discovered primary renderer before building the timeline. Run the
-bundled final delivery QA and inspect its contact sheet:
+or choose one discovered primary renderer before building the timeline. Final
+renders started from the Studio automatically run the bundled delivery QA and
+bind its artifacts to the final gate. For a cut-only manual output where the
+advanced editor final gate is not applicable, run QA and inspect its contact
+sheet:
 
 ```bash
 python3 "$SKILL/scripts/qa_video.py" \
@@ -352,9 +402,11 @@ Read [references/ROUTING.md](references/ROUTING.md) before selecting a renderer.
 - In agent-first cut-only mode, the user's explicit request to auto-edit the
   supplied file may authorize conservative low-risk decisions when that request
   is recorded in `destructive_edit`; high-risk decisions still default to keep.
-- Require `timeline` and `final` approvals when the optional visual timeline,
-  page editor, captions/cards, or publishing workflow is used. They may be
-  marked not applicable for a cut-only output that is not externally delivered.
+- Require `highlight_selection`, `timeline`, and `final` approvals when the
+  optional Studio/page-editor highlight, captions/cards, or publishing workflow
+  is used. Highlight selection is not applicable when no highlight plan exists;
+  timeline/final may be marked not applicable for a cut-only output that is not
+  externally delivered.
 - Treat all AI outputs as editable proposals.
 - Use only owned/licensed media, fonts, music, and voices; store provenance.
 - Do not fabricate B-roll evidence, quotes, product screens, or numerical cards.
@@ -364,9 +416,9 @@ Read [references/ROUTING.md](references/ROUTING.md) before selecting a renderer.
   final MP4, QA report, contact sheet, and unresolved risks.
 - Do not claim that a browser-only AI surface can execute this skill without a
   local filesystem, Python, FFmpeg, and permission to access the source video.
-- Do not describe the five visual director presets as full semantic recut
-  directors. In the current core they control typography, motion, and visual
-  density; pacing/cut-strategy personas are a later layer.
+- Do not describe the five director profiles as autonomous LLM agents. They are
+  deterministic, tested semantic-selection and visual-style strategies whose
+  duration, pacing, signal weights, typography, motion, and density differ.
 
 ## Output Contract
 
@@ -376,6 +428,7 @@ Read [references/ROUTING.md](references/ROUTING.md) before selecting a renderer.
   video. Return a real edited MP4 after QA; do not return only a plan or preview.
 - Agent-first cut-only output requires `project.json`, edit decisions, recorded
   low-risk authorization, an immutable source, the edited MP4, and a QA report.
-- The advanced visual workflow additionally requires all three human approval
-  gates, selected renderer, voice provider/ID or explicit voice-disabled state,
-  asset provenance, and contact-sheet inspection.
+- The advanced visual workflow additionally requires all four human approval
+  gates when highlights are present, selected renderer, voice provider/ID or
+  explicit voice-disabled state, asset provenance, a current delivery receipt,
+  and contact-sheet inspection.

@@ -1,14 +1,14 @@
 # Auto Edit Video Skill
 
-A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic A-roll video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. Subtitles, emphasis, title/cards, animations, and social canvases remain optional advanced capabilities.
+A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic A-roll video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. An optional loopback-only Studio adds local video import, editing intent, five deterministic director profiles, up to ten transcript-grounded highlights, editable captions/layers, preview, final QA, and reviewed download.
 
 [繁體中文](README.zh-TW.md)
 
 [Agent-first phase specification (Traditional Chinese)](skills/auto-edit-video/references/AGENT_FIRST.zh-TW.md)
 
-## Current phase: give the agent one video
+## Default mode: give the agent one video
 
-No user interface is required. Give a local coding agent one readable video:
+No user interface is required for the default agent-first path. Give a local coding agent one readable video:
 
 ```text
 Use auto-edit-video to automatically edit ./input.mp4 and return the MP4.
@@ -20,7 +20,35 @@ manifest, or a preview page. Without a requested duration, the default is a
 conservative full-length cleanup. Duration is not fixed at 30 seconds: the user
 can select a platform plus `short`, `medium`, or `long`, ask the agent to choose
 `auto` after transcription, or provide explicit seconds. UI, LINE delivery,
-uploads, and social publishing are outside the current phase.
+external uploads, and social publishing are not required by this path. LINE or
+other external delivery remains a separate explicitly authorized action.
+
+## Optional local Studio GUI
+
+When the user explicitly asks for an interface, launch the bundled Studio:
+
+```bash
+SKILL=/absolute/path/to/auto-edit-video
+python3 "$SKILL/scripts/auto_edit.py" studio \
+  --projects-root /absolute/path/to/auto-edit-projects \
+  --port 8765 --open
+```
+
+The browser sends the selected local File only to the loopback Studio. Studio
+validates it, creates an immutable owned project copy, runs local Whisper, and
+produces up to ten transcript-grounded highlight proposals. The user can choose
+short/medium/long platform targets, describe the desired edit, select one of
+five deterministic director profiles, keep or reject clips, correct caption
+text/timing, add title/cards/animations or licensed media, preview one clip, and
+render it separately.
+
+Approvals are revision-bound and ordered:
+`destructive_edit` → `highlight_selection` → `timeline` → `final`. Final render
+automatically creates a frozen render snapshot, SHA-256 receipt, mechanical QA
+report, and contact sheet. Download is exposed only after the current QA result
+and final artifact are manually approved. Reviewed interior delete decisions
+are intentionally fail-closed in the page renderer; use `render_cut.py` first,
+or mark those proposals keep, until the two render paths are composed.
 
 ## Platform duration presets
 
@@ -42,10 +70,11 @@ repeated, stretched, or speed-adjusted merely to hit the target.
 
 - Immutable source staging and a `project.json` source of truth.
 - Low-risk silence, filler, and immediate-stutter proposals.
-- Explicit `destructive_edit`, `timeline`, and `final` approval gates.
+- Explicit `destructive_edit`, `highlight_selection`, `timeline`, and `final` approval gates.
 - Approved-cut FFmpeg renderer and mandatory re-transcription workflow.
 - Chinese, English, bilingual, or hidden subtitle modes.
-- Local page editor with timed text/media layers and social canvas presets.
+- Loopback Studio import plus a local page editor with semantic highlights,
+  timed text/media layers, and social canvas presets.
 - Deterministic MP4/cover rendering plus mechanical QA and a contact sheet.
 - Optional Edge, Rumi/Fish, HyperFrames, premium captions, and visual-card integrations when those tools are already installed.
 
@@ -138,6 +167,11 @@ python3 "$SKILL/scripts/auto_edit.py" import-whisper \
 python3 "$SKILL/scripts/auto_edit.py" analyze-edits \
   --manifest /absolute/path/project/project.json
 
+python3 "$SKILL/scripts/auto_edit.py" plan-highlights \
+  --manifest /absolute/path/project/project.json \
+  --director high-energy --count 10 \
+  --brief "Lead with the clearest hook and keep claims complete"
+
 python3 "$SKILL/scripts/auto_edit.py" editor \
   --project-dir /absolute/path/project --port 8765 --open
 ```
@@ -177,10 +211,14 @@ Specific overrides include `VIDEO_AUTOPILOT_SKILL_DIR`, `CUT_NARRATION_SKILL_DIR
 
 - Original media remains immutable.
 - The page editor binds to loopback unless remote access is explicitly enabled.
+- Studio imports use a project-owned copy, CSRF/Host/Origin checks, media limits,
+  container probing, and atomic project creation.
 - Uploaded assets are project-scoped, type/size checked, and provenance-recorded.
 - No package manager or system dependency is invoked by the installer.
 - No cloud TTS runs without an explicit `--allow-cloud` decision.
 - AI cut, subtitle, translation, and visual suggestions remain proposals until reviewed.
+- Render snapshots bind the source, referenced assets, selected clip, editor
+  revision, and approvals; final approval also binds output/QA/contact-sheet hashes.
 
 ## Development
 

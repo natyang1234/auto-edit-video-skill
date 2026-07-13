@@ -6,30 +6,55 @@ The bundled editor is a local, project-scoped workstation rather than a hosted
 service. It reads `project.json`, transcript/cut proposals, emphasis/visual
 plans, source QA, and `working/editor_state.json`.
 
+- Loopback-only new-project Studio with local File import, owned immutable copy,
+  media validation, local Whisper, and visible pipeline progress.
 - Live source-video preview with timed editable layers.
 - Hybrid editorial workstation: warm source/inspector panels, dark preview and
   multitrack timeline, with vermilion actions and amber emphasis.
 - Project-scoped editing brief, selectable director cards, and quick actions for
   subtitles, emphasis text, title cards, animations, images, GIFs, and video.
-- Up to ten clickable clip-navigation sections derived from the current caption
-  timeline, or from reviewed `state.highlights` when an agent supplies them.
+- Up to ten transcript-grounded semantic highlights with source timing,
+  evidence, score, strategy, per-clip keep/reject, title/range editing, and a
+  clip-scoped timeline.
 - Font family, size, fill/accent color, X/Y position, visibility, timing, and
   `none` / `fade` / `pop` / `slide-up` motion.
 - Text, emphasis, title, card, image, GIF, and inserted-video layers.
 - Instagram Reels, YouTube Shorts, YouTube 16:9, TikTok, and two editorial
   Xiaohongshu working presets with platform safe-zone guides.
-- Five visual direction presets. These are typography/motion/density presets,
-  not yet five independent semantic recut algorithms.
-- Five-track source/animation/card/subtitle/audio timeline. Double-clicking a
+- Five deterministic director profiles: professional teaching, viral short,
+  gossip/current-affairs, POV/hidden-camera, and concise editor. They alter
+  semantic-selection duration/pacing/signal weights and visual typography/
+  motion/density; they are not autonomous LLM agents.
+- Five-track source/animation/card/subtitle/audio timeline. Clicking a
   text block selects its timed layer and focuses the subtitle editor.
 - Deterministic transcript-based publishing-copy draft and cover-frame render.
-- Preview MP4, final MP4, and approval gates bound to the render-state revision.
+- Versioned per-clip preview/final MP4s, audible-audio normalization, frozen
+  render snapshots, SHA-256 receipts, automatic QA/contact sheet, and approved
+  final download.
+- Revision-bound `destructive_edit` → `highlight_selection` → `timeline` →
+  `final` gates with stale-write rejection and downstream invalidation.
 
 The Xiaohongshu 3:4 and 9:16 entries are working presets. Do not claim they are
 verified current official video-post requirements without a fresh primary-source
 check.
 
-## Launch
+## Launch a new-project Studio
+
+```bash
+SKILL="/absolute/path/to/the/installed/auto-edit-video"
+
+python3 "$SKILL/scripts/auto_edit.py" studio \
+  --projects-root /absolute/path/to/auto-edit-projects \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --open
+```
+
+The Studio File picker is not an external upload. The browser streams the file
+to the loopback process, which creates a project-owned copy and never changes
+the selected source.
+
+## Reopen one existing project
 
 ```bash
 SKILL="/absolute/path/to/the/installed/auto-edit-video"
@@ -46,39 +71,50 @@ non-loopback bind requires `--allow-remote` and a trusted network.
 
 ## Review order
 
-1. Correct Whisper text and reject wrong cut suggestions.
-2. Approve destructive-edit decisions before any source cut.
-3. Review auto emphasis/title/card layers; remove claims created from bad ASR.
-4. Pick the social canvas and inspect its safe zone.
-5. Adjust typography, positions, motions, and uploaded licensed assets.
-6. Render a preview MP4 and run video QA/contact-sheet review.
-7. Approve the current timeline revision.
-8. Render final; run final QA; approve final only if QA and human review pass.
+1. Wait for local transcription/planning; correct Whisper text and inspect every
+   cut suggestion.
+2. Approve destructive-edit decisions. The page renderer does not apply
+   interior deletes: set them keep or run the destructive cut renderer first.
+3. Review all highlight candidates, mark at least one keep, reject the rest, and
+   approve the current highlight-selection revision.
+4. Review auto emphasis/title/card layers; remove claims created from bad ASR.
+5. Pick the social canvas, inspect its safe zone, and adjust typography,
+   positions, motions, and licensed assets.
+6. Render and watch a versioned preview MP4 for the selected clip.
+7. Approve the current timeline revision, then render final.
+8. Inspect the full final playback and QA contact sheet. Approve final only when
+   QA is current and the output is correct; download then becomes available.
 
-Changing render-affecting state after step 7 automatically invalidates timeline
-and final approvals. Publishing text or inspector selection alone does not alter
-the render revision.
+Changing render-affecting state automatically invalidates affected highlight,
+timeline, and final approvals. Publishing text or merely selecting a clip/layer
+does not alter the render revision. Re-rendering final invalidates the prior
+final approval even if the timeline did not change.
 
 ## Security and provenance
 
 - Server routes are scoped to the selected project and assets/renders cannot
   traverse into other project files.
+- Studio File imports use CSRF, Host/Origin checks, byte and disk limits,
+  filename/MIME/container validation, ffprobe stream limits, SHA-256, and atomic
+  project creation.
 - Loopback Host headers and mutating browser origins are checked to block DNS
   rebinding and cross-site writes.
 - Uploads are size/type limited and recorded in `assets/provenance.json`.
 - Uploaded or generated media must still be owned/licensed and fact-checked.
 - Cloud TTS is never invoked by opening the editor. Rumi/Edge voice generation
   remains an explicit opt-in workflow.
+- Final approval validates current output, render receipt, QA report, and
+  contact-sheet hashes; changed artifacts make the approval non-current.
 
 ## Known boundaries
 
-- The source panel displays the A-roll already staged in the project. Creating a
-  new project, copying a newly chosen source, transcribing it, and generating a
-  semantic recut still belongs to the agent/CLI workflow; the browser does not
-  pretend that a local file preview alone completed those steps.
-- The ten-section navigator is a review/navigation surface, not ten rendered
-  semantic highlight videos. When a future agent writes reviewed highlight
-  ranges to `state.highlights`, the same surface displays those ranges directly.
+- The Studio creates semantic proposals, not guaranteed editorial truth. Local
+  Whisper errors and strategy scores require human review.
+- Studio can propose up to ten highlights, but renders one selected clip at a
+  time. Batch-exporting all ten in one click is not implemented yet.
+- Reviewed interior delete decisions must use the destructive cut renderer
+  before page-editor final render; the page renderer fails closed instead of
+  silently ignoring them.
 - Local copy generation is a conservative draft, not a full brand-trained
   platform strategist.
 - Content-related stock/GIF retrieval is not automatic; the local planner makes

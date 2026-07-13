@@ -1,14 +1,14 @@
 # Auto Edit Video 自動剪輯 Skill
 
-這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個 A-roll／口播影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。字幕、重點字、標題／字卡／動畫與社群尺寸保留為進階選配。
+這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個 A-roll／口播影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。另提供選配的 loopback-only Studio，可從本機匯入影片、描述剪輯需求、選擇五種確定性導演策略、產生最多十段語意精華，並逐段改字幕／圖層、預覽、QA、核可與下載。
 
 [English](README.md)
 
 [第一階段 Agent-first 完整規格](skills/auto-edit-video/references/AGENT_FIRST.zh-TW.md)
 
-## 現階段用法：只交給 Agent 一個影片檔
+## 預設用法：只交給 Agent 一個影片檔
 
-目前不需要操作介面。使用者只要把 Agent 能讀取的本機影片檔交給它：
+預設 Agent-first 路徑不需要操作介面。使用者只要把 Agent 能讀取的本機影片檔交給它：
 
 ```text
 請用 auto-edit-video 自動剪輯 ./input.mp4
@@ -16,7 +16,22 @@
 
 Agent 應自行建立工作專案、在本機轉錄、提出並套用保守剪輯、輸出新的 MP4、執行 QA，再回報成品。使用者不必另外準備 Whisper JSON、SRT、manifest，也不必打開預覽網頁。
 
-時長不固定為 30 秒。使用者可用自然語言指定平台與 `短／中／長`、要求 Agent 看完逐字稿後 `自動` 選擇，或直接指定秒數。若沒有精華、縮短或平台需求，預設做保守的全長清理。LINE、雲端上傳、社群發佈與 UI 都不在第一階段範圍。
+時長不固定為 30 秒。使用者可用自然語言指定平台與 `短／中／長`、要求 Agent 看完逐字稿後 `自動` 選擇，或直接指定秒數。若沒有精華、縮短或平台需求，預設做保守的全長清理。UI 不是此路徑的必要條件；LINE、雲端上傳與社群發佈仍是必須另外明確授權的外部動作。
+
+## 選配：本機 Studio GUI
+
+使用者明確要求介面時，可啟動內建 Studio：
+
+```bash
+SKILL=/auto-edit-video/實際安裝路徑
+python3 "$SKILL/scripts/auto_edit.py" studio \
+  --projects-root /本機/自動剪輯專案目錄 \
+  --port 8765 --open
+```
+
+瀏覽器只把選定的本機 File 傳給 loopback Studio。Studio 會驗證影片、建立不可變的 owned copy、執行本機 Whisper，再依平台短／中／長、剪輯重點與五種確定性導演策略產生最多十段有原文證據的精華。使用者可逐段保留／排除、改標題與起訖、校正字幕、加入字卡／動畫／授權素材、預覽並分別輸出。
+
+人工閘依序為 `destructive_edit` → `highlight_selection` → `timeline` → `final`，每一閘都綁定當下 revision。正式輸出會自動建立 frozen snapshot、SHA-256 receipt、機械 QA 與九宮格；只有目前版本通過 QA 且人工核可後才顯示下載。頁面 renderer 目前不會悄悄忽略 interior delete：若審查決定含 `delete`，正式輸出會 fail closed，必須先走 `render_cut.py`，或把該提案改為 keep。
 
 ## 平台時長預設
 
@@ -36,10 +51,10 @@ Agent 應自行建立工作專案、在本機轉錄、提出並套用保守剪�
 
 - 原始影片保持不可變，`project.json` 是唯一事實來源。
 - 偵測低風險停頓、贅字與緊鄰口吃。
-- `destructive_edit`、`timeline`、`final` 三道人工作業閘門。
+- `destructive_edit`、`highlight_selection`、`timeline`、`final` 四道人工作業閘門。
 - 依核准決策輸出剪切版，之後強制重新轉錄。
 - 繁中、英文、中英雙語或關閉可見字幕。
-- 本機頁面編輯器、定時文字／媒體圖層與社群畫布。
+- loopback Studio 匯入、本機頁面編輯器、語意精華、定時文字／媒體圖層與社群畫布。
 - MP4／封面確定性輸出、機械 QA 與 contact sheet。
 - 已安裝時才啟用 Edge、Rumi/Fish、HyperFrames、進階字幕與視覺字卡整合。
 
@@ -130,6 +145,11 @@ python3 "$SKILL/scripts/auto_edit.py" import-whisper \
 python3 "$SKILL/scripts/auto_edit.py" analyze-edits \
   --manifest /專案/絕對路徑/project.json
 
+python3 "$SKILL/scripts/auto_edit.py" plan-highlights \
+  --manifest /專案/絕對路徑/project.json \
+  --director high-energy --count 10 \
+  --brief "優先保留鉤子清楚、資訊完整的片段"
+
 python3 "$SKILL/scripts/auto_edit.py" editor \
   --project-dir /專案/絕對路徑 --port 8765 --open
 ```
@@ -166,10 +186,12 @@ export AUTO_EDIT_SKILLS_ROOTS="/opt/agent-skills:$HOME/my-skills"
 
 - 原始素材不修改。
 - 頁面編輯器預設只綁 loopback；遠端開放需明示。
+- Studio 匯入含 CSRF／Host／Origin、防 traversal、大小／格式／container／ffprobe 檢查與原子建案。
 - 上傳素材限制在專案內，檢查類型／大小並記錄來源。
 - 安裝器不會自行呼叫系統套件管理器。
 - 未明確同意前不執行任何雲端 TTS。
 - AI 產生的刪剪、字幕、翻譯與視覺配置都只是待審提案。
+- render snapshot 會綁定來源、素材、選段、editor revision 與核可；final 另綁輸出、QA 與九宮格 hash。
 
 ## 開發驗證
 

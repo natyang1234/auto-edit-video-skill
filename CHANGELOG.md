@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.2.0 - 2026-07-14
+
+### Features
+
+- Add a loopback-only Studio that imports one local browser File into an
+  immutable owned project copy and runs local transcription/planning with
+  visible status.
+- Add five deterministic semantic director profiles and a validated
+  `highlight_plan.json` with up to ten transcript-grounded, scored, reviewable
+  source ranges.
+- Add per-highlight keep/reject, title/range editing, clip-scoped captions and
+  timeline layers, versioned per-clip preview/final MP4s, and reviewed download.
+- Normalize audible render audio toward -16 LUFS while safely bypassing silent
+  or missing audio tracks.
+
+### Safety
+
+- Add revision-bound ordered `destructive_edit`, `highlight_selection`,
+  `timeline`, and `final` gates with stale-write rejection and downstream
+  invalidation.
+- Freeze source, asset, clip, state, and approval hashes in render snapshots;
+  write atomic output/render receipts and bind final approval to output, QA
+  report, and contact-sheet SHA-256 values.
+- Fail closed when page-editor final render would otherwise ignore reviewed
+  interior delete decisions; require the destructive cut renderer first.
+- Add CSRF/Host/Origin checks, project-scoped paths, media limits, container and
+  ffprobe validation, atomic project creation, and tamper-aware approval status.
+
+### Documentation and tests
+
+- Document Studio launch, highlight artifacts, editor review order, QA-bound
+  final approval, current limitations, and the unchanged Agent-first default.
+- Expand the regression suite to 46 tests and complete a real 492.874-second
+  local-video import → Whisper → 10 highlights → review → preview/final → QA
+  validation without changing the source file.
+
 ## 1.1.0 - 2026-07-14
 
 ### Features
