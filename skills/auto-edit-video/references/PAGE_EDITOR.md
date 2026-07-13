@@ -7,6 +7,12 @@ service. It reads `project.json`, transcript/cut proposals, emphasis/visual
 plans, source QA, and `working/editor_state.json`.
 
 - Live source-video preview with timed editable layers.
+- Hybrid editorial workstation: warm source/inspector panels, dark preview and
+  multitrack timeline, with vermilion actions and amber emphasis.
+- Project-scoped editing brief, selectable director cards, and quick actions for
+  subtitles, emphasis text, title cards, animations, images, GIFs, and video.
+- Up to ten clickable clip-navigation sections derived from the current caption
+  timeline, or from reviewed `state.highlights` when an agent supplies them.
 - Font family, size, fill/accent color, X/Y position, visibility, timing, and
   `none` / `fade` / `pop` / `slide-up` motion.
 - Text, emphasis, title, card, image, GIF, and inserted-video layers.
@@ -14,6 +20,8 @@ plans, source QA, and `working/editor_state.json`.
   Xiaohongshu working presets with platform safe-zone guides.
 - Five visual direction presets. These are typography/motion/density presets,
   not yet five independent semantic recut algorithms.
+- Five-track source/animation/card/subtitle/audio timeline. Double-clicking a
+  text block selects its timed layer and focuses the subtitle editor.
 - Deterministic transcript-based publishing-copy draft and cover-frame render.
 - Preview MP4, final MP4, and approval gates bound to the render-state revision.
 
@@ -64,6 +72,13 @@ the render revision.
 
 ## Known boundaries
 
+- The source panel displays the A-roll already staged in the project. Creating a
+  new project, copying a newly chosen source, transcribing it, and generating a
+  semantic recut still belongs to the agent/CLI workflow; the browser does not
+  pretend that a local file preview alone completed those steps.
+- The ten-section navigator is a review/navigation surface, not ten rendered
+  semantic highlight videos. When a future agent writes reviewed highlight
+  ranges to `state.highlights`, the same surface displays those ranges directly.
 - Local copy generation is a conservative draft, not a full brand-trained
   platform strategist.
 - Content-related stock/GIF retrieval is not automatic; the local planner makes

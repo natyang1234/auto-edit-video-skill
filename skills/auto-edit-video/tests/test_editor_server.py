@@ -116,6 +116,25 @@ class EditorServerTests(unittest.TestCase):
             "the loaded-video placeholder must not override the hidden attribute",
         )
 
+    def test_hybrid_editor_workflow_controls_are_present(self) -> None:
+        html = (SKILL_DIR / "editor/index.html").read_text(encoding="utf-8")
+        css = (SKILL_DIR / "editor/styles.css").read_text(encoding="utf-8")
+        script = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
+        for element_id in (
+            "source-file-name",
+            "highlight-list",
+            "editing-brief",
+            "director-grid",
+            "layer-list",
+            "timeline-tracks",
+            "render-button",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("Hybrid editorial workstation", css)
+        self.assertIn('const DIRECTOR_ORDER = ["teacher-punch", "high-energy"', script)
+        self.assertIn('name: "影片", kind: "source"', script)
+        self.assertIn('name: "字幕", types: ["caption"]', script)
+
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -175,6 +194,11 @@ class EditorServerTests(unittest.TestCase):
             any(voice["voice_id"] == "rumi" for voice in payload["voice_catalog"]["voices"])
         )
         self.assertEqual(payload["state"]["overlays"][0]["type"], "caption")
+        self.assertEqual(payload["state"]["editing_brief"], "")
+        self.assertEqual(
+            {preset["label"] for preset in payload["director_presets"].values()},
+            {"專業教學", "爆款短影音", "八卦時事", "POV 藏鏡人", "編輯精簡"},
+        )
         self.assertEqual(
             {item["type"] for item in payload["state"]["overlays"]},
             {"caption", "emphasis", "title"},

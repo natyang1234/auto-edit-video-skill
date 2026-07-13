@@ -109,8 +109,8 @@ PLATFORM_PRESETS: dict[str, dict[str, Any]] = {
 
 DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
     "teacher-punch": {
-        "label": "教學重點派",
-        "description": "白字黑描邊、黃色重點、節奏性特寫；貼近本次樣本。",
+        "label": "專業教學",
+        "description": "先講結論、拆解步驟，以高對比重點字協助理解。",
         "caption": {
             "font_family": "PingFang TC",
             "font_size": 58,
@@ -127,8 +127,8 @@ DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
         "visual_density": "balanced",
     },
     "editorial-clean": {
-        "label": "編輯台精簡派",
-        "description": "小而準的字幕、克制標題卡、保留畫面呼吸。",
+        "label": "編輯精簡",
+        "description": "小而準的字幕、克制字卡，保留人物與畫面呼吸。",
         "caption": {
             "font_family": "Avenir Next",
             "font_size": 44,
@@ -145,8 +145,8 @@ DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
         "visual_density": "sparse",
     },
     "documentary": {
-        "label": "紀錄片敘事派",
-        "description": "暖白字、赭色重點、較慢淡入與下三分之一構圖。",
+        "label": "八卦時事",
+        "description": "快速交代背景與衝突，用暖色重點帶出討論焦點。",
         "caption": {
             "font_family": "Songti TC",
             "font_size": 48,
@@ -163,8 +163,8 @@ DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
         "visual_density": "sparse",
     },
     "high-energy": {
-        "label": "高能短影音派",
-        "description": "大字、快進場、高視覺密度，適合強 Hook 與密集節奏。",
+        "label": "爆款短影音",
+        "description": "強 Hook、大字、快進場，適合密集節奏與高張力片段。",
         "caption": {
             "font_family": "PingFang TC",
             "font_size": 68,
@@ -181,8 +181,8 @@ DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
         "visual_density": "dense",
     },
     "minimal": {
-        "label": "極簡訪談派",
-        "description": "低干擾字幕與幾乎無動效，讓人物與內容主導。",
+        "label": "POV 藏鏡人",
+        "description": "低干擾字幕與沉浸節奏，讓第一視角與現場感主導。",
         "caption": {
             "font_family": "Avenir Next",
             "font_size": 40,
@@ -427,6 +427,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             "show_safe_zones": True,
         },
         "director_style": director_id,
+        "editing_brief": "",
         "caption_defaults": caption_style,
         "overlays": overlays,
         "publishing": {

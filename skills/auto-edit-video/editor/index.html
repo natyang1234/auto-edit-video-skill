@@ -3,19 +3,22 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="color-scheme" content="light">
-    <title>Auto Edit Studio</title>
+    <meta name="color-scheme" content="light dark">
+    <title>自動剪輯工作室</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
 
     <header class="topbar">
-      <div class="brand-lockup" aria-label="Auto Edit Studio">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <div>
-          <p class="eyebrow">AUTO EDIT STUDIO</p>
-          <h1 id="project-name">讀取專案中</h1>
+      <div class="brand-lockup" aria-label="自動剪輯工作室">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <div class="brand-copy">
+          <p class="product-name">自動剪輯工作室</p>
+          <div class="project-context">
+            <span>目前專案</span>
+            <h1 id="project-name">讀取專案中</h1>
+          </div>
         </div>
       </div>
 
@@ -24,70 +27,64 @@
           <span>輸出平台</span>
           <select id="platform-select" aria-label="選擇輸出平台"></select>
         </label>
-        <label class="compact-field director-field">
-          <span>剪輯導演</span>
-          <select id="director-select" aria-label="選擇剪輯導演風格"></select>
-        </label>
         <div class="save-state" id="save-state" role="status" aria-live="polite">
           <span class="save-dot" aria-hidden="true"></span>
           <span>等待載入</span>
         </div>
-        <button class="button button-secondary" id="save-button" type="button">儲存時間軸</button>
+        <button class="button button-quiet" id="save-button" type="button">儲存</button>
         <button class="button button-primary" id="render-button" type="button">輸出預覽</button>
       </div>
     </header>
 
     <main class="editor-shell" id="main-content">
-      <aside class="left-rail" aria-label="剪輯建議與圖層">
-        <section class="rail-section review-section">
+      <aside class="left-rail" aria-label="來源影片與片段">
+        <section class="rail-section source-section">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">CUT REVIEW</p>
-              <h2>剪輯建議</h2>
+              <p class="eyebrow">A-ROLL SOURCE</p>
+              <h2>來源影片</h2>
             </div>
-            <span class="count-badge" id="candidate-count">0</span>
+            <span class="source-state"><i aria-hidden="true"></i>已導入</span>
           </div>
-          <p class="section-note">AI 只提出建議；核可前不會刪除原片。</p>
-          <div class="candidate-list" id="candidate-list"></div>
-          <button class="button button-danger-quiet full-width" id="approve-cuts" type="button">
-            核可目前刪除決定
-          </button>
+          <div class="source-file">
+            <span class="source-file-icon" aria-hidden="true"></span>
+            <div>
+              <strong id="source-file-name">讀取影片中</strong>
+              <span id="source-file-detail">等待來源資訊</span>
+            </div>
+            <button class="icon-button" id="source-preview-button" type="button" aria-label="從頭預覽來源影片">▶</button>
+          </div>
+          <p class="section-note">原片保持不變；所有剪輯都寫入專案時間軸。</p>
         </section>
 
-        <section class="rail-section layer-section">
+        <section class="rail-section highlight-section">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">LAYERS</p>
-              <h2>新增圖層</h2>
+              <p class="eyebrow">CLIP NAVIGATION</p>
+              <h2>精華片段</h2>
             </div>
+            <span class="count-badge" id="highlight-count">0</span>
           </div>
-          <div class="tool-grid" role="group" aria-label="新增時間軸圖層">
-            <button class="tool-button" data-add-type="caption" type="button">
-              <strong>字幕</strong><span>跟著口播</span>
-            </button>
-            <button class="tool-button" data-add-type="title" type="button">
-              <strong>標題卡</strong><span>開場或轉場</span>
-            </button>
-            <button class="tool-button" data-add-type="emphasis" type="button">
-              <strong>特效字</strong><span>放大關鍵詞</span>
-            </button>
-            <button class="tool-button" data-add-type="animation" type="button">
-              <strong>動畫字卡</strong><span>說明與提示</span>
-            </button>
-            <button class="tool-button tool-button-wide" id="asset-upload-button" type="button">
-              <strong>圖片／GIF／影片</strong><span>插入內容相關素材</span>
-            </button>
-            <input id="asset-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/quicktime" hidden>
-          </div>
-          <div class="layer-list" id="layer-list" aria-label="時間軸圖層清單"></div>
+          <p class="section-note">最多顯示 10 個段落；點選即可跳到該段字幕與畫面。</p>
+          <div class="highlight-list" id="highlight-list" aria-label="精華片段導覽"></div>
         </section>
+
+        <details class="rail-section cut-review">
+          <summary>
+            <span><small>CUT REVIEW</small>低風險刪剪</span>
+            <span class="count-badge" id="candidate-count">0</span>
+          </summary>
+          <p class="section-note">AI 只提出停頓與贅字建議；核可前不會刪除原片。</p>
+          <div class="candidate-list" id="candidate-list"></div>
+          <button class="button button-danger-quiet full-width" id="approve-cuts" type="button">核可刪剪決定</button>
+        </details>
       </aside>
 
       <section class="preview-workspace" id="preview-workspace" aria-label="即時影片預覽">
         <div class="preview-heading">
           <div>
-            <p class="eyebrow">FRAME PREVIEW</p>
-            <h2>畫面即時預覽</h2>
+            <p class="eyebrow">LIVE CANVAS</p>
+            <h2>即時畫面</h2>
           </div>
           <div class="preview-meta">
             <span id="canvas-resolution">1080 × 1920</span>
@@ -105,7 +102,7 @@
             </div>
           </div>
           <aside class="frame-warning" id="frame-warning" aria-live="polite">
-            <p class="eyebrow">SOURCE CHECK</p>
+            <p class="eyebrow">QA CHECK</p>
             <p id="warning-copy">等待機械 QA</p>
           </aside>
         </div>
@@ -125,13 +122,50 @@
         </div>
       </section>
 
-      <aside class="inspector" aria-label="選取圖層設定">
+      <aside class="inspector" aria-label="剪輯意圖與圖層設定">
+        <section class="intent-panel" aria-labelledby="brief-heading">
+          <div class="intent-heading">
+            <div>
+              <p class="eyebrow">EDITING BRIEF</p>
+              <h2 id="brief-heading">你想怎麼剪？</h2>
+            </div>
+            <span class="local-chip">儲存在本機</span>
+          </div>
+          <label class="brief-field">
+            <span class="sr-only">剪輯風格與重點</span>
+            <textarea id="editing-brief" rows="3" maxlength="500" placeholder="例如：保留最有張力的觀點，節奏快，字幕強調結論。"></textarea>
+          </label>
+
+          <div class="director-heading">
+            <div>
+              <h3>選擇剪輯導演</h3>
+              <p>套用字幕、字卡與動態語言</p>
+            </div>
+          </div>
+          <select id="director-select" aria-label="選擇剪輯導演風格" hidden></select>
+          <div class="director-grid" id="director-grid" role="radiogroup" aria-label="剪輯導演風格"></div>
+
+          <div class="quick-tools" role="group" aria-label="加入時間軸內容">
+            <button class="quick-tool" data-add-type="animation" type="button"><i aria-hidden="true">✦</i><span>加入動畫</span></button>
+            <button class="quick-tool" data-add-type="title" type="button"><i aria-hidden="true">T</i><span>加入字卡</span></button>
+            <button class="quick-tool" data-add-type="emphasis" type="button"><i aria-hidden="true">Aa</i><span>加入特效字</span></button>
+            <button class="quick-tool" data-add-type="caption" type="button"><i aria-hidden="true">CC</i><span>新增字幕</span></button>
+            <button class="quick-tool" id="asset-upload-button" type="button"><i aria-hidden="true">▧</i><span>圖片／影片素材</span></button>
+          </div>
+          <input id="asset-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/quicktime" hidden>
+        </section>
+
         <div class="inspector-tabs" role="tablist" aria-label="設定區">
-          <button role="tab" aria-selected="true" aria-controls="style-panel" id="style-tab" type="button">圖層</button>
-          <button role="tab" aria-selected="false" aria-controls="publish-panel" id="publish-tab" type="button">發布</button>
+          <button role="tab" aria-selected="true" aria-controls="style-panel" id="style-tab" type="button">字幕與圖層</button>
+          <button role="tab" aria-selected="false" aria-controls="publish-panel" id="publish-tab" type="button">輸出設定</button>
         </div>
 
         <section class="inspector-panel" id="style-panel" role="tabpanel" aria-labelledby="style-tab">
+          <div class="layer-list-heading">
+            <span>目前圖層</span>
+            <span id="layer-count">0</span>
+          </div>
+          <div class="layer-list" id="layer-list" aria-label="時間軸圖層清單"></div>
           <div class="inspector-empty" id="inspector-empty">
             <p class="eyebrow">SELECT A LAYER</p>
             <h2>選一個時間軸圖層</h2>
@@ -274,13 +308,13 @@
       <section class="timeline-panel" aria-label="影片時間軸">
         <div class="timeline-header">
           <div>
-            <p class="eyebrow">TIMELINE</p>
-            <h2>字幕、字卡與素材</h2>
+            <p class="eyebrow">MULTITRACK TIMELINE</p>
+            <h2>影片、動畫、字卡與字幕</h2>
           </div>
           <div class="timeline-legend">
+            <span><i class="legend-asset"></i>影片／動畫</span>
+            <span><i class="legend-emphasis"></i>字卡</span>
             <span><i class="legend-caption"></i>字幕</span>
-            <span><i class="legend-emphasis"></i>特效字</span>
-            <span><i class="legend-asset"></i>素材／動畫</span>
             <span><i class="legend-cut"></i>刪除建議</span>
           </div>
         </div>

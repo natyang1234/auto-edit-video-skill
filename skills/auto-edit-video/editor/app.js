@@ -9,6 +9,16 @@ let history = [];
 let sourceMediaUrl = null;
 let showingRenderedMedia = false;
 let lastOverlaySignature = "";
+let highlightSegments = [];
+
+const DIRECTOR_CARD_META = {
+  "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
+  "high-energy": { icon: "爆", eyebrow: "強 Hook" },
+  documentary: { icon: "聞", eyebrow: "衝突脈絡" },
+  minimal: { icon: "視", eyebrow: "第一視角" },
+  "editorial-clean": { icon: "編", eyebrow: "克制精準" },
+};
+const DIRECTOR_ORDER = ["teacher-punch", "high-energy", "documentary", "minimal", "editorial-clean"];
 
 const byId = (id) => document.getElementById(id);
 const deepCopy = (value) => JSON.parse(JSON.stringify(value));
@@ -16,7 +26,9 @@ const deepCopy = (value) => JSON.parse(JSON.stringify(value));
 function cacheElements() {
   [
     "project-name", "platform-select", "director-select", "save-state", "save-button",
-    "render-button", "candidate-count", "candidate-list", "approve-cuts", "layer-list",
+    "render-button", "source-file-name", "source-file-detail", "source-preview-button",
+    "highlight-count", "highlight-list", "editing-brief", "director-grid", "candidate-count",
+    "candidate-list", "approve-cuts", "layer-list", "layer-count",
     "asset-upload-button", "asset-input", "canvas-resolution", "source-meta", "stage-frame",
     "preview-video", "overlay-layer", "safe-zone", "stage-empty", "warning-copy", "jump-start",
     "play-button", "current-time", "total-time", "scrubber", "toggle-safe-zone", "style-tab",
@@ -67,6 +79,13 @@ function formatTime(seconds) {
   const minutes = Math.floor(safe / 60);
   const remainder = safe - minutes * 60;
   return `${String(minutes).padStart(2, "0")}:${remainder.toFixed(3).padStart(6, "0")}`;
+}
+
+function formatClipTime(seconds) {
+  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const minutes = Math.floor(safe / 60);
+  const remainder = Math.floor(safe % 60);
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
 }
 
 function duration() {
@@ -163,6 +182,47 @@ function populatePresets() {
   });
   elements["platform-select"].value = state.canvas.platform_id;
   elements["director-select"].value = state.director_style;
+  renderDirectorCards();
+}
+
+function renderDirectorCards() {
+  elements["director-grid"].replaceChildren();
+  Object.entries(projectPayload.director_presets)
+    .sort(([left], [right]) => DIRECTOR_ORDER.indexOf(left) - DIRECTOR_ORDER.indexOf(right))
+    .forEach(([id, preset], index) => {
+      const meta = DIRECTOR_CARD_META[id] || { icon: "導", eyebrow: "導演風格" };
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `director-card${id === state.director_style ? " is-selected" : ""}`;
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", String(id === state.director_style));
+      button.dataset.directorId = id;
+      button.style.setProperty("--director-index", String(index));
+
+      const icon = document.createElement("span");
+      icon.className = "director-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = meta.icon;
+      const copy = document.createElement("span");
+      copy.className = "director-copy";
+      const eyebrow = document.createElement("small");
+      eyebrow.textContent = meta.eyebrow;
+      const name = document.createElement("strong");
+      name.textContent = preset.label;
+      const description = document.createElement("span");
+      description.textContent = preset.description;
+      copy.append(eyebrow, name, description);
+      const check = document.createElement("i");
+      check.className = "director-check";
+      check.setAttribute("aria-hidden", "true");
+      check.textContent = "✓";
+      button.append(icon, copy, check);
+      button.addEventListener("click", () => {
+        elements["director-select"].value = id;
+        elements["director-select"].dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      elements["director-grid"].append(button);
+    });
 }
 
 function applyCanvas() {
@@ -211,6 +271,109 @@ function renderCandidateList() {
   });
 }
 
+function deriveHighlightSegments() {
+  const supplied = Array.isArray(state.highlights) ? state.highlights : [];
+  const validSupplied = supplied.filter((item) =>
+    Number.isFinite(Number(item.start)) && Number.isFinite(Number(item.end)) && Number(item.end) > Number(item.start)
+  ).slice(0, 10);
+  if (validSupplied.length) {
+    return validSupplied.map((item, index) => ({
+      id: String(item.id || `highlight-${index + 1}`),
+      start: Number(item.start),
+      end: Number(item.end),
+      title: String(item.title || item.text || `精華片段 ${index + 1}`),
+      overlayId: item.overlay_id || null,
+      source: "AI 精華",
+    }));
+  }
+
+  const captions = state.overlays
+    .filter((overlay) => overlay.type === "caption" && overlay.visible !== false)
+    .sort((a, b) => a.start - b.start);
+  if (!captions.length) return [];
+  const count = Math.min(10, captions.length);
+  const groups = [];
+  for (let index = 0; index < count; index += 1) {
+    const firstIndex = Math.floor((index * captions.length) / count);
+    const lastIndex = Math.max(firstIndex, Math.floor(((index + 1) * captions.length) / count) - 1);
+    const first = captions[firstIndex];
+    const last = captions[lastIndex];
+    const rawTitle = captions.slice(firstIndex, lastIndex + 1).map((item) => item.text).join(" ").trim();
+    groups.push({
+      id: `caption-section-${index + 1}`,
+      start: first.start,
+      end: last.end,
+      title: rawTitle || `字幕段落 ${index + 1}`,
+      overlayId: first.id,
+      source: "字幕段落",
+    });
+  }
+  return groups;
+}
+
+function renderHighlightList() {
+  highlightSegments = deriveHighlightSegments();
+  elements["highlight-count"].textContent = String(highlightSegments.length);
+  elements["highlight-list"].replaceChildren();
+  if (!highlightSegments.length) {
+    const empty = document.createElement("div");
+    empty.className = "highlight-empty";
+    const title = document.createElement("strong");
+    title.textContent = "尚未建立片段";
+    const copy = document.createElement("span");
+    copy.textContent = "完成本機轉錄後，字幕段落會顯示在這裡。";
+    empty.append(title, copy);
+    elements["highlight-list"].append(empty);
+    return;
+  }
+  highlightSegments.forEach((segment, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "highlight-row";
+    button.dataset.highlightIndex = String(index);
+    button.style.setProperty("--clip-index", String(index));
+    button.setAttribute("aria-label", `片段 ${index + 1}：${segment.title}`);
+
+    const number = document.createElement("span");
+    number.className = "highlight-number";
+    number.textContent = String(index + 1).padStart(2, "0");
+    const thumb = document.createElement("span");
+    thumb.className = "highlight-thumb";
+    thumb.setAttribute("aria-hidden", "true");
+    const copy = document.createElement("span");
+    copy.className = "highlight-copy";
+    const title = document.createElement("strong");
+    title.textContent = segment.title;
+    const meta = document.createElement("span");
+    meta.textContent = `${segment.source} · ${formatClipTime(segment.start)}–${formatClipTime(segment.end)}`;
+    copy.append(title, meta);
+    const durationLabel = document.createElement("span");
+    durationLabel.className = "highlight-duration";
+    durationLabel.textContent = `${Math.max(0, segment.end - segment.start).toFixed(0)}s`;
+    button.append(number, thumb, copy, durationLabel);
+    button.addEventListener("click", () => {
+      if (segment.overlayId) selectOverlay(segment.overlayId, false);
+      elements["preview-video"].currentTime = segment.start;
+      updateActiveHighlight();
+    });
+    elements["highlight-list"].append(button);
+  });
+  updateActiveHighlight();
+}
+
+function updateActiveHighlight() {
+  const current = elements["preview-video"].currentTime || 0;
+  const activeIndex = highlightSegments.findIndex((segment, index) =>
+    current >= segment.start && (current < segment.end || (index === highlightSegments.length - 1 && current <= segment.end))
+  );
+  elements["highlight-list"].querySelectorAll(".highlight-row").forEach((button, index) => {
+    const active = index === activeIndex;
+    button.classList.toggle("is-active", active);
+    if (active) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
+  });
+}
+
 function decisionItems() {
   return (projectPayload.edit_candidates?.items || []).map((candidate) => {
     const checkbox = elements["candidate-list"].querySelector(`[data-candidate-id="${candidate.id}"]`);
@@ -248,6 +411,14 @@ function layerLabel(overlay) {
 
 function renderLayerList() {
   elements["layer-list"].replaceChildren();
+  elements["layer-count"].textContent = String(state.overlays.length);
+  if (!state.overlays.length) {
+    const empty = document.createElement("p");
+    empty.className = "layer-list-empty";
+    empty.textContent = "目前沒有圖層；可從上方加入字幕、動畫或素材。";
+    elements["layer-list"].append(empty);
+    return;
+  }
   [...state.overlays]
     .sort((a, b) => a.start - b.start || (a.z_index || 0) - (b.z_index || 0))
     .forEach((overlay) => {
@@ -441,55 +612,103 @@ function renderTimeline() {
   elements["timeline-ruler"].style.width = `${width}px`;
   elements["timeline-tracks"].style.width = `${width}px`;
   elements["timeline-ruler"].replaceChildren();
+  const rulerLabel = document.createElement("span");
+  rulerLabel.className = "ruler-label";
+  rulerLabel.textContent = "時間";
+  elements["timeline-ruler"].append(rulerLabel);
   const tickStep = duration() > 180 ? 30 : duration() > 70 ? 10 : 5;
   for (let second = 0; second <= duration(); second += tickStep) {
     const tick = document.createElement("div");
     tick.className = "ruler-tick";
-    tick.style.left = `${(second / Math.max(duration(), 1)) * 100}%`;
+    const progress = second / Math.max(duration(), 1);
+    tick.style.left = `${84 + progress * Math.max(0, width - 84)}px`;
     const label = document.createElement("span");
-    label.textContent = `${second}s`;
+    label.textContent = formatClipTime(second);
     tick.append(label);
     elements["timeline-ruler"].append(tick);
   }
   const groups = [
+    { name: "影片", kind: "source" },
+    { name: "動畫", types: ["image", "gif", "video", "animation"] },
+    { name: "字卡", types: ["emphasis", "title", "card"] },
     { name: "字幕", types: ["caption"] },
-    { name: "字卡與特效", types: ["emphasis", "title", "card"] },
-    { name: "素材與動畫", types: ["image", "gif", "video", "animation"] },
+    { name: "音訊", kind: "audio" },
   ];
   elements["timeline-tracks"].replaceChildren();
-  groups.forEach((group, groupIndex) => {
+  groups.forEach((group) => {
     const track = document.createElement("div");
     track.className = "timeline-track";
     track.setAttribute("aria-label", group.name);
-    state.overlays.filter((overlay) => group.types.includes(overlay.type)).forEach((overlay) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `timeline-item type-${overlay.type}${overlay.id === selectedOverlayId ? " is-selected" : ""}`;
-      button.style.left = `${(overlay.start / Math.max(duration(), 1)) * 100}%`;
-      button.style.width = `${Math.max(0.15, ((overlay.end - overlay.start) / Math.max(duration(), 1)) * 100)}%`;
-      button.textContent = overlay.text || overlay.source?.split("/").pop() || layerLabel(overlay);
-      button.title = `${layerLabel(overlay)} ${overlay.start.toFixed(2)}–${overlay.end.toFixed(2)} 秒`;
-      button.addEventListener("click", () => selectOverlay(overlay.id, true));
-      track.append(button);
-    });
-    if (groupIndex === 0) {
+    const trackLabel = document.createElement("span");
+    trackLabel.className = "track-label";
+    trackLabel.textContent = group.name;
+    const lane = document.createElement("div");
+    lane.className = `track-lane lane-${group.kind || "overlay"}`;
+
+    if (group.kind === "source") {
+      const sourceSegments = highlightSegments.length ? highlightSegments : [{
+        id: "source-full",
+        start: 0,
+        end: duration(),
+        title: "完整 A-roll",
+      }];
+      sourceSegments.forEach((segment, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "timeline-source-item";
+        button.style.left = `${(segment.start / Math.max(duration(), 1)) * 100}%`;
+        button.style.width = `${Math.max(0.2, ((segment.end - segment.start) / Math.max(duration(), 1)) * 100)}%`;
+        button.textContent = String(index + 1).padStart(2, "0");
+        button.title = `${segment.title} · ${formatClipTime(segment.start)}–${formatClipTime(segment.end)}`;
+        button.addEventListener("click", () => {
+          elements["preview-video"].currentTime = segment.start;
+          updateActiveHighlight();
+        });
+        lane.append(button);
+      });
       const decisionMap = new Map(decisionItems().map((item) => [item.candidate_id, item.action]));
       (projectPayload.edit_candidates?.items || []).filter((candidate) => decisionMap.get(candidate.id) === "delete").forEach((candidate) => {
         const cut = document.createElement("span");
         cut.className = "cut-item";
         cut.style.left = `${(candidate.start / Math.max(duration(), 1)) * 100}%`;
         cut.style.width = `${Math.max(0.12, ((candidate.end - candidate.start) / Math.max(duration(), 1)) * 100)}%`;
-        track.append(cut);
+        lane.append(cut);
+      });
+    } else if (group.kind === "audio") {
+      const audio = document.createElement("span");
+      audio.className = "timeline-audio-item";
+      audio.textContent = "原始音訊";
+      lane.append(audio);
+    } else {
+      state.overlays.filter((overlay) => group.types.includes(overlay.type)).forEach((overlay) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `timeline-item type-${overlay.type}${overlay.id === selectedOverlayId ? " is-selected" : ""}`;
+        button.style.left = `${(overlay.start / Math.max(duration(), 1)) * 100}%`;
+        button.style.width = `${Math.max(0.15, ((overlay.end - overlay.start) / Math.max(duration(), 1)) * 100)}%`;
+        button.textContent = overlay.text || overlay.source?.split("/").pop() || layerLabel(overlay);
+        button.title = `${layerLabel(overlay)} ${overlay.start.toFixed(2)}–${overlay.end.toFixed(2)} 秒`;
+        button.addEventListener("click", () => selectOverlay(overlay.id, true));
+        button.addEventListener("dblclick", () => {
+          selectOverlay(overlay.id, true);
+          if (!["image", "gif", "video"].includes(overlay.type)) {
+            elements["overlay-text"].focus();
+            elements["overlay-text"].select();
+          }
+        });
+        lane.append(button);
       });
     }
+    track.append(trackLabel, lane);
     elements["timeline-tracks"].append(track);
   });
   updatePlayhead();
 }
 
 function updatePlayhead() {
-  const percent = (elements["preview-video"].currentTime / Math.max(duration(), 1)) * 100;
-  elements.playhead.style.left = `${Math.max(0, Math.min(100, percent))}%`;
+  const progress = Math.max(0, Math.min(1, elements["preview-video"].currentTime / Math.max(duration(), 1)));
+  const width = timelineWidth();
+  elements.playhead.style.left = `${84 + progress * Math.max(0, width - 84)}px`;
 }
 
 function renderPublishing() {
@@ -783,6 +1002,7 @@ function renderSourceWarning() {
 function renderAll() {
   applyCanvas();
   renderCandidateList();
+  renderHighlightList();
   renderLayerList();
   renderInspector();
   renderPublishing();
@@ -822,6 +1042,7 @@ function bindEvents() {
       if (["title", "card", "animation"].includes(overlay.type)) overlay.style.box = true;
     });
     markDirty("剪輯導演風格已套用");
+    renderDirectorCards();
     renderInspector();
     showToast(`已套用「${preset.label}」到文字圖層`, "success");
   });
@@ -863,6 +1084,7 @@ function bindEvents() {
     elements["current-time"].textContent = formatTime(current);
     elements.scrubber.value = String(current);
     updatePlayhead();
+    updateActiveHighlight();
     renderPreviewOverlays(false);
   });
   elements["preview-video"].addEventListener("play", () => {
@@ -874,6 +1096,14 @@ function bindEvents() {
     elements["play-button"].setAttribute("aria-label", "播放影片");
   });
   elements["candidate-list"].addEventListener("change", () => renderTimeline());
+  elements["source-preview-button"].addEventListener("click", () => {
+    elements["preview-video"].currentTime = 0;
+    elements["preview-video"].play();
+  });
+  elements["editing-brief"].addEventListener("input", () => {
+    state.editing_brief = elements["editing-brief"].value;
+    markDirty("剪輯意圖變更，儲存中…");
+  });
   window.addEventListener("resize", () => { renderPreviewOverlays(true); renderTimeline(); });
   window.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
@@ -902,6 +1132,10 @@ async function initialize() {
     elements["project-name"].textContent = projectPayload.manifest.project_id || "未命名專案";
     const source = projectPayload.manifest.source || {};
     elements["source-meta"].textContent = `${source.width || "?"}×${source.height || "?"} · ${source.fps || "?"}fps · ${Number(source.duration_s || 0).toFixed(1)}s`;
+    const stagedName = String(source.staged_path || source.original_path || "source video").split("/").pop();
+    elements["source-file-name"].textContent = stagedName;
+    elements["source-file-detail"].textContent = `${source.width || "?"}×${source.height || "?"} · ${source.fps || "?"}fps · ${formatClipTime(Number(source.duration_s || 0))}`;
+    elements["editing-brief"].value = state.editing_brief || "";
     populatePresets();
     if (sourceMediaUrl) {
       elements["preview-video"].src = sourceMediaUrl;
