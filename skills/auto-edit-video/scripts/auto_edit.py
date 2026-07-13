@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -178,6 +179,75 @@ EDIT_PRESETS = {
     },
 }
 
+DURATION_PROFILE_NAMES = ("short", "medium", "long")
+DURATION_PROFILES = ("full", "auto", *DURATION_PROFILE_NAMES)
+DURATION_PRESETS: dict[str, dict[str, Any]] = {
+    "generic-vertical": {
+        "label": "Generic vertical social video",
+        "aspect_ratio": "9:16",
+        "profiles": {
+            "short": {"min_seconds": 15, "target_seconds": 30, "max_seconds": 30},
+            "medium": {"min_seconds": 45, "target_seconds": 60, "max_seconds": 90},
+            "long": {"min_seconds": 120, "target_seconds": 180, "max_seconds": 180},
+        },
+    },
+    "instagram-reels": {
+        "label": "Instagram Reels",
+        "aspect_ratio": "9:16",
+        "profiles": {
+            "short": {"min_seconds": 15, "target_seconds": 30, "max_seconds": 30},
+            "medium": {"min_seconds": 45, "target_seconds": 60, "max_seconds": 90},
+            "long": {"min_seconds": 120, "target_seconds": 180, "max_seconds": 180},
+        },
+    },
+    "youtube-shorts": {
+        "label": "YouTube Shorts",
+        "aspect_ratio": "9:16",
+        "profiles": {
+            "short": {"min_seconds": 15, "target_seconds": 30, "max_seconds": 30},
+            "medium": {"min_seconds": 45, "target_seconds": 60, "max_seconds": 60},
+            "long": {"min_seconds": 90, "target_seconds": 180, "max_seconds": 180},
+        },
+    },
+    "tiktok": {
+        "label": "TikTok",
+        "aspect_ratio": "9:16",
+        "profiles": {
+            "short": {"min_seconds": 15, "target_seconds": 30, "max_seconds": 30},
+            "medium": {"min_seconds": 45, "target_seconds": 60, "max_seconds": 90},
+            "long": {"min_seconds": 120, "target_seconds": 180, "max_seconds": 300},
+        },
+    },
+    "xiaohongshu-portrait": {
+        "label": "Xiaohongshu portrait",
+        "aspect_ratio": "3:4",
+        "profiles": {
+            "short": {"min_seconds": 15, "target_seconds": 30, "max_seconds": 30},
+            "medium": {"min_seconds": 45, "target_seconds": 60, "max_seconds": 60},
+            "long": {"min_seconds": 90, "target_seconds": 120, "max_seconds": 180},
+        },
+    },
+    "xiaohongshu-full": {
+        "label": "Xiaohongshu full-screen",
+        "aspect_ratio": "9:16",
+        "profiles": {
+            "short": {"min_seconds": 15, "target_seconds": 30, "max_seconds": 30},
+            "medium": {"min_seconds": 45, "target_seconds": 60, "max_seconds": 60},
+            "long": {"min_seconds": 90, "target_seconds": 120, "max_seconds": 180},
+        },
+    },
+    "youtube-landscape": {
+        "label": "YouTube landscape video",
+        "aspect_ratio": "16:9",
+        "profiles": {
+            "short": {"min_seconds": 60, "target_seconds": 120, "max_seconds": 180},
+            "medium": {"min_seconds": 300, "target_seconds": 480, "max_seconds": 600},
+            "long": {"min_seconds": 600, "target_seconds": 900, "max_seconds": 1200},
+        },
+    },
+}
+PLATFORMS = ("auto", *DURATION_PRESETS)
+
 STAGES = (
     "ingest",
     "transcribe",
@@ -217,6 +287,73 @@ FILLER_TOKENS = {
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def resolve_output_target(
+    platform: str,
+    duration_profile: str,
+    target_duration: float | None = None,
+) -> dict[str, Any]:
+    """Resolve user/agent intent into a portable, non-publishing edit target."""
+    if platform not in PLATFORMS:
+        raise ValueError(f"unsupported platform: {platform}")
+    if duration_profile not in DURATION_PROFILES:
+        raise ValueError(f"unsupported duration profile: {duration_profile}")
+
+    preset_platform = "generic-vertical" if platform == "auto" else platform
+    common: dict[str, Any] = {
+        "platform": platform,
+        "preset_platform": preset_platform,
+        "semantic_completeness_over_exact_duration": True,
+        "source_shorter_policy": "keep_actual_length_without_padding",
+        "publishing_in_scope": False,
+    }
+
+    if target_duration is not None:
+        if not math.isfinite(target_duration) or target_duration <= 0:
+            raise ValueError("target duration must be a positive finite number")
+        target = round(float(target_duration), 3)
+        tolerance = round(max(2.0, min(15.0, target * 0.10)), 3)
+        return {
+            **common,
+            "duration_profile": "custom",
+            "selection": "explicit_seconds",
+            "basis": "user-explicit-seconds",
+            "min_seconds": round(max(0.1, target - tolerance), 3),
+            "target_seconds": target,
+            "max_seconds": round(target + tolerance, 3),
+        }
+
+    if duration_profile == "full":
+        return {
+            **common,
+            "duration_profile": "full",
+            "selection": "full_cleanup",
+            "basis": "source-duration",
+            "min_seconds": None,
+            "target_seconds": None,
+            "max_seconds": None,
+        }
+
+    if duration_profile == "auto":
+        return {
+            **common,
+            "duration_profile": "auto",
+            "selection": "agent_after_transcript",
+            "basis": "editorial-preset-pending",
+            "min_seconds": None,
+            "target_seconds": None,
+            "max_seconds": None,
+        }
+
+    profile = DURATION_PRESETS[preset_platform]["profiles"][duration_profile]
+    return {
+        **common,
+        "duration_profile": duration_profile,
+        "selection": "user_profile",
+        "basis": "auto-edit-video-editorial-preset",
+        **profile,
+    }
 
 
 def emit(payload: Any) -> None:
@@ -571,6 +708,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     try:
         media = probe_media(source)
         voice = make_voice_config(args)
+        output_target = resolve_output_target(
+            args.platform,
+            args.duration_profile,
+            args.target_duration,
+        )
         ensure_new_project(project_dir)
     except ValueError as exc:
         return die(str(exc))
@@ -601,6 +743,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "size_bytes": source.stat().st_size,
             **media,
         },
+        "output_target": output_target,
         "editing": {
             "preset": args.edit_preset,
             **EDIT_PRESETS[args.edit_preset],
@@ -662,9 +805,59 @@ def cmd_init(args: argparse.Namespace) -> int:
             "manifest": str(project_dir / "project.json"),
             "project_dir": str(project_dir),
             "voiceover": voice,
+            "output_target": output_target,
             "next": "materialize video-profile-context.md, then transcribe locally",
         }
     )
+    return 0
+
+
+def cmd_duration_presets(args: argparse.Namespace) -> int:
+    emit(
+        {
+            "profiles": list(DURATION_PROFILE_NAMES),
+            "special_modes": ["full", "auto", "custom seconds via --target-duration"],
+            "default_without_highlight_request": "full",
+            "auto_rule": "select the smallest profile that preserves a complete idea after transcription",
+            "presets": DURATION_PRESETS,
+            "notes": [
+                "These are editorial targets, not a promise of current publishing eligibility.",
+                "Re-check platform rules before publishing; publishing is outside this skill phase.",
+                "Never pad, stretch, or speed up a short source merely to hit a target.",
+            ],
+        }
+    )
+    return 0
+
+
+def cmd_set_target(args: argparse.Namespace) -> int:
+    path = Path(args.manifest).expanduser().resolve()
+    try:
+        manifest = read_json(path)
+        existing = manifest.get("output_target", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        platform = args.platform or existing.get("platform") or "auto"
+        duration_profile = (
+            args.duration_profile or existing.get("duration_profile") or "auto"
+        )
+        if duration_profile == "custom":
+            if args.target_duration is None:
+                raise ValueError(
+                    "set-target needs --target-duration to replace a custom target"
+                )
+            duration_profile = "auto"
+        output_target = resolve_output_target(
+            platform,
+            duration_profile,
+            args.target_duration,
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    manifest["output_target"] = output_target
+    manifest["updated_at"] = now_utc()
+    write_json(path, manifest)
+    emit({"ok": True, "manifest": str(path), "output_target": output_target})
     return 0
 
 
@@ -684,6 +877,38 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> tuple[li
     render = manifest.get("render", {})
     if render.get("capcut") is not False:
         errors.append("CapCut must remain disabled")
+
+    output_target = manifest.get("output_target")
+    if output_target is None:
+        warnings.append("output_target is absent; legacy project defaults to full cleanup")
+    elif not isinstance(output_target, dict):
+        errors.append("output_target must be an object")
+    else:
+        platform = output_target.get("platform")
+        preset_platform = output_target.get("preset_platform")
+        duration_profile = output_target.get("duration_profile")
+        if platform not in PLATFORMS:
+            errors.append(f"invalid output target platform: {platform}")
+        if preset_platform not in DURATION_PRESETS:
+            errors.append(f"invalid output target preset platform: {preset_platform}")
+        if duration_profile not in (*DURATION_PROFILES, "custom"):
+            errors.append(f"invalid duration profile: {duration_profile}")
+        if output_target.get("publishing_in_scope") is not False:
+            errors.append("publishing must remain outside the current skill phase")
+        seconds = [
+            output_target.get("min_seconds"),
+            output_target.get("target_seconds"),
+            output_target.get("max_seconds"),
+        ]
+        numeric_seconds = [value for value in seconds if isinstance(value, (int, float))]
+        if len(numeric_seconds) not in {0, 3}:
+            errors.append("duration bounds must be all numeric or all null")
+        elif numeric_seconds and not (
+            0 < float(numeric_seconds[0])
+            <= float(numeric_seconds[1])
+            <= float(numeric_seconds[2])
+        ):
+            errors.append("duration bounds must satisfy 0 < min <= target <= max")
 
     subtitles = manifest.get("subtitles", {})
     mode = subtitles.get("mode")
@@ -1656,6 +1881,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "project_id": manifest.get("project_id"),
             "stages": manifest.get("stages", {}),
             "approvals": manifest.get("approvals", {}),
+            "output_target": manifest.get("output_target", {}),
             "voiceover": manifest.get("voiceover", {}),
         }
     )
@@ -1696,12 +1922,25 @@ def build_parser() -> argparse.ArgumentParser:
     preflight = sub.add_parser("preflight", help="Check installed editing capabilities")
     preflight.set_defaults(func=cmd_preflight)
 
+    presets = sub.add_parser(
+        "duration-presets",
+        help="List platform-aware short, medium, and long editorial targets",
+    )
+    presets.set_defaults(func=cmd_duration_presets)
+
     init = sub.add_parser("init", help="Create a non-destructive auto-edit project")
     init.add_argument("--input", required=True)
     init.add_argument("--project-dir", required=True)
     init.add_argument("--source-language", default="auto")
     init.add_argument("--subtitle-mode", choices=SUBTITLE_MODES, default="source")
     init.add_argument("--target-language")
+    init.add_argument("--platform", choices=PLATFORMS, default="auto")
+    init.add_argument("--duration-profile", choices=DURATION_PROFILES, default="full")
+    init.add_argument(
+        "--target-duration",
+        type=float,
+        help="Approximate custom target in seconds; overrides the duration profile",
+    )
     init.add_argument("--edit-preset", choices=tuple(EDIT_PRESETS), default="balanced")
     init.add_argument("--emphasis", choices=("off", "sparse", "balanced", "dense"), default="balanced")
     init.add_argument("--visual-density", choices=("sparse", "balanced", "dense"), default="balanced")
@@ -1715,6 +1954,20 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--voice-speed", type=float, default=1.0)
     init.add_argument("--voice-mode", choices=("replace", "add"), default="replace")
     init.set_defaults(func=cmd_init)
+
+    target = sub.add_parser(
+        "set-target",
+        help="Resolve or change the platform and duration target after transcription",
+    )
+    target.add_argument("--manifest", required=True)
+    target.add_argument("--platform", choices=PLATFORMS)
+    target.add_argument("--duration-profile", choices=DURATION_PROFILES)
+    target.add_argument(
+        "--target-duration",
+        type=float,
+        help="Approximate custom target in seconds; overrides the duration profile",
+    )
+    target.set_defaults(func=cmd_set_target)
 
     validate = sub.add_parser("validate", help="Validate project invariants")
     validate.add_argument("--manifest", required=True)

@@ -1,4 +1,4 @@
 interface:
   display_name: "Auto Edit Video"
   short_description: "Give the agent one local video; receive an edited MP4"
-  default_prompt: "Use $auto-edit-video on the local video file I provide. In the current agent-first mode, do not launch a UI unless requested: create the local transcript and project, make conservative edits, export an MP4, run QA, and return the result without uploading or delivering it elsewhere."
+  default_prompt: "Use $auto-edit-video on the local A-roll video file I provide. In the current agent-first mode, do not launch a UI unless requested: create the local transcript and project, resolve any platform plus short/medium/long/auto/custom-seconds target, make conservative edits, export an MP4, run QA, and return the result without uploading or delivering it elsewhere."

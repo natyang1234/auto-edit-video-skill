@@ -7,8 +7,10 @@ description: >-
   return the result without requiring a UI or user-supplied Whisper files. Use
   when the user gives a video path and asks to auto edit, clean up speech,
   remove silence/fillers/stutters/repetitions/false starts, or make a short
-  highlight. Advanced subtitles, cards, animations, social formats, and
-  voiceover remain optional. Never uploads by default and never uses CapCut.
+  highlight. Support platform-aware short, medium, long, automatic, full, and
+  custom-second targets without hard-coding 30 seconds. Advanced subtitles,
+  cards, animations, social formats, and voiceover remain optional. Never
+  uploads by default and never uses CapCut.
 ---
 
 # Auto Edit Video
@@ -42,9 +44,13 @@ edits, write conservative decisions, record the user's auto-edit request as the
 low-risk destructive-edit authorization, render, and run QA. High-risk cuts
 default to keep.
 
-If no length is requested, clean the full video conservatively. Apply the
-25–35-second highlight target only when the user asks for an approximately
-30-second edit.
+If no highlight or length is requested, clean the full video conservatively.
+When the user selects a platform and `short`, `medium`, or `long`, use the
+platform matrix in the Agent-first specification. A user-specified number of
+seconds overrides the profile. Use `auto` only when the user asks the agent to
+choose: after transcription, select the smallest profile that preserves a
+complete idea. Never pad, stretch, or change playback speed merely to hit a
+target.
 
 ## Internal quick start
 
@@ -53,9 +59,13 @@ SKILL="/absolute/path/to/the/installed/auto-edit-video"
 
 python3 "$SKILL/scripts/auto_edit.py" preflight
 
+python3 "$SKILL/scripts/auto_edit.py" duration-presets
+
 python3 "$SKILL/scripts/auto_edit.py" init \
   --input /absolute/path/source.mp4 \
   --project-dir /absolute/path/project \
+  --platform youtube-shorts \
+  --duration-profile long \
   --source-language zh-TW \
   --subtitle-mode bilingual \
   --target-language en \
@@ -87,6 +97,20 @@ Omit every `--voice-*` flag to keep the original voice. Voiceover is opt-in.
 The `editor` command is optional and is not part of the current agent-first
 acceptance path.
 
+For an automatic duration decision, initialize with `--duration-profile auto`,
+transcribe locally, then persist the semantic decision before editing:
+
+```bash
+python3 "$SKILL/scripts/auto_edit.py" set-target \
+  --manifest /absolute/path/project/project.json \
+  --platform tiktok \
+  --duration-profile medium
+```
+
+Use `--target-duration 75` on `init` or `set-target` when the user gives an
+explicit approximate number of seconds. The target is editing metadata only;
+this phase exports an MP4 and does not publish it.
+
 ## Advanced reviewed workflow
 
 The sections below define the full captions/cards/voice/editor workflow. The
@@ -113,6 +137,12 @@ contains verified profile data.
 Run `init`, then treat `project.json` as the single source of truth. Keep the
 original media immutable. Read [references/ARTIFACTS.md](references/ARTIFACTS.md)
 before writing pipeline artifacts.
+
+Resolve `output_target` from the user's natural language. Default to `full` when
+the request is only cleanup. Use `short`, `medium`, or `long` when explicitly
+selected. Use `auto` only when the user requests a semantic choice, then call
+`set-target` after reading the transcript so the manifest contains the chosen
+platform, profile, range, and target seconds.
 
 Defaults are deliberately conservative:
 

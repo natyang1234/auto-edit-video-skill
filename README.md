@@ -1,6 +1,6 @@
 # Auto Edit Video Skill
 
-A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. Subtitles, emphasis, title/cards, animations, and social canvases remain optional advanced capabilities.
+A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic A-roll video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. Subtitles, emphasis, title/cards, animations, and social canvases remain optional advanced capabilities.
 
 [繁體中文](README.zh-TW.md)
 
@@ -17,9 +17,26 @@ Use auto-edit-video to automatically edit ./input.mp4 and return the MP4.
 The agent owns project setup, local transcription, conservative edit decisions,
 rendering, and QA. The user does not need to prepare Whisper JSON, SRT, a
 manifest, or a preview page. Without a requested duration, the default is a
-conservative full-length cleanup; the 25–35-second target applies only when the
-user asks for an approximately 30-second highlight. UI, LINE delivery, uploads,
-and social publishing are outside the current phase.
+conservative full-length cleanup. Duration is not fixed at 30 seconds: the user
+can select a platform plus `short`, `medium`, or `long`, ask the agent to choose
+`auto` after transcription, or provide explicit seconds. UI, LINE delivery,
+uploads, and social publishing are outside the current phase.
+
+## Platform duration presets
+
+Parentheses show the editorial target. See the [phase-one specification](skills/auto-edit-video/references/AGENT_FIRST.zh-TW.md) for selection rules and official platform references.
+
+| Platform | Short | Medium | Long |
+|---|---:|---:|---:|
+| Generic vertical / Instagram Reels | 15–30s (30) | 45–90s (60) | 120–180s (180) |
+| YouTube Shorts | 15–30s (30) | 45–60s (60) | 90–180s (180) |
+| TikTok | 15–30s (30) | 45–90s (60) | 120–300s (180) |
+| Xiaohongshu 3:4 / 9:16 | 15–30s (30) | 45–60s (60) | 90–180s (120) |
+| YouTube landscape | 60–180s (120) | 300–600s (480) | 600–1200s (900) |
+
+These are editorial targets, not platform upload limits. `auto` chooses the
+smallest profile that preserves a complete idea. A short source is never padded,
+repeated, stretched, or speed-adjusted merely to hit the target.
 
 ## What ships in the standalone core
 
@@ -108,6 +125,8 @@ SKILL=/absolute/path/to/auto-edit-video
 python3 "$SKILL/scripts/auto_edit.py" init \
   --input /absolute/path/source.mp4 \
   --project-dir /absolute/path/project \
+  --platform youtube-shorts \
+  --duration-profile long \
   --source-language zh-TW \
   --subtitle-mode zh
 
@@ -122,6 +141,11 @@ python3 "$SKILL/scripts/auto_edit.py" analyze-edits \
 python3 "$SKILL/scripts/auto_edit.py" editor \
   --project-dir /absolute/path/project --port 8765 --open
 ```
+
+Run `duration-presets` to inspect the complete matrix. If the project starts
+with `--duration-profile auto`, the agent must call `set-target` after local
+transcription to persist the selected profile. Use `--target-duration 75` when
+the user supplies explicit approximate seconds.
 
 After explicit destructive-edit approval and reviewed decisions:
 

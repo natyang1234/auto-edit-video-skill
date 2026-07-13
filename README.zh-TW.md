@@ -1,6 +1,6 @@
 # Auto Edit Video 自動剪輯 Skill
 
-這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。字幕、重點字、標題／字卡／動畫與社群尺寸保留為進階選配。
+這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個 A-roll／口播影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。字幕、重點字、標題／字卡／動畫與社群尺寸保留為進階選配。
 
 [English](README.md)
 
@@ -16,7 +16,21 @@
 
 Agent 應自行建立工作專案、在本機轉錄、提出並套用保守剪輯、輸出新的 MP4、執行 QA，再回報成品。使用者不必另外準備 Whisper JSON、SRT、manifest，也不必打開預覽網頁。
 
-若沒有指定長度，預設做保守的全長清理；只有明示「約 30 秒精華」時才以 25–35 秒為目標。LINE、雲端上傳、社群發佈與 UI 都不在第一階段範圍。
+時長不固定為 30 秒。使用者可用自然語言指定平台與 `短／中／長`、要求 Agent 看完逐字稿後 `自動` 選擇，或直接指定秒數。若沒有精華、縮短或平台需求，預設做保守的全長清理。LINE、雲端上傳、社群發佈與 UI 都不在第一階段範圍。
+
+## 平台時長預設
+
+括號內是建議目標；完整規則與官方依據見[第一階段規格](skills/auto-edit-video/references/AGENT_FIRST.zh-TW.md)。
+
+| 平台 | 短 | 中 | 長 |
+|---|---:|---:|---:|
+| 通用直式／Instagram Reels | 15–30 秒（30） | 45–90 秒（60） | 120–180 秒（180） |
+| YouTube Shorts | 15–30 秒（30） | 45–60 秒（60） | 90–180 秒（180） |
+| TikTok | 15–30 秒（30） | 45–90 秒（60） | 120–300 秒（180） |
+| 小紅書 3:4／9:16 | 15–30 秒（30） | 45–60 秒（60） | 90–180 秒（120） |
+| YouTube 橫式 | 60–180 秒（120） | 300–600 秒（480） | 600–1200 秒（900） |
+
+這是編輯建議，不是平台上傳上限。`auto` 會選擇足以保留完整主張的最小級距；原片不足時不補空白、不重複，也不改變播放速度湊秒數。
 
 ## 內建核心
 
@@ -103,6 +117,8 @@ SKILL=/auto-edit-video/實際安裝路徑
 python3 "$SKILL/scripts/auto_edit.py" init \
   --input /影片/絕對路徑.mp4 \
   --project-dir /專案/絕對路徑 \
+  --platform youtube-shorts \
+  --duration-profile long \
   --source-language zh-TW \
   --subtitle-mode zh
 
@@ -117,6 +133,8 @@ python3 "$SKILL/scripts/auto_edit.py" analyze-edits \
 python3 "$SKILL/scripts/auto_edit.py" editor \
   --project-dir /專案/絕對路徑 --port 8765 --open
 ```
+
+可先用 `duration-presets` 取得所有平台矩陣。若以 `--duration-profile auto` 建立專案，Agent 應在本機轉錄後執行 `set-target` 寫回選定級距；使用者指定秒數時改傳 `--target-duration 75`。
 
 明確核准破壞式刪剪、且逐項審核 edit decisions 後：
 

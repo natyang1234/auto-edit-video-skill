@@ -111,6 +111,93 @@ class AutoEditVoiceTests(unittest.TestCase):
         self.assertTrue(rumi["default"])
         self.assertEqual(rumi["backend"], "fish")
 
+    def test_duration_presets_cover_platform_profiles(self) -> None:
+        result = self.run_cli("duration-presets")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["profiles"], ["short", "medium", "long"])
+        self.assertEqual(
+            payload["presets"]["youtube-shorts"]["profiles"]["long"],
+            {"min_seconds": 90, "target_seconds": 180, "max_seconds": 180},
+        )
+        self.assertEqual(
+            payload["presets"]["youtube-landscape"]["profiles"]["medium"][
+                "target_seconds"
+            ],
+            480,
+        )
+
+    def test_init_stores_platform_duration_profile(self) -> None:
+        project = self.root / "youtube-shorts-long"
+        result = self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--platform",
+            "youtube-shorts",
+            "--duration-profile",
+            "long",
+        )
+        payload = json.loads(result.stdout)
+        target = payload["output_target"]
+        self.assertEqual(target["platform"], "youtube-shorts")
+        self.assertEqual(target["duration_profile"], "long")
+        self.assertEqual(target["target_seconds"], 180)
+        self.assertFalse(target["publishing_in_scope"])
+        self.run_cli("validate", "--manifest", str(project / "project.json"))
+
+    def test_agent_can_resolve_auto_or_custom_target_after_transcription(self) -> None:
+        project = self.root / "target-resolution"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--platform",
+            "tiktok",
+            "--duration-profile",
+            "auto",
+        )
+        manifest_path = project / "project.json"
+        pending = json.loads(manifest_path.read_text(encoding="utf-8"))["output_target"]
+        self.assertEqual(pending["selection"], "agent_after_transcript")
+        self.assertIsNone(pending["target_seconds"])
+
+        resolved = self.run_cli(
+            "set-target",
+            "--manifest",
+            str(manifest_path),
+            "--platform",
+            "tiktok",
+            "--duration-profile",
+            "medium",
+        )
+        target = json.loads(resolved.stdout)["output_target"]
+        self.assertEqual(target["selection"], "user_profile")
+        self.assertEqual(
+            (
+                target["min_seconds"],
+                target["target_seconds"],
+                target["max_seconds"],
+            ),
+            (45, 60, 90),
+        )
+
+        custom = self.run_cli(
+            "set-target",
+            "--manifest",
+            str(manifest_path),
+            "--target-duration",
+            "75",
+        )
+        custom_target = json.loads(custom.stdout)["output_target"]
+        self.assertEqual(custom_target["duration_profile"], "custom")
+        self.assertEqual(custom_target["platform"], "tiktok")
+        self.assertEqual(custom_target["target_seconds"], 75.0)
+        self.run_cli("validate", "--manifest", str(manifest_path))
+
     def test_rumi_dry_run_redacts_narration(self) -> None:
         manifest_path, _ = self.init_project("dry-run", "zh-TW", "female")
         script = manifest_path.parent / "voice/narration.txt"
