@@ -16,6 +16,8 @@ import os
 import re
 import secrets
 import shutil
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -37,7 +39,8 @@ from auto_edit import (
     initialize_project,
     probe_media,
 )
-from editor_server import EDITOR_DIR, EditorServer
+from editor_server import EDITOR_DIR, EditorServer, atomic_write_json
+from highlight_planner import DIRECTOR_PROFILES
 from local_http_security import (
     csrf_token_matches,
     host_header_allowed,
@@ -60,6 +63,7 @@ SOURCE_MIME_TYPES = {
     ".webm": {"video/webm"},
 }
 SOURCE_LANGUAGES = {"auto", "zh-TW", "zh-CN", "en-US", "en-GB"}
+AUTO_EDIT_SCRIPT = Path(__file__).with_name("auto_edit.py")
 
 
 def now_utc() -> str:
@@ -125,6 +129,7 @@ class StudioServer(ThreadingHTTPServer):
         max_import_bytes: int = DEFAULT_MAX_IMPORT_BYTES,
         max_duration_s: float = DEFAULT_MAX_DURATION_S,
         max_source_pixels: int = DEFAULT_MAX_SOURCE_PIXELS,
+        auto_process: bool = False,
     ):
         bound_host = str(address[0])
         if not is_loopback_host(bound_host):
@@ -140,11 +145,17 @@ class StudioServer(ThreadingHTTPServer):
         self.max_import_bytes = int(max_import_bytes)
         self.max_duration_s = float(max_duration_s)
         self.max_source_pixels = int(max_source_pixels)
+        self.auto_process = bool(auto_process)
         self.csrf_token = secrets.token_urlsafe(32)
         self.imports: dict[str, dict[str, Any]] = {}
         self.import_lock = threading.Lock()
         self.active_upload_id: str | None = None
+        self.active_pipeline_project: Path | None = None
         self.editor_servers: list[tuple[EditorServer, threading.Thread]] = []
+        self.pipeline_lock = threading.Lock()
+        self.pipeline_processes: set[subprocess.Popen[str]] = set()
+        self.pipeline_threads: list[threading.Thread] = []
+        self.stop_event = threading.Event()
         self.cleanup_stale_creating_dirs()
 
     def cleanup_stale_creating_dirs(self) -> None:
@@ -163,7 +174,233 @@ class StudioServer(ThreadingHTTPServer):
         self.editor_servers.append((server, thread))
         return f"http://127.0.0.1:{server.server_port}/"
 
+    @staticmethod
+    def terminate_pipeline_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            try:
+                process.terminate()
+            except OSError:
+                return
+        try:
+            process.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except OSError:
+                return
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def run_pipeline_command(
+        self,
+        project_dir: Path,
+        arguments: list[str],
+        *,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.stop_event.is_set():
+            raise RuntimeError("Studio is shutting down")
+        process = subprocess.Popen(
+            [sys.executable, str(AUTO_EDIT_SCRIPT), *arguments],
+            cwd=str(project_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        with self.pipeline_lock:
+            self.pipeline_processes.add(process)
+        try:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                self.terminate_pipeline_process(process)
+                stdout, stderr = process.communicate()
+                raise RuntimeError("local processing step timed out") from exc
+            return subprocess.CompletedProcess(
+                process.args,
+                int(process.returncode or 0),
+                stdout,
+                stderr,
+            )
+        finally:
+            with self.pipeline_lock:
+                self.pipeline_processes.discard(process)
+
+    def pipeline_worker(
+        self,
+        project_dir: Path,
+        director_profile: str,
+        editing_brief: str,
+    ) -> None:
+        status_path = project_dir / "working/pipeline_status.json"
+        started_at = now_utc()
+
+        def write_status(
+            state: str,
+            phase: str,
+            message: str,
+            *,
+            error_code: str | None = None,
+            detail: str | None = None,
+        ) -> None:
+            payload: dict[str, Any] = {
+                "schema_version": 1,
+                "state": state,
+                "phase": phase,
+                "message": message,
+                "started_at": started_at,
+                "updated_at": now_utc(),
+            }
+            if error_code:
+                payload["error_code"] = error_code
+            if detail:
+                payload["detail"] = detail[-600:]
+            atomic_write_json(status_path, payload)
+
+        manifest = project_dir / "project.json"
+        steps = [
+            (
+                "transcribe",
+                "正在用本機 Whisper 轉錄影片…",
+                ["transcribe-local", "--manifest", str(manifest), "--model", "base"],
+                21660,
+            ),
+            (
+                "edit_analysis",
+                "正在分析可剪除片段…",
+                ["analyze-edits", "--manifest", str(manifest)],
+                300,
+            ),
+            (
+                "overlay_plan",
+                "正在建立字幕、字卡與動畫提案…",
+                ["plan-overlays", "--manifest", str(manifest)],
+                300,
+            ),
+            (
+                "highlight_plan",
+                "正在挑選最多 10 段精華…",
+                [
+                    "plan-highlights",
+                    "--manifest",
+                    str(manifest),
+                    "--director",
+                    director_profile,
+                    "--count",
+                    "10",
+                    "--brief",
+                    editing_brief,
+                ],
+                300,
+            ),
+        ]
+        try:
+            for phase, message, arguments, timeout in steps:
+                write_status("running", phase, message)
+                result = self.run_pipeline_command(project_dir, arguments, timeout=timeout)
+                if result.returncode == 0:
+                    continue
+                if phase == "highlight_plan" and result.returncode == 3:
+                    write_status(
+                        "needs_attention",
+                        phase,
+                        "轉錄完成，但沒有足夠語音內容可建立精華。",
+                        error_code="no_highlight_candidates",
+                    )
+                    return
+                write_status(
+                    "failed",
+                    phase,
+                    "本機自動處理未完成；原始影片與專案已安全保留。",
+                    error_code=f"{phase}_failed",
+                    detail=(result.stderr or result.stdout or "").strip(),
+                )
+                return
+            write_status(
+                "needs_review",
+                "human_review",
+                "已產生精華提案；請人工確認片段、字幕與時間線。",
+            )
+        except (OSError, RuntimeError) as exc:
+            if self.stop_event.is_set():
+                write_status("stopped", "shutdown", "Studio 已停止；可重新啟動後再處理。")
+            else:
+                write_status(
+                    "failed",
+                    "pipeline",
+                    "本機自動處理無法啟動；原始影片與專案已安全保留。",
+                    error_code="pipeline_failed",
+                    detail=str(exc),
+                )
+        finally:
+            with self.pipeline_lock:
+                if self.active_pipeline_project == project_dir:
+                    self.active_pipeline_project = None
+
+    def start_local_pipeline(
+        self,
+        project_dir: Path,
+        director_profile: str,
+        editing_brief: str,
+    ) -> None:
+        status_path = project_dir / "working/pipeline_status.json"
+        if not self.auto_process:
+            atomic_write_json(
+                status_path,
+                {
+                    "schema_version": 1,
+                    "state": "pending",
+                    "phase": "transcribe",
+                    "message": "等待啟動本機自動處理。",
+                    "updated_at": now_utc(),
+                },
+            )
+            return
+        with self.pipeline_lock:
+            if self.active_pipeline_project is not None:
+                atomic_write_json(
+                    status_path,
+                    {
+                        "schema_version": 1,
+                        "state": "needs_attention",
+                        "phase": "queue",
+                        "message": "另一個影片仍在處理；請稍後重新啟動這個專案。",
+                        "error_code": "pipeline_busy",
+                        "updated_at": now_utc(),
+                    },
+                )
+                return
+            self.active_pipeline_project = project_dir
+        thread = threading.Thread(
+            target=self.pipeline_worker,
+            args=(project_dir, director_profile, editing_brief),
+            daemon=False,
+            name=f"auto-edit-{project_dir.name}",
+        )
+        self.pipeline_threads.append(thread)
+        thread.start()
+
     def server_close(self) -> None:
+        self.stop_event.set()
+        with self.pipeline_lock:
+            processes = list(self.pipeline_processes)
+        for process in processes:
+            self.terminate_pipeline_process(process)
+        for thread in list(self.pipeline_threads):
+            thread.join(timeout=6)
+        self.pipeline_threads.clear()
         for server, thread in list(self.editor_servers):
             try:
                 server.shutdown()
@@ -369,6 +606,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             "platform": str(settings.get("platform", "auto")),
             "duration_profile": str(settings.get("duration_profile", "auto")),
             "edit_preset": str(settings.get("edit_preset", "balanced")),
+            "director_profile": str(settings.get("director_profile", "teacher-punch")),
+            "editing_brief": str(settings.get("editing_brief", "")).strip(),
         }
         if normalized_settings["source_language"] not in SOURCE_LANGUAGES:
             raise StudioRequestError(422, "invalid_settings", "source language is unsupported")
@@ -380,6 +619,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise StudioRequestError(422, "invalid_settings", "duration profile is unsupported")
         if normalized_settings["edit_preset"] not in EDIT_PRESETS:
             raise StudioRequestError(422, "invalid_settings", "edit preset is unsupported")
+        if normalized_settings["director_profile"] not in DIRECTOR_PROFILES:
+            raise StudioRequestError(422, "invalid_settings", "director profile is unsupported")
+        if len(normalized_settings["editing_brief"]) > 2000:
+            raise StudioRequestError(422, "invalid_settings", "editing brief is too long")
 
         last_modified = file_meta.get("last_modified_ms")
         if last_modified is not None and (isinstance(last_modified, bool) or not isinstance(last_modified, int)):
@@ -403,8 +646,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             "updated_at": created,
         }
         with self.server.import_lock:
-            if self.server.active_upload_id is not None:
-                raise StudioRequestError(409, "import_busy", "another video import is already active")
+            with self.server.pipeline_lock:
+                pipeline_busy = self.server.active_pipeline_project is not None
+            if self.server.active_upload_id is not None or pipeline_busy:
+                raise StudioRequestError(409, "import_busy", "another video import or pipeline is already active")
             self.server.imports[import_id] = session
             self.server.active_upload_id = import_id
         self.send_json({"ok": True, "import": import_public_payload(session)}, status=201)
@@ -517,13 +762,23 @@ class StudioHandler(BaseHTTPRequestHandler):
             os.replace(creating, final_project)
             finalized = True
             editor_url = self.server.start_editor(final_project)
+            pipeline_message = "影片已建立；正在排程本機轉錄與精華提案"
+            try:
+                self.server.start_local_pipeline(
+                    final_project,
+                    settings["director_profile"],
+                    settings["editing_brief"],
+                )
+            except OSError as exc:
+                self.log_error("local pipeline could not start: %s", exc)
+                pipeline_message = "影片已建立；本機自動處理尚未啟動"
             session.update(
                 {
                     "state": "ready",
                     "updated_at": now_utc(),
                     "project_id": project_id,
                     "editor_url": editor_url,
-                    "message": "影片已建立為獨立專案；等待本機轉錄",
+                    "message": pipeline_message,
                 }
             )
             self.send_json(
@@ -592,6 +847,7 @@ def main() -> int:
             (args.host, args.port),
             Path(args.projects_root),
             max_import_bytes=args.max_import_bytes,
+            auto_process=True,
         )
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

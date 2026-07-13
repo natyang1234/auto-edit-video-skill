@@ -82,6 +82,8 @@ async function createImportSession() {
         platform: byId("import-platform").value,
         duration_profile: byId("import-duration").value,
         edit_preset: byId("import-preset").value,
+        director_profile: byId("import-director").value,
+        editing_brief: byId("import-brief").value.trim(),
       },
     }),
   });

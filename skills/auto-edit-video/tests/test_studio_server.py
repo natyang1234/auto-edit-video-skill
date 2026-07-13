@@ -12,6 +12,7 @@ import threading
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -129,6 +130,8 @@ class StudioServerTests(unittest.TestCase):
                     "platform": "youtube-shorts",
                     "duration_profile": "short",
                     "edit_preset": "balanced",
+                    "director_profile": "documentary",
+                    "editing_brief": "保留有證據的轉折，不要補寫內容。",
                 },
             },
             {"X-Auto-Edit-CSRF": self.csrf_token},
@@ -151,6 +154,8 @@ class StudioServerTests(unittest.TestCase):
         html_status, _headers, html = self.request("GET", "/")
         self.assertEqual(html_status, 200)
         self.assertIn("導入影片", html.decode("utf-8"))
+        self.assertIn('id="import-director"', html.decode("utf-8"))
+        self.assertIn('id="import-brief"', html.decode("utf-8"))
 
         import_payload = self.create_import(
             name=self.source.name,
@@ -179,6 +184,12 @@ class StudioServerTests(unittest.TestCase):
         self.assertEqual(manifest["stages"]["ingest"], "complete")
         self.assertEqual(manifest["stages"]["transcribe"], "pending")
         self.assertTrue(all(not item["approved"] for item in manifest["approvals"].values()))
+        stored_session = self.server.imports[str(import_payload["id"])]
+        self.assertEqual(stored_session["settings"]["director_profile"], "documentary")
+        self.assertEqual(
+            stored_session["settings"]["editing_brief"],
+            "保留有證據的轉折，不要補寫內容。",
+        )
         errors, _warnings = validate_manifest(manifest, manifest_path)
         self.assertEqual(errors, [])
 
@@ -257,6 +268,34 @@ class StudioServerTests(unittest.TestCase):
         ]
         self.assertEqual(final_projects, [])
         self.assertFalse(any(self.projects_root.glob(".creating-*")))
+
+    def test_local_pipeline_runs_all_draft_steps_without_approval(self) -> None:
+        project = self.projects_root / "pipeline-project"
+        (project / "working").mkdir(parents=True)
+        calls: list[list[str]] = []
+
+        def fake_run(_project: Path, arguments: list[str], *, timeout: int):
+            self.assertGreater(timeout, 0)
+            calls.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, "{}", "")
+
+        self.server.auto_process = True
+        with patch.object(self.server, "run_pipeline_command", side_effect=fake_run):
+            self.server.start_local_pipeline(project, "high-energy", "只保留明確結論")
+            self.server.pipeline_threads[-1].join(timeout=3)
+
+        self.assertEqual(
+            [arguments[0] for arguments in calls],
+            ["transcribe-local", "analyze-edits", "plan-overlays", "plan-highlights"],
+        )
+        self.assertIn("high-energy", calls[-1])
+        self.assertIn("只保留明確結論", calls[-1])
+        status = json.loads(
+            (project / "working/pipeline_status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["state"], "needs_review")
+        self.assertEqual(status["phase"], "human_review")
+        self.assertIsNone(self.server.active_pipeline_project)
 
 
 if __name__ == "__main__":

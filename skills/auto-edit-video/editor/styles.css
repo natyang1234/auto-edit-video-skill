@@ -1344,7 +1344,9 @@ h2 {
 .import-settings label { display: grid; gap: 0.42rem; }
 .import-settings label > span { color: oklch(0.46 0.02 63); font-size: 0.74rem; font-weight: 800; letter-spacing: 0.025em; }
 .import-settings input,
-.import-settings select { width: 100%; min-height: 2.75rem; border-color: oklch(0.8 0.025 72); background: oklch(0.99 0.007 75); }
+.import-settings select,
+.import-settings textarea { width: 100%; min-height: 2.75rem; border-color: oklch(0.8 0.025 72); background: oklch(0.99 0.007 75); }
+.import-settings textarea { min-height: 6.5rem; padding-block: 0.75rem; resize: vertical; line-height: 1.55; }
 .import-setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
 
 .import-progress { margin-top: 1.2rem; padding: 0.9rem 1rem; border-radius: 0.85rem; background: oklch(0.93 0.025 80); }

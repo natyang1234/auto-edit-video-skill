@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -49,7 +50,7 @@ ALLOWED_ASSET_MIME_TYPES = {
 }
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_ASSET_BYTES = 50 * 1024 * 1024
-GATES = {"destructive_edit", "timeline", "final"}
+GATES = {"destructive_edit", "highlight_selection", "timeline", "final"}
 VOICE_LANGUAGES = {"zh-TW", "zh-CN", "en-US", "en-GB"}
 VOICE_GENDERS = {"female", "male"}
 
@@ -229,12 +230,15 @@ def read_json(path: Path, fallback: Any = None) -> Any:
 
 def atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def editor_state_revision(state: dict[str, Any]) -> str:
@@ -248,6 +252,11 @@ def editor_state_revision(state: dict[str, Any]) -> str:
             for key in ("platform_id", "width", "height", "fps", "fit")
         },
         "director_style": state.get("director_style"),
+        "source_sha256": state.get("source_sha256"),
+        "highlight_plan_revision": state.get("highlight_plan_revision"),
+        "active_highlight_id": state.get("active_highlight_id"),
+        "highlights": state.get("highlights"),
+        "asset_digests": state.get("asset_digests"),
         "caption_defaults": state.get("caption_defaults"),
         "overlays": state.get("overlays"),
     }
@@ -289,6 +298,29 @@ def project_entry_path(project_dir: Path, relative: str) -> Path:
     if root not in candidate.parents and candidate != root:
         raise ValueError("path escapes project directory")
     return candidate
+
+
+def referenced_asset_digests(project_dir: Path, state: dict[str, Any]) -> dict[str, str]:
+    """Hash every renderable user asset referenced by the editor state."""
+    digests: dict[str, str] = {}
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict) or overlay.get("type") not in {"image", "gif", "video"}:
+            continue
+        source = str(overlay.get("source", ""))
+        if not source or source in digests:
+            continue
+        entry = project_dir / Path(source)
+        if entry.is_symlink():
+            raise ValueError(f"asset {source} must be an owned regular file")
+        asset = scoped_project_path(project_dir, source, "assets")
+        if not asset.is_file():
+            raise ValueError(f"asset {source} is missing")
+        digest = hashlib.sha256()
+        with asset.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digests[source] = digest.hexdigest()
+    return dict(sorted(digests.items()))
 
 
 def asset_magic_matches(data: bytes, suffix: str) -> bool:
@@ -453,7 +485,15 @@ def artifact_plan_overlays(
 
 def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     transcript = read_json(project_dir / "working/transcript_words.json", {}) or {}
-    director_id = "teacher-punch"
+    highlight_plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
+    plan_configuration = (
+        highlight_plan.get("configuration")
+        if isinstance(highlight_plan.get("configuration"), dict)
+        else {}
+    )
+    director_id = str(plan_configuration.get("director_profile", "teacher-punch"))
+    if director_id not in DIRECTOR_PRESETS:
+        director_id = "teacher-punch"
     director = DIRECTOR_PRESETS[director_id]
     caption_style = dict(director["caption"])
     overlays: list[dict[str, Any]] = []
@@ -484,10 +524,29 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             float(manifest.get("source", {}).get("duration_s", 0.0)),
         )
     )
+    highlights = [
+        {
+            "id": str(item.get("id", "")),
+            "plan_item_id": str(item.get("id", "")),
+            "start": item.get("start"),
+            "end": item.get("end"),
+            "title": str(item.get("title", "")),
+            "review_status": str(item.get("review_status", "pending")),
+            "score": item.get("score"),
+            "source": "working/highlight_plan.json",
+        }
+        for item in highlight_plan.get("items", [])[:10]
+        if isinstance(item, dict)
+    ]
     state = {
         "schema_version": 1,
         "updated_at": now_utc(),
         "project_id": manifest.get("project_id"),
+        "source_sha256": manifest.get("source", {}).get("sha256"),
+        "highlight_plan_revision": highlight_plan.get("plan_revision"),
+        "active_highlight_id": highlights[0]["id"] if highlights else None,
+        "highlights": highlights,
+        "asset_digests": {},
         "canvas": {
             "platform_id": "instagram-reels",
             "width": 1080,
@@ -497,7 +556,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             "show_safe_zones": True,
         },
         "director_style": director_id,
-        "editing_brief": "",
+        "editing_brief": str(plan_configuration.get("editing_brief", ""))[:2000],
         "caption_defaults": caption_style,
         "overlays": overlays,
         "publishing": {
@@ -517,6 +576,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             "warnings_acknowledged": [],
         },
     }
+    state["asset_digests"] = referenced_asset_digests(project_dir, state)
     state["revision"] = editor_state_revision(state)
     atomic_write_json(project_dir / STATE_REL, state)
     return state
@@ -535,10 +595,23 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
             errors.append("canvas platform_id is not supported")
         for key in ("width", "height"):
             value = canvas.get(key)
-            if not isinstance(value, int) or not 240 <= value <= 4096:
+            if isinstance(value, bool) or not isinstance(value, int) or not 240 <= value <= 4096:
                 errors.append(f"canvas {key} must be an integer between 240 and 4096")
+        fps = canvas.get("fps")
+        if (
+            isinstance(fps, bool)
+            or not isinstance(fps, (int, float))
+            or not math.isfinite(float(fps))
+            or not 1 <= float(fps) <= 240
+        ):
+            errors.append("canvas fps must be finite and between 1 and 240")
         if canvas.get("fit") not in {"cover", "contain"}:
             errors.append("canvas fit must be cover or contain")
+    if state.get("director_style") not in DIRECTOR_PRESETS:
+        errors.append("director_style is not supported")
+    editing_brief = state.get("editing_brief", "")
+    if not isinstance(editing_brief, str) or len(editing_brief) > 2000:
+        errors.append("editing_brief must be a string of at most 2000 characters")
     overlays = state.get("overlays")
     if not isinstance(overlays, list):
         errors.append("overlays must be an array")
@@ -560,12 +633,47 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
         try:
             start = float(overlay.get("start"))
             end = float(overlay.get("end"))
-            if start < 0 or end <= start or end > duration_s + 0.05:
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0
+                or end <= start
+                or end > duration_s + 0.05
+            ):
                 errors.append(f"overlay {overlay_id or index} has invalid timing")
         except (TypeError, ValueError):
             errors.append(f"overlay {overlay_id or index} timing must be numeric")
         if len(str(overlay.get("text", ""))) > 1000:
             errors.append(f"overlay {overlay_id or index} text is too long")
+        z_index = overlay.get("z_index", 0)
+        if (
+            isinstance(z_index, bool)
+            or not isinstance(z_index, (int, float))
+            or not math.isfinite(float(z_index))
+            or not -1000 <= float(z_index) <= 1000
+        ):
+            errors.append(f"overlay {overlay_id or index} z_index is invalid")
+        style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+        style_bounds = {
+            "font_size": (8, 500),
+            "stroke_width": (0, 50),
+            "x": (-100, 200),
+            "y": (-100, 200),
+            "max_width": (1, 200),
+            "width": (1, 200),
+            "opacity": (0, 1),
+        }
+        for key, (minimum, maximum) in style_bounds.items():
+            if key not in style:
+                continue
+            value = style[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not minimum <= float(value) <= maximum
+            ):
+                errors.append(f"overlay {overlay_id or index} style {key} is invalid")
         source = overlay.get("source")
         if source and overlay.get("type") in {"image", "gif", "video"}:
             try:
@@ -576,6 +684,51 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
                 )
             except ValueError:
                 errors.append(f"overlay {overlay_id or index} source must be under assets/")
+    source_sha256 = state.get("source_sha256")
+    if source_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", str(source_sha256)):
+        errors.append("source_sha256 must be a lowercase SHA-256 digest")
+    plan_revision = state.get("highlight_plan_revision")
+    if plan_revision is not None and not re.fullmatch(r"[0-9a-f]{64}", str(plan_revision)):
+        errors.append("highlight_plan_revision must be a lowercase SHA-256 digest")
+    highlights = state.get("highlights", [])
+    highlight_ids: set[str] = set()
+    if not isinstance(highlights, list):
+        errors.append("highlights must be an array")
+    else:
+        if len(highlights) > 10:
+            errors.append("highlights cannot exceed 10 items")
+        for index, highlight in enumerate(highlights):
+            if not isinstance(highlight, dict):
+                errors.append(f"highlight {index} must be an object")
+                continue
+            highlight_id = str(highlight.get("id", ""))
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", highlight_id)
+                or highlight_id in highlight_ids
+            ):
+                errors.append(f"highlight {index} has an invalid or duplicate id")
+            highlight_ids.add(highlight_id)
+            try:
+                start = float(highlight.get("start"))
+                end = float(highlight.get("end"))
+            except (TypeError, ValueError):
+                errors.append(f"highlight {highlight_id or index} timing must be numeric")
+                continue
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0
+                or end <= start
+                or end > duration_s + 0.05
+            ):
+                errors.append(f"highlight {highlight_id or index} timing is invalid")
+            if highlight.get("review_status") not in {"pending", "approved", "rejected"}:
+                errors.append(f"highlight {highlight_id or index} review status is invalid")
+            if len(str(highlight.get("title", ""))) > 200:
+                errors.append(f"highlight {highlight_id or index} title is too long")
+    active_highlight_id = state.get("active_highlight_id")
+    if active_highlight_id is not None and str(active_highlight_id) not in highlight_ids:
+        errors.append("active_highlight_id must reference a highlight in state")
     return errors
 
 
@@ -798,6 +951,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             if state is None:
                 state = default_editor_state(project, manifest)
             else:
+                state["asset_digests"] = referenced_asset_digests(project, state)
                 revision = editor_state_revision(state)
                 if state.get("revision") != revision:
                     state["revision"] = revision
@@ -811,6 +965,15 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "voice_catalog": self.server.voice_catalog,
                 "edit_candidates": read_json(project / "working/edit_candidates.json", {"items": []}),
                 "edit_decisions": read_json(project / "working/edit_decisions.json", {"items": []}),
+                "highlight_plan": read_json(project / "working/highlight_plan.json", {}),
+                "pipeline_status": read_json(
+                    project / "working/pipeline_status.json",
+                    {
+                        "state": "not_started",
+                        "phase": "idle",
+                        "message": "這個專案尚未啟動本機自動處理。",
+                    },
+                ),
                 "qa": read_json(project / "qa/source-qa.json", {}),
                 "media_url": "/media/source" if source_rel else None,
                 "render_status": self.server.render_status,
@@ -819,6 +982,18 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/render-status":
             self.send_json(self.server.render_status)
+            return
+        if path == "/api/pipeline-status":
+            self.send_json(
+                read_json(
+                    project / "working/pipeline_status.json",
+                    {
+                        "state": "not_started",
+                        "phase": "idle",
+                        "message": "這個專案尚未啟動本機自動處理。",
+                    },
+                )
+            )
             return
         if path == "/media/source":
             manifest = read_json(project / "project.json", {}) or {}
@@ -871,9 +1046,16 @@ class EditorHandler(BaseHTTPRequestHandler):
             state = self.read_json_body()
             manifest = read_json(self.server.project_dir / "project.json", {}) or {}
             duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+            plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
+            state["source_sha256"] = manifest.get("source", {}).get("sha256")
+            state["highlight_plan_revision"] = plan.get("plan_revision")
             state["project_dir"] = str(self.server.project_dir)
             errors = validate_editor_state(state, duration)
             state.pop("project_dir", None)
+            try:
+                state["asset_digests"] = referenced_asset_digests(self.server.project_dir, state)
+            except ValueError as exc:
+                errors.append(str(exc))
             if errors:
                 self.send_json({"ok": False, "errors": errors}, status=422)
                 return
@@ -1099,6 +1281,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "original_name": Path(filename).name,
                 "source": "user-uploaded-through-local-editor",
                 "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
                 "uploaded_at": now_utc(),
             }
         )
@@ -1108,6 +1291,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "source": f"assets/{stored_name}",
                 "url": f"/assets/{urllib.parse.quote(stored_name)}",
+                "sha256": hashlib.sha256(data).hexdigest(),
             }
         )
 

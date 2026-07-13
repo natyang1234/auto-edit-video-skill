@@ -52,9 +52,15 @@ class AutoEditVoiceTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._tmp.cleanup()
 
-    def run_cli(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        *args: str,
+        expected: int = 0,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["RUMI_VOICE_SYSTEM"] = str(RUMI_FIXTURE)
+        env.update(extra_env or {})
         result = subprocess.run(
             ["python3", str(CLI), *args],
             text=True,
@@ -63,6 +69,123 @@ class AutoEditVoiceTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, expected, result.stderr or result.stdout)
         return result
+
+    def test_local_transcription_and_highlight_planning_sync_editor(self) -> None:
+        project = self.root / "local-pipeline"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-TW",
+            "--duration-profile",
+            "auto",
+        )
+        manifest_path = project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        state = {
+            "schema_version": 1,
+            "project_id": manifest["project_id"],
+            "canvas": {
+                "platform_id": "instagram-reels",
+                "width": 1080,
+                "height": 1920,
+                "fps": 30,
+                "fit": "cover",
+                "show_safe_zones": True,
+            },
+            "director_style": "high-energy",
+            "editing_brief": "保留三倍這個結論",
+            "caption_defaults": {
+                "font_size": 58,
+                "x": 50,
+                "y": 76,
+                "max_width": 86,
+            },
+            "overlays": [],
+            "publishing": {},
+            "review": {"selected_overlay_id": None},
+        }
+        (project / "working/editor_state.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        fake_whisper = self.root / "fake-whisper"
+        fake_whisper.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[sys.argv.index('--output_dir') + 1])
+output.mkdir(parents=True, exist_ok=True)
+payload = {
+    'text': '你以為只是運氣嗎？其實完整看完的人增加三倍。',
+    'language': 'zh',
+    'segments': [
+        {
+            'start': 0.02,
+            'end': 0.36,
+            'text': '你以為只是運氣嗎？其實完整看完的人增加三倍。',
+            'words': [
+                {'word': '你以為只是運氣嗎？', 'start': 0.02, 'end': 0.16, 'probability': 0.95},
+                {'word': '其實完整看完的人增加三倍。', 'start': 0.17, 'end': 0.36, 'probability': 0.93},
+            ],
+        }
+    ],
+}
+(output / f'{source.stem}.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+(output / f'{source.stem}.srt').write_text('1\\n00:00:00,020 --> 00:00:00,360\\n你以為只是運氣嗎？其實完整看完的人增加三倍。\\n', encoding='utf-8')
+""",
+            encoding="utf-8",
+        )
+        fake_whisper.chmod(0o755)
+
+        transcribed = self.run_cli(
+            "transcribe-local",
+            "--manifest",
+            str(manifest_path),
+            "--model",
+            "base",
+            "--timeout",
+            "30",
+            extra_env={"WHISPER_BIN": str(fake_whisper)},
+        )
+        transcript_payload = json.loads(transcribed.stdout)
+        self.assertEqual(transcript_payload["words"], 2)
+        self.assertEqual(transcript_payload["synced_editor_captions"], 1)
+        synced_state = json.loads(
+            (project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(synced_state["overlays"][0]["type"], "caption")
+
+        planned = self.run_cli(
+            "plan-highlights",
+            "--manifest",
+            str(manifest_path),
+            "--director",
+            "high-energy",
+            "--count",
+            "3",
+            "--brief",
+            "保留三倍這個結論",
+        )
+        plan_payload = json.loads(planned.stdout)
+        self.assertEqual(plan_payload["status"], "needs_review")
+        self.assertGreaterEqual(plan_payload["items"], 1)
+        plan = json.loads((project / "working/highlight_plan.json").read_text(encoding="utf-8"))
+        self.assertTrue(all(item["review_status"] == "pending" for item in plan["items"]))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["stages"]["highlight_plan"], "needs_review")
+        self.assertFalse(manifest["approvals"]["highlight_selection"]["approved"])
+        synced_state = json.loads(
+            (project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(synced_state["highlight_plan_revision"], plan["plan_revision"])
+        self.assertGreaterEqual(len(synced_state["highlights"]), 1)
 
     def init_project(self, name: str, language: str, gender: str) -> tuple[Path, dict]:
         project = self.root / name

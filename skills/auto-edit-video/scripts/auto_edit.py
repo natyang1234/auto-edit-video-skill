@@ -13,10 +13,17 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from highlight_planner import (
+    DIRECTOR_PROFILES as HIGHLIGHT_DIRECTOR_PROFILES,
+    build_highlight_plan,
+    validate_highlight_plan,
+)
 
 
 SCHEMA_VERSION = 1
@@ -260,13 +267,14 @@ STAGES = (
     "subtitles",
     "emphasis",
     "visual_plan",
+    "highlight_plan",
     "voiceover",
     "timeline_review",
     "render",
     "qa",
 )
 
-GATES = ("destructive_edit", "timeline", "final")
+GATES = ("destructive_edit", "highlight_selection", "timeline", "final")
 SUBTITLE_MODES = ("source", "zh", "en", "bilingual", "off")
 VOICE_LANGUAGES = tuple(VOICE_PRESETS)
 VOICE_PROVIDERS = ("rumi", "edge", "auto", "heygen", "elevenlabs", "kokoro")
@@ -381,10 +389,12 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    os.replace(temporary, path)
 
 
 def parse_rate(value: str | None) -> float | None:
@@ -867,6 +877,7 @@ def initialize_project(
             "transcript_final": "working/transcript_final.json",
             "emphasis_plan": "working/emphasis_plan.json",
             "visual_plan": "working/visual_plan.json",
+            "highlight_plan": "working/highlight_plan.json",
             "edit_review": "review/edit-review.html",
             "timeline_preview": "review/timeline-preview.html",
             "final_video": "renders/final.mp4",
@@ -1242,12 +1253,16 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
                 continue
             start = round(float(raw_word.get("start", raw_segment.get("start", 0.0))), 3)
             end = round(float(raw_word.get("end", raw_segment.get("end", start))), 3)
+            probability = raw_word.get("probability")
+            confidence = None
+            if isinstance(probability, (int, float)) and math.isfinite(float(probability)):
+                confidence = round(float(probability), 4)
             word = {
                 "id": f"word-{len(flat_words) + 1:05d}",
                 "text": text,
                 "start": start,
                 "end": end,
-                "confidence": round(float(raw_word.get("probability", 0.0)), 4),
+                "confidence": confidence,
                 "segment_id": f"segment-{segment_index:04d}",
             }
             words.append(word)
@@ -1311,16 +1326,142 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
     return transcript, compatibility
 
 
-def cmd_import_whisper(args: argparse.Namespace) -> int:
-    manifest_path = Path(args.manifest).expanduser().resolve()
-    whisper_path = Path(args.whisper_json).expanduser().resolve()
+def invalidate_approvals(
+    manifest: dict[str, Any],
+    gates: tuple[str, ...],
+    note: str,
+) -> list[str]:
+    invalidated: list[str] = []
+    approvals = manifest.setdefault("approvals", {})
+    for gate in gates:
+        previous = approvals.get(gate)
+        if isinstance(previous, dict) and previous.get("approved"):
+            invalidated.append(gate)
+        approvals[gate] = {
+            "approved": False,
+            "confirmed_by": None,
+            "at": None,
+            "note": note,
+            "invalidated_at": now_utc(),
+        }
+    return invalidated
+
+
+def sync_transcript_to_editor(project_dir: Path) -> int:
+    state_path = project_dir / "working/editor_state.json"
+    if not state_path.is_file():
+        return 0
+    state = read_json(state_path)
+    transcript = read_json(project_dir / "working/transcript_words.json")
+    manifest = read_json(project_dir / "project.json")
     try:
-        manifest = read_json(manifest_path)
-        data = read_json(whisper_path)
-    except ValueError as exc:
-        return die(str(exc))
+        from editor_server import DIRECTOR_PRESETS, editor_state_revision
+    except ImportError as exc:
+        raise ValueError(f"cannot load editor transcript bridge: {exc}") from exc
+    director_id = str(state.get("director_style") or "teacher-punch")
+    director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
+    caption_style = dict(state.get("caption_defaults") or director["caption"])
+    preserved = [
+        overlay
+        for overlay in state.get("overlays", [])
+        if not (
+            isinstance(overlay, dict)
+            and overlay.get("type") == "caption"
+            and overlay.get("source") == "working/transcript_words.json"
+        )
+    ]
+    captions: list[dict[str, Any]] = []
+    for index, segment in enumerate(transcript.get("segments", []), start=1):
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        captions.append(
+            {
+                "id": f"caption-{index:04d}",
+                "type": "caption",
+                "start": round(float(segment.get("start", 0.0)), 3),
+                "end": round(float(segment.get("end", 0.0)), 3),
+                "text": text,
+                "emphasis": [],
+                "visible": True,
+                "locked": False,
+                "z_index": 20,
+                "style": dict(caption_style),
+                "source": "working/transcript_words.json",
+                "provenance": "local-whisper draft; requires transcript review",
+            }
+        )
+    state["overlays"] = captions + preserved
+    state["source_sha256"] = manifest.get("source", {}).get("sha256")
+    state.setdefault("review", {})["selected_overlay_id"] = captions[0]["id"] if captions else (preserved[0].get("id") if preserved else None)
+    state["updated_at"] = now_utc()
+    state["revision"] = editor_state_revision(state)
+    write_json(state_path, state)
+    return len(captions)
+
+
+def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> int:
+    state_path = project_dir / "working/editor_state.json"
+    if not state_path.is_file():
+        return 0
+    state = read_json(state_path)
+    manifest = read_json(project_dir / "project.json")
+    try:
+        from editor_server import DIRECTOR_PRESETS, editor_state_revision
+    except ImportError as exc:
+        raise ValueError(f"cannot load editor highlight bridge: {exc}") from exc
+    highlights = [
+        {
+            "id": str(item["id"]),
+            "plan_item_id": str(item["id"]),
+            "start": item["start"],
+            "end": item["end"],
+            "title": str(item["title"]),
+            "review_status": str(item["review_status"]),
+            "score": item["score"],
+            "source": "working/highlight_plan.json",
+        }
+        for item in plan.get("items", [])[:10]
+    ]
+    state["highlights"] = highlights
+    state["highlight_plan_revision"] = plan.get("plan_revision")
+    state["source_sha256"] = manifest.get("source", {}).get("sha256")
+    state["active_highlight_id"] = highlights[0]["id"] if highlights else None
+    configuration = plan.get("configuration") if isinstance(plan.get("configuration"), dict) else {}
+    director_id = str(configuration.get("director_profile", "teacher-punch"))
+    if director_id in DIRECTOR_PRESETS:
+        caption_style = dict(DIRECTOR_PRESETS[director_id]["caption"])
+        state["director_style"] = director_id
+        state["caption_defaults"] = caption_style
+        generated_sources = {
+            "working/transcript_words.json",
+            "working/emphasis_plan.json",
+            "working/visual_plan.json",
+        }
+        for overlay in state.get("overlays", []):
+            if not isinstance(overlay, dict) or overlay.get("source") not in generated_sources:
+                continue
+            if overlay.get("type") not in {"caption", "emphasis", "title", "card", "animation"}:
+                continue
+            overlay["style"] = {**dict(overlay.get("style") or {}), **caption_style}
+    state["editing_brief"] = str(configuration.get("editing_brief", ""))[:2000]
+    state["updated_at"] = now_utc()
+    state["revision"] = editor_state_revision(state)
+    write_json(state_path, state)
+    return len(highlights)
+
+
+def import_whisper_artifacts(
+    manifest_path: Path,
+    whisper_path: Path,
+    *,
+    srt_path: Path | None,
+    model: str,
+) -> dict[str, Any]:
+    manifest = read_json(manifest_path)
+    data = read_json(whisper_path)
     if not isinstance(data.get("segments"), list):
-        return die("Whisper JSON must contain a segments array")
+        raise ValueError("Whisper JSON must contain a segments array")
     duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
     transcript, compatibility = whisper_payload(data, duration_s)
     project_dir = manifest_path.parent
@@ -1328,10 +1469,10 @@ def cmd_import_whisper(args: argparse.Namespace) -> int:
     compatibility_path = project_dir / "working/subtitles_words.json"
     write_json(transcript_path, transcript)
     write_json(compatibility_path, compatibility)
-    if args.srt:
-        srt_path = Path(args.srt).expanduser().resolve()
+    if srt_path is not None:
+        srt_path = srt_path.expanduser().resolve()
         if not srt_path.is_file():
-            return die(f"SRT not found: {srt_path}")
+            raise ValueError(f"SRT not found: {srt_path}")
         shutil.copy2(srt_path, project_dir / "subtitles/source.srt")
     manifest.setdefault("stages", {})["transcribe"] = "complete"
     manifest["stages"]["edit_analysis"] = "pending"
@@ -1340,7 +1481,7 @@ def cmd_import_whisper(args: argparse.Namespace) -> int:
     )
     manifest["transcription"] = {
         "engine": "openai-whisper",
-        "model": args.model,
+        "model": model,
         "language": data.get("language"),
         "word_count": len(transcript["words"]),
         "segment_count": len(transcript["segments"]),
@@ -1348,17 +1489,200 @@ def cmd_import_whisper(args: argparse.Namespace) -> int:
         "imported_at": now_utc(),
     }
     manifest["updated_at"] = now_utc()
+    invalidate_approvals(
+        manifest,
+        ("highlight_selection", "timeline", "final"),
+        "Invalidated because the source transcript changed",
+    )
     write_json(manifest_path, manifest)
+    synced = sync_transcript_to_editor(project_dir)
+    return {
+        "ok": True,
+        "transcript": str(transcript_path),
+        "compatibility": str(compatibility_path),
+        "words": len(transcript["words"]),
+        "segments": len(transcript["segments"]),
+        "synced_editor_captions": synced,
+    }
+
+
+def cmd_import_whisper(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    whisper_path = Path(args.whisper_json).expanduser().resolve()
+    try:
+        payload = import_whisper_artifacts(
+            manifest_path,
+            whisper_path,
+            srt_path=Path(args.srt) if args.srt else None,
+            model=args.model,
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    emit(payload)
+    return 0
+
+
+def project_staged_source(manifest_path: Path, manifest: dict[str, Any]) -> Path:
+    project_dir = manifest_path.parent.resolve()
+    relative = Path(str(manifest.get("source", {}).get("staged_path", "")))
+    if relative.is_absolute():
+        raise ValueError("staged source must be project-relative")
+    entry = project_dir / relative
+    if entry.is_symlink():
+        raise ValueError("staged source must be an owned regular file")
+    source = entry.resolve()
+    if project_dir not in source.parents or not source.is_file():
+        raise ValueError("staged source is missing or outside the project")
+    return source
+
+
+def cmd_transcribe_local(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    try:
+        manifest = read_json(manifest_path)
+        source = project_staged_source(manifest_path, manifest)
+    except ValueError as exc:
+        return die(str(exc))
+    whisper = os.environ.get("WHISPER_BIN", "").strip() or shutil.which("whisper")
+    if not whisper:
+        return die("local Whisper CLI is not installed")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", args.model):
+        return die("Whisper model name is invalid")
+    run_dir = manifest_path.parent / "working/whisper-local" / uuid.uuid4().hex
+    run_dir.mkdir(parents=True, exist_ok=False)
+    language = str(manifest.get("subtitles", {}).get("source_language", "auto"))
+    language_map = {"zh-TW": "zh", "zh-CN": "zh", "en-US": "en", "en-GB": "en"}
+    command = [
+        whisper,
+        str(source),
+        "--model",
+        args.model,
+        "--output_dir",
+        str(run_dir),
+        "--output_format",
+        "all",
+        "--word_timestamps",
+        "True",
+        "--verbose",
+        "False",
+        "--fp16",
+        "False",
+    ]
+    if language in language_map:
+        command.extend(["--language", language_map[language]])
+    manifest.setdefault("stages", {})["transcribe"] = "in_progress"
+    manifest["updated_at"] = now_utc()
+    write_json(manifest_path, manifest)
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        manifest = read_json(manifest_path)
+        manifest.setdefault("stages", {})["transcribe"] = "failed"
+        manifest["transcription"] = {
+            "engine": "openai-whisper",
+            "model": args.model,
+            "status": "failed",
+            "error_code": "timeout",
+            "updated_at": now_utc(),
+        }
+        write_json(manifest_path, manifest)
+        return die("local Whisper transcription timed out")
+    if result.returncode != 0:
+        manifest = read_json(manifest_path)
+        manifest.setdefault("stages", {})["transcribe"] = "failed"
+        manifest["transcription"] = {
+            "engine": "openai-whisper",
+            "model": args.model,
+            "status": "failed",
+            "error_code": "whisper_failed",
+            "updated_at": now_utc(),
+        }
+        write_json(manifest_path, manifest)
+        return die("local Whisper transcription failed")
+    whisper_json = run_dir / f"{source.stem}.json"
+    whisper_srt = run_dir / f"{source.stem}.srt"
+    try:
+        payload = import_whisper_artifacts(
+            manifest_path,
+            whisper_json,
+            srt_path=whisper_srt if whisper_srt.is_file() else None,
+            model=args.model,
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    payload["local"] = True
+    emit(payload)
+    return 0
+
+
+def cmd_plan_highlights(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    project_dir = manifest_path.parent
+    try:
+        manifest = read_json(manifest_path)
+        transcript = read_json(project_dir / "working/transcript_words.json")
+    except ValueError:
+        try:
+            manifest = read_json(manifest_path)
+        except ValueError as exc:
+            return die(str(exc))
+        transcript = {"schema_version": 1, "text": "", "segments": [], "words": []}
+    try:
+        plan = build_highlight_plan(
+            transcript,
+            manifest,
+            director_profile=args.director,
+            requested_count=args.count,
+            editing_brief=args.brief or "",
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    errors = validate_highlight_plan(
+        plan,
+        float(manifest.get("source", {}).get("duration_s", 0.0)),
+    )
+    if errors:
+        return die("; ".join(errors))
+    output = project_dir / "working/highlight_plan.json"
+    write_json(output, plan)
+    previous_revision = manifest.get("highlight_planning", {}).get("plan_revision")
+    manifest.setdefault("artifacts", {})["highlight_plan"] = "working/highlight_plan.json"
+    manifest.setdefault("stages", {})["highlight_plan"] = plan["status"]
+    manifest["highlight_planning"] = {
+        "generator": plan["generator"],
+        "director_profile": args.director,
+        "requested_count": args.count,
+        "plan_revision": plan["plan_revision"],
+        "status": plan["status"],
+        "updated_at": now_utc(),
+    }
+    if previous_revision != plan["plan_revision"]:
+        invalidate_approvals(
+            manifest,
+            ("highlight_selection", "timeline", "final"),
+            "Invalidated because the highlight plan changed",
+        )
+        manifest["approvals"]["highlight_selection"]["plan_revision"] = plan["plan_revision"]
+    manifest["updated_at"] = now_utc()
+    write_json(manifest_path, manifest)
+    synced = sync_highlight_plan_to_editor(project_dir, plan)
     emit(
         {
-            "ok": True,
-            "transcript": str(transcript_path),
-            "compatibility": str(compatibility_path),
-            "words": len(transcript["words"]),
-            "segments": len(transcript["segments"]),
+            "ok": plan["status"] == "needs_review",
+            "status": plan["status"],
+            "plan": str(output),
+            "plan_revision": plan["plan_revision"],
+            "items": len(plan["items"]),
+            "synced_editor_highlights": synced,
+            "warnings": plan["warnings"],
         }
     )
-    return 0
+    return 0 if plan["status"] == "needs_review" else 3
 
 
 def new_edit_candidate(
@@ -2130,6 +2454,15 @@ def build_parser() -> argparse.ArgumentParser:
     whisper_import.add_argument("--model", default="unknown")
     whisper_import.set_defaults(func=cmd_import_whisper)
 
+    transcribe = sub.add_parser(
+        "transcribe-local",
+        help="Run the installed local Whisper CLI and import timed transcript artifacts",
+    )
+    transcribe.add_argument("--manifest", required=True)
+    transcribe.add_argument("--model", default="base")
+    transcribe.add_argument("--timeout", type=int, default=21600)
+    transcribe.set_defaults(func=cmd_transcribe_local)
+
     analyze = sub.add_parser(
         "analyze-edits",
         help="Propose low-risk silence/filler/stutter edits for human review",
@@ -2143,6 +2476,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plans.add_argument("--manifest", required=True)
     plans.set_defaults(func=cmd_plan_overlays)
+
+    highlights = sub.add_parser(
+        "plan-highlights",
+        help="Create 1-10 deterministic transcript-grounded highlight proposals",
+    )
+    highlights.add_argument("--manifest", required=True)
+    highlights.add_argument(
+        "--director",
+        choices=tuple(HIGHLIGHT_DIRECTOR_PROFILES),
+        default="teacher-punch",
+    )
+    highlights.add_argument("--count", type=int, default=10)
+    highlights.add_argument("--brief", default="")
+    highlights.set_defaults(func=cmd_plan_highlights)
 
     voices = sub.add_parser("voices", help="List Rumi/Fish and Edge voice options")
     voices.add_argument("--language", choices=VOICE_LANGUAGES)

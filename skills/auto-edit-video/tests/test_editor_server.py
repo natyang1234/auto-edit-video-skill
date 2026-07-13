@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -195,6 +196,8 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(payload["state"]["overlays"][0]["type"], "caption")
         self.assertEqual(payload["state"]["editing_brief"], "")
+        self.assertIn("highlight_plan", payload)
+        self.assertEqual(payload["pipeline_status"]["state"], "not_started")
         self.assertEqual(
             {preset["label"] for preset in payload["director_presets"].values()},
             {"專業教學", "爆款短影音", "八卦時事", "POV 藏鏡人", "編輯精簡"},
@@ -328,6 +331,30 @@ class EditorServerTests(unittest.TestCase):
             (self.project / "assets/provenance.json").read_text(encoding="utf-8")
         )
         self.assertEqual(provenance["items"][0]["source"], "user-uploaded-through-local-editor")
+        expected_digest = hashlib.sha256(upload_body).hexdigest()
+        self.assertEqual(upload["sha256"], expected_digest)
+        self.assertEqual(provenance["items"][0]["sha256"], expected_digest)
+
+        status, _headers, body = self.request("GET", "/api/project")
+        state_with_asset = json.loads(body.decode("utf-8"))["state"]
+        state_with_asset["overlays"].append(
+            {
+                "id": "image-owned",
+                "type": "image",
+                "start": 0.2,
+                "end": 1.0,
+                "source": upload["source"],
+                "visible": True,
+                "z_index": 30,
+                "style": {"x": 50, "y": 50, "width": 30},
+            }
+        )
+        status, saved = self.json_request("PUT", "/api/editor-state", state_with_asset)
+        self.assertEqual(status, 200, saved)
+        persisted = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["asset_digests"][upload["source"]], expected_digest)
 
         status, payload = self.json_request("POST", "/api/render", {"quality": "final"})
         self.assertEqual(status, 409)

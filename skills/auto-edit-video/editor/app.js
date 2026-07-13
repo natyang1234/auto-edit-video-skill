@@ -5,11 +5,13 @@ let selectedOverlayId = null;
 let saveTimer = null;
 let toastTimer = null;
 let renderPollTimer = null;
+let pipelinePollTimer = null;
 let history = [];
 let sourceMediaUrl = null;
 let showingRenderedMedia = false;
 let lastOverlaySignature = "";
 let highlightSegments = [];
+let stateDirty = false;
 
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
@@ -130,6 +132,7 @@ function ensureSourcePreview() {
 }
 
 function markDirty(message = "尚未儲存") {
+  stateDirty = true;
   ensureSourcePreview();
   setSaveState(message, "dirty");
   clearTimeout(saveTimer);
@@ -141,6 +144,7 @@ function markDirty(message = "尚未儲存") {
 
 async function saveState(showConfirmation = true) {
   clearTimeout(saveTimer);
+  saveTimer = null;
   try {
     const payload = await request("/api/editor-state", {
       method: "PUT",
@@ -149,6 +153,7 @@ async function saveState(showConfirmation = true) {
     });
     state.updated_at = payload.updated_at;
     state.revision = payload.revision;
+    stateDirty = false;
     if ((payload.invalidated_gates || []).includes("timeline")) {
       if (projectPayload?.manifest?.approvals?.timeline) {
         projectPayload.manifest.approvals.timeline.approved = false;
@@ -980,6 +985,9 @@ function switchInspectorTab(tab) {
 function renderSourceWarning() {
   const report = projectPayload.qa?.report || projectPayload.qa || {};
   const warnings = [];
+  const pipeline = projectPayload.pipeline_status || {};
+  if (["pending", "running"].includes(pipeline.state)) warnings.push(pipeline.message || "本機自動處理中");
+  if (["failed", "needs_attention", "stopped"].includes(pipeline.state)) warnings.push(pipeline.message || "本機自動處理需要處理");
   if (!Object.keys(report).length) warnings.push("來源 QA 尚未載入");
   if (report.dead_border?.border_flag || report.border_flag) warnings.push("來源有黑邊");
   if (report.loudness?.ok === false) warnings.push(`音量 ${report.loudness.lufs} LUFS`);
@@ -997,6 +1005,31 @@ function renderSourceWarning() {
   elements["warning-copy"].textContent = warnings.length
     ? `${warnings.join("、")}；核可前需處理。`
     : "來源 QA 已通過，仍需人工檢查字幕與畫面。";
+}
+
+function pollPipelineStatus() {
+  clearInterval(pipelinePollTimer);
+  pipelinePollTimer = setInterval(async () => {
+    try {
+      const status = await request("/api/pipeline-status");
+      projectPayload.pipeline_status = status;
+      renderSourceWarning();
+      if (["pending", "running"].includes(status.state)) return;
+      if (status.state === "needs_review") {
+        if (stateDirty) return;
+        clearInterval(pipelinePollTimer);
+        window.location.reload();
+        return;
+      }
+      clearInterval(pipelinePollTimer);
+      if (["failed", "needs_attention", "stopped"].includes(status.state)) {
+        showToast(status.message || "本機自動處理需要處理", "error");
+      }
+    } catch (error) {
+      clearInterval(pipelinePollTimer);
+      showToast(`無法讀取自動處理進度：${error.message}`, "error");
+    }
+  }, 1800);
 }
 
 function renderAll() {
@@ -1147,6 +1180,7 @@ async function initialize() {
     renderAll();
     renderVoicePanel();
     if (projectPayload.render_status?.state === "running") pollRenderStatus(elements["render-button"]);
+    if (["pending", "running"].includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();
   } catch (error) {
     elements["stage-empty"].innerHTML = "";
     const message = document.createElement("p");
