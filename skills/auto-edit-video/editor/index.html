@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light">
+    <title>Auto Edit Studio</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
+
+    <header class="topbar">
+      <div class="brand-lockup" aria-label="Auto Edit Studio">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">AUTO EDIT STUDIO</p>
+          <h1 id="project-name">讀取專案中</h1>
+        </div>
+      </div>
+
+      <div class="topbar-controls">
+        <label class="compact-field">
+          <span>輸出平台</span>
+          <select id="platform-select" aria-label="選擇輸出平台"></select>
+        </label>
+        <label class="compact-field director-field">
+          <span>剪輯導演</span>
+          <select id="director-select" aria-label="選擇剪輯導演風格"></select>
+        </label>
+        <div class="save-state" id="save-state" role="status" aria-live="polite">
+          <span class="save-dot" aria-hidden="true"></span>
+          <span>等待載入</span>
+        </div>
+        <button class="button button-secondary" id="save-button" type="button">儲存時間軸</button>
+        <button class="button button-primary" id="render-button" type="button">輸出預覽</button>
+      </div>
+    </header>
+
+    <main class="editor-shell" id="main-content">
+      <aside class="left-rail" aria-label="剪輯建議與圖層">
+        <section class="rail-section review-section">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">CUT REVIEW</p>
+              <h2>剪輯建議</h2>
+            </div>
+            <span class="count-badge" id="candidate-count">0</span>
+          </div>
+          <p class="section-note">AI 只提出建議；核可前不會刪除原片。</p>
+          <div class="candidate-list" id="candidate-list"></div>
+          <button class="button button-danger-quiet full-width" id="approve-cuts" type="button">
+            核可目前刪除決定
+          </button>
+        </section>
+
+        <section class="rail-section layer-section">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">LAYERS</p>
+              <h2>新增圖層</h2>
+            </div>
+          </div>
+          <div class="tool-grid" role="group" aria-label="新增時間軸圖層">
+            <button class="tool-button" data-add-type="caption" type="button">
+              <strong>字幕</strong><span>跟著口播</span>
+            </button>
+            <button class="tool-button" data-add-type="title" type="button">
+              <strong>標題卡</strong><span>開場或轉場</span>
+            </button>
+            <button class="tool-button" data-add-type="emphasis" type="button">
+              <strong>特效字</strong><span>放大關鍵詞</span>
+            </button>
+            <button class="tool-button" data-add-type="animation" type="button">
+              <strong>動畫字卡</strong><span>說明與提示</span>
+            </button>
+            <button class="tool-button tool-button-wide" id="asset-upload-button" type="button">
+              <strong>圖片／GIF／影片</strong><span>插入內容相關素材</span>
+            </button>
+            <input id="asset-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/quicktime" hidden>
+          </div>
+          <div class="layer-list" id="layer-list" aria-label="時間軸圖層清單"></div>
+        </section>
+      </aside>
+
+      <section class="preview-workspace" id="preview-workspace" aria-label="即時影片預覽">
+        <div class="preview-heading">
+          <div>
+            <p class="eyebrow">FRAME PREVIEW</p>
+            <h2>畫面即時預覽</h2>
+          </div>
+          <div class="preview-meta">
+            <span id="canvas-resolution">1080 × 1920</span>
+            <span id="source-meta">—</span>
+          </div>
+        </div>
+
+        <div class="stage-zone">
+          <div class="stage-frame" id="stage-frame">
+            <video id="preview-video" preload="metadata" playsinline></video>
+            <div class="overlay-layer" id="overlay-layer" aria-live="off"></div>
+            <div class="safe-zone" id="safe-zone" aria-hidden="true"></div>
+            <div class="stage-empty" id="stage-empty">
+              <p>正在準備本機影片預覽…</p>
+            </div>
+          </div>
+          <aside class="frame-warning" id="frame-warning" aria-live="polite">
+            <p class="eyebrow">SOURCE CHECK</p>
+            <p id="warning-copy">等待機械 QA</p>
+          </aside>
+        </div>
+
+        <div class="transport" aria-label="播放控制">
+          <button class="transport-button" id="jump-start" type="button" aria-label="回到影片開頭">00</button>
+          <button class="play-button" id="play-button" type="button" aria-label="播放影片">
+            <span aria-hidden="true">▶</span><span class="sr-only">播放</span>
+          </button>
+          <div class="time-readout" aria-label="目前時間與片長">
+            <span id="current-time">00:00.000</span>
+            <span class="time-divider">/</span>
+            <span id="total-time">00:00.000</span>
+          </div>
+          <input id="scrubber" class="scrubber" type="range" min="0" max="1" step="0.01" value="0" aria-label="影片播放位置">
+          <button class="transport-button" id="toggle-safe-zone" type="button" aria-pressed="true">安全框</button>
+        </div>
+      </section>
+
+      <aside class="inspector" aria-label="選取圖層設定">
+        <div class="inspector-tabs" role="tablist" aria-label="設定區">
+          <button role="tab" aria-selected="true" aria-controls="style-panel" id="style-tab" type="button">圖層</button>
+          <button role="tab" aria-selected="false" aria-controls="publish-panel" id="publish-tab" type="button">發布</button>
+        </div>
+
+        <section class="inspector-panel" id="style-panel" role="tabpanel" aria-labelledby="style-tab">
+          <div class="inspector-empty" id="inspector-empty">
+            <p class="eyebrow">SELECT A LAYER</p>
+            <h2>選一個時間軸圖層</h2>
+            <p>可以改文字、顏色、大小、位置、出現時間與動畫。</p>
+          </div>
+          <form id="layer-form" class="layer-form" hidden>
+            <div class="form-heading">
+              <div>
+                <p class="eyebrow" id="selected-type">CAPTION</p>
+                <h2 id="selected-name">字幕</h2>
+              </div>
+              <button class="text-button danger-text" id="delete-layer" type="button">刪除圖層</button>
+            </div>
+
+            <label class="field field-full" id="text-field">
+              <span>顯示文字</span>
+              <textarea id="overlay-text" rows="3" maxlength="1000"></textarea>
+            </label>
+
+            <div class="field-pair">
+              <label class="field"><span>開始（秒）</span><input id="overlay-start" type="number" min="0" step="0.01"></label>
+              <label class="field"><span>結束（秒）</span><input id="overlay-end" type="number" min="0.01" step="0.01"></label>
+            </div>
+
+            <label class="field field-full">
+              <span>字體</span>
+              <select id="font-family">
+                <option value="PingFang TC">蘋方繁體</option>
+                <option value="Songti TC">宋體繁體</option>
+                <option value="Avenir Next">Avenir Next</option>
+                <option value="Arial Unicode MS">Arial Unicode</option>
+              </select>
+            </label>
+
+            <label class="field range-field">
+              <span>字體大小 <output id="font-size-output">58</output></span>
+              <input id="font-size" type="range" min="24" max="120" step="1">
+            </label>
+
+            <label class="field range-field" id="asset-width-row" hidden>
+              <span>素材寬度 <output id="asset-width-output">32%</output></span>
+              <input id="asset-width" type="range" min="5" max="100" step="1">
+            </label>
+
+            <div class="field-pair color-pair">
+              <label class="field color-field"><span>文字顏色</span><input id="font-color" type="color"></label>
+              <label class="field color-field"><span>重點顏色</span><input id="emphasis-color" type="color"></label>
+            </div>
+
+            <label class="field range-field">
+              <span>水平位置 <output id="position-x-output">50%</output></span>
+              <input id="position-x" type="range" min="0" max="100" step="1">
+            </label>
+            <label class="field range-field">
+              <span>垂直位置 <output id="position-y-output">76%</output></span>
+              <input id="position-y" type="range" min="0" max="100" step="1">
+            </label>
+
+            <label class="field field-full">
+              <span>進場動畫</span>
+              <select id="overlay-animation">
+                <option value="none">無</option>
+                <option value="fade">淡入</option>
+                <option value="pop">重點彈出</option>
+                <option value="slide-up">由下進場</option>
+              </select>
+            </label>
+
+            <label class="visibility-control">
+              <input id="overlay-visible" type="checkbox">
+              <span>在畫面與輸出中顯示</span>
+            </label>
+          </form>
+        </section>
+
+        <section class="inspector-panel publish-panel" id="publish-panel" role="tabpanel" aria-labelledby="publish-tab" hidden>
+          <div class="publish-heading">
+            <p class="eyebrow">PLATFORM PACKAGE</p>
+            <h2>文案與封面草稿</h2>
+            <p>由目前逐字稿產生本機草稿；發布前仍需人工校對。</p>
+          </div>
+          <button class="button button-secondary full-width" id="generate-copy" type="button">依平台產生文案草稿</button>
+          <label class="field field-full"><span>標題</span><textarea id="publish-title" rows="2" maxlength="160"></textarea></label>
+          <label class="field field-full"><span>貼文內容</span><textarea id="publish-body" rows="6" maxlength="4000"></textarea></label>
+          <label class="field field-full"><span>Hashtags（逗號分隔）</span><input id="publish-hashtags" type="text"></label>
+          <div class="publish-divider"></div>
+          <label class="field field-full"><span>封面文字</span><textarea id="cover-text" rows="2" maxlength="200"></textarea></label>
+          <label class="field range-field">
+            <span>取幀時間 <output id="cover-time-output">1.00s</output></span>
+            <input id="cover-time" type="range" min="0" max="1" step="0.05">
+          </label>
+          <button class="button button-secondary full-width" id="generate-cover" type="button">產生封面預覽</button>
+          <img class="cover-preview" id="cover-preview" alt="產生後的封面預覽" hidden>
+          <div class="publish-divider"></div>
+          <section class="voice-panel" aria-labelledby="voice-heading">
+            <div class="voice-heading">
+              <p class="eyebrow">OPTIONAL VOICEOVER</p>
+              <h3 id="voice-heading">配音選擇</h3>
+              <p>只儲存選項，不會自動傳出文字或呼叫雲端配音。</p>
+            </div>
+            <label class="visibility-control">
+              <input id="voice-enabled" type="checkbox">
+              <span>啟用選配配音</span>
+            </label>
+            <div class="field-pair">
+              <label class="field"><span>語言</span>
+                <select id="voice-language">
+                  <option value="zh-TW">繁體中文</option>
+                  <option value="zh-CN">簡體中文</option>
+                  <option value="en-US">English (US)</option>
+                  <option value="en-GB">English (UK)</option>
+                </select>
+              </label>
+              <label class="field"><span>聲線</span>
+                <select id="voice-gender">
+                  <option value="female">女聲</option>
+                  <option value="male">男聲</option>
+                </select>
+              </label>
+            </div>
+            <label class="field field-full"><span>語音</span><select id="voice-id"></select></label>
+            <div class="field-pair">
+              <label class="field"><span>用法</span>
+                <select id="voice-mode">
+                  <option value="replace">取代原聲</option>
+                  <option value="add">保留原聲並加入</option>
+                </select>
+              </label>
+              <label class="field"><span>語速</span><input id="voice-speed" type="number" min="0.7" max="1.3" step="0.05" value="1"></label>
+            </div>
+            <button class="button button-secondary full-width" id="save-voice" type="button">儲存配音選擇</button>
+            <p class="voice-status" id="voice-status" role="status">原聲模式</p>
+          </section>
+          <div class="publish-divider"></div>
+          <button class="button button-primary full-width" id="approve-timeline" type="button">核可時間軸</button>
+          <button class="button button-secondary full-width" id="render-final" type="button">輸出最終影片</button>
+        </section>
+      </aside>
+
+      <section class="timeline-panel" aria-label="影片時間軸">
+        <div class="timeline-header">
+          <div>
+            <p class="eyebrow">TIMELINE</p>
+            <h2>字幕、字卡與素材</h2>
+          </div>
+          <div class="timeline-legend">
+            <span><i class="legend-caption"></i>字幕</span>
+            <span><i class="legend-emphasis"></i>特效字</span>
+            <span><i class="legend-asset"></i>素材／動畫</span>
+            <span><i class="legend-cut"></i>刪除建議</span>
+          </div>
+        </div>
+        <div class="timeline-scroll" id="timeline-scroll">
+          <div class="timeline-ruler" id="timeline-ruler"></div>
+          <div class="timeline-tracks" id="timeline-tracks"></div>
+          <div class="playhead" id="playhead" aria-hidden="true"></div>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

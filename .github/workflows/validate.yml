@@ -1,0 +1,22 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg and CJK font
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk
+      - name: Validate package
+        run: python3 scripts/validate_skill.py
+      - name: Run unit tests
+        run: python3 -m unittest discover -s skills/auto-edit-video/tests -p 'test_*.py'
+      - name: Test universal installer
+        run: bash tests/test_install.sh

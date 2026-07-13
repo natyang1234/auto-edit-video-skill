@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Edit Video"
+  short_description: "Reviewed local cuts, captions, motion, and QA"
+  default_prompt: "Use $auto-edit-video to build a reviewed local video edit and export only after all approval and QA gates pass."

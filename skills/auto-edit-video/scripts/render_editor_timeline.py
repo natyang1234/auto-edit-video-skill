@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""Render editor_state.json to a reproducible MP4 preview/final or cover PNG."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from typing import Any
+
+from editor_server import PLATFORM_PRESETS, editor_state_revision, read_json
+
+
+FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
+FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/PingFang.ttc"),
+    Path("/System/Library/Fonts/STHeiti Light.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/mnt/c/Windows/Fonts/msjh.ttc"),
+)
+
+
+def ffmpeg_path() -> str:
+    override = str(os.environ.get("AUTO_EDIT_FFMPEG", "")).strip()
+    if override and Path(override).expanduser().is_file():
+        return str(Path(override).expanduser())
+    if FFMPEG_FULL.is_file():
+        return str(FFMPEG_FULL)
+    command = shutil.which("ffmpeg")
+    if not command:
+        raise ValueError("ffmpeg is required")
+    return command
+
+
+def font_path() -> Path:
+    override = str(os.environ.get("AUTO_EDIT_FONT", "")).strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            return candidate
+        raise ValueError(f"AUTO_EDIT_FONT does not exist: {candidate}")
+    match = shutil.which("fc-match")
+    if match:
+        for family in ("Noto Sans CJK TC:lang=zh-tw", "PingFang TC", "WenQuanYi Zen Hei"):
+            result = subprocess.run(
+                [match, family, "-f", "%{file}"],
+                text=True,
+                capture_output=True,
+            )
+            candidate = Path(result.stdout.strip())
+            if result.returncode == 0 and candidate.is_file():
+                return candidate
+    for candidate in FONT_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    raise ValueError("no CJK-capable font found")
+
+
+def even(value: float) -> int:
+    rounded = max(2, int(round(value)))
+    return rounded if rounded % 2 == 0 else rounded + 1
+
+
+def preview_dimensions(width: int, height: int) -> tuple[int, int]:
+    longest = max(width, height)
+    scale = min(1.0, 960.0 / longest)
+    return even(width * scale), even(height * scale)
+
+
+def color(value: Any, fallback: str = "#f7f2e8") -> str:
+    raw = str(value or fallback).strip()
+    match = re.fullmatch(r"#([0-9a-fA-F]{6})", raw)
+    return f"0x{match.group(1)}" if match else f"0x{fallback.removeprefix('#')}"
+
+
+def filter_path(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def wrap_overlay_text(text: str, width: int, style: dict[str, Any], render_scale: float) -> str:
+    font_size = max(16, int(float(style.get("font_size", 52)) * render_scale))
+    max_width = max(20.0, min(96.0, float(style.get("max_width", 84))))
+    chars = max(5, int(width * (max_width / 100.0) / max(font_size, 1)))
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return ""
+    if re.search(r"[\u3400-\u9fff]", compact):
+        return "\n".join(compact[index : index + chars] for index in range(0, len(compact), chars))
+    return "\n".join(textwrap.wrap(compact, width=max(chars, 8), break_long_words=False))
+
+
+def motion_values(
+    style: dict[str, Any],
+    start: float,
+    end: float,
+    base_y: str,
+    offset: float,
+) -> tuple[str, str | None]:
+    """Return FFmpeg y/alpha expressions matching the live editor motions."""
+    animation = str(style.get("animation", "none"))
+    if animation not in {"fade", "pop", "slide-up"}:
+        return base_y, None
+    duration = max(0.01, end - start)
+    fade_duration = min(0.18, max(0.01, duration * 0.22))
+    fade_in_end = start + fade_duration
+    fade_out_start = end - fade_duration
+    alpha = (
+        f"if(lt(t,{fade_in_end:.3f}),(t-{start:.3f})/{fade_duration:.3f},"
+        f"if(gt(t,{fade_out_start:.3f}),({end:.3f}-t)/{fade_duration:.3f},1))"
+    )
+    if animation == "fade":
+        return base_y, alpha
+    motion_duration = min(0.22, max(0.01, duration * 0.28))
+    motion_end = start + motion_duration
+    motion_offset = offset if animation == "slide-up" else offset * 0.35
+    y = (
+        f"if(lt(t,{motion_end:.3f}),({base_y})+"
+        f"({motion_end:.3f}-t)/{motion_duration:.3f}*{motion_offset:.3f},({base_y}))"
+    )
+    return y, alpha
+
+
+def text_filter(
+    input_label: str,
+    output_label: str,
+    overlay: dict[str, Any],
+    width: int,
+    height: int,
+    render_scale: float,
+    font: Path,
+    text_file: Path,
+) -> str:
+    style = overlay.get("style") or {}
+    font_size = max(14, int(float(style.get("font_size", 52)) * render_scale))
+    border = max(0, int(float(style.get("stroke_width", 3)) * render_scale))
+    x_pct = max(0.0, min(100.0, float(style.get("x", 50))))
+    y_pct = max(0.0, min(100.0, float(style.get("y", 78))))
+    x = f"{width * x_pct / 100.0:.3f}-text_w/2"
+    base_y = f"{height * y_pct / 100.0:.3f}-text_h/2"
+    start = max(0.0, float(overlay.get("start", 0.0)))
+    end = max(start + 0.01, float(overlay.get("end", start + 0.01)))
+    y, alpha = motion_values(style, start, end, base_y, max(12.0, font_size * 0.7))
+    enable = f"between(t,{start:.3f},{end:.3f})"
+    filters: list[str] = []
+    current = input_label
+    kind = overlay.get("type")
+    if kind in {"title", "card"} or bool(style.get("box")):
+        max_width = max(20.0, min(96.0, float(style.get("max_width", 84))))
+        box_width = int(width * max_width / 100.0)
+        box_height = max(int(font_size * 2.6), int(height * 0.08))
+        box_x = int(width * x_pct / 100.0 - box_width / 2)
+        box_y = int(height * y_pct / 100.0 - box_height / 2)
+        box_color = color(style.get("box_color"), "#201b17")
+        box_out = f"{output_label}_box"
+        filters.append(
+            f"[{current}]drawbox=x={box_x}:y={box_y}:w={box_width}:h={box_height}:"
+            f"color={box_color}@0.88:t=fill:enable='{enable}'[{box_out}]"
+        )
+        current = box_out
+    alpha_option = f":alpha='{alpha}'" if alpha else ""
+    filters.append(
+        f"[{current}]drawtext=fontfile='{filter_path(font)}':"
+        f"textfile='{filter_path(text_file)}':expansion=none:"
+        f"fontcolor={color(style.get('color'))}:fontsize={font_size}:"
+        f"borderw={border}:bordercolor={color(style.get('stroke_color'), '#17130f')}:"
+        f"line_spacing={max(2, int(font_size * 0.14))}:x='{x}':y='{y}'"
+        f"{alpha_option}:enable='{enable}'[{output_label}]"
+    )
+    return ";".join(filters)
+
+
+def image_filter(
+    input_label: str,
+    output_label: str,
+    asset_label: str,
+    overlay: dict[str, Any],
+    width: int,
+    height: int,
+) -> str:
+    style = overlay.get("style") or {}
+    asset_width = even(width * max(5.0, min(100.0, float(style.get("width", 32)))) / 100.0)
+    x_pct = max(0.0, min(100.0, float(style.get("x", 50))))
+    y_pct = max(0.0, min(100.0, float(style.get("y", 50))))
+    x = f"{width * x_pct / 100.0:.3f}-overlay_w/2"
+    base_y = f"{height * y_pct / 100.0:.3f}-overlay_h/2"
+    start = max(0.0, float(overlay.get("start", 0.0)))
+    end = max(start + 0.01, float(overlay.get("end", start + 0.01)))
+    y, _alpha = motion_values(style, start, end, base_y, max(12.0, height * 0.04))
+    duration = max(0.01, end - start)
+    fade_duration = min(0.18, max(0.01, duration * 0.22))
+    animation = str(style.get("animation", "none"))
+    scaled = f"{output_label}_asset"
+    asset_filters = (
+        f"[{asset_label}]scale={asset_width}:-2,format=rgba,"
+        f"setpts=PTS-STARTPTS+{start:.3f}/TB"
+    )
+    if animation in {"fade", "pop", "slide-up"}:
+        asset_filters += (
+            f",fade=t=in:st={start:.3f}:d={fade_duration:.3f}:alpha=1"
+            f",fade=t=out:st={max(start, end - fade_duration):.3f}:"
+            f"d={fade_duration:.3f}:alpha=1"
+        )
+    return (
+        f"{asset_filters}[{scaled}];"
+        f"[{input_label}][{scaled}]overlay=x='{x}':y='{y}':"
+        f"enable='between(t,{start:.3f},{end:.3f})':eof_action=pass:shortest=0[{output_label}]"
+    )
+
+
+def build_render_command(
+    project_dir: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    output: Path,
+    quality: str,
+) -> list[str]:
+    canvas = state.get("canvas") or {}
+    target_width = int(canvas.get("width", 1080))
+    target_height = int(canvas.get("height", 1920))
+    if quality == "preview":
+        width, height = preview_dimensions(target_width, target_height)
+    else:
+        width, height = even(target_width), even(target_height)
+    render_scale = width / max(target_width, 1)
+    duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+    source_rel = str(manifest.get("source", {}).get("staged_path", ""))
+    source = project_dir / source_rel
+    if not source.is_file():
+        raise ValueError(f"source media missing: {source}")
+    fit = canvas.get("fit", "cover")
+    if fit == "contain":
+        base_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x171512,setsar=1"
+        )
+    else:
+        base_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},setsar=1"
+        )
+
+    command = [ffmpeg_path(), "-y", "-i", str(source)]
+    overlays = [
+        overlay
+        for overlay in state.get("overlays", [])
+        if overlay.get("visible", True)
+        and float(overlay.get("end", 0.0)) > float(overlay.get("start", 0.0))
+    ]
+    overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
+    asset_inputs: dict[str, int] = {}
+    for overlay in overlays:
+        if overlay.get("type") not in {"image", "gif", "video"}:
+            continue
+        source_rel = str(overlay.get("source", ""))
+        asset = (project_dir / source_rel).resolve()
+        if project_dir.resolve() not in asset.parents or not asset.is_file():
+            raise ValueError(f"asset missing or outside project: {source_rel}")
+        key = str(asset)
+        if key in asset_inputs:
+            continue
+        suffix = asset.suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            command.extend(["-loop", "1", "-framerate", str(canvas.get("fps", 30)), "-i", key])
+        elif suffix == ".gif":
+            command.extend(["-ignore_loop", "0", "-stream_loop", "-1", "-i", key])
+        else:
+            command.extend(["-stream_loop", "-1", "-i", key])
+        asset_inputs[key] = len(asset_inputs) + 1
+
+    render_text_dir = project_dir / "working/render_text"
+    render_text_dir.mkdir(parents=True, exist_ok=True)
+    filters = [f"[0:v]{base_filter}[v0]"]
+    current = "v0"
+    font = font_path()
+    for index, overlay in enumerate(overlays, start=1):
+        output_label = f"v{index}"
+        kind = overlay.get("type")
+        if kind in {"image", "gif", "video"}:
+            asset = str((project_dir / str(overlay.get("source", ""))).resolve())
+            filters.append(
+                image_filter(current, output_label, f"{asset_inputs[asset]}:v", overlay, width, height)
+            )
+        else:
+            text = wrap_overlay_text(str(overlay.get("text", "")), width, overlay.get("style") or {}, render_scale)
+            if not text:
+                continue
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(overlay.get("id", index)))
+            text_file = render_text_dir / f"{safe_id}.txt"
+            text_file.write_text(text, encoding="utf-8")
+            filters.append(
+                text_filter(
+                    current,
+                    output_label,
+                    overlay,
+                    width,
+                    height,
+                    render_scale,
+                    font,
+                    text_file,
+                )
+            )
+        current = output_label
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{current}]",
+            "-map",
+            "0:a?",
+            "-t",
+            f"{duration:.3f}",
+            "-r",
+            str(int(canvas.get("fps", 30))),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast" if quality == "preview" else "medium",
+            "-crf",
+            "24" if quality == "preview" else "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+    )
+    return command
+
+
+def render_project(project_dir: Path, output: Path, quality: str) -> None:
+    manifest = read_json(project_dir / "project.json", {}) or {}
+    state = read_json(project_dir / "working/editor_state.json", {}) or {}
+    if quality == "final":
+        approval = manifest.get("approvals", {}).get("timeline", {})
+        if (
+            not approval.get("approved")
+            or approval.get("state_revision") != editor_state_revision(state)
+        ):
+            raise ValueError("current timeline revision must be approved before final render")
+    command = build_render_command(project_dir, state, manifest, output, quality)
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode != 0 or not output.is_file():
+        raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
+
+
+def render_cover(
+    project_dir: Path,
+    output: Path,
+    platform_id: str,
+    timestamp: float,
+    title: str,
+) -> None:
+    manifest = read_json(project_dir / "project.json", {}) or {}
+    state = read_json(project_dir / "working/editor_state.json", {}) or {}
+    preset = PLATFORM_PRESETS[platform_id]
+    width = even(int(preset["cover_width"]))
+    height = even(int(preset["cover_height"]))
+    source = project_dir / str(manifest.get("source", {}).get("staged_path", ""))
+    if not source.is_file():
+        raise ValueError(f"source media missing: {source}")
+    style = dict(state.get("caption_defaults") or {})
+    style.update(
+        {
+            "font_size": max(34, int(width * 0.065)),
+            "x": 50,
+            "y": 68,
+            "max_width": 84,
+            "box": True,
+            "box_color": "#201b17",
+        }
+    )
+    text_dir = project_dir / "working/render_text"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    text_file = text_dir / "cover.txt"
+    text_file.write_text(wrap_overlay_text(title, width, style, 1.0), encoding="utf-8")
+    overlay = {
+        "type": "title",
+        "start": 0,
+        "end": 1,
+        "text": title,
+        "style": style,
+    }
+    filters = [
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},setsar=1[v0]"
+    ]
+    if title.strip():
+        filters.append(text_filter("v0", "v1", overlay, width, height, 1.0, font_path(), text_file))
+        final_label = "v1"
+    else:
+        final_label = "v0"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg_path(),
+        "-y",
+        "-ss",
+        f"{max(0.0, timestamp):.3f}",
+        "-i",
+        str(source),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        f"[{final_label}]",
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        str(output),
+    ]
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode != 0 or not output.is_file():
+        raise RuntimeError((result.stderr or result.stdout or "cover render failed")[-5000:])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-dir", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--quality", choices=("preview", "final"), default="preview")
+    parser.add_argument("--cover", action="store_true")
+    parser.add_argument("--platform", choices=tuple(PLATFORM_PRESETS), default="instagram-reels")
+    parser.add_argument("--cover-time", type=float, default=0.0)
+    parser.add_argument("--cover-text", default="")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    try:
+        if args.cover:
+            render_cover(project_dir, output, args.platform, args.cover_time, args.cover_text)
+        else:
+            render_project(project_dir, output, args.quality)
+    except (ValueError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"ok": True, "output": str(output)}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

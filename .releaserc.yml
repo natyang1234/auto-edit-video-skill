@@ -1,0 +1,19 @@
+version:
+  file: VERSION
+
+changelog:
+  files:
+    - path: CHANGELOG.md
+      lang: en
+
+commit:
+  message: "chore: release v{version}"
+
+tag:
+  prefix: v
+  sign: false
+
+include:
+  - README.md
+  - README.zh-TW.md
+  - LICENSE
