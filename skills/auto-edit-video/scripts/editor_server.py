@@ -39,6 +39,14 @@ from visual_quality import (
     visual_quality_errors,
     visual_quality_report,
 )
+from template_catalog import (
+    cutout_capability,
+    default_video_template_state,
+    public_template_catalog,
+    template_readiness_errors,
+    upgrade_video_template_state,
+    validate_video_template_state,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -259,6 +267,7 @@ def editor_state_revision(state: dict[str, Any]) -> str:
             for key in ("platform_id", "width", "height", "fps", "fit")
         },
         "director_style": state.get("director_style"),
+        "video_template": state.get("video_template"),
         "source_sha256": state.get("source_sha256"),
         "highlight_plan_revision": state.get("highlight_plan_revision"),
         "highlights": state.get("highlights"),
@@ -574,11 +583,20 @@ def project_entry_path(project_dir: Path, relative: str) -> Path:
 def referenced_asset_digests(project_dir: Path, state: dict[str, Any]) -> dict[str, str]:
     """Hash every renderable user asset referenced by the editor state."""
     digests: dict[str, str] = {}
+    sources: list[str] = []
     for overlay in state.get("overlays", []):
         if not isinstance(overlay, dict) or overlay.get("type") not in {"image", "gif", "video"}:
             continue
         source = str(overlay.get("source", ""))
-        if not source or source in digests:
+        if source:
+            sources.append(source)
+    video_template = state.get("video_template")
+    if isinstance(video_template, dict):
+        background = video_template.get("background")
+        if isinstance(background, dict) and background.get("source"):
+            sources.append(str(background["source"]))
+    for source in sources:
+        if source in digests:
             continue
         entry = project_dir / Path(source)
         if entry.is_symlink():
@@ -1053,6 +1071,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         "director_style": director_id,
         "visual_quality_mode": "designed",
         "graphic_package_style": "craft-stack",
+        "video_template": default_video_template_state(),
         "editing_brief": str(plan_configuration.get("editing_brief", ""))[:2000],
         "caption_defaults": caption_style,
         "overlays": overlays,
@@ -1106,6 +1125,8 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
             errors.append("canvas fit must be cover or contain")
     if state.get("director_style") not in DIRECTOR_PRESETS:
         errors.append("director_style is not supported")
+    if state.get("video_template") is not None:
+        errors.extend(validate_video_template_state(state.get("video_template")))
     if state.get("visual_quality_mode", "basic") not in {"basic", "designed"}:
         errors.append("visual_quality_mode must be basic or designed")
     editing_brief = state.get("editing_brief", "")
@@ -1530,6 +1551,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 state = default_editor_state(project, manifest)
             else:
                 upgraded = upgrade_editor_state_layout_effects(project, state)
+                upgraded = upgrade_video_template_state(state) or upgraded
                 state["asset_digests"] = referenced_asset_digests(project, state)
                 revision = editor_state_revision(state)
                 if upgraded or state.get("revision") != revision:
@@ -1541,6 +1563,14 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "state": state,
                 "platform_presets": PLATFORM_PRESETS,
                 "director_presets": DIRECTOR_PRESETS,
+                "video_templates": public_template_catalog(),
+                "template_capabilities": {
+                    "cutout": {
+                        key: value
+                        for key, value in cutout_capability().items()
+                        if key not in {"python", "model_path"}
+                    }
+                },
                 "voice_catalog": self.server.voice_catalog,
                 "edit_candidates": read_json(project / "working/edit_candidates.json", {"items": []}),
                 "edit_decisions": read_json(project / "working/edit_decisions.json", {"items": []}),
@@ -1661,6 +1691,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
                 state["source_sha256"] = manifest.get("source", {}).get("sha256")
                 state["highlight_plan_revision"] = plan.get("plan_revision")
+                upgrade_video_template_state(state)
                 state["project_dir"] = str(self.server.project_dir)
                 errors = validate_editor_state(state, duration)
                 state.pop("project_dir", None)
@@ -2185,6 +2216,30 @@ class EditorHandler(BaseHTTPRequestHandler):
                     status=409,
                 )
                 return
+            template_state = state.get("video_template")
+            if isinstance(template_state, dict):
+                readiness = template_readiness_errors(template_state)
+                if readiness:
+                    self.send_json(
+                        {"ok": False, "error": "; ".join(readiness)},
+                        status=409,
+                    )
+                    return
+                template_id = str(template_state.get("id") or "")
+                if template_id.startswith("cutout-"):
+                    capability = cutout_capability()
+                    if not capability.get("available"):
+                        self.send_json(
+                            {
+                                "ok": False,
+                                "error": str(
+                                    capability.get("reason")
+                                    or "local subject cutout is unavailable"
+                                ),
+                            },
+                            status=409,
+                        )
+                        return
             highlights = state.get("highlights", []) if isinstance(state.get("highlights"), list) else []
             clip_id = str(body.get("clip_id") or state.get("active_highlight_id") or "")
             clip = next(

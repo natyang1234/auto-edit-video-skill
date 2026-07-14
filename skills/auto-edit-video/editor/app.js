@@ -14,6 +14,7 @@ let highlightSegments = [];
 let stateDirty = false;
 let selectedEffectSpanId = null;
 let effectCreationMode = false;
+let activeTemplateGroup = "fixed";
 
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
@@ -37,6 +38,16 @@ const deepCopy = (value) => JSON.parse(JSON.stringify(value));
 function cacheElements() {
   [
     "project-name", "platform-select", "director-select", "save-state", "save-button",
+    "template-select", "template-group-tabs", "template-grid", "template-controls",
+    "template-name", "template-description", "template-motion-chip", "frame-controls",
+    "template-frame-x", "template-frame-x-output", "template-frame-y", "template-frame-y-output",
+    "template-frame-width", "template-frame-width-output", "template-frame-height", "template-frame-height-output",
+    "subject-controls", "template-subject-x", "template-subject-x-output",
+    "template-subject-y", "template-subject-y-output", "template-subject-scale", "template-subject-scale-output",
+    "background-controls", "template-background-color-row", "template-background-color",
+    "template-background-fit-row", "template-background-fit",
+    "template-background-button", "template-background-input", "template-background-status",
+    "template-capability-note", "template-background-image", "template-background-video",
     "render-button", "source-file-name", "source-file-detail", "source-preview-button",
     "highlight-count", "highlight-list", "editing-brief", "director-grid", "candidate-count",
     "highlight-editor", "highlight-title", "highlight-start", "highlight-end", "replan-highlights",
@@ -166,6 +177,7 @@ function undo() {
   }
   state = history.pop();
   selectedOverlayId = state.review?.selected_overlay_id || null;
+  activeTemplateGroup = projectPayload.video_templates?.[state.video_template?.id]?.group || "fixed";
   markDirty("已撤銷上一個變更");
   renderAll();
 }
@@ -249,8 +261,20 @@ function populatePresets() {
     option.title = preset.description;
     elements["director-select"].append(option);
   });
+  elements["template-select"].replaceChildren();
+  Object.entries(projectPayload.video_templates || {}).forEach(([id, preset]) => {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = preset.label;
+    option.disabled = preset.available === false;
+    elements["template-select"].append(option);
+  });
   elements["platform-select"].value = state.canvas.platform_id;
   elements["director-select"].value = state.director_style;
+  const template = projectPayload.video_templates?.[state.video_template?.id];
+  activeTemplateGroup = template?.group || "fixed";
+  elements["template-select"].value = state.video_template?.id || "dynamic-craft";
+  renderTemplatePicker();
   renderDirectorCards();
 }
 
@@ -294,11 +318,177 @@ function renderDirectorCards() {
     });
 }
 
+function templateStateDefaults(templateId) {
+  const preset = projectPayload.video_templates[templateId];
+  return {
+    id: templateId,
+    frame: deepCopy(preset.frame_defaults),
+    subject: { x: 50, y: 54, scale: 1, feather: 2, mask_stride: 3 },
+    background: { color: "#17251d", source: null, fit: "cover", blur: 0 },
+  };
+}
+
+function selectVideoTemplate(templateId) {
+  const preset = projectPayload.video_templates?.[templateId];
+  if (!preset || preset.available === false) {
+    showToast(preset?.unavailable_reason || "這個模板目前不可用", "error");
+    return;
+  }
+  pushHistory();
+  const previous = state.video_template || {};
+  const next = templateStateDefaults(templateId);
+  if (previous.subject) next.subject = { ...next.subject, ...deepCopy(previous.subject) };
+  if (previous.background?.color) next.background.color = previous.background.color;
+  if (previous.background?.fit) next.background.fit = previous.background.fit;
+  state.video_template = next;
+  activeTemplateGroup = preset.group;
+  elements["template-select"].value = templateId;
+  renderTemplatePicker();
+  applyCanvas();
+  markDirty(`已套用「${preset.label}」畫面模板`);
+  showToast(`畫面模板已改為「${preset.label}」`, "success");
+}
+
+function renderTemplatePicker() {
+  const catalog = projectPayload.video_templates || {};
+  const currentId = state.video_template?.id || "dynamic-craft";
+  const current = catalog[currentId];
+  if (!current) return;
+  elements["template-select"].value = currentId;
+  elements["template-grid"].replaceChildren();
+  elements["template-group-tabs"].querySelectorAll("[data-template-group]").forEach((button) => {
+    const selected = button.dataset.templateGroup === activeTemplateGroup;
+    button.setAttribute("aria-selected", String(selected));
+    button.classList.toggle("is-selected", selected);
+  });
+  Object.entries(catalog)
+    .filter(([, preset]) => preset.group === activeTemplateGroup)
+    .forEach(([id, preset]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `template-card${id === currentId ? " is-selected" : ""}`;
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", String(id === currentId));
+      button.disabled = preset.available === false;
+      const motion = preset.camera_motion === "none" ? "固定" : preset.camera_motion === "punch" ? "推近" : "重構";
+      const marker = document.createElement("span");
+      marker.className = "template-card-marker";
+      marker.textContent = preset.subject_mode === "cutout" ? "人" : motion.slice(0, 1);
+      const copy = document.createElement("span");
+      copy.innerHTML = `<strong></strong><small></small>`;
+      copy.querySelector("strong").textContent = preset.short_label || preset.label;
+      copy.querySelector("small").textContent = preset.available === false ? "本機功能未就緒" : `${motion}鏡位`;
+      button.title = preset.description;
+      button.append(marker, copy);
+      button.addEventListener("click", () => selectVideoTemplate(id));
+      elements["template-grid"].append(button);
+    });
+
+  elements["template-name"].textContent = current.label;
+  elements["template-description"].textContent = current.description;
+  const motionLabel = current.camera_motion === "none" ? "固定鏡位" : current.camera_motion === "punch" ? "克制推近" : "動態重構";
+  elements["template-motion-chip"].textContent = motionLabel;
+  elements["template-motion-chip"].dataset.motion = current.camera_motion;
+
+  const frame = state.video_template.frame;
+  [["x", "%"], ["y", "%"], ["width", "%"], ["height", "%"]].forEach(([key, suffix]) => {
+    const input = elements[`template-frame-${key}`];
+    const output = elements[`template-frame-${key}-output`];
+    input.value = String(frame[key]);
+    output.textContent = `${Math.round(Number(frame[key]))}${suffix}`;
+  });
+  const isCutout = current.subject_mode === "cutout";
+  elements["frame-controls"].hidden = isCutout;
+  elements["subject-controls"].hidden = !isCutout;
+  elements["background-controls"].hidden = !isCutout;
+  const subject = state.video_template.subject;
+  ["x", "y"].forEach((key) => {
+    elements[`template-subject-${key}`].value = String(subject[key]);
+    elements[`template-subject-${key}-output`].textContent = `${Math.round(Number(subject[key]))}%`;
+  });
+  elements["template-subject-scale"].value = String(subject.scale);
+  elements["template-subject-scale-output"].textContent = `${Math.round(Number(subject.scale) * 100)}%`;
+  const background = state.video_template.background;
+  elements["template-background-color"].value = background.color || "#17251d";
+  const needsAsset = ["image", "video"].includes(current.background_mode);
+  elements["template-background-color-row"].hidden = current.background_mode !== "solid";
+  elements["template-background-fit-row"].hidden = !needsAsset;
+  elements["template-background-fit"].value = background.fit || "cover";
+  elements["template-background-button"].hidden = !needsAsset;
+  elements["template-background-status"].hidden = !needsAsset;
+  elements["template-background-button"].textContent = current.background_mode === "video" ? "選擇背景影片" : "選擇背景圖片";
+  elements["template-background-input"].accept = current.background_mode === "video"
+    ? "video/mp4,video/quicktime"
+    : "image/png,image/jpeg,image/webp";
+  const source = String(background.source || "");
+  elements["template-background-status"].textContent = source
+    ? `已選：${source.split("/").pop()}`
+    : "尚未選擇背景素材；輸出會先擋下來";
+  const capability = projectPayload.template_capabilities?.cutout || {};
+  elements["template-capability-note"].hidden = !isCutout;
+  elements["template-capability-note"].classList.toggle("is-error", isCutout && !capability.available);
+  if (isCutout) {
+    elements["template-capability-note"].textContent = capability.available
+      ? "本機人物去背模型已就緒。處理可能較慢；畫布先顯示人物定位預覽，產生預覽後會看到真實去背邊緣。"
+      : `人物去背不可用：${capability.reason || "本機引擎未就緒"}`;
+  }
+}
+
+function templateAssetUrl(source) {
+  const name = String(source || "").split("/").pop();
+  return name ? `/assets/${encodeURIComponent(name)}` : "";
+}
+
+function applyTemplatePreview() {
+  const template = projectPayload.video_templates?.[state.video_template?.id];
+  if (!template) return;
+  const video = elements["preview-video"];
+  const stage = elements["stage-frame"];
+  const image = elements["template-background-image"];
+  const backgroundVideo = elements["template-background-video"];
+  const frame = state.video_template.frame;
+  const background = state.video_template.background;
+  image.hidden = true;
+  backgroundVideo.hidden = true;
+  image.style.objectFit = background.fit === "contain" ? "contain" : "cover";
+  backgroundVideo.style.objectFit = background.fit === "contain" ? "contain" : "cover";
+  stage.classList.toggle("is-cutout-guide", template.subject_mode === "cutout");
+  stage.style.setProperty("--template-background", background.color || "#17251d");
+
+  if (template.subject_mode === "cutout") {
+    const source = templateAssetUrl(background.source);
+    if (template.background_mode === "image" && source) {
+      image.src = source;
+      image.hidden = false;
+    } else if (template.background_mode === "video" && source) {
+      if (backgroundVideo.getAttribute("src") !== source) backgroundVideo.src = source;
+      backgroundVideo.hidden = false;
+      backgroundVideo.play().catch(() => {});
+    }
+    const subject = state.video_template.subject;
+    video.style.inset = "auto";
+    video.style.left = `${subject.x}%`;
+    video.style.top = `${subject.y}%`;
+    video.style.width = `${Math.min(140, 72 * Number(subject.scale))}%`;
+    video.style.height = `${Math.min(140, 72 * Number(subject.scale))}%`;
+    video.style.transform = "translate(-50%, -50%)";
+    video.style.objectFit = "contain";
+    return;
+  }
+  video.style.inset = "auto";
+  video.style.left = `${Number(frame.x) - Number(frame.width) / 2}%`;
+  video.style.top = `${Number(frame.y) - Number(frame.height) / 2}%`;
+  video.style.width = `${frame.width}%`;
+  video.style.height = `${frame.height}%`;
+  video.style.transform = "none";
+  video.style.objectFit = frame.fit === "contain" ? "contain" : "cover";
+}
+
 function applyCanvas() {
   const preset = projectPayload.platform_presets[state.canvas.platform_id];
   const ratio = `${state.canvas.width} / ${state.canvas.height}`;
   elements["stage-frame"].style.setProperty("--canvas-ratio", ratio);
-  elements["preview-video"].style.objectFit = state.canvas.fit === "contain" ? "contain" : "cover";
+  applyTemplatePreview();
   elements["canvas-resolution"].textContent = `${state.canvas.width} × ${state.canvas.height} · ${preset.aspect}`;
   elements["safe-zone"].style.setProperty("--safe-top", `${preset.safe.top}%`);
   elements["safe-zone"].style.setProperty("--safe-right", `${preset.safe.right}%`);
@@ -1659,6 +1849,39 @@ async function uploadAsset(file) {
   }
 }
 
+async function uploadTemplateBackground(file) {
+  if (!file) return;
+  const template = projectPayload.video_templates?.[state.video_template?.id];
+  if (!template || !["image", "video"].includes(template.background_mode)) return;
+  const allowed = template.background_mode === "video"
+    ? ["video/mp4", "video/quicktime"]
+    : ["image/png", "image/jpeg", "image/webp"];
+  if (!allowed.includes(file.type)) {
+    showToast(template.background_mode === "video" ? "請選擇 MP4 或 MOV" : "請選擇 PNG、JPG 或 WEBP", "error");
+    elements["template-background-input"].value = "";
+    return;
+  }
+  elements["template-background-button"].disabled = true;
+  try {
+    const result = await request(`/api/assets?filename=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      headers: { "Content-Type": file.type },
+      body: await file.arrayBuffer(),
+    });
+    pushHistory();
+    state.video_template.background.source = result.source;
+    renderTemplatePicker();
+    applyCanvas();
+    markDirty("背景素材已加入模板");
+    showToast("背景素材已加入專案並納入輸出版本", "success");
+  } catch (error) {
+    showToast(`背景素材加入失敗：${error.message}`, "error");
+  } finally {
+    elements["template-background-button"].disabled = false;
+    elements["template-background-input"].value = "";
+  }
+}
+
 function switchInspectorTab(tab) {
   const publish = tab === "publish";
   elements["style-tab"].setAttribute("aria-selected", String(!publish));
@@ -1719,6 +1942,7 @@ function pollPipelineStatus() {
 }
 
 function renderAll() {
+  renderTemplatePicker();
   applyCanvas();
   renderCandidateList();
   renderHighlightList();
@@ -1769,6 +1993,47 @@ function bindEvents() {
     applyCanvas();
     renderPublishing();
   });
+  elements["template-group-tabs"].querySelectorAll("[data-template-group]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeTemplateGroup = button.dataset.templateGroup;
+      renderTemplatePicker();
+    });
+  });
+  elements["template-select"].addEventListener("change", () => selectVideoTemplate(elements["template-select"].value));
+  ["x", "y", "width", "height"].forEach((key) => {
+    elements[`template-frame-${key}`].addEventListener("input", () => {
+      state.video_template.frame[key] = Number(elements[`template-frame-${key}`].value);
+      elements[`template-frame-${key}-output`].textContent = `${Math.round(state.video_template.frame[key])}%`;
+      applyCanvas();
+      markDirty("影片框位置已變更");
+    });
+  });
+  ["x", "y"].forEach((key) => {
+    elements[`template-subject-${key}`].addEventListener("input", () => {
+      state.video_template.subject[key] = Number(elements[`template-subject-${key}`].value);
+      elements[`template-subject-${key}-output`].textContent = `${Math.round(state.video_template.subject[key])}%`;
+      applyCanvas();
+      markDirty("人物位置已變更");
+    });
+  });
+  elements["template-subject-scale"].addEventListener("input", () => {
+    state.video_template.subject.scale = Number(elements["template-subject-scale"].value);
+    elements["template-subject-scale-output"].textContent = `${Math.round(state.video_template.subject.scale * 100)}%`;
+    applyCanvas();
+    markDirty("人物大小已變更");
+  });
+  elements["template-background-color"].addEventListener("input", () => {
+    state.video_template.background.color = elements["template-background-color"].value;
+    applyCanvas();
+    markDirty("去背背景顏色已變更");
+  });
+  elements["template-background-fit"].addEventListener("change", () => {
+    state.video_template.background.fit = elements["template-background-fit"].value;
+    applyCanvas();
+    markDirty("背景填滿方式已變更");
+  });
+  elements["template-background-button"].addEventListener("click", () => elements["template-background-input"].click());
+  elements["template-background-input"].addEventListener("change", () => uploadTemplateBackground(elements["template-background-input"].files[0]));
   elements["director-select"].addEventListener("change", () => {
     pushHistory();
     const id = elements["director-select"].value;

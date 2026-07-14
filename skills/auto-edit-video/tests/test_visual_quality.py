@@ -15,6 +15,7 @@ from graphic_package import (  # noqa: E402
     package_captions,
     package_cards,
 )
+from template_catalog import default_video_template_state  # noqa: E402
 from visual_quality import (  # noqa: E402
     build_highlight_design_overlays,
     overlays_for_clip,
@@ -179,6 +180,58 @@ class HighlightVisualPlanningTests(unittest.TestCase):
 
 
 class GraphicPackageTemplateTests(unittest.TestCase):
+    def template_cards(self) -> list[dict[str, object]]:
+        return [
+            {
+                "id": f"card-{index}",
+                "role": role,
+                "start": index * 2.0,
+                "end": index * 2.0 + 1.5,
+                "kicker": "重點",
+                "text": "內容",
+                "detail": "說明",
+            }
+            for index, role in enumerate(("hook", "concept", "rule", "memory", "recap"))
+        ]
+
+    def test_fixed_templates_never_emit_source_zoom_or_reframe_tweens(self) -> None:
+        for template_id in ("fixed-full", "fixed-stage", "fixed-stack"):
+            with self.subTest(template_id=template_id):
+                template = default_video_template_state(template_id)
+                document = build_composition_html(
+                    self.template_cards(), 12.0, "teacher-punch", template_state=template
+                )
+                self.assertIn(f'data-template-id="{template_id}"', document)
+                self.assertIn('data-camera-motion="none"', document)
+                self.assertNotIn("tl.to('#video-wrap'", document)
+
+    def test_dynamic_templates_emit_only_their_declared_camera_motion(self) -> None:
+        craft = build_composition_html(
+            self.template_cards(),
+            12.0,
+            "teacher-punch",
+            template_state=default_video_template_state("dynamic-craft"),
+        )
+        punch = build_composition_html(
+            self.template_cards(),
+            12.0,
+            "teacher-punch",
+            template_state=default_video_template_state("dynamic-punch"),
+        )
+        self.assertIn('data-camera-motion="reframe"', craft)
+        self.assertIn("tl.to('#video-wrap'", craft)
+        self.assertIn('data-camera-motion="punch"', punch)
+        self.assertIn("scale:1.06", punch)
+
+    def test_cutout_templates_use_full_stage_without_source_camera_motion(self) -> None:
+        template = default_video_template_state("cutout-solid")
+        document = build_composition_html(
+            self.template_cards(), 12.0, "teacher-punch", template_state=template
+        )
+        self.assertIn('data-subject-mode="cutout"', document)
+        self.assertIn('left:0px;top:0px;width:1080px;height:1920px', document)
+        self.assertNotIn("tl.to('#video-wrap'", document)
+
     def test_package_uses_five_cards_and_escapes_transcript_text(self) -> None:
         clip = {
             "id": "highlight-x",

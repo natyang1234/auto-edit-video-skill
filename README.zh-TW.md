@@ -33,6 +33,8 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 字幕可直接選取句內字詞，套用可輸出的彈出、螢光或底線效果；字幕與設計圖卡可拖曳，並可調整位置、寬度／高度。GUI 會即時提示平台安全框與同時段圖層重疊。設計模式會把字幕、重點字與圖卡烘焙進同一份 HTML／GSAP graphic package，避免預覽能調、MP4 卻落回另一套字幕 renderer。
 
+畫面模板與導演策略彼此獨立。編輯器內建 3 種固定鏡位、2 種可選動態鏡位，以及純色／專案圖片／循環影片背景共 3 種本機人物去背模板。固定模板不會輸出任何來源畫面的縮放或重新取景 tween；去背模板可調人物 X／Y／大小，最終時間軸仍使用原片音軌。瀏覽器畫布會明確標示為人物定位預覽，真實去背邊緣以輸出的預覽 MP4 為準。
+
 人工閘依序為 `destructive_edit` → `highlight_selection` → `timeline` → `final`，每一閘都綁定當下 revision。正式輸出會自動建立 frozen snapshot、SHA-256 receipt、機械 QA 與九宮格；只有目前版本通過 QA 且人工核可後才顯示下載。頁面 renderer 目前不會悄悄忽略 interior delete：若審查決定含 `delete`，正式輸出會 fail closed，必須先走 `render_cut.py`，或把該提案改為 keep。
 
 ## 平台時長預設
@@ -83,7 +85,7 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 - 可顯示中文的字型；自動偵測失敗時設定 `AUTO_EDIT_FONT=/字型/絕對路徑`。
 - 本機 Whisper 相容轉錄引擎，可產生 word timestamps。Agent 負責從輸入影片建立轉錄，不會要求使用者先準備 JSON，也不會暗中上傳原始音訊。
 
-`edge-tts`、Node.js／HyperFrames 與其他視覺技能都是選配；任何雲端配音都要先取得明確同意。
+`edge-tts`、Node.js／HyperFrames 與其他視覺技能都是選配。3 種人物去背模板另需本機 `rembg` CPU 環境與已下載的 `isnet-general-use.onnx`；缺少任一項就會停用，不會下載模型或上傳影格。任何雲端配音都要先取得明確同意。
 
 ## 安裝
 

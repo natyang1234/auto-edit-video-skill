@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.4.0 - 2026-07-14
+
+### Multi-template video composition
+
+- Separate director typography/card strategy from video framing and add three
+  fixed-camera, two dynamic-camera, and three subject-cutout templates.
+- Guarantee that fixed templates emit no source zoom/reframe tween while the
+  dynamic templates retain explicit craft-reframe or controlled-punch motion.
+- Add GUI controls for template groups, source frame X/Y/width/height, cutout
+  subject X/Y/scale, solid color, and project-owned image/video backgrounds.
+
+### Local subject cutout and safety
+
+- Add a local rembg/ISNet compositor with solid, image, and looping-video
+  backgrounds; preserve original audio through the final timeline renderer.
+- Hash template background assets into editor revisions, reject symlinks and
+  paths outside `assets/`, and fail closed when the local engine, model, or
+  required background is missing.
+- Add fixed/dynamic HTML contracts, template state migration, browser
+  round-trip coverage, compositor tests, and real fixed/cutout MP4 smoke tests.
+
 ## 1.3.0 - 2026-07-14
 
 ### Caption and layout editing

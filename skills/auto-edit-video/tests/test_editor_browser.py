@@ -148,7 +148,9 @@ class EditorBrowserSmokeTests(unittest.TestCase):
 
             page.locator("#position-x").fill("62")
             page.locator("#preview-video").evaluate(
-                "el => { el.currentTime = 0.3; el.dispatchEvent(new Event('timeupdate')); }"
+                # The reviewed full-screen hook owns 0.0–0.8s and intentionally
+                # replaces captions there; inspect the caption after that card.
+                "el => { el.currentTime = 1.0; el.dispatchEvent(new Event('timeupdate')); }"
             )
             page.locator(".preview-overlay mark.effect-highlight").first.wait_for()
             self.assertEqual(
@@ -162,6 +164,15 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             page.locator("#overlay-max-width").fill("72")
             page.locator("#card-height").fill("33")
             page.locator("#position-y").fill("44")
+            page.locator('[data-template-group="cutout"]').click()
+            cutout_card = page.locator(".template-card:has-text('純色背景')")
+            if cutout_card.is_enabled():
+                cutout_card.click()
+                self.assertTrue(page.locator("#subject-controls").is_visible())
+                page.locator("#template-subject-x").fill("61")
+                page.locator("#template-subject-scale").fill("1.25")
+                page.locator("#template-background-color").fill("#2557a7")
+                self.assertIn("定位預覽", page.locator("#template-capability-note").inner_text())
             page.screenshot(path="/private/tmp/auto-edit-gui-phase7-smoke.png", full_page=True)
 
             time.sleep(0.9)
@@ -179,6 +190,10 @@ class EditorBrowserSmokeTests(unittest.TestCase):
         self.assertEqual(hook["layout"]["width"], 72)
         self.assertEqual(hook["layout"]["height"], 33)
         self.assertEqual(hook["layout"]["y"], 44)
+        if state["video_template"]["id"] == "cutout-solid":
+            self.assertEqual(state["video_template"]["subject"]["x"], 61)
+            self.assertEqual(state["video_template"]["subject"]["scale"], 1.25)
+            self.assertEqual(state["video_template"]["background"]["color"], "#2557a7")
         self.assertEqual(console_errors, [])
 
 

@@ -77,6 +77,16 @@ title/cards/animations and licensed project assets, clip-scoped timeline
 preview, and separate clip rendering. These profiles are tested heuristic
 strategies, not five autonomous LLM agents.
 
+Director profiles control copy, captions, cards, and motion language. The
+separate video-template selector controls source framing and compositing: three
+templates are fixed (`camera_motion=none`), two opt into reframe/punch motion,
+and three use a local rembg subject mask over solid, project-owned image, or
+project-owned looping-video backgrounds. Cutout controls include subject X/Y/
+scale. Treat the browser cutout view as a positioning guide and render a preview
+MP4 to review real mask edges. Never substitute a cloud background-removal API.
+If the local rembg environment or model is absent, leave those templates
+disabled and report the missing capability.
+
 Keep the approval order:
 `destructive_edit` → `highlight_selection` → `timeline` → `final`. Every request
 uses the server-provided current revision. A final render freezes state/source/

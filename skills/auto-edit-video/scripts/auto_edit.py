@@ -25,6 +25,7 @@ from highlight_planner import (
     validate_highlight_plan,
 )
 from visual_quality import build_highlight_design_overlays
+from template_catalog import cutout_capability
 
 
 SCHEMA_VERSION = 1
@@ -118,6 +119,8 @@ PATHS = {
     "editor_server": SKILL_DIR / "scripts/editor_server.py",
     "studio_server": SKILL_DIR / "scripts/studio_server.py",
     "editor_renderer": SKILL_DIR / "scripts/render_editor_timeline.py",
+    "template_catalog": SKILL_DIR / "scripts/template_catalog.py",
+    "subject_compositor": SKILL_DIR / "scripts/subject_compositor.py",
     "editor_index": SKILL_DIR / "editor/index.html",
     "studio_index": SKILL_DIR / "editor/import.html",
     "cut_renderer": SKILL_DIR / "scripts/render_cut.py",
@@ -582,11 +585,12 @@ def preflight_payload() -> dict[str, Any]:
     rumi_has_reference = "FISH_REFERENCE_ID" in rumi_env_names or bool(
         os.environ.get("FISH_REFERENCE_ID")
     )
+    subject_cutout = cutout_capability()
     core_checks = {
         "ffmpeg": bool(commands["ffmpeg"]),
         "ffprobe": bool(commands["ffprobe"]),
         "python3": bool(commands["python3"]),
-        "page_editor": files["editor_server"] and files["editor_index"],
+        "page_editor": files["editor_server"] and files["editor_index"] and files["template_catalog"],
         "studio_import": files["studio_server"] and files["studio_index"],
         "timeline_renderer": files["editor_renderer"],
         "cut_renderer": files["cut_renderer"],
@@ -609,7 +613,8 @@ def preflight_payload() -> dict[str, Any]:
         "files": files,
         "skill_roots": [str(path) for path in _skill_roots()],
         "missing_required": [name for name, ok in core_checks.items() if not ok],
-        "missing_optional": [name for name, ok in extended_checks.items() if not ok],
+        "missing_optional": [name for name, ok in extended_checks.items() if not ok]
+        + ([] if subject_cutout.get("available") else ["local_subject_cutout"]),
         "capabilities": {
             "destructive_edit_review": True,
             "destructive_cut_render": files["cut_renderer"] and bool(commands["ffmpeg"]),
@@ -627,8 +632,14 @@ def preflight_payload() -> dict[str, Any]:
             "voice_edge": bool(commands["edge-tts"]),
             "page_editor": files["editor_server"]
             and files["editor_renderer"]
-            and files["editor_index"],
+            and files["editor_index"]
+            and files["template_catalog"],
             "studio_import": files["studio_server"] and files["studio_index"],
+            "local_subject_cutout": bool(
+                files["subject_compositor"] and subject_cutout.get("available")
+            ),
+            "subject_cutout_engine": subject_cutout.get("engine"),
+            "subject_cutout_reason": subject_cutout.get("reason"),
             "capcut": False,
         },
     }

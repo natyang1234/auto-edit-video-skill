@@ -13,6 +13,10 @@ plans, source QA, and `working/editor_state.json`.
   multitrack timeline, with vermilion actions and amber emphasis.
 - Project-scoped editing brief, selectable director cards, and quick actions for
   subtitles, emphasis text, title cards, animations, images, GIFs, and video.
+- Independent video-template catalog: three fixed-camera layouts with no source
+  transform tween, two opt-in dynamic layouts, and three local subject-cutout
+  layouts for solid, owned-image, or owned-looping-video backgrounds. Frame
+  X/Y/width/height and cutout subject X/Y/scale are editable.
 - Up to ten transcript-grounded semantic highlights with source timing,
   evidence, score, strategy, per-clip keep/reject, title/range editing, and a
   clip-scoped timeline.
@@ -86,12 +90,14 @@ non-loopback bind requires `--allow-remote` and a trusted network.
 3. Review all highlight candidates, mark at least one keep, reject the rest, and
    approve the current highlight-selection revision.
 4. Review auto emphasis/title/card layers; remove claims created from bad ASR.
-5. Pick the social canvas, inspect its safe zone and collision status, select
+5. Pick the social canvas and video template. For cutout, position the subject,
+   choose the background, and render a preview MP4 to inspect real mask edges.
+6. Inspect the safe zone and collision status, select
    any inline emphasis words, then adjust typography, positions, card size,
    motions, and licensed assets.
-6. Render and watch a versioned preview MP4 for the selected clip.
-7. Approve the current timeline revision, then render final.
-8. Inspect the full final playback and QA contact sheet. Approve final only when
+7. Render and watch a versioned preview MP4 for the selected clip.
+8. Approve the current timeline revision, then render final.
+9. Inspect the full final playback and QA contact sheet. Approve final only when
    QA is current and the output is correct; download then becomes available.
 
 Changing render-affecting state automatically invalidates affected highlight,
@@ -110,6 +116,9 @@ final approval even if the timeline did not change.
   rebinding and cross-site writes.
 - Uploads are size/type limited and recorded in `assets/provenance.json`.
 - Uploaded or generated media must still be owned/licensed and fact-checked.
+- Subject extraction uses only the detected local rembg environment and local
+  model. Background asset hashes are revision-bound; missing, changed, or
+  symlinked assets fail closed before render.
 - Cloud TTS is never invoked by opening the editor. Rumi/Edge voice generation
   remains an explicit opt-in workflow.
 - Final approval validates current output, render receipt, QA report, and
@@ -131,4 +140,7 @@ final approval even if the timeline did not change.
 - A source that already contains burned captions will show duplicate captions
   if generated caption layers remain visible. Use clean source footage for a
   production edit.
+- Burned-in source graphics may also be retained by the person mask. Use clean
+  A-roll when cutout quality matters; the browser view is positioning-only and
+  the rendered preview is the mask-quality truth.
 - CapCut is intentionally absent.

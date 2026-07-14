@@ -46,6 +46,15 @@ animations or licensed media, preview one clip, and render it separately. In
 designed mode, captions and effect spans are baked into the same HTML/GSAP
 graphic package used by the rendered MP4.
 
+Video layout is selected independently from the director profile. The editor
+ships three fixed-camera templates, two opt-in dynamic-camera templates, and
+three local subject-cutout templates for solid, project-owned image, or
+project-owned looping-video backgrounds. Fixed templates emit no source zoom or
+reframe tween. Cutout templates expose subject X/Y/scale controls and preserve
+the original source audio in the final timeline render. The canvas labels its
+browser view as a positioning preview; actual cutout edges are shown by the
+rendered preview MP4.
+
 Approvals are revision-bound and ordered:
 `destructive_edit` → `highlight_selection` → `timeline` → `final`. Final render
 automatically creates a frozen render snapshot, SHA-256 receipt, mechanical QA
@@ -105,7 +114,7 @@ This is designed for local coding agents with filesystem, Python, and FFmpeg acc
 - A CJK-capable font for Chinese subtitles. Set `AUTO_EDIT_FONT=/absolute/font/path` when auto-discovery is insufficient.
 - A local Whisper-compatible transcription engine that can produce word timestamps. The agent creates the transcript from the input video rather than asking the user for JSON or silently uploading source audio.
 
-Optional: `edge-tts`, Node.js/HyperFrames, or separately installed visual/caption skills. Cloud narration always requires explicit consent.
+Optional: `edge-tts`, Node.js/HyperFrames, or separately installed visual/caption skills. The three subject-cutout templates additionally require a local `rembg` CPU environment and an already-downloaded `isnet-general-use.onnx` model; they disable themselves when either is missing and never upload frames. Cloud narration always requires explicit consent.
 
 ## Install
 

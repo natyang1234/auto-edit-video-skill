@@ -11,13 +11,21 @@ import re
 import shutil
 import subprocess
 import uuid
+import copy
 from pathlib import Path
 from typing import Any
 
 from visual_quality import DESIGN_ROLES, overlays_for_clip
+from template_catalog import (
+    DEFAULT_VIDEO_TEMPLATE_ID,
+    VIDEO_TEMPLATES,
+    cutout_capability,
+    default_video_template_state,
+    template_readiness_errors,
+)
 
 
-TEMPLATE_VERSION = "craft-stack-v3"
+TEMPLATE_VERSION = "multi-template-v1"
 ROLE_INDEX = {role: index for index, role in enumerate(DESIGN_ROLES)}
 DEFAULT_CARD_BOUNDS = {
     "hook": (0, 0, 1080, 1920),
@@ -433,23 +441,75 @@ def _caption_lifecycle_js(caption: dict[str, Any]) -> str:
     return f'captionLifecycle("{caption_id}", {start:.4f}, {end:.4f}, "{animation}");'
 
 
+def _resolved_template_state(value: dict[str, Any] | None) -> dict[str, Any]:
+    template_id = str(value.get("id") or "") if isinstance(value, dict) else ""
+    if template_id not in VIDEO_TEMPLATES:
+        template_id = DEFAULT_VIDEO_TEMPLATE_ID
+    resolved = default_video_template_state(template_id)
+    if isinstance(value, dict):
+        for section in ("frame", "subject", "background"):
+            if isinstance(value.get(section), dict):
+                resolved[section].update(copy.deepcopy(value[section]))
+    return resolved
+
+
+def _template_frame_bounds(template_state: dict[str, Any]) -> tuple[int, int, int, int]:
+    template = VIDEO_TEMPLATES[str(template_state["id"])]
+    if template["subject_mode"] == "cutout":
+        return (0, 0, 1080, 1920)
+    frame = template_state["frame"]
+    width = round(float(frame["width"]) * 10.8)
+    height = round(float(frame["height"]) * 19.2)
+    left = round(float(frame["x"]) * 10.8 - width / 2)
+    top = round(float(frame["y"]) * 19.2 - height / 2)
+    return (left, top, width, height)
+
+
+def _template_camera_transitions(template_id: str, cards: list[dict[str, Any]]) -> str:
+    if template_id == "dynamic-craft":
+        hook, concept, rule, _memory, recap = cards
+        return f'''
+          tl.to('#video-wrap', {{x:0,y:0,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(hook['end']) - .3):.4f});
+          tl.to('#video-wrap', {{x:0,y:-315,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(concept['start']) - .25):.4f});
+          tl.to('#video-wrap', {{x:0,y:0,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(concept['end']) - .25):.4f});
+          tl.to('#video-wrap', {{x:0,y:-335,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(rule['start']) - .25):.4f});
+          tl.to('#video-wrap', {{x:0,y:0,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(rule['end']) - .25):.4f});
+          tl.to('#video-wrap', {{x:660,y:-400,scale:.34,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(recap['start']) - .3):.4f});'''
+    if template_id == "dynamic-punch":
+        _hook, concept, rule, memory, recap = cards
+        return f'''
+          tl.to('#video-wrap', {{scale:1.06,duration:.30,ease:'power2.out'}}, {max(0.0, float(concept['start'])):.4f});
+          tl.to('#video-wrap', {{scale:1,duration:.34,ease:'power2.inOut'}}, {max(0.0, float(concept['end']) - .34):.4f});
+          tl.to('#video-wrap', {{scale:1.06,duration:.30,ease:'power2.out'}}, {max(0.0, float(rule['start'])):.4f});
+          tl.to('#video-wrap', {{scale:1,duration:.34,ease:'power2.inOut'}}, {max(0.0, float(rule['end']) - .34):.4f});
+          tl.to('#video-wrap', {{scale:1.04,duration:.30,ease:'power2.out'}}, {max(0.0, float(memory['start'])):.4f});
+          tl.to('#video-wrap', {{scale:1,duration:.34,ease:'power2.inOut'}}, {max(0.0, float(recap['start']) - .34):.4f});'''
+    return ""
+
+
 def build_composition_html(
     cards: list[dict[str, Any]],
     duration: float,
     director_style: str,
     brand_label: str = "AUTO EDIT",
     captions: list[dict[str, Any]] | None = None,
+    template_state: dict[str, Any] | None = None,
 ) -> str:
     if len(cards) != 5:
         raise ValueError("graphic package composition requires exactly five cards")
+    resolved_template = _resolved_template_state(template_state)
+    template_id = str(resolved_template["id"])
+    template = VIDEO_TEMPLATES[template_id]
     hosts: list[str] = []
     washes: list[str] = []
+    wash_cards: list[dict[str, Any]] = []
+    show_scene_washes = template_id == "dynamic-craft"
     for card in cards:
         x, y, width, height = _card_bounds(card)
         hosts.append(
             f'''<div id="{card['id']}-host" class="card-host clip" data-card-id="{card['id']}" data-start="{float(card['start']):.4f}" data-duration="{float(card['end']) - float(card['start']):.4f}" data-track-index="2" style="left:{x}px;top:{y}px;width:{width}px;height:{height}px;visibility:hidden;opacity:0;">{_card_fragment(card)}</div>'''
         )
-        if card["role"] != "hook":
+        if card["role"] != "hook" and show_scene_washes:
             wash = {
                 "concept": "#f3e6ca",
                 "rule": "#b44732",
@@ -459,23 +519,28 @@ def build_composition_html(
             washes.append(
                 f'''<div id="wash-{card['id']}" class="scene-wash clip" data-start="{float(card['start']):.4f}" data-duration="{float(card['end']) - float(card['start']):.4f}" data-track-index="0" style="background:{wash};"></div>'''
             )
+            wash_cards.append(card)
     lifecycle = "\n          ".join(_lifecycle_js(card) for card in cards)
     caption_items = captions or []
     caption_hosts = "".join(_caption_fragment(caption) for caption in caption_items)
     caption_lifecycle = "\n          ".join(_caption_lifecycle_js(caption) for caption in caption_items)
     hard_washes = "\n          ".join(
         f'hardWash("wash-{card["id"]}", {float(card["start"]):.4f}, {float(card["end"]):.4f});'
-        for card in cards
-        if card["role"] != "hook"
+        for card in wash_cards
     )
-    hook, concept, rule, _memory, recap = cards
-    transitions = f'''
-          tl.to('#video-wrap', {{x:0,y:0,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(hook['end']) - .3):.4f});
-          tl.to('#video-wrap', {{x:0,y:-315,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(concept['start']) - .25):.4f});
-          tl.to('#video-wrap', {{x:0,y:0,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(concept['end']) - .25):.4f});
-          tl.to('#video-wrap', {{x:0,y:-335,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(rule['start']) - .25):.4f});
-          tl.to('#video-wrap', {{x:0,y:0,scale:1,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(rule['end']) - .25):.4f});
-          tl.to('#video-wrap', {{x:660,y:-400,scale:.34,duration:.5667,ease:'power2.inOut'}}, {max(0.0, float(recap['start']) - .3):.4f});'''
+    transitions = _template_camera_transitions(template_id, cards)
+    frame_left, frame_top, frame_width, frame_height = _template_frame_bounds(resolved_template)
+    frame_fit = str(resolved_template["frame"].get("fit") or "cover")
+    decorated = template_id in {"dynamic-craft", "fixed-stage", "fixed-stack"}
+    initial_transform = "transform:translate(660px,-400px) scale(.34);" if template_id == "dynamic-craft" else ""
+    wrapper_chrome = (
+        '<div class="photo"><video id="bg-video" class="clip" src="input-video.mp4" muted playsinline preload="auto" '
+        f'data-start="0" data-duration="{duration:.4f}" data-track-index="1"></video></div>'
+        f'<div class="photo-label">{html.escape(_safe_text(brand_label, 28) or "AUTO EDIT")} · 精華片段</div><div class="washi"></div>'
+        if decorated
+        else '<video id="bg-video" class="clip" src="input-video.mp4" muted playsinline preload="auto" '
+        f'data-start="0" data-duration="{duration:.4f}" data-track-index="1"></video>'
+    )
     label = _safe_text(brand_label, 28) or "AUTO EDIT"
     desk = {
         "teacher-punch": "LEARNING LAB",
@@ -498,8 +563,8 @@ def build_composition_html(
 #stage::before{{content:"";position:absolute;inset:0;opacity:.15;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.09) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.09) 1px,transparent 1px);background-size:54px 54px}}
 .brandline{{position:absolute;left:58px;top:70px;color:#fdf6e3;z-index:0;font:800 30px/1 "Inter","LXGW WenKai TC",sans-serif;letter-spacing:.12em}}.brandline::after{{content:"";display:block;width:170px;height:7px;margin-top:18px;background:#e9b54a;border-radius:999px}}
 .ghost-word{{position:absolute;right:-24px;top:174px;color:rgba(253,246,227,.38);font:900 118px/1 "Inter",sans-serif;letter-spacing:-.05em;transform:rotate(90deg);transform-origin:right top}}
-.scene-wash{{position:absolute;inset:0;z-index:0;visibility:hidden}}.video-wrapper{{position:absolute;left:40px;top:460px;width:1000px;height:630px;overflow:visible;z-index:1;background:#fefefe;transform:translate(660px,-400px) scale(.34);transform-origin:left top;box-shadow:0 30px 70px rgba(0,0,0,.46),0 5px 14px rgba(0,0,0,.24)}}
-.video-wrapper .photo{{position:absolute;left:18px;right:18px;top:18px;bottom:70px;overflow:hidden;background:#000}}.video-wrapper video{{width:100%;height:100%;object-fit:cover}}.video-wrapper .photo-label{{position:absolute;left:0;right:0;bottom:18px;text-align:center;color:#25231f;font:700 28px/1 "Caveat","LXGW WenKai TC",cursive}}.video-wrapper .washi{{position:absolute;top:-10px;left:18%;width:34%;height:32px;background:rgba(183,211,231,.9);box-shadow:0 4px 8px rgba(0,0,0,.18)}}
+.scene-wash{{position:absolute;inset:0;z-index:0;visibility:hidden}}.video-wrapper{{position:absolute;left:{frame_left}px;top:{frame_top}px;width:{frame_width}px;height:{frame_height}px;overflow:hidden;z-index:1;background:#000;{initial_transform}transform-origin:center center;box-shadow:0 30px 70px rgba(0,0,0,.36)}}
+.video-wrapper .photo{{position:absolute;left:18px;right:18px;top:18px;bottom:70px;overflow:hidden;background:#000}}.video-wrapper>video,.video-wrapper .photo video{{width:100%;height:100%;object-fit:{frame_fit}}}.video-wrapper .photo-label{{position:absolute;left:0;right:0;bottom:18px;text-align:center;color:#25231f;font:700 28px/1 "Caveat","LXGW WenKai TC",cursive}}.video-wrapper .washi{{position:absolute;top:-10px;left:18%;width:34%;height:32px;background:rgba(183,211,231,.9);box-shadow:0 4px 8px rgba(0,0,0,.18)}}
 .card-host{{position:absolute;overflow:hidden;pointer-events:none;z-index:2}}.card-host .card{{position:relative;width:100%;height:100%;overflow:hidden}}
 .caption-host{{position:absolute;z-index:4;width:max-content;transform:translate(-50%,-50%);pointer-events:none;text-align:center;font-family:var(--caption-font),"LXGW WenKai TC",sans-serif}}
 .caption-line{{display:inline;margin:0;color:var(--caption-color);font-size:var(--caption-size);font-weight:var(--caption-weight);line-height:1.14;letter-spacing:-.02em;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-text-stroke:var(--caption-stroke-width) var(--caption-stroke);paint-order:stroke fill;filter:drop-shadow(0 6px 10px rgba(0,0,0,.42))}}
@@ -508,7 +573,7 @@ def build_composition_html(
 .effect-highlight{{z-index:0;padding:0 .06em;color:#171713;-webkit-text-stroke:0}}
 .effect-highlight::before{{content:"";position:absolute;z-index:-1;left:-.05em;right:-.05em;top:.48em;bottom:-.02em;background:var(--effect-color);transform:rotate(-1.5deg)}}
 .effect-underline::after{{content:"";position:absolute;left:0;right:0;bottom:-.08em;height:.10em;border-radius:999px;background:var(--effect-color)}}
-</style></head><body><div id="stage" data-composition-id="talking-head-recut" data-start="0" data-duration="{duration:.4f}" data-fps="30" data-width="1080" data-height="1920"><div class="brandline">{html.escape(brand)}</div><div class="ghost-word">LESSON</div>{''.join(washes)}<div class="video-wrapper" id="video-wrap"><div class="photo"><video id="bg-video" class="clip" src="input-video.mp4" muted playsinline preload="auto" data-start="0" data-duration="{duration:.4f}" data-track-index="1"></video></div><div class="photo-label">{html.escape(label)} · 精華片段</div><div class="washi"></div></div>{''.join(hosts)}{caption_hosts}<script src="vendor/gsap.min.js"></script><script>(function(){{const tl=window.gsap.timeline({{paused:true}});function lifecycle(id,start,end){{const sel='.card-host[data-card-id="'+id+'"]';tl.set(sel,{{visibility:'visible'}},start);tl.fromTo(sel,{{opacity:0}},{{opacity:1,duration:.2667,ease:'power2.out'}},start);tl.to(sel,{{opacity:0,duration:.2667,ease:'power2.in'}},Math.max(start,end-.2667));tl.set(sel,{{visibility:'hidden'}},end)}}function hardWash(id,start,end){{const sel='#'+id;tl.set(sel,{{visibility:'visible',opacity:1}},start);tl.set(sel,{{visibility:'hidden'}},end)}}function captionLifecycle(id,start,end,motion){{const sel='#'+id+'-host';const from=motion==='slide-up'?{{opacity:0,y:34}}:motion==='pop'?{{opacity:0,scale:.86}}:{{opacity:0}};tl.set(sel,{{visibility:'visible'}},start);tl.fromTo(sel,from,{{opacity:1,y:0,scale:1,duration:.2667,ease:'power3.out'}},start);tl.fromTo(sel+' .effect-pop',{{opacity:.65,scale:.72}},{{opacity:1,scale:function(i,target){{return Number(getComputedStyle(target).getPropertyValue('--effect-scale'))||1.18}},duration:.2667,ease:'power3.out',stagger:.04}},start+.10);tl.to(sel,{{opacity:0,duration:.20,ease:'power2.in'}},Math.max(start,end-.20));tl.set(sel,{{visibility:'hidden'}},end)}}{lifecycle}{caption_lifecycle}{hard_washes}{transitions}window.__timelines=window.__timelines||{{}};window.__timelines["talking-head-recut"]=tl;}})();</script></div></body></html>'''
+</style></head><body><div id="stage" data-composition-id="talking-head-recut" data-template-id="{template_id}" data-camera-motion="{template['camera_motion']}" data-subject-mode="{template['subject_mode']}" data-start="0" data-duration="{duration:.4f}" data-fps="30" data-width="1080" data-height="1920"><div class="brandline">{html.escape(brand)}</div><div class="ghost-word">LESSON</div>{''.join(washes)}<div class="video-wrapper" id="video-wrap">{wrapper_chrome}</div>{''.join(hosts)}{caption_hosts}<script src="vendor/gsap.min.js"></script><script>(function(){{const tl=window.gsap.timeline({{paused:true}});function lifecycle(id,start,end){{const sel='.card-host[data-card-id="'+id+'"]';tl.set(sel,{{visibility:'visible'}},start);tl.fromTo(sel,{{opacity:0}},{{opacity:1,duration:.2667,ease:'power2.out'}},start);tl.to(sel,{{opacity:0,duration:.2667,ease:'power2.in'}},Math.max(start,end-.2667));tl.set(sel,{{visibility:'hidden'}},end)}}function hardWash(id,start,end){{const sel='#'+id;tl.set(sel,{{visibility:'visible',opacity:1}},start);tl.set(sel,{{visibility:'hidden'}},end)}}function captionLifecycle(id,start,end,motion){{const sel='#'+id+'-host';const from=motion==='slide-up'?{{opacity:0,y:34}}:motion==='pop'?{{opacity:0,scale:.86}}:{{opacity:0}};tl.set(sel,{{visibility:'visible'}},start);tl.fromTo(sel,from,{{opacity:1,y:0,scale:1,duration:.2667,ease:'power3.out'}},start);tl.fromTo(sel+' .effect-pop',{{opacity:.65,scale:.72}},{{opacity:1,scale:function(i,target){{return Number(getComputedStyle(target).getPropertyValue('--effect-scale'))||1.18}},duration:.2667,ease:'power3.out',stagger:.04}},start+.10);tl.to(sel,{{opacity:0,duration:.20,ease:'power2.in'}},Math.max(start,end-.20));tl.set(sel,{{visibility:'hidden'}},end)}}{lifecycle}{caption_lifecycle}{hard_washes}{transitions}window.__timelines=window.__timelines||{{}};window.__timelines["talking-head-recut"]=tl;}})();</script></div></body></html>'''
 
 
 def _source_brand(manifest: dict[str, Any]) -> str:
@@ -585,12 +650,146 @@ def _signature(
         "brand": _source_brand(manifest),
         "clip": clip,
         "director_style": state.get("director_style"),
+        "video_template": _resolved_template_state(
+            state.get("video_template") if isinstance(state.get("video_template"), dict) else None
+        ),
+        "asset_digests": state.get("asset_digests"),
         "cards": package_cards(state, clip),
         "captions": package_captions(state, clip),
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _owned_background_asset(root: Path, template_state: dict[str, Any]) -> Path | None:
+    source = template_state.get("background", {}).get("source")
+    if not source:
+        return None
+    relative = Path(str(source))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("template background must be a project-owned asset")
+    entry = root / relative
+    if entry.is_symlink():
+        raise ValueError("template background must not be a symlink")
+    asset = entry.resolve()
+    assets_root = (root / "assets").resolve()
+    if assets_root not in asset.parents or not asset.is_file():
+        raise ValueError("template background is missing or outside assets/")
+    return asset
+
+
+def _stage_input_video(
+    *,
+    root: Path,
+    source: Path,
+    output: Path,
+    clip_start: float,
+    duration: float,
+    template_state: dict[str, Any],
+    ffmpeg: str,
+) -> str:
+    template = VIDEO_TEMPLATES[str(template_state["id"])]
+    if template["subject_mode"] != "cutout":
+        command = [
+            ffmpeg,
+            "-y",
+            "-ss",
+            f"{clip_start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(source),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+        timeout = 30 * 60
+        timeout_message = "graphic source staging timed out"
+        engine = "source"
+    else:
+        readiness = template_readiness_errors(template_state)
+        if readiness:
+            raise ValueError("; ".join(readiness))
+        capability = cutout_capability()
+        if not capability.get("available"):
+            raise ValueError(str(capability.get("reason") or "local subject cutout is unavailable"))
+        background = template_state["background"]
+        subject = template_state["subject"]
+        background_asset = _owned_background_asset(root, template_state)
+        try:
+            working_size = int(os.environ.get("AUTO_EDIT_CUTOUT_WORKING_SIZE", "640"))
+        except ValueError:
+            working_size = 640
+        command = [
+            str(capability["python"]),
+            str(Path(__file__).with_name("subject_compositor.py")),
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+            "--start",
+            f"{clip_start:.4f}",
+            "--duration",
+            f"{duration:.4f}",
+            "--fps",
+            "30",
+            "--width",
+            "1080",
+            "--height",
+            "1920",
+            "--working-size",
+            str(max(320, min(960, working_size))),
+            "--model-home",
+            str(Path(str(capability["model_path"])).parent),
+            "--background-mode",
+            str(template["background_mode"]),
+            "--background-color",
+            str(background["color"]),
+            "--background-fit",
+            str(background["fit"]),
+            "--background-blur",
+            str(background["blur"]),
+            "--subject-x",
+            str(subject["x"]),
+            "--subject-y",
+            str(subject["y"]),
+            "--subject-scale",
+            str(subject["scale"]),
+            "--feather",
+            str(subject["feather"]),
+            "--mask-stride",
+            str(subject["mask_stride"]),
+        ]
+        if background_asset is not None:
+            command.extend(["--background-source", str(background_asset)])
+        timeout = 4 * 60 * 60
+        timeout_message = "local subject cutout timed out"
+        engine = "rembg-local"
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(timeout_message) from exc
+    if result.returncode != 0 or not _has_video(output):
+        detail = result.stderr or result.stdout or "graphic source staging failed"
+        raise RuntimeError(detail[-5000:])
+    return engine
 
 
 def ensure_graphic_package(
@@ -640,46 +839,25 @@ def ensure_graphic_package(
     vendor_dir.mkdir(parents=True, exist_ok=True)
     cards = package_cards(state, clip)
     captions = package_captions(state, clip)
+    template_state = _resolved_template_state(
+        state.get("video_template") if isinstance(state.get("video_template"), dict) else None
+    )
     try:
         for font in (skill_dir / "assets/fonts").glob("*.woff2"):
             shutil.copy2(font, fonts_dir / font.name)
         shutil.copy2(skill_dir / "assets/vendor/gsap.min.js", vendor_dir / "gsap.min.js")
-        try:
-            stage_result = subprocess.run(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-ss",
-                    f"{clip_start:.3f}",
-                    "-t",
-                    f"{duration:.3f}",
-                    "-i",
-                    str(source),
-                    "-an",
-                    "-c:v",
-                    "libx264",
-                    "-crf",
-                    "18",
-                    "-g",
-                    "30",
-                    "-keyint_min",
-                    "30",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                    str(public / "input-video.mp4"),
-                ],
-                text=True,
-                capture_output=True,
-                timeout=30 * 60,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("graphic source staging timed out") from exc
-        if stage_result.returncode != 0:
-            raise RuntimeError((stage_result.stderr or "graphic source staging failed")[-3000:])
+        source_engine = _stage_input_video(
+            root=root,
+            source=source,
+            output=public / "input-video.mp4",
+            clip_start=clip_start,
+            duration=duration,
+            template_state=template_state,
+            ffmpeg=ffmpeg,
+        )
         for card in cards:
             (cards_dir / f"{card['id']}.html").write_text(_card_fragment(card) + "\n", encoding="utf-8")
+        frame_left, frame_top, frame_width, frame_height = _template_frame_bounds(template_state)
         storyboard = {
             "schemaVersion": 3,
             "composition": {
@@ -695,7 +873,13 @@ def ensure_graphic_package(
                 "sourcePath": "input-video.mp4",
                 "startSec": 0,
                 "endSec": round(duration, 4),
-                "bounds": {"x": 40, "y": 460, "width": 1000, "height": 630},
+                "bounds": {
+                    "x": frame_left,
+                    "y": frame_top,
+                    "width": frame_width,
+                    "height": frame_height,
+                },
+                "templateId": template_state["id"],
             },
             "subtitles": {"enabled": bool(captions), "items": captions},
             "cards": cards,
@@ -711,6 +895,7 @@ def ensure_graphic_package(
                 str(state.get("director_style") or "teacher-punch"),
                 _source_brand(manifest),
                 captions,
+                template_state,
             ),
             encoding="utf-8",
         )
@@ -735,6 +920,8 @@ def ensure_graphic_package(
                 {
                     "schema_version": 1,
                     "template_version": TEMPLATE_VERSION,
+                    "template_id": template_state["id"],
+                    "source_engine": source_engine,
                     "signature": signature,
                     "clip_id": clip.get("id"),
                     "card_count": len(cards),

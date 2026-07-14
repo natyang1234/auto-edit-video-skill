@@ -106,6 +106,8 @@
 
         <div class="stage-zone">
           <div class="stage-frame" id="stage-frame">
+            <img id="template-background-image" class="template-background-preview" alt="" hidden>
+            <video id="template-background-video" class="template-background-preview" muted loop playsinline hidden></video>
             <video id="preview-video" preload="metadata" playsinline></video>
             <div class="overlay-layer" id="overlay-layer" aria-live="off"></div>
             <div class="safe-zone" id="safe-zone" aria-hidden="true"></div>
@@ -147,6 +149,64 @@
             <span class="sr-only">剪輯風格與重點</span>
             <textarea id="editing-brief" rows="3" maxlength="500" placeholder="例如：保留最有張力的觀點，節奏快，字幕強調結論。"></textarea>
           </label>
+
+          <section class="template-picker" aria-labelledby="template-heading">
+            <div class="director-heading">
+              <div>
+                <h3 id="template-heading">選擇畫面模板</h3>
+                <p>決定鏡位、人物與背景；不改字幕風格</p>
+              </div>
+              <span class="template-motion-chip" id="template-motion-chip">固定鏡位</span>
+            </div>
+            <select id="template-select" aria-label="選擇畫面模板" hidden></select>
+            <div class="template-group-tabs" id="template-group-tabs" role="tablist" aria-label="模板類型">
+              <button type="button" role="tab" data-template-group="fixed">固定</button>
+              <button type="button" role="tab" data-template-group="dynamic">動態</button>
+              <button type="button" role="tab" data-template-group="cutout">人物去背</button>
+            </div>
+            <div class="template-grid" id="template-grid" role="radiogroup" aria-label="畫面模板"></div>
+            <div class="template-controls" id="template-controls">
+              <div class="template-summary">
+                <strong id="template-name">固定全畫面</strong>
+                <p id="template-description"></p>
+              </div>
+              <div class="template-control-section" id="frame-controls">
+                <span class="field-label">影片框位置</span>
+                <div class="template-range-grid">
+                  <label><span>水平</span><input id="template-frame-x" type="range" min="0" max="100" step="1"><output id="template-frame-x-output">50%</output></label>
+                  <label><span>垂直</span><input id="template-frame-y" type="range" min="0" max="100" step="1"><output id="template-frame-y-output">50%</output></label>
+                  <label><span>寬度</span><input id="template-frame-width" type="range" min="5" max="100" step="1"><output id="template-frame-width-output">100%</output></label>
+                  <label><span>高度</span><input id="template-frame-height" type="range" min="5" max="100" step="1"><output id="template-frame-height-output">100%</output></label>
+                </div>
+              </div>
+              <div class="template-control-section" id="subject-controls" hidden>
+                <span class="field-label">去背人物位置</span>
+                <div class="template-range-grid">
+                  <label><span>水平</span><input id="template-subject-x" type="range" min="-25" max="125" step="1"><output id="template-subject-x-output">50%</output></label>
+                  <label><span>垂直</span><input id="template-subject-y" type="range" min="-25" max="125" step="1"><output id="template-subject-y-output">54%</output></label>
+                  <label class="range-wide"><span>人物大小</span><input id="template-subject-scale" type="range" min="0.3" max="2" step="0.05"><output id="template-subject-scale-output">100%</output></label>
+                </div>
+              </div>
+              <div class="template-control-section" id="background-controls" hidden>
+                <span class="field-label">合成背景</span>
+                <label class="template-color-row" id="template-background-color-row">
+                  <span>棚拍顏色</span>
+                  <input id="template-background-color" type="color" value="#17251d" aria-label="棚拍背景顏色">
+                </label>
+                <label class="template-select-row" id="template-background-fit-row" hidden>
+                  <span>背景填滿</span>
+                  <select id="template-background-fit" aria-label="背景填滿方式">
+                    <option value="cover">裁滿畫布</option>
+                    <option value="contain">完整顯示</option>
+                  </select>
+                </label>
+                <button class="button button-secondary full-width" id="template-background-button" type="button">選擇背景素材</button>
+                <input id="template-background-input" type="file" hidden>
+                <p class="template-background-status" id="template-background-status">尚未選擇背景素材</p>
+              </div>
+              <p class="template-capability-note" id="template-capability-note" aria-live="polite"></p>
+            </div>
+          </section>
 
           <div class="director-heading">
             <div>

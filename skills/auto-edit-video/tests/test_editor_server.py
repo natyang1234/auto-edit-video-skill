@@ -168,6 +168,10 @@ class EditorServerTests(unittest.TestCase):
             "approve-highlights",
             "editing-brief",
             "director-grid",
+            "template-grid",
+            "template-frame-x",
+            "template-subject-scale",
+            "template-background-input",
             "replan-highlights",
             "layer-list",
             "timeline-tracks",
@@ -180,6 +184,7 @@ class EditorServerTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("Hybrid editorial workstation", css)
         self.assertIn('const DIRECTOR_ORDER = ["teacher-punch", "high-energy"', script)
+        self.assertIn("function selectVideoTemplate(templateId)", script)
         self.assertIn('name: "影片", kind: "source"', script)
         self.assertIn('name: "字幕", types: ["caption"]', script)
 
@@ -257,6 +262,9 @@ class EditorServerTests(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(len(payload["platform_presets"]), 6)
         self.assertEqual(len(payload["director_presets"]), 5)
+        self.assertEqual(len(payload["video_templates"]), 8)
+        self.assertIn("cutout", payload["template_capabilities"])
+        self.assertEqual(payload["state"]["video_template"]["id"], "dynamic-craft")
         self.assertTrue(
             any(voice["voice_id"] == "rumi" for voice in payload["voice_catalog"]["voices"])
         )
@@ -481,12 +489,22 @@ class EditorServerTests(unittest.TestCase):
                 "style": {"x": 50, "y": 50, "width": 30},
             }
         )
+        state_with_asset["video_template"] = {
+            "id": "cutout-image",
+            "frame": {"x": 50, "y": 50, "width": 100, "height": 100, "fit": "cover"},
+            "subject": {"x": 50, "y": 54, "scale": 1.0, "feather": 2, "mask_stride": 3},
+            "background": {"color": "#17251d", "source": upload["source"], "fit": "cover", "blur": 0},
+        }
         status, saved = self.json_request("PUT", "/api/editor-state", state_with_asset)
         self.assertEqual(status, 200, saved)
         persisted = json.loads(
             (self.project / "working/editor_state.json").read_text(encoding="utf-8")
         )
         self.assertEqual(persisted["asset_digests"][upload["source"]], expected_digest)
+
+        original_revision = persisted["revision"]
+        persisted["video_template"]["subject"]["x"] = 61
+        self.assertNotEqual(editor_state_revision(persisted), original_revision)
 
         status, payload = self.json_request(
             "POST",
@@ -513,6 +531,26 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 415)
         self.assertFalse(any(item.name.startswith("payload-") for item in (self.project / "assets").iterdir()))
+
+    def test_cutout_asset_template_fails_closed_before_render(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["video_template"] = {
+            "id": "cutout-image",
+            "frame": {"x": 50, "y": 50, "width": 100, "height": 100, "fit": "cover"},
+            "subject": {"x": 50, "y": 54, "scale": 1.0, "feather": 2, "mask_stride": 3},
+            "background": {"color": "#17251d", "source": None, "fit": "cover", "blur": 0},
+        }
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+        status, rejected = self.json_request(
+            "POST",
+            "/api/render",
+            {"quality": "preview", "expected_revision": saved["revision"]},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("image background asset", rejected["error"])
 
     def test_timeline_approval_is_bound_to_render_state_revision(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
