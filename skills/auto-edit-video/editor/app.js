@@ -903,10 +903,13 @@ function createTextWithEmphasis(overlay) {
     const mark = document.createElement("mark");
     const effectStyle = span.style || {};
     const effect = ["pop", "highlight", "underline"].includes(effectStyle.effect) ? effectStyle.effect : "pop";
+    const fontScale = Math.min(3, Math.max(0.5, Number(effectStyle.font_scale) || 1.18));
     mark.className = `effect-word effect-${effect}`;
     mark.dataset.effect = effect;
     mark.style.setProperty("--effect-color", effectStyle.color || overlay.style?.emphasis_color || "#ffd447");
-    mark.style.setProperty("--effect-scale", String(effectStyle.font_scale || 1.18));
+    mark.style.setProperty("--effect-scale", String(fontScale));
+    mark.style.setProperty("--effect-font-size", `${fontScale}em`);
+    mark.style.setProperty("--effect-pop-from", String(0.72 / fontScale));
     mark.textContent = text.slice(span.start_char, span.end_char);
     fragment.append(mark);
     cursor = span.end_char;

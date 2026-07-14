@@ -367,6 +367,9 @@ class GraphicPackageTemplateTests(unittest.TestCase):
         self.assertIn('left:48.000%;top:74.000%;max-width:76.000%', document)
         self.assertIn("看到 ", document)
         self.assertIn(">It</span>", document)
+        self.assertIn("--effect-font-size:1.200em", document)
+        self.assertIn("font-size:var(--effect-font-size,1em)", document)
+        self.assertIn("scale:1,duration:.2667", document)
 
     def test_full_screen_hook_replaces_caption_instead_of_overlapping_it(self) -> None:
         clip = {"id": "highlight-x", "start": 10.0, "end": 20.0}

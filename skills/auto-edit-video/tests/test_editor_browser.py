@@ -159,6 +159,23 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             )
             self.assertIn("重疊", page.locator("#layout-warning").inner_text())
 
+            # A transformed inline effect must reserve its enlarged width in
+            # normal text flow. Otherwise the painted glyphs intrude into the
+            # neighbouring caption text even though DOM collision checks pass.
+            pop_word = page.locator(
+                '.preview-overlay[data-overlay-id="caption-0001"] mark.effect-pop'
+            )
+            pop_word.wait_for()
+            page.wait_for_timeout(320)
+            pop_metrics = pop_word.evaluate(
+                "el => ({layoutWidth: el.offsetWidth, visualWidth: el.getBoundingClientRect().width})"
+            )
+            self.assertLessEqual(
+                pop_metrics["visualWidth"],
+                pop_metrics["layoutWidth"] + 1,
+                pop_metrics,
+            )
+
             page.locator('.layer-row:has-text("標題卡 · It 作虛主詞")').click()
             self.assertTrue(page.locator("#card-height-row").is_visible())
             page.locator("#overlay-max-width").fill("72")

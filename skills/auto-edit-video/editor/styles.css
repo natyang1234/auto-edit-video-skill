@@ -587,6 +587,7 @@ h2 {
   position: relative;
   display: inline-block;
   color: var(--effect-color, var(--overlay-emphasis, #ffd447));
+  font-size: var(--effect-font-size, 1em);
   transform-origin: center bottom;
 }
 
@@ -648,8 +649,8 @@ h2 {
 }
 
 @keyframes effect-word-pop {
-  from { opacity: 0.65; transform: scale(0.72); }
-  to { opacity: 1; transform: scale(var(--effect-scale, 1.18)); }
+  from { opacity: 0.65; transform: scale(var(--effect-pop-from, 0.61)); }
+  to { opacity: 1; transform: scale(1); }
 }
 
 .preview-overlay.type-title,
