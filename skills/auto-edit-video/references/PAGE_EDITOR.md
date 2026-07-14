@@ -11,6 +11,15 @@ plans, source QA, and `working/editor_state.json`.
 - Chinese/English code-switch mode with an optional terminology glossary,
   conservative close-spelling repair, readable word-timed caption chunks, and
   a project-local transcript review report.
+- Default-on whole-transcript contextual calibration through loopback Ollama:
+  every caption is checked against the numbered whole-document transcript plus
+  previous/next context, each proposed patch is separately verified, and the
+  GUI reports checked/total, corrected, and
+  pending counts. Pending captions receive an amber layer marker with the
+  source → proposed wording so the existing subtitle editor can resolve them.
+  During a long local pass, pipeline status reports live checked/total progress.
+  Removing the flagged source through a manual caption edit clears that layer's
+  pending marker. Partial coverage stops highlight planning.
 - Live source-video preview with timed editable layers.
 - Hybrid editorial workstation: warm source/inspector panels, dark preview and
   multitrack timeline, with vermilion actions and amber emphasis.

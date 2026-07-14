@@ -36,7 +36,9 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 The browser sends the selected local File only to the loopback Studio. Studio
 validates it, creates an immutable owned project copy, runs local Whisper, and
-produces up to ten transcript-grounded highlight proposals. The user can choose
+reviews every readable caption with surrounding context through loopback-only
+Ollama before producing up to ten transcript-grounded highlight proposals. The
+user can choose
 short/medium/long platform targets, describe the desired edit, select one of
 five deterministic director profiles, keep or reject clips, correct caption
 text/timing, select words inside a caption for exportable pop/highlight/
@@ -60,11 +62,22 @@ boundaries where possible, write a correction audit, and may be time-scoped in t
 mechanical-warning count is never presented as semantic review; calibration
 remains `applied_needs_review` until a person checks the captions.
 
-After those corrections, Chinese transcript truth is normalized before SRT,
-GUI, emphasis, card, and highlight generation. `zh-TW`, `zh-en`, and
-auto-detected Chinese use a bundled OpenCC Taiwan phrase dictionary, while an
-explicit `zh-CN` source remains Simplified. English tokens and all word timings
-are preserved, and `working/transcript_orthography.json` records the conversion.
+The default-on contextual pass gives every target the numbered whole-document
+transcript plus its immediate neighbors, audits checked/total coverage,
+proposes the smallest exact ASR patch, and runs a second verification call. Only
+high-confidence, time-scoped patches that preserve numbers and punctuation pass
+deterministic validation. Sentence rewrites, general word choice, unlisted
+English changes, and uncertain candidates remain rejected or pending in
+`working/transcript_semantic_review.json`. Partial coverage stops downstream
+planning, and transcript text stays on loopback.
+
+After declared-rule and glossary corrections, Chinese transcript truth is
+normalized before contextual review, SRT, GUI, emphasis, card, and highlight
+generation. `zh-TW`, `zh-en`, and auto-detected Chinese use a bundled OpenCC
+Taiwan phrase dictionary, so contextual patches target Taiwan Traditional text;
+an explicit `zh-CN` source remains Simplified. English tokens and all word
+timings are preserved, and `working/transcript_orthography.json` records the
+conversion.
 
 Video layout is selected independently from the director profile. The editor
 ships three fixed-camera templates, two opt-in dynamic-camera templates, and

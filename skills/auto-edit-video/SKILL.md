@@ -67,8 +67,9 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 The Studio accepts one browser File stream over loopback, validates its size,
 extension, MIME, container, streams, duration, resolution, and frame rate, then
 atomically creates an immutable project-owned source copy. It runs local
-Whisper, low-risk edit analysis, overlay planning, and transcript-grounded
-highlight planning without setting any human approval.
+Whisper, a default-on loopback Ollama whole-transcript context pass, low-risk
+edit analysis, overlay planning, and transcript-grounded highlight planning
+without setting any human approval. Partial semantic coverage stops planning.
 
 The GUI supports platform and duration presets, a natural-language editing
 brief, five deterministic strategy profiles, up to ten sourced highlight
@@ -85,14 +86,22 @@ span, reuse Whisper word boundaries where possible, and optional manifest
 `start`/`end` scopes constrain ambiguous aliases. Auto and Chinese source modes also prompt local Whisper to retain
 incidental English spelling. Import writes both
 `working/transcript_review.json`, `working/transcript_calibration.json`, and
-`working/transcript_orthography.json`,
+`working/transcript_orthography.json`. The contextual pass writes
+`working/transcript_semantic_review.json`, checks every caption against the
+numbered whole-document transcript plus previous and next context, separately
+verifies proposed patches, applies only exact
+minimal time-scoped high-confidence corrections, and leaves uncertain wording
+pending. It never treats model confidence as approval and never sends the
+transcript beyond loopback. Import then
 bounds the prompt and excludes long glossary sentences so English hints do not
 degrade adjacent Chinese, safely repairs close spellings or split tokens, and
-creates readable caption chunks from word timings. After semantic/glossary
-correction and before any SRT, GUI, highlight, or card artifact is built,
-`zh-TW`, `zh-en`, and auto-detected Chinese transcripts are normalized with the
-vendored OpenCC `s2twp` Taiwan dictionary. Latin text and word timings remain
-unchanged. Explicit `zh-CN` is the supported opt-out.
+creates readable caption chunks from word timings. After declared-rule/glossary
+correction and before contextual review, `zh-TW`, `zh-en`, and auto-detected
+Chinese transcripts are normalized with the vendored OpenCC `s2twp` Taiwan
+dictionary. Contextual patches therefore target Taiwan Traditional text. Every
+step completes before any SRT, GUI, highlight, or card artifact is built. Latin
+text and word timings remain unchanged. Explicit `zh-CN` is the supported
+opt-out.
 
 Director profiles control copy, captions, cards, and motion language. The
 separate video-template selector controls source framing and compositing: three
@@ -143,6 +152,10 @@ python3 "$SKILL/scripts/auto_edit.py" import-whisper \
   --whisper-json /absolute/path/whisper.json \
   --srt /absolute/path/whisper.srt \
   --model base
+
+python3 "$SKILL/scripts/auto_edit.py" semantic-calibrate \
+  --manifest /absolute/path/project/project.json \
+  --model qwen2.5:7b
 
 python3 "$SKILL/scripts/auto_edit.py" analyze-edits \
   --manifest /absolute/path/project/project.json

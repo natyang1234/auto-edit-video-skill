@@ -259,6 +259,19 @@ def atomic_write_json(path: Path, payload: Any) -> None:
 def editor_state_revision(state: dict[str, Any]) -> str:
     """Hash only fields that can change the rendered video."""
     canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
+    raw_revision_overlays = state.get("overlays", [])
+    if not isinstance(raw_revision_overlays, list):
+        raw_revision_overlays = []
+    revision_overlays = [
+        {
+            key: value
+            for key, value in overlay.items()
+            if key != "semantic_review"
+        }
+        if isinstance(overlay, dict)
+        else overlay
+        for overlay in raw_revision_overlays
+    ]
     payload = {
         "schema_version": state.get("schema_version"),
         "project_id": state.get("project_id"),
@@ -273,7 +286,7 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         "highlights": state.get("highlights"),
         "asset_digests": state.get("asset_digests"),
         "caption_defaults": state.get("caption_defaults"),
-        "overlays": state.get("overlays"),
+        "overlays": revision_overlays,
     }
     canonical = json.dumps(
         payload,
@@ -1592,6 +1605,19 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "human_review_required": True,
                     },
                 ),
+                "transcript_semantic_review": read_json(
+                    project / "working/transcript_semantic_review.json",
+                    {
+                        "status": "not_configured",
+                        "coverage_status": "not_started",
+                        "reviewed_unit_count": 0,
+                        "total_unit_count": 0,
+                        "accepted_count": 0,
+                        "pending_count": 0,
+                        "applied_correction_count": 0,
+                        "human_review_required": True,
+                    },
+                ),
                 "highlight_plan": read_json(project / "working/highlight_plan.json", {}),
                 "pipeline_status": read_json(
                     project / "working/pipeline_status.json",
@@ -1631,16 +1657,63 @@ class EditorHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/pipeline-status":
-            self.send_json(
-                read_json(
-                    project / "working/pipeline_status.json",
-                    {
-                        "state": "not_started",
-                        "phase": "idle",
-                        "message": "這個專案尚未啟動本機自動處理。",
-                    },
-                )
+            pipeline_status = read_json(
+                project / "working/pipeline_status.json",
+                {
+                    "state": "not_started",
+                    "phase": "idle",
+                    "message": "這個專案尚未啟動本機自動處理。",
+                },
             )
+            if (
+                pipeline_status.get("state") == "running"
+                and pipeline_status.get("phase") == "semantic_calibration"
+            ):
+                semantic_progress = read_json(
+                    project / "working/transcript_semantic_review.json",
+                    {},
+                )
+                reviewed_raw = semantic_progress.get("reviewed_unit_count", 0)
+                total_raw = semantic_progress.get("total_unit_count", 0)
+                reviewed = (
+                    int(reviewed_raw)
+                    if isinstance(reviewed_raw, (int, float))
+                    and not isinstance(reviewed_raw, bool)
+                    and reviewed_raw >= 0
+                    else 0
+                )
+                total = (
+                    int(total_raw)
+                    if isinstance(total_raw, (int, float))
+                    and not isinstance(total_raw, bool)
+                    and total_raw >= 0
+                    else 0
+                )
+                if total > 0:
+                    candidate_raw = semantic_progress.get("candidate_count", 0)
+                    error_raw = semantic_progress.get("model_error_count", 0)
+                    pipeline_status["semantic_progress"] = {
+                        "reviewed_unit_count": reviewed,
+                        "total_unit_count": total,
+                        "candidate_count": (
+                            int(candidate_raw)
+                            if isinstance(candidate_raw, (int, float))
+                            and not isinstance(candidate_raw, bool)
+                            and candidate_raw >= 0
+                            else 0
+                        ),
+                        "model_error_count": (
+                            int(error_raw)
+                            if isinstance(error_raw, (int, float))
+                            and not isinstance(error_raw, bool)
+                            and error_raw >= 0
+                            else 0
+                        ),
+                    }
+                    pipeline_status["message"] = (
+                        f"正在用整份上下文逐句校準字幕… {reviewed}/{total}"
+                    )
+            self.send_json(pipeline_status)
             return
         if path == "/media/source":
             manifest = read_json(project / "project.json", {}) or {}

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,9 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parents[1]
 CLI = SKILL_DIR / "scripts/auto_edit.py"
 RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
+sys.path.insert(0, str(SKILL_DIR / "scripts"))
+
+import auto_edit  # noqa: E402
 
 
 class AutoEditVoiceTests(unittest.TestCase):
@@ -711,6 +715,226 @@ payload = {
         self.assertEqual(corrections[("音譽句", "例句")]["end"], 1.24)
         self.assertEqual(review["mechanical_issue_count"], 0)
 
+    def test_contextual_semantic_calibration_reviews_whole_transcript_and_reimports(self) -> None:
+        project = self.root / "contextual-semantic-calibration"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-TW",
+            "--contextual-semantic-calibration",
+        )
+        manifest_path = project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source"]["duration_s"] = 3.2
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (project / "working/editor_state.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_id": manifest["project_id"],
+                    "director_style": "teacher-punch",
+                    "caption_defaults": {},
+                    "overlays": [],
+                    "review": {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        whisper_json = self.root / "contextual-semantic-calibration.json"
+        source_words = [
+            {
+                "word": "這是一個英文文法教學。",
+                "start": 0.02,
+                "end": 1.00,
+                "probability": 0.97,
+            },
+            {
+                "word": "這句不要頭重小琴。",
+                "start": 1.01,
+                "end": 2.00,
+                "probability": 0.82,
+            },
+            {
+                "word": "下一句會解釋頭太大就會翻過來。",
+                "start": 2.01,
+                "end": 3.00,
+                "probability": 0.96,
+            },
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "".join(item["word"] for item in source_words),
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 3.00,
+                            "text": "".join(item["word"] for item in source_words),
+                            "words": source_words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(manifest_path),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for gate in ("destructive_edit", "highlight_selection", "timeline", "final"):
+            manifest["approvals"][gate] = {
+                "approved": True,
+                "confirmed_by": "prior-review",
+                "at": "2026-01-01T00:00:00+00:00",
+                "note": "stale transcript approval",
+            }
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        proposals = self.root / "contextual-semantic-proposals.json"
+        proposals.write_text(
+            json.dumps(
+                {
+                    "reviewed_unit_ids": [
+                        "caption-segment-0001",
+                        "caption-segment-0002",
+                        "caption-segment-0003",
+                    ],
+                    "items": [
+                        {
+                            "unit_id": "caption-segment-0002",
+                            "source": "小琴",
+                            "replacement": "腳輕",
+                            "category": "idiom",
+                            "reason": "前後文談句子失衡與頭太大會翻倒，固定成語應為頭重腳輕。",
+                            "confidence": 0.99,
+                            "verifier_decision": "accept",
+                            "verifier_confidence": 0.98,
+                        },
+                        {
+                            "unit_id": "caption-segment-0001",
+                            "source": "教學",
+                            "replacement": "課程",
+                            "category": "word_choice",
+                            "reason": "屬於一般措辭選擇，不能自動套用。",
+                            "confidence": 0.8,
+                            "verifier_decision": "uncertain",
+                            "verifier_confidence": 0.8,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "semantic-calibrate",
+            "--manifest",
+            str(manifest_path),
+            "--proposals-json",
+            str(proposals),
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        artifact = json.loads(
+            (project / "working/transcript_semantic_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        updated_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        editor_state = json.loads(
+            (project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["reviewed_units"], 3)
+        self.assertEqual(payload["total_units"], 3)
+        self.assertEqual(payload["accepted"], 1)
+        self.assertEqual(payload["applied_corrections"], 1)
+        self.assertIn("頭重腳輕", transcript["text"])
+        self.assertNotIn("頭重小琴", transcript["text"])
+        corrected_word = next(
+            item for item in transcript["words"] if "頭重腳輕" in item["text"]
+        )
+        self.assertEqual((corrected_word["start"], corrected_word["end"]), (1.01, 2.00))
+        source_srt = (project / "subtitles/source.srt").read_text(encoding="utf-8")
+        self.assertIn("頭重腳輕", source_srt)
+        editor_text = " ".join(
+            str(item.get("text", "")) for item in editor_state.get("overlays", [])
+        )
+        self.assertIn("頭重腳輕", editor_text)
+        self.assertEqual(artifact["status"], "complete_needs_review")
+        self.assertEqual(artifact["coverage_status"], "complete")
+        self.assertEqual(artifact["accepted_count"], 1)
+        self.assertEqual(artifact["pending_count"], 1)
+        self.assertEqual(artifact["applied_correction_count"], 1)
+        pending_caption = next(
+            item
+            for item in editor_state["overlays"]
+            if item.get("semantic_review", {}).get("status") == "pending"
+        )
+        self.assertEqual(
+            pending_caption["semantic_review"]["candidates"][0]["source"],
+            "教學",
+        )
+        self.assertEqual(
+            updated_manifest["transcription"]["contextual_semantic_coverage_status"],
+            "complete",
+        )
+        for gate in ("destructive_edit", "highlight_selection", "timeline", "final"):
+            self.assertFalse(updated_manifest["approvals"][gate]["approved"])
+
+        followup_proposals = self.root / "contextual-semantic-followup.json"
+        followup_proposals.write_text(
+            json.dumps(
+                {
+                    "reviewed_unit_ids": [
+                        "caption-segment-0001",
+                        "caption-segment-0002",
+                        "caption-segment-0003",
+                    ],
+                    "items": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli(
+            "semantic-calibrate",
+            "--manifest",
+            str(manifest_path),
+            "--proposals-json",
+            str(followup_proposals),
+        )
+        followup_artifact = json.loads(
+            (project / "working/transcript_semantic_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(followup_artifact["accepted_count"], 1)
+        self.assertEqual(followup_artifact["pending_count"], 1)
+
     def test_whisper_import_normalizes_chinese_to_taiwan_traditional(self) -> None:
         project = self.root / "taiwan-traditional-normalization"
         self.run_cli(
@@ -927,6 +1151,42 @@ payload = {
         self.assertIn("cigarette", canonical_srt)
         self.assertIn("good grades", canonical_srt)
         self.assertNotIn("sigarette", canonical_srt)
+
+    def test_glossary_does_not_replace_an_exact_term_with_a_similar_term(self) -> None:
+        data = {
+            "segments": [
+                {
+                    "text": "It is bad for you to smoke a cigar",
+                    "words": [
+                        {"word": "It", "start": 0.0, "end": 0.2},
+                        {"word": " is", "start": 0.2, "end": 0.4},
+                        {"word": " bad", "start": 0.4, "end": 0.6},
+                        {"word": " for", "start": 0.6, "end": 0.8},
+                        {"word": " you", "start": 0.8, "end": 1.0},
+                        {"word": " to", "start": 1.0, "end": 1.2},
+                        {"word": " smoke", "start": 1.2, "end": 1.4},
+                        {"word": " a", "start": 1.4, "end": 1.6},
+                        {"word": " cigar", "start": 1.6, "end": 1.8},
+                    ],
+                }
+            ]
+        }
+
+        corrections = auto_edit.apply_glossary_corrections(
+            data,
+            [
+                "cigar",
+                "cigarette",
+                "It is bad for you to smoke a cigar",
+                "It is bad for you to smoke a cigarette",
+            ],
+        )
+
+        self.assertEqual(corrections, [])
+        self.assertEqual(
+            data["segments"][0]["text"],
+            "It is bad for you to smoke a cigar",
+        )
 
     def test_glossary_repairs_split_first_word_in_multiword_phrase(self) -> None:
         project = self.root / "mixed-language-split-phrase"

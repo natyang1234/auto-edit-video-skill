@@ -121,6 +121,13 @@
           <input id="import-transcription-calibration" type="text" maxlength="2400" placeholder="例如：複數=富數；It is=意思；例句=音譽句">
           <small>格式為「正確寫法=可能誤字」，兩邊可不同長度，多個誤字用 | 分隔；校準會保留來源時間範圍並留下稽核紀錄。</small>
         </label>
+        <div class="import-semantic-option">
+          <label>
+            <input id="import-contextual-semantic" type="checkbox" checked>
+            <span>全文上下文語意校準（本機）</span>
+          </label>
+          <small>逐句參照前後文檢查整份字幕；高信心錯字才自動套用，其餘保留為待確認，不會上傳逐字稿。</small>
+        </div>
         <label>
           <span>想強調的風格與重點（選填）</span>
           <textarea id="import-brief" maxlength="2000" rows="4" placeholder="例如：保留 Crystal 談創業失敗與轉折的段落，節奏俐落但不要過度聳動。"></textarea>

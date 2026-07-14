@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.7.0 - 2026-07-14
+
+### Whole-transcript contextual semantic calibration
+
+- Add a loopback-only Ollama pass that reviews every readable caption with the
+  numbered whole-document transcript plus bounded previous/next context, then
+  sends each proposed ASR patch through a separate verification pass. Coverage
+  is derived from the transcript rather than trusted from model output.
+- Apply only exact, time-scoped, high-confidence minimal patches. Deterministic
+  guards reject sentence rewrites, unchanged context wrapped around a change,
+  punctuation or number changes, unlisted English changes, overlapping edits,
+  cross-caption duplicate characters, and verifier rejections; general
+  word-choice edits remain pending.
+- Preserve exact glossary words and full phrases before fuzzy matching so a
+  valid `cigar` example cannot be overwritten by the similar `cigarette`
+  example; safely scope zero-duration Whisper words with a bounded epsilon.
+- Write `working/transcript_semantic_review.json` with complete/partial
+  coverage, accepted/pending/rejected proposals, active rules, model errors,
+  and actual applied correction counts. Re-import canonical SRT and GUI
+  captions from immutable Whisper output and invalidate all transcript-bound
+  approvals after accepted corrections.
+- Enable the local whole-context pass by default in new Studio imports, stop
+  planning when coverage is partial, and show checked/total, corrected, and
+  pending counts in the editor instead of treating zero mechanical warnings as
+  semantic completion.
+- Use a 16K local context window for the numbered document, cap generated JSON
+  to 1,536 tokens per call, persist per-batch progress, and expose live
+  checked/total progress through the Studio pipeline endpoint.
+
 ## 1.6.2 - 2026-07-14
 
 ### Taiwan Traditional subtitle normalization

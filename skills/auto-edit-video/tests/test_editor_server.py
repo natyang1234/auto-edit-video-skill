@@ -33,6 +33,28 @@ from render_editor_timeline import build_render_command, text_filter  # noqa: E4
 
 
 class CaptionEffectModelTests(unittest.TestCase):
+    def test_semantic_review_metadata_does_not_change_render_revision(self) -> None:
+        state = {
+            "schema_version": 1,
+            "project_id": "revision-test",
+            "overlays": [
+                {
+                    "id": "caption-1",
+                    "type": "caption",
+                    "text": "字幕",
+                    "start": 0.0,
+                    "end": 1.0,
+                }
+            ],
+        }
+        original = editor_state_revision(state)
+        state["overlays"][0]["semantic_review"] = {
+            "status": "pending",
+            "candidates": [{"source": "字暮", "replacement": "字幕"}],
+        }
+
+        self.assertEqual(editor_state_revision(state), original)
+
     def test_highlight_copy_proposes_bounded_editable_caption_keywords(self) -> None:
         keywords = extract_effect_keywords(
             [
@@ -119,6 +141,19 @@ class EditorServerTests(unittest.TestCase):
                     "status": "applied_needs_review",
                     "correction_count": 3,
                 },
+            },
+        )
+        self.write_json(
+            "working/transcript_semantic_review.json",
+            {
+                "status": "complete_needs_review",
+                "coverage_status": "complete",
+                "reviewed_unit_count": 1,
+                "total_unit_count": 1,
+                "accepted_count": 1,
+                "pending_count": 0,
+                "applied_correction_count": 1,
+                "human_review_required": True,
             },
         )
         self.write_json(
@@ -299,6 +334,10 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("highlight_plan", payload)
         self.assertEqual(payload["transcript_calibration"]["correction_count"], 3)
         self.assertEqual(payload["transcript_review"]["risk_status"], "review_required")
+        self.assertEqual(
+            payload["transcript_semantic_review"]["coverage_status"],
+            "complete",
+        )
         self.assertEqual(payload["pipeline_status"]["state"], "not_started")
         self.assertEqual(
             {preset["label"] for preset in payload["director_presets"].values()},
@@ -309,6 +348,33 @@ class EditorServerTests(unittest.TestCase):
             {"caption", "emphasis", "title"},
         )
         self.assertTrue((self.project / "working/editor_state.json").is_file())
+
+    def test_pipeline_status_exposes_semantic_caption_progress(self) -> None:
+        self.write_json(
+            "working/pipeline_status.json",
+            {
+                "state": "running",
+                "phase": "semantic_calibration",
+                "message": "正在校準字幕…",
+            },
+        )
+        self.write_json(
+            "working/transcript_semantic_review.json",
+            {
+                "status": "running",
+                "reviewed_unit_count": 42,
+                "total_unit_count": 116,
+                "candidate_count": 7,
+                "model_error_count": 0,
+            },
+        )
+
+        status, _headers, body = self.request("GET", "/api/pipeline-status")
+        payload = json.loads(body.decode("utf-8"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["semantic_progress"]["reviewed_unit_count"], 42)
+        self.assertIn("42/116", payload["message"])
 
     def test_state_validation_accepts_valid_effect_spans_and_rejects_stale_offsets(self) -> None:
         state = {

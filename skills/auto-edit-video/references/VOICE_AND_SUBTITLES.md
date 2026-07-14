@@ -34,13 +34,26 @@ pass is intentionally conservative: it may repair close glossary spellings and
 split English subwords, but it never turns a draft transcript into an approved
 subtitle without human review.
 
-Chinese orthography is normalized after glossary/semantic calibration and
-before transcript, SRT, GUI caption, emphasis, card, or highlight artifacts are
-written. `zh-TW`, `zh-en`, and auto-detected Chinese use the portable OpenCC
-`s2twp` Taiwan phrase dictionary. English spelling, punctuation, numbers, word
-timestamps, and source timing are preserved. Select `zh-CN` explicitly when the
-source subtitle track must remain Simplified Chinese. The auditable result is
-stored in `working/transcript_orthography.json`.
+When enabled, contextual semantic calibration runs only against loopback
+Ollama. It reviews every readable caption with the numbered whole-document
+transcript plus previous/next context, uses a second model pass to verify
+candidates, and then applies deterministic guards.
+Only exact minimal ASR corrections with safe source timing and dual confidence
+at or above the configured threshold can apply automatically. Word-choice
+rewrites, punctuation/number changes, unsupported English changes, and
+uncertain candidates remain pending or rejected. Read checked/total coverage
+from `working/transcript_semantic_review.json`; zero mechanical issues or a
+model-provided confidence value never proves completion.
+
+Chinese orthography is normalized after declared-rule/glossary correction and
+before contextual semantic review or any transcript, SRT, GUI caption,
+emphasis, card, or highlight artifact is written. `zh-TW`, `zh-en`, and
+auto-detected Chinese use the portable OpenCC `s2twp` Taiwan phrase dictionary,
+so contextual patches target Taiwan Traditional text. English spelling,
+punctuation, numbers, word timestamps, and source timing are preserved. Select
+`zh-CN` explicitly when the source subtitle track must remain Simplified
+Chinese. The auditable result is stored in
+`working/transcript_orthography.json`.
 
 ## Voice engines
 

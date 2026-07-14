@@ -109,10 +109,38 @@ function renderTranscriptStatus() {
   const calibration = projectPayload?.transcript_calibration || {};
   const review = projectPayload?.transcript_review || {};
   const semantic = review.semantic_calibration || {};
+  const contextual = projectPayload?.transcript_semantic_review
+    || review.contextual_semantic_calibration
+    || {};
+  const contextualStatus = String(contextual.status || "not_configured");
+  const reviewedUnits = Number(contextual.reviewed_unit_count || 0);
+  const totalUnits = Number(contextual.total_unit_count || 0);
+  const appliedContextual = Number(
+    contextual.applied_correction_count ?? contextual.accepted_count ?? 0,
+  );
+  const pendingContextual = Number(contextual.pending_count || 0);
   const status = String(calibration.status || semantic.status || "not_configured");
   const correctionCount = Number(calibration.correction_count || semantic.correction_count || 0);
   const mechanicalCount = Number(review.mechanical_issue_count ?? review.issue_count ?? 0);
   container.classList.remove("is-applied", "is-pending", "is-warning");
+  if (contextualStatus === "complete_needs_review") {
+    container.classList.add(pendingContextual > 0 ? "is-pending" : "is-applied");
+    elements["transcript-calibration-title"].textContent = "全文上下文語意校準已執行";
+    elements["transcript-calibration-copy"].textContent = `已逐句檢查 ${reviewedUnits}/${totalUnits}；${appliedContextual} 處已更正、${pendingContextual} 處待確認。`;
+    return;
+  }
+  if (contextualStatus === "partial_needs_review") {
+    container.classList.add("is-warning");
+    elements["transcript-calibration-title"].textContent = "全文語意校準未完成";
+    elements["transcript-calibration-copy"].textContent = `目前只檢查 ${reviewedUnits}/${totalUnits}；請完成全文覆蓋後再使用字幕。`;
+    return;
+  }
+  if (contextualStatus === "pending") {
+    container.classList.add("is-pending");
+    elements["transcript-calibration-title"].textContent = "等待全文上下文校準";
+    elements["transcript-calibration-copy"].textContent = `目前 0/${totalUnits}；尚未完成逐句語意檢查。`;
+    return;
+  }
   if (status === "applied_needs_review") {
     container.classList.add("is-applied");
     elements["transcript-calibration-title"].textContent = "字幕語義校準已套用";
@@ -849,11 +877,18 @@ function renderLayerList() {
     .forEach((overlay) => {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = `layer-row${overlay.id === selectedOverlayId ? " is-selected" : ""}`;
+      const semanticPending = overlay.type === "caption"
+        && overlay.semantic_review?.status === "pending";
+      button.className = `layer-row${overlay.id === selectedOverlayId ? " is-selected" : ""}${semanticPending ? " is-semantic-pending" : ""}`;
       const title = document.createElement("strong");
       title.textContent = `${layerLabel(overlay)} · ${overlay.text || overlay.source?.split("/").pop() || "未命名"}`;
       const timing = document.createElement("span");
-      timing.textContent = `${overlay.start.toFixed(2)}–${overlay.end.toFixed(2)}s${overlay.visible === false ? " · 已隱藏" : ""}`;
+      const candidate = overlay.semantic_review?.candidates?.[0];
+      const semanticNote = semanticPending
+        ? ` · 語意待確認${candidate ? `：${candidate.source} → ${candidate.replacement}` : ""}`
+        : "";
+      timing.textContent = `${overlay.start.toFixed(2)}–${overlay.end.toFixed(2)}s${overlay.visible === false ? " · 已隱藏" : ""}${semanticNote}`;
+      if (semanticPending) button.title = "此字幕有全文上下文校準候選，請在右側字幕欄確認。";
       button.append(title, timing);
       button.addEventListener("click", () => selectOverlay(overlay.id, true));
       elements["layer-list"].append(button);
@@ -1330,7 +1365,19 @@ function updateOverlayFromForm() {
   const designCard = Boolean(overlay.design_role);
   const position = editableLayout(overlay);
   const nextText = elements["overlay-text"].value;
-  if (nextText !== overlay.text) reconcileEffectSpans(overlay, nextText);
+  if (nextText !== overlay.text) {
+    reconcileEffectSpans(overlay, nextText);
+    if (overlay.semantic_review?.status === "pending") {
+      const unresolved = (overlay.semantic_review.candidates || [])
+        .filter((candidate) => nextText.includes(String(candidate.source || "")));
+      overlay.semantic_review = {
+        ...overlay.semantic_review,
+        status: unresolved.length ? "pending" : "resolved_manual",
+        candidates: unresolved,
+        resolved_at: unresolved.length ? null : new Date().toISOString(),
+      };
+    }
+  }
   overlay.text = nextText;
   overlay.start = Math.max(0, Number(elements["overlay-start"].value) || 0);
   overlay.end = Math.min(duration(), Math.max(overlay.start + 0.01, Number(elements["overlay-end"].value) || overlay.start + 0.01));

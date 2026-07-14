@@ -156,6 +156,7 @@ class StudioServerTests(unittest.TestCase):
         self.assertIn("導入影片", html.decode("utf-8"))
         self.assertIn('id="import-director"', html.decode("utf-8"))
         self.assertIn('id="import-brief"', html.decode("utf-8"))
+        self.assertIn('id="import-contextual-semantic"', html.decode("utf-8"))
 
         import_payload = self.create_import(
             name=self.source.name,
@@ -183,6 +184,9 @@ class StudioServerTests(unittest.TestCase):
         self.assertEqual(manifest["source"]["sha256"], self.source_hash)
         self.assertEqual(manifest["stages"]["ingest"], "complete")
         self.assertEqual(manifest["stages"]["transcribe"], "pending")
+        self.assertTrue(
+            manifest["subtitles"]["contextual_semantic_calibration"]["enabled"]
+        )
         self.assertTrue(all(not item["approved"] for item in manifest["approvals"].values()))
         stored_session = self.server.imports[str(import_payload["id"])]
         self.assertEqual(stored_session["settings"]["director_profile"], "documentary")
@@ -344,6 +348,75 @@ class StudioServerTests(unittest.TestCase):
         self.assertEqual(status["state"], "needs_review")
         self.assertEqual(status["phase"], "human_review")
         self.assertIsNone(self.server.active_pipeline_project)
+
+    def test_local_pipeline_runs_contextual_semantic_pass_before_planning(self) -> None:
+        project = self.projects_root / "semantic-pipeline-project"
+        (project / "working").mkdir(parents=True)
+        calls: list[list[str]] = []
+
+        def fake_run(_project: Path, arguments: list[str], *, timeout: int):
+            self.assertGreater(timeout, 0)
+            calls.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, "{}", "")
+
+        self.server.auto_process = True
+        with patch.object(self.server, "run_pipeline_command", side_effect=fake_run):
+            self.server.start_local_pipeline(
+                project,
+                "teacher-punch",
+                "逐句校準",
+                True,
+                "qwen2.5:7b",
+            )
+            self.server.pipeline_threads[-1].join(timeout=3)
+
+        self.assertEqual(
+            [arguments[0] for arguments in calls],
+            [
+                "transcribe-local",
+                "semantic-calibrate",
+                "analyze-edits",
+                "plan-overlays",
+                "plan-highlights",
+            ],
+        )
+        self.assertIn("qwen2.5:7b", calls[1])
+
+    def test_partial_contextual_coverage_stops_downstream_planning(self) -> None:
+        project = self.projects_root / "partial-semantic-pipeline"
+        (project / "working").mkdir(parents=True)
+        calls: list[list[str]] = []
+
+        def fake_run(_project: Path, arguments: list[str], *, timeout: int):
+            self.assertGreater(timeout, 0)
+            calls.append(arguments)
+            return subprocess.CompletedProcess(
+                arguments,
+                3 if arguments[0] == "semantic-calibrate" else 0,
+                '{"coverage_status":"partial"}',
+                "",
+            )
+
+        self.server.auto_process = True
+        with patch.object(self.server, "run_pipeline_command", side_effect=fake_run):
+            self.server.start_local_pipeline(
+                project,
+                "teacher-punch",
+                "逐句校準",
+                True,
+                "qwen2.5:7b",
+            )
+            self.server.pipeline_threads[-1].join(timeout=3)
+
+        self.assertEqual(
+            [arguments[0] for arguments in calls],
+            ["transcribe-local", "semantic-calibrate"],
+        )
+        status = json.loads(
+            (project / "working/pipeline_status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["state"], "needs_attention")
+        self.assertEqual(status["error_code"], "semantic_calibration_partial")
 
 
 if __name__ == "__main__":

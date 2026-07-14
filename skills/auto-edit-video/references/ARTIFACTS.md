@@ -17,6 +17,7 @@ PROJECT/
 ├── working/
 │   ├── transcript_words.json       # original word timings
 │   ├── transcript_calibration.json # exact homophone/spelling replacements
+│   ├── transcript_semantic_review.json # whole-context coverage and safe patches
 │   ├── transcript_orthography.json # Taiwan Traditional conversion audit
 │   ├── transcript_review.json      # mechanical issues + semantic status
 │   ├── edit_candidates.json        # machine proposals
@@ -109,14 +110,47 @@ values scope an otherwise ambiguous alias to a reviewed source interval.
 `semantic_calibration.status` and `risk_status` separately; zero mechanical
 issues must not be described as semantically clear.
 
+### `transcript_semantic_review.json`
+
+The contextual pass reviews every caption with the numbered whole-document
+transcript plus bounded previous/next context, then separately verifies every
+proposed patch. `coverage_status=complete` means
+every current caption unit was checked; it does not mean the transcript is
+human-approved. Only accepted minimal patches become time-scoped calibration
+rules. Pending wording stays visible for human confirmation, and rejected
+proposals are never applied.
+
+```json
+{
+  "schema_version": 1,
+  "status": "complete_needs_review|partial_needs_review",
+  "coverage_status": "complete|partial",
+  "provider": "ollama",
+  "model": "qwen2.5:7b",
+  "document_context_unit_count": 116,
+  "reviewed_unit_count": 116,
+  "total_unit_count": 116,
+  "accepted_count": 3,
+  "pending_count": 4,
+  "rejected_count": 7,
+  "applied_correction_count": 3,
+  "accepted": [],
+  "pending": [],
+  "rejected": [],
+  "rules": [],
+  "model_errors": [],
+  "human_review_required": true
+}
+```
+
 ### `transcript_orthography.json`
 
 This artifact records deterministic orthography normalization separately from
 semantic calibration. For `zh-TW`, `zh-en`, and auto-detected Chinese, the
-vendored OpenCC `s2twp` dictionaries run after calibration but before any
-downstream subtitle or visual artifact. `changed_strings` is an audit count,
-not a quality score. Explicit `zh-CN` records `not_requested` and preserves the
-source orthography.
+vendored OpenCC `s2twp` dictionaries run after declared-rule/glossary correction
+but before contextual review and any downstream subtitle or visual artifact.
+`changed_strings` is an audit count, not a quality score. Explicit `zh-CN`
+records `not_requested` and preserves the source orthography.
 
 ```json
 {

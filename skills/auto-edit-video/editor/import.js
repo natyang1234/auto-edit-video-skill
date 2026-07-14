@@ -80,6 +80,7 @@ async function createImportSession() {
         source_language: byId("import-language").value,
         transcription_glossary: byId("import-transcription-glossary").value.trim(),
         transcription_calibration: byId("import-transcription-calibration").value.trim(),
+        contextual_semantic_calibration: byId("import-contextual-semantic").checked,
         subtitle_mode: "source",
         platform: byId("import-platform").value,
         duration_profile: byId("import-duration").value,

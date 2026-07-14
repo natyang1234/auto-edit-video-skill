@@ -245,6 +245,8 @@ class StudioServer(ThreadingHTTPServer):
         project_dir: Path,
         director_profile: str,
         editing_brief: str,
+        contextual_semantic_calibration: bool = False,
+        semantic_model: str = "qwen2.5:7b",
     ) -> None:
         status_path = project_dir / "working/pipeline_status.json"
         started_at = now_utc()
@@ -279,35 +281,54 @@ class StudioServer(ThreadingHTTPServer):
                 ["transcribe-local", "--manifest", str(manifest), "--model", "base"],
                 21660,
             ),
-            (
-                "edit_analysis",
-                "正在分析可剪除片段…",
-                ["analyze-edits", "--manifest", str(manifest)],
-                300,
-            ),
-            (
-                "overlay_plan",
-                "正在建立字幕、字卡與動畫提案…",
-                ["plan-overlays", "--manifest", str(manifest)],
-                300,
-            ),
-            (
-                "highlight_plan",
-                "正在挑選最多 10 段精華…",
-                [
-                    "plan-highlights",
-                    "--manifest",
-                    str(manifest),
-                    "--director",
-                    director_profile,
-                    "--count",
-                    "10",
-                    "--brief",
-                    editing_brief,
-                ],
-                300,
-            ),
         ]
+        if contextual_semantic_calibration:
+            steps.append(
+                (
+                    "semantic_calibration",
+                    "正在逐句結合前後文校準整份字幕…",
+                    [
+                        "semantic-calibrate",
+                        "--manifest",
+                        str(manifest),
+                        "--model",
+                        semantic_model,
+                    ],
+                    21600,
+                )
+            )
+        steps.extend(
+            [
+                (
+                    "edit_analysis",
+                    "正在分析可剪除片段…",
+                    ["analyze-edits", "--manifest", str(manifest)],
+                    300,
+                ),
+                (
+                    "overlay_plan",
+                    "正在建立字幕、字卡與動畫提案…",
+                    ["plan-overlays", "--manifest", str(manifest)],
+                    300,
+                ),
+                (
+                    "highlight_plan",
+                    "正在挑選最多 10 段精華…",
+                    [
+                        "plan-highlights",
+                        "--manifest",
+                        str(manifest),
+                        "--director",
+                        director_profile,
+                        "--count",
+                        "10",
+                        "--brief",
+                        editing_brief,
+                    ],
+                    300,
+                ),
+            ]
+        )
         try:
             for phase, message, arguments, timeout in steps:
                 write_status("running", phase, message)
@@ -320,6 +341,15 @@ class StudioServer(ThreadingHTTPServer):
                         phase,
                         "轉錄完成，但沒有足夠語音內容可建立精華。",
                         error_code="no_highlight_candidates",
+                    )
+                    return
+                if phase == "semantic_calibration" and result.returncode == 3:
+                    write_status(
+                        "needs_attention",
+                        phase,
+                        "全文語意校準未完整覆蓋；已保留完成部分，請先檢查校準紀錄。",
+                        error_code="semantic_calibration_partial",
+                        detail=(result.stderr or result.stdout or "").strip(),
                     )
                     return
                 write_status(
@@ -356,6 +386,8 @@ class StudioServer(ThreadingHTTPServer):
         project_dir: Path,
         director_profile: str,
         editing_brief: str,
+        contextual_semantic_calibration: bool = False,
+        semantic_model: str = "qwen2.5:7b",
     ) -> None:
         status_path = project_dir / "working/pipeline_status.json"
         if not self.auto_process:
@@ -387,7 +419,13 @@ class StudioServer(ThreadingHTTPServer):
             self.active_pipeline_project = project_dir
         thread = threading.Thread(
             target=self.pipeline_worker,
-            args=(project_dir, director_profile, editing_brief),
+            args=(
+                project_dir,
+                director_profile,
+                editing_brief,
+                contextual_semantic_calibration,
+                semantic_model,
+            ),
             daemon=False,
             name=f"auto-edit-{project_dir.name}",
         )
@@ -611,10 +649,22 @@ class StudioHandler(BaseHTTPRequestHandler):
             )
         except ValueError as exc:
             raise StudioRequestError(422, "invalid_settings", str(exc)) from exc
+        contextual_semantic_calibration = settings.get(
+            "contextual_semantic_calibration",
+            True,
+        )
+        if not isinstance(contextual_semantic_calibration, bool):
+            raise StudioRequestError(
+                422,
+                "invalid_settings",
+                "contextual semantic calibration must be a boolean",
+            )
         normalized_settings = {
             "source_language": str(settings.get("source_language", "auto")),
             "transcription_glossary": transcription_glossary,
             "transcription_calibrations": transcription_calibrations,
+            "contextual_semantic_calibration": contextual_semantic_calibration,
+            "semantic_model": "qwen2.5:7b",
             "subtitle_mode": str(settings.get("subtitle_mode", "source")),
             "platform": str(settings.get("platform", "auto")),
             "duration_profile": str(settings.get("duration_profile", "auto")),
@@ -761,6 +811,10 @@ class StudioHandler(BaseHTTPRequestHandler):
                 source_language=settings["source_language"],
                 transcription_glossary=settings["transcription_glossary"],
                 transcription_calibrations=settings["transcription_calibrations"],
+                contextual_semantic_calibration=settings[
+                    "contextual_semantic_calibration"
+                ],
+                semantic_model=settings["semantic_model"],
                 subtitle_mode=settings["subtitle_mode"],
                 platform=settings["platform"],
                 duration_profile=settings["duration_profile"],
@@ -783,6 +837,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                     final_project,
                     settings["director_profile"],
                     settings["editing_brief"],
+                    settings["contextual_semantic_calibration"],
+                    settings["semantic_model"],
                 )
             except OSError as exc:
                 self.log_error("local pipeline could not start: %s", exc)

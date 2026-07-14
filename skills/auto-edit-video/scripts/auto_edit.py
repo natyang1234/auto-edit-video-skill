@@ -20,6 +20,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from contextual_semantic_calibration import (
+    ollama_json_model_call,
+    propose_contextual_corrections,
+    validate_contextual_proposals,
+)
 from highlight_planner import (
     DIRECTOR_PROFILES as HIGHLIGHT_DIRECTOR_PROFILES,
     build_highlight_plan,
@@ -830,6 +835,11 @@ def apply_glossary_corrections(
         if re.search(r"[A-Za-z]", term)
     ]
     glossary_tokens.sort(key=lambda item: (-len(item[1]), -len(item[0])))
+    exact_glossary_phrases = {
+        " ".join(words).casefold()
+        for _term, words in glossary_tokens
+        if words
+    }
     corrections: list[dict[str, Any]] = []
     for segment in data.get("segments", []):
         raw_words = segment.get("words")
@@ -878,9 +888,14 @@ def apply_glossary_corrections(
                     for index in range(start + 1, end):
                         prefix, core, _suffix = parsed[index] or ("", "", "")
                         candidate += (" " if prefix else "") + core
+                    candidate_key = re.sub(r"\s+", " ", candidate).strip().casefold()
+                    canonical_key = canonical_text.casefold()
+                    if (
+                        candidate_key in exact_glossary_phrases
+                        and candidate_key != canonical_key
+                    ):
+                        continue
                     if canonical_size == 1 and len(canonical_text) < 4:
-                        candidate_key = candidate.casefold()
-                        canonical_key = canonical_text.casefold()
                         confidence = raw_words[start].get(
                             "probability", raw_words[start].get("confidence")
                         )
@@ -1265,6 +1280,8 @@ def initialize_project(
     source_language: str = "auto",
     transcription_glossary: list[str] | None = None,
     transcription_calibrations: list[Any] | None = None,
+    contextual_semantic_calibration: bool = False,
+    semantic_model: str = "qwen2.5:7b",
     subtitle_mode: str = "source",
     target_language: str | None = None,
     platform: str = "auto",
@@ -1307,6 +1324,8 @@ def initialize_project(
         raise ValueError(f"unsupported visual density: {visual_density}")
     if source_mode not in {"copy", "move"}:
         raise ValueError("source_mode must be copy or move")
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", semantic_model):
+        raise ValueError("semantic calibration model name is invalid")
 
     media = probe_media(source)
     source_size = source.stat().st_size
@@ -1368,6 +1387,14 @@ def initialize_project(
             "target_language": target_language,
             "glossary": glossary,
             "calibrations": calibrations,
+            "contextual_calibrations": [],
+            "contextual_semantic_calibration": {
+                "enabled": bool(contextual_semantic_calibration),
+                "provider": "ollama",
+                "model": semantic_model,
+                "minimum_confidence": 0.92,
+                "context_radius": 2,
+            },
             "translation_variant": "zh-Hant" if subtitle_mode in {"zh", "bilingual"} else None,
             "style": "rail",
             "emphasis_enabled": emphasis != "off",
@@ -1427,6 +1454,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             source_language=args.source_language,
             transcription_glossary=args.transcription_glossary,
             transcription_calibrations=args.transcription_calibration,
+            contextual_semantic_calibration=args.contextual_semantic_calibration,
+            semantic_model=args.semantic_model,
             subtitle_mode=args.subtitle_mode,
             target_language=args.target_language,
             platform=args.platform,
@@ -1581,6 +1610,34 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> tuple[li
             warnings.append("detect source language before translating bilingual subtitles")
         elif language_family(source_language) == language_family(target_language):
             errors.append("bilingual source and target languages must differ")
+    contextual_config = subtitles.get("contextual_semantic_calibration", {})
+    if contextual_config and not isinstance(contextual_config, dict):
+        errors.append("contextual semantic calibration config must be an object")
+    elif isinstance(contextual_config, dict):
+        enabled = contextual_config.get("enabled", False)
+        if not isinstance(enabled, bool):
+            errors.append("contextual semantic calibration enabled must be boolean")
+        if contextual_config.get("provider", "ollama") != "ollama":
+            errors.append("contextual semantic calibration provider must be ollama")
+        semantic_model = str(contextual_config.get("model", "qwen2.5:7b"))
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", semantic_model):
+            errors.append("contextual semantic calibration model name is invalid")
+        minimum_confidence = contextual_config.get("minimum_confidence", 0.92)
+        if (
+            isinstance(minimum_confidence, bool)
+            or not isinstance(minimum_confidence, (int, float))
+            or not 0.5 <= float(minimum_confidence) <= 1
+        ):
+            errors.append("contextual semantic confidence must be between 0.5 and 1")
+    raw_contextual_rules = subtitles.get("contextual_calibrations", [])
+    if not isinstance(raw_contextual_rules, list) or len(raw_contextual_rules) > 512:
+        errors.append("contextual semantic calibration rules must be an array of at most 512")
+    else:
+        try:
+            for raw_rule in raw_contextual_rules:
+                normalize_transcription_calibrations([raw_rule])
+        except ValueError as exc:
+            errors.append(str(exc))
 
     voice = manifest.get("voiceover", {})
     if voice.get("enabled"):
@@ -2046,6 +2103,27 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
     director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
     caption_style = dict(state.get("caption_defaults") or director["caption"])
     emphasis_plan = read_json(project_dir / "working/emphasis_plan.json")
+    semantic_review_path = project_dir / "working/transcript_semantic_review.json"
+    semantic_review = (
+        read_json(semantic_review_path) if semantic_review_path.is_file() else {}
+    )
+    pending_by_unit: dict[str, list[dict[str, Any]]] = {}
+    for item in semantic_review.get("pending", []):
+        if not isinstance(item, dict):
+            continue
+        unit_id = str(item.get("unit_id", ""))
+        if not unit_id:
+            continue
+        pending_by_unit.setdefault(unit_id, []).append(
+            {
+                "source": str(item.get("source", "")),
+                "replacement": str(item.get("replacement", "")),
+                "reason": str(item.get("reason", ""))[:500],
+                "confidence": item.get("confidence"),
+                "verifier_confidence": item.get("verifier_confidence"),
+                "pending_reason": str(item.get("pending_reason", "")),
+            }
+        )
     preserved = [
         overlay
         for overlay in state.get("overlays", [])
@@ -2063,6 +2141,8 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
             continue
         segment_start = round(float(segment.get("start", 0.0)), 3)
         segment_end = round(float(segment.get("end", 0.0)), 3)
+        unit_id = str(segment.get("id", ""))
+        pending_candidates = pending_by_unit.get(unit_id, [])
         effects = caption_effect_spans(
             emphasis_plan,
             text,
@@ -2086,6 +2166,15 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
                 "style": dict(caption_style),
                 "source": "working/transcript_words.json",
                 "provenance": "local-whisper draft; requires transcript review",
+                "semantic_review": (
+                    {
+                        "status": "pending",
+                        "unit_id": unit_id,
+                        "candidates": pending_candidates,
+                    }
+                    if pending_candidates
+                    else {"status": "checked", "unit_id": unit_id, "candidates": []}
+                ),
             }
         )
     state["overlays"] = captions + preserved
@@ -2218,13 +2307,25 @@ def import_whisper_artifacts(
     model: str,
 ) -> dict[str, Any]:
     manifest = read_json(manifest_path)
-    source_language_mode = str(manifest.get("subtitles", {}).get("source_language", "auto"))
+    project_dir = manifest_path.parent
+    subtitles = manifest.get("subtitles", {})
+    if not isinstance(subtitles, dict):
+        raise ValueError("manifest subtitles must be an object")
+    source_language_mode = str(subtitles.get("source_language", "auto"))
     glossary = normalize_transcription_glossary(
-        manifest.get("subtitles", {}).get("glossary", [])
+        subtitles.get("glossary", [])
     )
     calibrations = normalize_transcription_calibrations(
-        manifest.get("subtitles", {}).get("calibrations", [])
+        subtitles.get("calibrations", [])
     )
+    contextual_rules: list[dict[str, Any]] = []
+    raw_contextual_rules = subtitles.get("contextual_calibrations", [])
+    if not isinstance(raw_contextual_rules, list):
+        raise ValueError("contextual semantic calibration rules must be an array")
+    if len(raw_contextual_rules) > 512:
+        raise ValueError("too many contextual semantic calibration rules")
+    for raw_rule in raw_contextual_rules:
+        contextual_rules.extend(normalize_transcription_calibrations([raw_rule]))
     data = read_json(whisper_path)
     if not isinstance(data.get("segments"), list):
         raise ValueError("Whisper JSON must contain a segments array")
@@ -2245,15 +2346,51 @@ def import_whisper_artifacts(
             "changed_characters": 0,
         }
     )
+    contextual_corrections = apply_transcription_calibrations(
+        data,
+        contextual_rules,
+    )
     duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
     transcript, compatibility = whisper_payload(data, duration_s)
     transcript["orthography_variant"] = orthography["variant"]
-    project_dir = manifest_path.parent
     transcript_path = project_dir / "working/transcript_words.json"
     compatibility_path = project_dir / "working/subtitles_words.json"
     review_path = project_dir / "working/transcript_review.json"
     calibration_path = project_dir / "working/transcript_calibration.json"
     orthography_path = project_dir / "working/transcript_orthography.json"
+    contextual_review_path = project_dir / "working/transcript_semantic_review.json"
+    contextual_config = subtitles.get("contextual_semantic_calibration", {})
+    if not isinstance(contextual_config, dict):
+        contextual_config = {}
+    if contextual_review_path.is_file():
+        contextual_review = read_json(contextual_review_path)
+    else:
+        contextual_review = {
+            "schema_version": SCHEMA_VERSION,
+            "status": (
+                "pending"
+                if contextual_config.get("enabled")
+                else "not_configured"
+            ),
+            "coverage_status": "not_started",
+            "reviewed_unit_count": 0,
+            "total_unit_count": len(transcript.get("caption_segments", [])),
+            "accepted_count": 0,
+            "pending_count": 0,
+            "rejected_count": 0,
+            "rules": raw_contextual_rules,
+            "human_review_required": True,
+            "generated_at": now_utc(),
+        }
+    if contextual_review.get("coverage_status") in {None, "not_started"}:
+        contextual_review["reviewed_unit_count"] = 0
+        contextual_review["total_unit_count"] = len(
+            transcript.get("caption_segments", [])
+        )
+    contextual_review["applied_correction_count"] = len(contextual_corrections)
+    contextual_review["active_rule_count"] = len(contextual_rules)
+    if contextual_config.get("enabled") or contextual_rules or contextual_review_path.is_file():
+        write_json(contextual_review_path, contextual_review)
     semantic_calibration = {
         "status": "applied_needs_review" if calibrations else "not_configured",
         "rule_count": len(calibrations),
@@ -2289,6 +2426,23 @@ def import_whisper_artifacts(
         glossary,
         semantic_calibration,
     )
+    transcript_review["contextual_semantic_calibration"] = {
+        "status": contextual_review.get("status", "not_configured"),
+        "coverage_status": contextual_review.get("coverage_status", "not_started"),
+        "reviewed_unit_count": int(contextual_review.get("reviewed_unit_count", 0)),
+        "total_unit_count": int(
+            contextual_review.get(
+                "total_unit_count",
+                len(transcript.get("caption_segments", [])),
+            )
+        ),
+        "accepted_count": int(contextual_review.get("accepted_count", 0)),
+        "pending_count": int(contextual_review.get("pending_count", 0)),
+        "rejected_count": int(contextual_review.get("rejected_count", 0)),
+        "applied_correction_count": len(contextual_corrections),
+        "human_review_required": True,
+        "artifact": "working/transcript_semantic_review.json",
+    }
     write_json(review_path, transcript_review)
     if srt_path is not None:
         srt_path = srt_path.expanduser().resolve()
@@ -2307,6 +2461,9 @@ def import_whisper_artifacts(
     manifest["artifacts"]["transcript_orthography"] = (
         "working/transcript_orthography.json"
     )
+    manifest["artifacts"]["transcript_semantic_review"] = (
+        "working/transcript_semantic_review.json"
+    )
     if orthography_enabled:
         manifest.setdefault("subtitles", {})["source_variant"] = ORTHOGRAPHY_VARIANT
     manifest["transcription"] = {
@@ -2319,6 +2476,28 @@ def import_whisper_artifacts(
         "semantic_calibration_status": semantic_calibration["status"],
         "semantic_calibration_rule_count": len(calibrations),
         "semantic_calibration_correction_count": len(semantic_corrections),
+        "contextual_semantic_status": contextual_review.get(
+            "status",
+            "not_configured",
+        ),
+        "contextual_semantic_coverage_status": contextual_review.get(
+            "coverage_status",
+            "not_started",
+        ),
+        "contextual_semantic_reviewed_units": int(
+            contextual_review.get("reviewed_unit_count", 0)
+        ),
+        "contextual_semantic_total_units": int(
+            contextual_review.get(
+                "total_unit_count",
+                len(transcript.get("caption_segments", [])),
+            )
+        ),
+        "contextual_semantic_rule_count": len(contextual_rules),
+        "contextual_semantic_correction_count": len(contextual_corrections),
+        "contextual_semantic_pending_count": int(
+            contextual_review.get("pending_count", 0)
+        ),
         "orthography_variant": orthography["variant"],
         "orthography_backend": orthography["backend"],
         "orthography_conversion_count": orthography["changed_strings"],
@@ -2347,6 +2526,16 @@ def import_whisper_artifacts(
         "transcript_review_issues": transcript_review["issue_count"],
         "semantic_calibration_status": semantic_calibration["status"],
         "semantic_calibration_corrections": len(semantic_corrections),
+        "contextual_semantic_status": contextual_review.get(
+            "status",
+            "not_configured",
+        ),
+        "contextual_semantic_coverage_status": contextual_review.get(
+            "coverage_status",
+            "not_started",
+        ),
+        "contextual_semantic_corrections": len(contextual_corrections),
+        "contextual_semantic_pending": int(contextual_review.get("pending_count", 0)),
         "glossary_corrections": len(glossary_corrections),
         "orthography_variant": orthography["variant"],
         "orthography_conversions": orthography["changed_strings"],
@@ -2371,6 +2560,225 @@ def cmd_import_whisper(args: argparse.Namespace) -> int:
         return die(str(exc))
     emit(payload)
     return 0
+
+
+def contextual_semantic_baseline(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    """Rebuild the pre-contextual transcript from immutable Whisper output."""
+
+    transcription = manifest.get("transcription", {})
+    if not isinstance(transcription, dict):
+        raise ValueError("manifest transcription must be an object")
+    raw_source = str(transcription.get("source_json", "")).strip()
+    if not raw_source:
+        raise ValueError("transcribe the video before semantic calibration")
+    whisper_path = Path(raw_source).expanduser()
+    if not whisper_path.is_absolute():
+        whisper_path = manifest_path.parent / whisper_path
+    whisper_path = whisper_path.resolve()
+    data = read_json(whisper_path)
+    if not isinstance(data.get("segments"), list):
+        raise ValueError("Whisper JSON must contain a segments array")
+    subtitles = manifest.get("subtitles", {})
+    if not isinstance(subtitles, dict):
+        raise ValueError("manifest subtitles must be an object")
+    calibrations = normalize_transcription_calibrations(
+        subtitles.get("calibrations", [])
+    )
+    glossary = normalize_transcription_glossary(subtitles.get("glossary", []))
+    apply_transcription_calibrations(data, calibrations)
+    apply_glossary_corrections(data, glossary)
+    if should_normalize_taiwan_traditional(manifest, data.get("language")):
+        normalize_whisper_orthography(data)
+    duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
+    transcript, _compatibility = whisper_payload(data, duration_s)
+    return whisper_path, transcript
+
+
+def cmd_semantic_calibrate(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    try:
+        manifest = read_json(manifest_path)
+        subtitles = manifest.get("subtitles", {})
+        if not isinstance(subtitles, dict):
+            raise ValueError("manifest subtitles must be an object")
+        glossary = normalize_transcription_glossary(subtitles.get("glossary", []))
+        whisper_path, transcript = contextual_semantic_baseline(
+            manifest_path,
+            manifest,
+        )
+        review_path = manifest_path.parent / "working/transcript_semantic_review.json"
+        previous_review = read_json(review_path) if review_path.is_file() else {}
+        if args.proposals_json:
+            proposal_path = Path(args.proposals_json).expanduser().resolve()
+            proposal_payload = read_json(proposal_path)
+            provider_used = "proposal_file"
+        else:
+            def write_semantic_progress(progress: dict[str, Any]) -> None:
+                write_json(
+                    review_path,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "running",
+                        "coverage_status": "partial",
+                        "provider": args.provider,
+                        "model": args.model,
+                        "context_radius": 2,
+                        "document_context_unit_count": progress[
+                            "total_unit_count"
+                        ],
+                        "reviewed_unit_count": progress["reviewed_unit_count"],
+                        "total_unit_count": progress["total_unit_count"],
+                        "candidate_count": progress["candidate_count"],
+                        "model_error_count": progress["model_error_count"],
+                        "human_review_required": True,
+                        "updated_at": now_utc(),
+                    },
+                )
+
+            proposal_payload = propose_contextual_corrections(
+                transcript,
+                glossary=glossary,
+                model_call=lambda prompt, stage: ollama_json_model_call(
+                    prompt,
+                    stage,
+                    model=args.model,
+                    timeout=args.timeout,
+                ),
+                batch_size=args.batch_size,
+                progress_callback=write_semantic_progress,
+            )
+            provider_used = args.provider
+
+        current_items = proposal_payload.get("items", [])
+        if not isinstance(current_items, list):
+            current_items = []
+        previous_accepted = previous_review.get("accepted", [])
+        if not isinstance(previous_accepted, list):
+            previous_accepted = []
+        previous_pending = previous_review.get("pending", [])
+        if not isinstance(previous_pending, list):
+            previous_pending = []
+        current_keys = {
+            (
+                str(item.get("unit_id", "")),
+                str(item.get("source", "")),
+                str(item.get("replacement", "")),
+            )
+            for item in current_items
+            if isinstance(item, dict)
+        }
+        preservable = previous_accepted + (
+            previous_pending if args.proposals_json else []
+        )
+        preserved = [
+            item
+            for item in preservable
+            if isinstance(item, dict)
+            and (
+                str(item.get("unit_id", "")),
+                str(item.get("source", "")),
+                str(item.get("replacement", "")),
+            )
+            not in current_keys
+        ]
+        validation_payload = {
+            **proposal_payload,
+            "items": current_items + preserved,
+        }
+        result = validate_contextual_proposals(
+            transcript,
+            validation_payload,
+            glossary=glossary,
+            minimum_confidence=args.minimum_confidence,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return die(str(exc))
+
+    coverage_complete = result["coverage_status"] == "complete"
+    status = "complete_needs_review" if coverage_complete else "partial_needs_review"
+    errors = proposal_payload.get("errors", [])
+    if not isinstance(errors, list):
+        errors = []
+    generated_at = now_utc()
+    artifact = {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "coverage_status": result["coverage_status"],
+        "provider": provider_used,
+        "model": args.model,
+        "context_radius": 2,
+        "document_context_unit_count": result["total_unit_count"],
+        "minimum_confidence": result["minimum_confidence"],
+        "reviewed_unit_ids": result["reviewed_unit_ids"],
+        "reviewed_unit_count": result["reviewed_unit_count"],
+        "total_unit_count": result["total_unit_count"],
+        "accepted_count": result["applied_count"],
+        "pending_count": result["pending_count"],
+        "rejected_count": result["rejected_count"],
+        "accepted": result["accepted"],
+        "pending": result["pending"],
+        "rejected": result["rejected"],
+        "rules": result["rules"],
+        "model_errors": errors,
+        "human_review_required": True,
+        "generated_at": generated_at,
+    }
+    subtitles["contextual_calibrations"] = result["rules"]
+    contextual_config = subtitles.get("contextual_semantic_calibration", {})
+    if not isinstance(contextual_config, dict):
+        contextual_config = {}
+    subtitles["contextual_semantic_calibration"] = {
+        **contextual_config,
+        "enabled": True,
+        "provider": args.provider,
+        "model": args.model,
+        "minimum_confidence": result["minimum_confidence"],
+        "context_radius": 2,
+        "last_status": status,
+        "last_run_at": generated_at,
+    }
+    manifest["subtitles"] = subtitles
+    manifest.setdefault("artifacts", {})["transcript_semantic_review"] = (
+        "working/transcript_semantic_review.json"
+    )
+    manifest.setdefault("stages", {})["edit_analysis"] = "pending"
+    manifest["updated_at"] = generated_at
+    write_json(review_path, artifact)
+    write_json(manifest_path, manifest)
+
+    try:
+        imported = import_whisper_artifacts(
+            manifest_path,
+            whisper_path,
+            srt_path=None,
+            model=str(manifest.get("transcription", {}).get("model", "unknown")),
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    refreshed_artifact = read_json(review_path)
+    emit(
+        {
+            "ok": coverage_complete,
+            "manifest": str(manifest_path),
+            "artifact": str(review_path),
+            "status": status,
+            "coverage_status": result["coverage_status"],
+            "reviewed_units": result["reviewed_unit_count"],
+            "total_units": result["total_unit_count"],
+            "accepted": result["applied_count"],
+            "applied_corrections": refreshed_artifact.get(
+                "applied_correction_count",
+                imported.get("contextual_semantic_corrections", 0),
+            ),
+            "pending": result["pending_count"],
+            "rejected": result["rejected_count"],
+            "model_errors": len(errors),
+        }
+    )
+    return 0 if coverage_complete else 3
 
 
 def project_staged_source(manifest_path: Path, manifest: dict[str, Any]) -> Path:
@@ -3350,6 +3758,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Semicolon-separated exact ASR aliases using canonical=alias|alias",
     )
+    init.add_argument(
+        "--contextual-semantic-calibration",
+        action="store_true",
+        help="Run a local whole-transcript context pass after Whisper",
+    )
+    init.add_argument("--semantic-model", default="qwen2.5:7b")
     init.add_argument("--subtitle-mode", choices=SUBTITLE_MODES, default="source")
     init.add_argument("--target-language")
     init.add_argument("--platform", choices=PLATFORMS, default="auto")
@@ -3409,6 +3823,19 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--model", default="base")
     transcribe.add_argument("--timeout", type=int, default=21600)
     transcribe.set_defaults(func=cmd_transcribe_local)
+
+    semantic = sub.add_parser(
+        "semantic-calibrate",
+        help="Review every caption with surrounding transcript context using local Ollama",
+    )
+    semantic.add_argument("--manifest", required=True)
+    semantic.add_argument("--provider", choices=("ollama",), default="ollama")
+    semantic.add_argument("--model", default="qwen2.5:7b")
+    semantic.add_argument("--proposals-json")
+    semantic.add_argument("--minimum-confidence", type=float, default=0.92)
+    semantic.add_argument("--batch-size", type=int, default=10)
+    semantic.add_argument("--timeout", type=int, default=300)
+    semantic.set_defaults(func=cmd_semantic_calibrate)
 
     analyze = sub.add_parser(
         "analyze-edits",
