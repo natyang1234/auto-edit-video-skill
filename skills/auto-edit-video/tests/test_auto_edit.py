@@ -186,6 +186,19 @@ payload = {
         )
         self.assertEqual(synced_state["highlight_plan_revision"], plan["plan_revision"])
         self.assertGreaterEqual(len(synced_state["highlights"]), 1)
+        self.assertEqual(synced_state["canvas"]["fit"], "contain")
+        self.assertEqual(synced_state["visual_quality_mode"], "designed")
+        for highlight in synced_state["highlights"]:
+            cards = [
+                item
+                for item in synced_state["overlays"]
+                if item.get("highlight_id") == highlight["id"] and item.get("design_role")
+            ]
+            self.assertEqual(len(cards), 5)
+            self.assertEqual(
+                {item["design_role"] for item in cards},
+                {"hook", "concept", "rule", "memory", "recap"},
+            )
 
     def init_project(self, name: str, language: str, gender: str) -> tuple[Path, dict]:
         project = self.root / name

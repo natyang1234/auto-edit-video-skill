@@ -24,6 +24,8 @@ from editor_server import (
     read_json,
     referenced_asset_digests,
 )
+from graphic_package import ensure_graphic_package
+from visual_quality import DESIGN_ROLES, overlays_for_clip, visual_quality_errors
 
 
 FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
@@ -274,6 +276,7 @@ def build_render_command(
     output: Path,
     quality: str,
     clip: dict[str, Any] | None = None,
+    visual_source: Path | None = None,
 ) -> list[str]:
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -306,7 +309,16 @@ def build_render_command(
     if not source.is_file():
         raise ValueError(f"source media missing: {source}")
     fit = canvas.get("fit", "cover")
-    if fit == "contain":
+    if visual_source is not None:
+        graphics_root = (project_dir / "working/graphic_packages").resolve()
+        visual_entry = visual_source.expanduser()
+        if visual_entry.is_symlink():
+            raise ValueError("designed graphic package must be a project-owned regular file")
+        visual_source = visual_entry.resolve()
+        if graphics_root not in visual_source.parents or not visual_source.is_file():
+            raise ValueError("designed graphic package must stay under working/graphic_packages")
+        base_filter = f"scale={width}:{height},setsar=1,setpts=PTS-STARTPTS"
+    elif fit == "contain":
         base_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x171512,setsar=1,setpts=PTS-STARTPTS"
@@ -321,9 +333,22 @@ def build_render_command(
     if clip_start > 0:
         command.extend(["-ss", f"{clip_start:.3f}"])
     command.extend(["-i", str(source)])
+    visual_input_index: int | None = None
+    if visual_source is not None:
+        visual_input_index = 1
+        command.extend(["-i", str(visual_source)])
     overlays: list[dict[str, Any]] = []
     for source_overlay in state.get("overlays", []):
         if not isinstance(source_overlay, dict) or not source_overlay.get("visible", True):
+            continue
+        scoped_highlight = str(source_overlay.get("highlight_id") or "")
+        clip_id = str(clip.get("id") or "") if clip is not None else ""
+        if scoped_highlight and scoped_highlight != clip_id:
+            continue
+        if visual_source is not None and (
+            source_overlay.get("design_role")
+            or source_overlay.get("type") in {"caption", "emphasis"}
+        ):
             continue
         raw_start = float(source_overlay.get("start", 0.0))
         raw_end = float(source_overlay.get("end", 0.0))
@@ -354,11 +379,11 @@ def build_render_command(
             command.extend(["-ignore_loop", "0", "-stream_loop", "-1", "-i", key])
         else:
             command.extend(["-stream_loop", "-1", "-i", key])
-        asset_inputs[key] = len(asset_inputs) + 1
+        asset_inputs[key] = len(asset_inputs) + (2 if visual_input_index is not None else 1)
 
     render_text_dir = project_dir / "working/render_text"
     render_text_dir.mkdir(parents=True, exist_ok=True)
-    filters = [f"[0:v]{base_filter}[v0]"]
+    filters = [f"[{visual_input_index if visual_input_index is not None else 0}:v]{base_filter}[v0]"]
     current = "v0"
     font = font_path()
     for index, overlay in enumerate(overlays, start=1):
@@ -540,7 +565,27 @@ def render_project(
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
     try:
-        command = build_render_command(project_dir, state, manifest, temporary, quality, clip)
+        visual_source: Path | None = None
+        if clip is not None and state.get("visual_quality_mode") == "designed":
+            quality_errors = visual_quality_errors(state, manifest, clip)
+            if quality_errors:
+                raise ValueError("visual-quality contract failed: " + "; ".join(quality_errors))
+            roles = {
+                str(item.get("design_role"))
+                for item in overlays_for_clip(state, clip)
+                if item.get("design_role")
+            }
+            if set(DESIGN_ROLES).issubset(roles):
+                visual_source = ensure_graphic_package(project_dir, state, manifest, clip)
+        command = build_render_command(
+            project_dir,
+            state,
+            manifest,
+            temporary,
+            quality,
+            clip,
+            visual_source,
+        )
         try:
             result = subprocess.run(
                 command,

@@ -21,8 +21,48 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from editor_server import EditorServer, editor_state_revision, gate_revision  # noqa: E402
+from editor_server import (  # noqa: E402
+    EditorServer,
+    caption_effect_spans,
+    editor_state_revision,
+    extract_effect_keywords,
+    gate_revision,
+    validate_editor_state,
+)
 from render_editor_timeline import build_render_command, text_filter  # noqa: E402
+
+
+class CaptionEffectModelTests(unittest.TestCase):
+    def test_highlight_copy_proposes_bounded_editable_caption_keywords(self) -> None:
+        keywords = extract_effect_keywords(
+            [
+                "It 作虛主詞：看到 It，想到 to V",
+                "真正主詞＝後面的不定詞片語",
+            ]
+        )
+        spans = caption_effect_spans(
+            {"items": []},
+            "是什麼意思？同學看到 It，想到 to V，你就這樣記吧。",
+            10.0,
+            16.0,
+            "#ffb000",
+            keywords,
+        )
+        self.assertEqual([item["text"] for item in spans], ["It", "to V"])
+        self.assertEqual({item["style"]["effect"] for item in spans}, {"pop", "highlight"})
+        self.assertLessEqual(len(spans), 2)
+
+    def test_keyword_matching_keeps_natural_chinese_de_in_caption_range(self) -> None:
+        spans = caption_effect_spans(
+            {"items": []},
+            "真正的主詞，也就是最重要的意思。",
+            20.0,
+            24.0,
+            "#ffb000",
+            ["真正主詞"],
+        )
+        self.assertEqual(spans[0]["text"], "真正的主詞")
+        self.assertEqual("真正的主詞，也就是最重要的意思。"[spans[0]["start_char"] : spans[0]["end_char"]], "真正的主詞")
 
 
 class EditorServerTests(unittest.TestCase):
@@ -143,6 +183,25 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn('name: "影片", kind: "source"', script)
         self.assertIn('name: "字幕", types: ["caption"]', script)
 
+    def test_inline_effect_and_layout_adjustment_controls_are_present(self) -> None:
+        html = (SKILL_DIR / "editor/index.html").read_text(encoding="utf-8")
+        script = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
+        for element_id in (
+            "effect-editor",
+            "effect-style",
+            "effect-color",
+            "effect-scale",
+            "add-effect-span",
+            "effect-span-list",
+            "overlay-max-width",
+            "card-height",
+            "layout-warning",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("effect_spans", script)
+        self.assertIn("enableOverlayDrag", script)
+        self.assertIn("renderLayoutWarning", script)
+
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -202,6 +261,9 @@ class EditorServerTests(unittest.TestCase):
             any(voice["voice_id"] == "rumi" for voice in payload["voice_catalog"]["voices"])
         )
         self.assertEqual(payload["state"]["overlays"][0]["type"], "caption")
+        caption = payload["state"]["overlays"][0]
+        self.assertEqual(caption["effect_spans"][0]["text"], "差別")
+        self.assertEqual(caption["effect_spans"][0]["style"]["effect"], "pop")
         self.assertEqual(payload["state"]["editing_brief"], "")
         self.assertIn("highlight_plan", payload)
         self.assertEqual(payload["pipeline_status"]["state"], "not_started")
@@ -214,6 +276,43 @@ class EditorServerTests(unittest.TestCase):
             {"caption", "emphasis", "title"},
         )
         self.assertTrue((self.project / "working/editor_state.json").is_file())
+
+    def test_state_validation_accepts_valid_effect_spans_and_rejects_stale_offsets(self) -> None:
+        state = {
+            "schema_version": 1,
+            "director_style": "teacher-punch",
+            "visual_quality_mode": "basic",
+            "canvas": {
+                "platform_id": "instagram-reels",
+                "width": 1080,
+                "height": 1920,
+                "fps": 30,
+                "fit": "contain",
+            },
+            "overlays": [
+                {
+                    "id": "caption-1",
+                    "type": "caption",
+                    "start": 0.1,
+                    "end": 1.0,
+                    "text": "看到 It",
+                    "layout": {"x": 50, "y": 50, "width": 80, "height": 20},
+                    "effect_spans": [
+                        {
+                            "id": "fx-it",
+                            "text": "It",
+                            "start_char": 3,
+                            "end_char": 5,
+                            "style": {"effect": "pop", "color": "#ffb000", "font_scale": 1.2},
+                        }
+                    ],
+                }
+            ],
+        }
+        self.assertEqual(validate_editor_state(state, 2.0), [])
+        state["overlays"][0]["effect_spans"][0]["start_char"] = 2
+        errors = validate_editor_state(state, 2.0)
+        self.assertTrue(any("effect span text does not match" in error for error in errors), errors)
 
     def test_rumi_voice_selection_is_saved_without_synthesis(self) -> None:
         status, payload = self.json_request(
@@ -470,6 +569,8 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(saved["invalidated_gates"], [])
 
         state["overlays"][0]["text"] = "已修改的字幕"
+        state["overlays"][0]["effect_spans"] = []
+        state["overlays"][0]["emphasis"] = []
         status, saved = self.json_request("PUT", "/api/editor-state", state)
         self.assertEqual(status, 200)
         self.assertIn("timeline", saved["invalidated_gates"])
@@ -1077,3 +1178,50 @@ class EditorRendererTests(unittest.TestCase):
             "preview",
         )
         self.assertNotIn("loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000", command)
+
+    def test_designed_package_is_the_visual_base_while_source_audio_is_preserved(self) -> None:
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        visual_source = self.project / "working/graphic_packages/test/output.mp4"
+        visual_source.parent.mkdir(parents=True, exist_ok=True)
+        visual_source.write_bytes(b"designed-visual")
+        clip = {"id": "highlight-rich", "start": 0.0, "end": 0.4}
+        command = build_render_command(
+            self.project,
+            state,
+            manifest,
+            self.project / "renders/designed-preview.mp4",
+            "preview",
+            clip,
+            visual_source,
+        )
+        inputs = [command[index + 1] for index, value in enumerate(command) if value == "-i"]
+        self.assertEqual(
+            inputs[:2],
+            [str(self.project / "source/source.mp4"), str(visual_source.resolve())],
+        )
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertTrue(filters.startswith("[1:v]scale="), filters)
+        self.assertNotIn("drawtext=", filters, "designed package must already contain captions")
+        audio_map = command[command.index("-map", command.index("-map") + 1) + 1]
+        self.assertEqual(audio_map, "0:a?")
+
+    def test_designed_package_outside_project_graphics_root_is_rejected(self) -> None:
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        external = Path(self._tmp.name) / "external-visual.mp4"
+        external.write_bytes(b"outside")
+        with self.assertRaisesRegex(ValueError, "working/graphic_packages"):
+            build_render_command(
+                self.project,
+                state,
+                manifest,
+                self.project / "renders/designed-preview.mp4",
+                "preview",
+                {"id": "highlight-rich", "start": 0.0, "end": 0.4},
+                external,
+            )

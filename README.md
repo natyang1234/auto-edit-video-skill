@@ -39,8 +39,12 @@ validates it, creates an immutable owned project copy, runs local Whisper, and
 produces up to ten transcript-grounded highlight proposals. The user can choose
 short/medium/long platform targets, describe the desired edit, select one of
 five deterministic director profiles, keep or reject clips, correct caption
-text/timing, add title/cards/animations or licensed media, preview one clip, and
-render it separately.
+text/timing, select words inside a caption for exportable pop/highlight/
+underline effects, drag caption/card layers, adjust their width/height, and see
+safe-zone or timed-layer collision warnings. Users can also add title/cards/
+animations or licensed media, preview one clip, and render it separately. In
+designed mode, captions and effect spans are baked into the same HTML/GSAP
+graphic package used by the rendered MP4.
 
 Approvals are revision-bound and ordered:
 `destructive_edit` → `highlight_selection` → `timeline` → `final`. Final render

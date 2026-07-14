@@ -583,6 +583,75 @@ h2 {
   background: transparent;
 }
 
+.preview-overlay mark.effect-word {
+  position: relative;
+  display: inline-block;
+  color: var(--effect-color, var(--overlay-emphasis, #ffd447));
+  transform-origin: center bottom;
+}
+
+.preview-overlay mark.effect-highlight {
+  z-index: 0;
+  padding: 0 0.06em;
+  color: var(--stage);
+  text-shadow: none;
+}
+
+.preview-overlay mark.effect-highlight::before {
+  position: absolute;
+  z-index: -1;
+  top: 48%;
+  right: -0.05em;
+  bottom: -0.02em;
+  left: -0.05em;
+  content: "";
+  background: var(--effect-color, #ffd447);
+  transform: rotate(-1.5deg);
+}
+
+.preview-overlay mark.effect-underline::after {
+  position: absolute;
+  right: 0;
+  bottom: -0.08em;
+  left: 0;
+  height: 0.1em;
+  content: "";
+  background: var(--effect-color, #ffd447);
+  border-radius: 999px;
+}
+
+.preview-overlay mark.effect-pop {
+  animation: effect-word-pop 260ms var(--ease-out) both;
+}
+
+.preview-overlay.is-draggable {
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.preview-overlay.is-dragging { cursor: grabbing; }
+
+.preview-overlay.is-design-card {
+  display: grid;
+  place-items: center;
+  width: var(--overlay-card-width, 84%);
+  height: var(--overlay-card-height, 24%);
+  max-width: none;
+  padding: 0.65em;
+  overflow: hidden;
+  color: var(--paper-0);
+  background: color-mix(in oklch, var(--stage-raised) 90%, transparent);
+  border: 2px solid var(--amber);
+  box-shadow: var(--shadow-soft);
+  text-shadow: none;
+}
+
+@keyframes effect-word-pop {
+  from { opacity: 0.65; transform: scale(0.72); }
+  to { opacity: 1; transform: scale(var(--effect-scale, 1.18)); }
+}
+
 .preview-overlay.type-title,
 .preview-overlay.type-card,
 .preview-overlay.type-animation {
@@ -855,6 +924,125 @@ h2 {
   width: 20px;
   height: 20px;
   accent-color: var(--vermilion);
+}
+
+.effect-editor {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: color-mix(in oklch, var(--amber) 9%, var(--paper-1));
+  border: 1px solid color-mix(in oklch, var(--amber) 42%, var(--line));
+}
+
+.effect-editor[hidden] { display: none; }
+
+.effect-editor-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.field-label {
+  display: block;
+  color: var(--ink-0);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.effect-editor small {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--ink-2);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
+.compact-button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  font-size: 0.68rem;
+}
+
+.effect-control-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(64px, 0.7fr);
+  gap: var(--space-2);
+}
+
+.effect-control-grid .range-field { grid-column: 1 / -1; }
+
+.effect-span-list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.effect-span-empty {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 0.68rem;
+}
+
+.effect-span-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: var(--space-2);
+  background: var(--paper-0);
+  border-left: 3px solid var(--effect-chip-color, var(--amber));
+}
+
+.effect-span-row strong {
+  overflow: hidden;
+  color: var(--ink-0);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.effect-span-row span {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-2);
+  font-size: 0.62rem;
+}
+
+.effect-span-select {
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+  background: transparent;
+}
+
+.effect-span-row.is-selected {
+  box-shadow: inset 0 0 0 1px var(--vermilion);
+}
+
+.effect-span-remove {
+  min-width: 44px;
+  min-height: 36px;
+  color: var(--danger);
+  background: transparent;
+  font-size: 0.68rem;
+}
+
+.layout-warning {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  color: var(--green);
+  background: color-mix(in oklch, var(--green) 9%, var(--paper-1));
+  border-left: 3px solid var(--green);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.layout-warning.is-warning {
+  color: var(--danger);
+  background: color-mix(in oklch, var(--danger) 8%, var(--paper-1));
+  border-left-color: var(--danger);
 }
 
 .publish-heading h2 {

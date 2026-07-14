@@ -33,6 +33,12 @@ from local_http_security import (
     is_loopback_host,
     mutation_origin_allowed,
 )
+from visual_quality import (
+    ROLE_LAYOUTS,
+    build_highlight_design_overlays,
+    visual_quality_errors,
+    visual_quality_report,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -398,6 +404,21 @@ def approval_prerequisite_errors(
         project_dir, manifest, "highlight_selection", state
     ):
         errors.append("highlight_selection must be approved for its current revision first")
+    active_id = str(state.get("active_highlight_id") or "")
+    active_clip = next(
+        (
+            item
+            for item in highlights
+            if isinstance(item, dict) and str(item.get("id")) == active_id
+        ),
+        None,
+    )
+    if highlights and active_clip is None:
+        errors.append("an active highlight is required for timeline review")
+    elif active_clip is not None and active_clip.get("review_status") != "approved":
+        errors.append("the active highlight must be approved for timeline review")
+    if active_clip is not None:
+        errors.extend(visual_quality_errors(state, manifest, active_clip))
     if gate == "timeline":
         return errors
     if gate == "final":
@@ -489,6 +510,33 @@ def delivery_qa_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
             errors.append("render receipt does not match the current editor revision")
         if render_receipt.get("output_sha256") != receipt.get("output_sha256"):
             errors.append("delivery QA and render receipt output digests differ")
+    highlights = state.get("highlights", []) if isinstance(state.get("highlights"), list) else []
+    receipt_clip_id = str(receipt.get("clip_id") or state.get("active_highlight_id") or "")
+    clip = next(
+        (
+            item
+            for item in highlights
+            if isinstance(item, dict) and str(item.get("id")) == receipt_clip_id
+        ),
+        None,
+    )
+    expected_visual = visual_quality_report(state, read_json(project_dir / "project.json", {}) or {}, clip)
+    receipt_visual = receipt.get("visual_quality")
+    if expected_visual.get("contract_applies"):
+        if not isinstance(receipt_visual, dict) or receipt_visual.get("status") != "pass":
+            errors.append("delivery QA visual-quality contract must pass before final approval")
+        elif any(
+            receipt_visual.get(key) != expected_visual.get(key)
+            for key in (
+                "mode",
+                "clip_id",
+                "designed_card_count",
+                "designed_roles",
+                "designed_types",
+                "designed_coverage_ratio",
+            )
+        ):
+            errors.append("delivery QA visual-quality contract does not match the current timeline")
     return errors
 
 
@@ -714,6 +762,185 @@ def artifact_plan_overlays(
     return overlays
 
 
+def extract_effect_keywords(values: list[Any]) -> list[str]:
+    """Extract reusable exact-match terms from reviewed highlight/card copy."""
+    keywords: set[str] = set()
+    for value in values:
+        text = str(value or "")
+        for match in re.finditer(r"(?<![A-Za-z])(?:to\s+[A-Za-z]|[A-Z][A-Za-z]+)(?![A-Za-z])", text):
+            keywords.add(match.group(0))
+        for chunk in re.findall(r"[\u3400-\u9fff]{3,}", text):
+            for size in range(min(6, len(chunk)), 2, -1):
+                for start in range(0, len(chunk) - size + 1):
+                    phrase = chunk[start : start + size]
+                    if phrase in {"什麼意思", "最重要", "這樣記", "直接來看", "看到想到"}:
+                        continue
+                    keywords.add(phrase)
+    return sorted(
+        keywords,
+        key=lambda item: (0 if re.search(r"[A-Za-z]", item) else 1, -len(item), item.casefold()),
+    )[:500]
+
+
+def effect_keywords_for_state(state: dict[str, Any]) -> list[str]:
+    active_id = str(state.get("active_highlight_id") or "")
+    sources: list[Any] = [
+        item.get("title")
+        for item in state.get("highlights", [])
+        if isinstance(item, dict)
+        and item.get("review_status") != "rejected"
+        and (not active_id or str(item.get("id") or "") == active_id)
+    ]
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict) or not overlay.get("design_role"):
+            continue
+        if active_id and str(overlay.get("highlight_id") or "") != active_id:
+            continue
+        sources.extend((overlay.get("text"), overlay.get("kicker"), overlay.get("detail")))
+    return extract_effect_keywords(sources)
+
+
+def effect_keywords_for_caption(state: dict[str, Any], start: float, end: float) -> list[str]:
+    matching = [
+        item
+        for item in state.get("highlights", [])
+        if isinstance(item, dict)
+        and item.get("review_status") != "rejected"
+        and float(item.get("end", 0.0)) > start
+        and float(item.get("start", 0.0)) < end
+    ]
+    highlight_ids = {str(item.get("id") or "") for item in matching}
+    sources: list[Any] = [item.get("title") for item in matching]
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict) or not overlay.get("design_role"):
+            continue
+        if str(overlay.get("highlight_id") or "") not in highlight_ids:
+            continue
+        sources.extend((overlay.get("text"), overlay.get("kicker"), overlay.get("detail")))
+    return extract_effect_keywords(sources)
+
+
+def caption_effect_spans(
+    emphasis_plan: dict[str, Any],
+    text: str,
+    start: float,
+    end: float,
+    color: str,
+    keywords: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Map transcript-grounded emphasis proposals onto exact caption character ranges."""
+    spans: list[dict[str, Any]] = []
+    occupied: list[tuple[int, int]] = []
+    for index, item in enumerate(emphasis_plan.get("items", [])[:200], start=1):
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_start = float(item.get("start", 0.0))
+            item_end = float(item.get("end", item_start))
+        except (TypeError, ValueError):
+            continue
+        phrase = str(item.get("text") or "").strip()
+        if not phrase or item_end <= start or item_start >= end:
+            continue
+        offset = text.find(phrase)
+        if offset < 0:
+            continue
+        span_end = offset + len(phrase)
+        if any(offset < used_end and span_end > used_start for used_start, used_end in occupied):
+            continue
+        occupied.append((offset, span_end))
+        spans.append(
+            {
+                "id": f"planned-fx-{index:04d}",
+                "text": phrase,
+                "start_char": offset,
+                "end_char": span_end,
+                "style": {
+                    "effect": "pop",
+                    "color": color,
+                    "font_scale": 1.18,
+                },
+                "source": "working/emphasis_plan.json",
+            }
+        )
+    for keyword_index, phrase in enumerate(keywords or [], start=1):
+        if len(spans) >= 2:
+            break
+        matched_phrase = phrase
+        offset = text.find(matched_phrase)
+        if offset < 0 and re.fullmatch(r"[\u3400-\u9fff]{3,}", phrase):
+            for split in range(1, len(phrase)):
+                variant = phrase[:split] + "的" + phrase[split:]
+                offset = text.find(variant)
+                if offset >= 0:
+                    matched_phrase = variant
+                    break
+        if offset < 0:
+            continue
+        span_end = offset + len(matched_phrase)
+        if any(offset < used_end and span_end > used_start for used_start, used_end in occupied):
+            continue
+        occupied.append((offset, span_end))
+        effect = "pop" if len(spans) % 2 == 0 else "highlight"
+        spans.append(
+            {
+                "id": f"keyword-fx-{keyword_index:04d}",
+                "text": matched_phrase,
+                "start_char": offset,
+                "end_char": span_end,
+                "style": {
+                    "effect": effect,
+                    "color": color,
+                    "font_scale": 1.18 if effect == "pop" else 1.08,
+                },
+                "source": "reviewed highlight/card copy exact-match proposal",
+            }
+        )
+    spans.sort(key=lambda item: (item["start_char"], item["end_char"]))
+    for index, span in enumerate(spans):
+        effect = "pop" if index % 2 == 0 else "highlight"
+        if span.get("source") != "working/emphasis_plan.json":
+            span["style"]["effect"] = effect
+            span["style"]["font_scale"] = 1.18 if effect == "pop" else 1.08
+    return spans
+
+
+def upgrade_editor_state_layout_effects(project_dir: Path, state: dict[str, Any]) -> bool:
+    """Add the v2 editable layout/effect model without overwriting reviewed user choices."""
+    changed = False
+    emphasis_plan = read_json(project_dir / "working/emphasis_plan.json", {"items": []}) or {
+        "items": []
+    }
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict):
+            continue
+        role = str(overlay.get("design_role") or "")
+        if role in ROLE_LAYOUTS and not isinstance(overlay.get("layout"), dict):
+            overlay["layout"] = dict(ROLE_LAYOUTS[role])
+            changed = True
+        if overlay.get("type") != "caption" or "effect_spans" in overlay:
+            continue
+        text = str(overlay.get("text") or "")
+        style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+        effects = caption_effect_spans(
+            emphasis_plan,
+            text,
+            float(overlay.get("start", 0.0)),
+            float(overlay.get("end", 0.0)),
+            str(style.get("emphasis_color") or "#ffd447"),
+            effect_keywords_for_caption(
+                state,
+                float(overlay.get("start", 0.0)),
+                float(overlay.get("end", 0.0)),
+            ),
+        )
+        overlay["effect_spans"] = effects
+        if effects and not overlay.get("emphasis"):
+            overlay["emphasis"] = [item["text"] for item in effects]
+        changed = True
+    return changed
+
+
 def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     transcript = read_json(project_dir / "working/transcript_words.json", {}) or {}
     highlight_plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
@@ -727,34 +954,9 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         director_id = "teacher-punch"
     director = DIRECTOR_PRESETS[director_id]
     caption_style = dict(director["caption"])
-    overlays: list[dict[str, Any]] = []
-    for index, segment in enumerate(transcript.get("segments", []), start=1):
-        text = str(segment.get("text", "")).strip()
-        if not text:
-            continue
-        overlays.append(
-            {
-                "id": f"caption-{index:04d}",
-                "type": "caption",
-                "start": round(float(segment.get("start", 0.0)), 3),
-                "end": round(float(segment.get("end", 0.0)), 3),
-                "text": text,
-                "emphasis": [],
-                "visible": True,
-                "locked": False,
-                "z_index": 20,
-                "style": dict(caption_style),
-                "source": "working/transcript_words.json",
-                "provenance": "local-whisper draft; requires transcript review",
-            }
-        )
-    overlays.extend(
-        artifact_plan_overlays(
-            project_dir,
-            caption_style,
-            float(manifest.get("source", {}).get("duration_s", 0.0)),
-        )
-    )
+    emphasis_plan = read_json(project_dir / "working/emphasis_plan.json", {"items": []}) or {
+        "items": []
+    }
     highlights = [
         {
             "id": str(item.get("id", "")),
@@ -769,6 +971,68 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         for item in highlight_plan.get("items", [])[:10]
         if isinstance(item, dict)
     ]
+    keyword_state = {"highlights": highlights, "overlays": []}
+    overlays: list[dict[str, Any]] = []
+    for index, segment in enumerate(transcript.get("segments", []), start=1):
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        segment_start = round(float(segment.get("start", 0.0)), 3)
+        segment_end = round(float(segment.get("end", 0.0)), 3)
+        effects = caption_effect_spans(
+            emphasis_plan,
+            text,
+            segment_start,
+            segment_end,
+            str(caption_style.get("emphasis_color") or "#ffd447"),
+            effect_keywords_for_caption(keyword_state, segment_start, segment_end),
+        )
+        overlays.append(
+            {
+                "id": f"caption-{index:04d}",
+                "type": "caption",
+                "start": segment_start,
+                "end": segment_end,
+                "text": text,
+                "emphasis": [item["text"] for item in effects],
+                "effect_spans": effects,
+                "visible": True,
+                "locked": False,
+                "z_index": 20,
+                "style": dict(caption_style),
+                "source": "working/transcript_words.json",
+                "provenance": "local-whisper draft; requires transcript review",
+            }
+        )
+    design_overlays: list[dict[str, Any]] = []
+    if highlights:
+        for highlight in highlights:
+            design_overlays.extend(
+                build_highlight_design_overlays(
+                    transcript,
+                    highlight,
+                    caption_style,
+                    director_id,
+                )
+            )
+        overlays.extend(design_overlays)
+        atomic_write_json(
+            project_dir / "working/highlight_visual_plan.json",
+            {
+                "schema_version": 1,
+                "generator": "highlight-scoped-designed-cards-v1",
+                "highlight_plan_revision": highlight_plan.get("plan_revision"),
+                "items": design_overlays,
+            },
+        )
+    else:
+        overlays.extend(
+            artifact_plan_overlays(
+                project_dir,
+                caption_style,
+                float(manifest.get("source", {}).get("duration_s", 0.0)),
+            )
+        )
     state = {
         "schema_version": 1,
         "updated_at": now_utc(),
@@ -783,10 +1047,12 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             "width": 1080,
             "height": 1920,
             "fps": 30,
-            "fit": "cover",
+            "fit": "contain",
             "show_safe_zones": True,
         },
         "director_style": director_id,
+        "visual_quality_mode": "designed",
+        "graphic_package_style": "craft-stack",
         "editing_brief": str(plan_configuration.get("editing_brief", ""))[:2000],
         "caption_defaults": caption_style,
         "overlays": overlays,
@@ -840,6 +1106,8 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
             errors.append("canvas fit must be cover or contain")
     if state.get("director_style") not in DIRECTOR_PRESETS:
         errors.append("director_style is not supported")
+    if state.get("visual_quality_mode", "basic") not in {"basic", "designed"}:
+        errors.append("visual_quality_mode must be basic or designed")
     editing_brief = state.get("editing_brief", "")
     if not isinstance(editing_brief, str) or len(editing_brief) > 2000:
         errors.append("editing_brief must be a string of at most 2000 characters")
@@ -850,6 +1118,7 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     if len(overlays) > 1000:
         errors.append("overlays cannot exceed 1000 items")
     seen: set[str] = set()
+    overlay_highlight_refs: list[tuple[str, str]] = []
     allowed_types = {"caption", "emphasis", "title", "card", "image", "gif", "video", "animation"}
     for index, overlay in enumerate(overlays):
         if not isinstance(overlay, dict):
@@ -874,8 +1143,82 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
                 errors.append(f"overlay {overlay_id or index} has invalid timing")
         except (TypeError, ValueError):
             errors.append(f"overlay {overlay_id or index} timing must be numeric")
-        if len(str(overlay.get("text", ""))) > 1000:
+        overlay_text = str(overlay.get("text", ""))
+        if len(overlay_text) > 1000:
             errors.append(f"overlay {overlay_id or index} text is too long")
+        if len(str(overlay.get("kicker", ""))) > 120 or len(str(overlay.get("detail", ""))) > 1000:
+            errors.append(f"overlay {overlay_id or index} design copy is too long")
+        scoped_highlight = overlay.get("highlight_id")
+        if scoped_highlight is not None:
+            scoped_highlight = str(scoped_highlight)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", scoped_highlight):
+                errors.append(f"overlay {overlay_id or index} highlight_id is invalid")
+            else:
+                overlay_highlight_refs.append((overlay_id or str(index), scoped_highlight))
+        design_role = overlay.get("design_role")
+        if design_role is not None and design_role not in {"hook", "concept", "rule", "memory", "recap"}:
+            errors.append(f"overlay {overlay_id or index} design_role is invalid")
+        layout = overlay.get("layout")
+        if layout is not None:
+            if not isinstance(layout, dict):
+                errors.append(f"overlay {overlay_id or index} layout must be an object")
+            else:
+                for key in ("x", "y", "width", "height"):
+                    value = layout.get(key)
+                    minimum = 0 if key in {"x", "y"} else 1
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or not minimum <= float(value) <= 100
+                    ):
+                        errors.append(f"overlay {overlay_id or index} layout {key} is invalid")
+        effect_spans = overlay.get("effect_spans", [])
+        if not isinstance(effect_spans, list):
+            errors.append(f"overlay {overlay_id or index} effect_spans must be an array")
+        else:
+            if len(effect_spans) > 50:
+                errors.append(f"overlay {overlay_id or index} cannot exceed 50 effect spans")
+            occupied: list[tuple[int, int]] = []
+            for span_index, span in enumerate(effect_spans):
+                if not isinstance(span, dict):
+                    errors.append(f"overlay {overlay_id or index} effect span {span_index} must be an object")
+                    continue
+                span_id = str(span.get("id") or "")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", span_id):
+                    errors.append(f"overlay {overlay_id or index} effect span {span_index} id is invalid")
+                start_char = span.get("start_char")
+                end_char = span.get("end_char")
+                if (
+                    isinstance(start_char, bool)
+                    or isinstance(end_char, bool)
+                    or not isinstance(start_char, int)
+                    or not isinstance(end_char, int)
+                    or start_char < 0
+                    or end_char <= start_char
+                    or end_char > len(overlay_text)
+                ):
+                    errors.append(f"overlay {overlay_id or index} effect span {span_index} range is invalid")
+                    continue
+                if overlay_text[start_char:end_char] != str(span.get("text") or ""):
+                    errors.append(f"overlay {overlay_id or index} effect span text does not match its range")
+                if any(start_char < used_end and end_char > used_start for used_start, used_end in occupied):
+                    errors.append(f"overlay {overlay_id or index} effect spans cannot overlap")
+                occupied.append((start_char, end_char))
+                effect_style = span.get("style") if isinstance(span.get("style"), dict) else {}
+                if effect_style.get("effect") not in {"pop", "highlight", "underline"}:
+                    errors.append(f"overlay {overlay_id or index} effect span effect is invalid")
+                effect_color = str(effect_style.get("color") or "")
+                if not re.fullmatch(r"#[0-9A-Fa-f]{6}", effect_color):
+                    errors.append(f"overlay {overlay_id or index} effect span color is invalid")
+                effect_scale = effect_style.get("font_scale")
+                if (
+                    isinstance(effect_scale, bool)
+                    or not isinstance(effect_scale, (int, float))
+                    or not math.isfinite(float(effect_scale))
+                    or not 0.5 <= float(effect_scale) <= 3.0
+                ):
+                    errors.append(f"overlay {overlay_id or index} effect span font_scale is invalid")
         z_index = overlay.get("z_index", 0)
         if (
             isinstance(z_index, bool)
@@ -960,6 +1303,9 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     active_highlight_id = state.get("active_highlight_id")
     if active_highlight_id is not None and str(active_highlight_id) not in highlight_ids:
         errors.append("active_highlight_id must reference a highlight in state")
+    for overlay_id, highlight_id in overlay_highlight_refs:
+        if highlight_id not in highlight_ids:
+            errors.append(f"overlay {overlay_id} highlight_id must reference a highlight in state")
     return errors
 
 
@@ -1183,9 +1529,10 @@ class EditorHandler(BaseHTTPRequestHandler):
             if state is None:
                 state = default_editor_state(project, manifest)
             else:
+                upgraded = upgrade_editor_state_layout_effects(project, state)
                 state["asset_digests"] = referenced_asset_digests(project, state)
                 revision = editor_state_revision(state)
-                if state.get("revision") != revision:
+                if upgraded or state.get("revision") != revision:
                     state["revision"] = revision
                     atomic_write_json(project / STATE_REL, state)
             source_rel = str(manifest.get("source", {}).get("staged_path", ""))
@@ -1920,6 +2267,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "state_revision": current_revision,
                 "approval_revisions": approval_revisions(self.server.project_dir, state),
                 "clip": clip_snapshot,
+                "visual_quality": visual_quality_report(state, manifest, clip_snapshot),
                 "manifest": manifest,
                 "state": state,
                 "authorization": {
@@ -1992,6 +2340,12 @@ class EditorHandler(BaseHTTPRequestHandler):
         ]
         temporary.parent.mkdir(parents=True, exist_ok=True)
         try:
+            snapshot_payload = read_json(snapshot_path, {}) or {}
+            visual_quality = (
+                snapshot_payload.get("visual_quality")
+                if isinstance(snapshot_payload.get("visual_quality"), dict)
+                else {}
+            )
             try:
                 result = subprocess.run(
                     command,
@@ -2029,6 +2383,8 @@ class EditorHandler(BaseHTTPRequestHandler):
                 except subprocess.TimeoutExpired as exc:
                     raise RuntimeError("delivery QA timed out; previous output was preserved") from exc
                 qa_payload = read_json(qa_report, {}) or {}
+                qa_payload["visual_quality"] = visual_quality
+                atomic_write_json(qa_report, qa_payload)
                 if qa_result.returncode != 0 or qa_payload.get("status") != "pass":
                     failure_receipt = {
                         "schema_version": 1,
@@ -2043,6 +2399,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                         else None,
                         "failures": qa_payload.get("failures", []),
                         "warnings": qa_payload.get("warnings", []),
+                        "visual_quality": visual_quality,
                         "completed_at": now_utc(),
                     }
                     atomic_write_json(
@@ -2107,6 +2464,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "render_receipt_sha256": file_sha256(render_receipt_path),
                     "warnings": qa_payload.get("warnings", []),
                     "failures": qa_payload.get("failures", []),
+                    "visual_quality": visual_quality,
                     "human_review_required": True,
                     "completed_at": now_utc(),
                 }

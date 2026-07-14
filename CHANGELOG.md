@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.0 - 2026-07-14
+
+### Caption and layout editing
+
+- Add exact character-range caption effects with editable pop, highlight, and
+  underline styles, color, and scale; derive sparse transcript-grounded terms
+  from reviewed highlight/card copy when no manual span exists.
+- Add drag-to-position caption/card layers, caption/card width and card-height
+  controls, platform safe-zone checks, and timed-layer collision warnings.
+- Persist card layout in the render package instead of using role-only hardcoded
+  coordinates.
+
+### Render parity and validation
+
+- Bake designed captions and inline effect spans into the same HTML/GSAP visual
+  package used by the final MP4; prevent the FFmpeg path from drawing a second,
+  inconsistent caption layer.
+- Let full-screen hook cards replace their overlapping caption interval and
+  reserve a lower subtitle band under the recap card.
+- Add browser round-trip coverage for inline effects and card layout, strict
+  state validation for span offsets/styles, and graphic-package regression
+  tests against preview/final divergence.
+
 ## 1.2.0 - 2026-07-14
 
 ### Features

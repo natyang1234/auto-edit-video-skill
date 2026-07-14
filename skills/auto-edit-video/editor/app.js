@@ -12,6 +12,8 @@ let showingRenderedMedia = false;
 let lastOverlaySignature = "";
 let highlightSegments = [];
 let stateDirty = false;
+let selectedEffectSpanId = null;
+let effectCreationMode = false;
 
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
@@ -21,6 +23,13 @@ const DIRECTOR_CARD_META = {
   "editorial-clean": { icon: "編", eyebrow: "克制精準" },
 };
 const DIRECTOR_ORDER = ["teacher-punch", "high-energy", "documentary", "minimal", "editorial-clean"];
+const ROLE_LAYOUTS = {
+  hook: { x: 50, y: 50, width: 100, height: 100 },
+  concept: { x: 50, y: 56, width: 93, height: 22 },
+  rule: { x: 50, y: 56, width: 93, height: 27 },
+  memory: { x: 50, y: 16, width: 87, height: 15 },
+  recap: { x: 50, y: 41, width: 92, height: 48 },
+};
 
 const byId = (id) => document.getElementById(id);
 const deepCopy = (value) => JSON.parse(JSON.stringify(value));
@@ -40,7 +49,11 @@ function cacheElements() {
     "selected-name", "delete-layer", "text-field", "overlay-text", "overlay-start", "overlay-end",
     "font-family", "font-size", "font-size-output", "asset-width-row", "asset-width",
     "asset-width-output", "font-color", "emphasis-color", "position-x", "position-x-output",
-    "position-y", "position-y-output", "overlay-animation", "overlay-visible", "generate-copy",
+    "position-y", "position-y-output", "overlay-animation", "overlay-visible", "effect-editor",
+    "effect-style", "effect-color", "effect-scale", "effect-scale-output", "add-effect-span",
+    "effect-span-list", "overlay-max-width-row", "overlay-max-width-label", "overlay-max-width",
+    "overlay-max-width-output", "card-height-row", "card-height", "card-height-output",
+    "layout-warning", "generate-copy",
     "publish-title", "publish-body", "publish-hashtags", "cover-text", "cover-time",
     "cover-time-output", "generate-cover", "cover-preview", "approve-timeline", "render-final",
     "delivery-qa-status", "qa-contact-link", "approve-final",
@@ -101,6 +114,12 @@ function activeHighlight() {
   const activeId = state?.active_highlight_id;
   if (!activeId || !Array.isArray(state?.highlights)) return null;
   return state.highlights.find((item) => String(item.id) === String(activeId)) || null;
+}
+
+function overlayBelongsToHighlight(overlay, highlight = activeHighlight()) {
+  const scopedId = overlay?.highlight_id ? String(overlay.highlight_id) : "";
+  if (!highlight) return !scopedId;
+  return !scopedId || scopedId === String(highlight.id);
 }
 
 function timelineBounds() {
@@ -431,9 +450,9 @@ function selectHighlight(highlightId, seek = true) {
   const changed = state.active_highlight_id !== segment.id;
   state.active_highlight_id = segment.id;
   const selected = state.overlays.find((overlay) => overlay.id === selectedOverlayId);
-  if (!selected || selected.end <= segment.start || selected.start >= segment.end) {
+  if (!selected || !overlayBelongsToHighlight(selected, segment) || selected.end <= segment.start || selected.start >= segment.end) {
     selectedOverlayId = state.overlays.find(
-      (overlay) => overlay.end > segment.start && overlay.start < segment.end
+      (overlay) => overlayBelongsToHighlight(overlay, segment) && overlay.end > segment.start && overlay.start < segment.end
     )?.id || null;
     state.review = state.review || {};
     state.review.selected_overlay_id = selectedOverlayId;
@@ -597,8 +616,8 @@ function layerLabel(overlay) {
 function renderLayerList() {
   const bounds = timelineBounds();
   const visibleOverlays = activeHighlight()
-    ? state.overlays.filter((overlay) => overlay.end > bounds.start && overlay.start < bounds.end)
-    : state.overlays;
+    ? state.overlays.filter((overlay) => overlayBelongsToHighlight(overlay) && overlay.end > bounds.start && overlay.start < bounds.end)
+    : state.overlays.filter((overlay) => overlayBelongsToHighlight(overlay, null));
   elements["layer-list"].replaceChildren();
   elements["layer-count"].textContent = String(visibleOverlays.length);
   if (!visibleOverlays.length) {
@@ -624,38 +643,96 @@ function renderLayerList() {
     });
 }
 
+function normalizedEffectSpans(overlay) {
+  const text = String(overlay.text || "");
+  const explicit = Array.isArray(overlay.effect_spans) ? overlay.effect_spans : [];
+  const valid = explicit.filter((span) => Number.isInteger(span.start_char)
+    && Number.isInteger(span.end_char)
+    && span.start_char >= 0
+    && span.end_char > span.start_char
+    && span.end_char <= text.length
+    && text.slice(span.start_char, span.end_char) === String(span.text || ""))
+    .sort((a, b) => a.start_char - b.start_char || a.end_char - b.end_char);
+  if (valid.length) return valid;
+  const phrases = overlay.type === "emphasis" ? [text] : (overlay.emphasis || []).filter(Boolean);
+  let cursor = 0;
+  return phrases.flatMap((phrase, index) => {
+    const start = text.indexOf(phrase, cursor);
+    if (start < 0) return [];
+    const end = start + phrase.length;
+    cursor = end;
+    return [{
+      id: `legacy-fx-${index + 1}`,
+      text: phrase,
+      start_char: start,
+      end_char: end,
+      style: {
+        effect: "pop",
+        color: overlay.style?.emphasis_color || "#ffd447",
+        font_scale: 1.18,
+      },
+    }];
+  });
+}
+
 function createTextWithEmphasis(overlay) {
   const fragment = document.createDocumentFragment();
   const text = String(overlay.text || "");
-  const phrases = overlay.type === "emphasis" ? [text] : (overlay.emphasis || []).filter(Boolean);
-  if (!phrases.length) {
-    fragment.append(document.createTextNode(text));
-    return fragment;
-  }
+  const spans = normalizedEffectSpans(overlay);
   let cursor = 0;
-  phrases.forEach((phrase) => {
-    const index = text.indexOf(phrase, cursor);
-    if (index < 0) return;
-    fragment.append(document.createTextNode(text.slice(cursor, index)));
+  spans.forEach((span) => {
+    if (span.start_char < cursor) return;
+    fragment.append(document.createTextNode(text.slice(cursor, span.start_char)));
     const mark = document.createElement("mark");
-    mark.textContent = phrase;
+    const effectStyle = span.style || {};
+    const effect = ["pop", "highlight", "underline"].includes(effectStyle.effect) ? effectStyle.effect : "pop";
+    mark.className = `effect-word effect-${effect}`;
+    mark.dataset.effect = effect;
+    mark.style.setProperty("--effect-color", effectStyle.color || overlay.style?.emphasis_color || "#ffd447");
+    mark.style.setProperty("--effect-scale", String(effectStyle.font_scale || 1.18));
+    mark.textContent = text.slice(span.start_char, span.end_char);
     fragment.append(mark);
-    cursor = index + phrase.length;
+    cursor = span.end_char;
   });
   fragment.append(document.createTextNode(text.slice(cursor)));
   return fragment;
 }
 
+function isFullScreenHook(overlay) {
+  const layout = overlay.layout || ROLE_LAYOUTS.hook;
+  return overlay.design_role === "hook"
+    && Number(layout.width ?? 100) >= 95
+    && Number(layout.height ?? 100) >= 90;
+}
+
+function captionReplacedAtTime(overlay, time) {
+  if (!["caption", "emphasis"].includes(overlay.type) || overlay.design_role) return false;
+  return state.overlays.some((item) => item.visible !== false
+    && overlayBelongsToHighlight(item)
+    && isFullScreenHook(item)
+    && time >= Number(item.start)
+    && time < Number(item.end));
+}
+
 function renderPreviewOverlays(force = false) {
   if (!state || showingRenderedMedia) return;
   const time = elements["preview-video"].currentTime || 0;
-  const active = state.overlays.filter((overlay) => overlay.visible !== false && time >= overlay.start && time < overlay.end);
-  const signature = JSON.stringify(active.map((overlay) => [overlay.id, overlay.text, overlay.source, overlay.style, overlay.emphasis, selectedOverlayId]));
+  const active = state.overlays.filter((overlay) => overlayBelongsToHighlight(overlay)
+    && overlay.visible !== false
+    && time >= overlay.start
+    && time < overlay.end
+    && !captionReplacedAtTime(overlay, time));
+  const signature = JSON.stringify(active.map((overlay) => [
+    overlay.id, overlay.text, overlay.source, overlay.style, overlay.layout,
+    overlay.emphasis, overlay.effect_spans, selectedOverlayId,
+  ]));
   if (!force && signature === lastOverlaySignature) return;
   lastOverlaySignature = signature;
   elements["overlay-layer"].replaceChildren();
   active.sort((a, b) => (a.z_index || 0) - (b.z_index || 0)).forEach((overlay) => {
     const style = overlay.style || {};
+    const designCard = Boolean(overlay.design_role);
+    const layout = overlay.layout || {};
     const assetType = ["image", "gif", "video"].includes(overlay.type);
     let node;
     if (assetType) {
@@ -670,11 +747,17 @@ function renderPreviewOverlays(force = false) {
       node.alt = overlay.provenance || "插入素材";
     } else {
       node = document.createElement("p");
+      if (designCard && overlay.kicker) {
+        const kicker = document.createElement("small");
+        kicker.textContent = overlay.kicker;
+        node.append(kicker);
+      }
       node.append(createTextWithEmphasis(overlay));
     }
     node.className = `preview-overlay type-${overlay.type} motion-${style.animation || "none"}`;
-    node.style.left = `${style.x ?? 50}%`;
-    node.style.top = `${style.y ?? 76}%`;
+    node.dataset.overlayId = overlay.id;
+    node.style.left = `${designCard ? (layout.x ?? 50) : (style.x ?? 50)}%`;
+    node.style.top = `${designCard ? (layout.y ?? 50) : (style.y ?? 76)}%`;
     node.style.zIndex = String(overlay.z_index || 0);
     node.style.setProperty("--overlay-max-width", `${style.max_width ?? 84}%`);
     node.style.setProperty("--overlay-color", style.color || "#f7f2e8");
@@ -685,8 +768,243 @@ function renderPreviewOverlays(force = false) {
     node.style.setProperty("--overlay-font-size", `${Math.max(12, (style.font_size || 58) * stageScale)}px`);
     node.style.setProperty("--overlay-weight", String(style.font_weight || 800));
     node.style.setProperty("--overlay-asset-width", `${style.width || 32}%`);
-    if (overlay.id === selectedOverlayId) node.style.outline = "2px solid var(--vermilion)";
+    if (designCard) {
+      node.classList.add("is-design-card", `design-${overlay.design_role}`);
+      node.style.setProperty("--overlay-card-width", `${layout.width ?? 84}%`);
+      node.style.setProperty("--overlay-card-height", `${layout.height ?? 24}%`);
+    }
+    if (overlay.id === selectedOverlayId) {
+      node.style.outline = "2px solid var(--vermilion)";
+      node.classList.add("is-draggable");
+      node.tabIndex = 0;
+      node.setAttribute("aria-label", `${layerLabel(overlay)}；拖曳可調整位置`);
+      enableOverlayDrag(node, overlay);
+    }
     elements["overlay-layer"].append(node);
+  });
+}
+
+function editableLayout(overlay) {
+  if (!overlay.design_role) return overlay.style || (overlay.style = {});
+  if (!overlay.layout) overlay.layout = deepCopy(ROLE_LAYOUTS[overlay.design_role] || { x: 50, y: 50, width: 84, height: 24 });
+  return overlay.layout;
+}
+
+function effectLabel(effect) {
+  return { pop: "重點彈出", highlight: "螢光標記", underline: "動態底線" }[effect] || "重點彈出";
+}
+
+function renderEffectSpanList(overlay) {
+  elements["effect-span-list"].replaceChildren();
+  const spans = Array.isArray(overlay.effect_spans) ? overlay.effect_spans : (overlay.effect_spans = []);
+  if (!effectCreationMode && !spans.some((span) => span.id === selectedEffectSpanId)) {
+    selectedEffectSpanId = spans[0]?.id || null;
+  }
+  const selected = spans.find((span) => span.id === selectedEffectSpanId);
+  if (selected) {
+    elements["effect-style"].value = selected.style?.effect || "pop";
+    elements["effect-color"].value = selected.style?.color || overlay.style?.emphasis_color || "#ffd447";
+    elements["effect-scale"].value = selected.style?.font_scale || 1.18;
+  } else if (!effectCreationMode) {
+    elements["effect-color"].value = overlay.style?.emphasis_color || "#ffd447";
+  }
+  elements["effect-scale-output"].value = `${Number(elements["effect-scale"].value).toFixed(2)}×`;
+  if (!spans.length) {
+    const empty = document.createElement("p");
+    empty.className = "effect-span-empty";
+    empty.textContent = "尚未指定重點字；選取字幕中的字詞即可加入。";
+    elements["effect-span-list"].append(empty);
+    return;
+  }
+  spans.forEach((span) => {
+    const row = document.createElement("div");
+    row.className = `effect-span-row${span.id === selectedEffectSpanId ? " is-selected" : ""}`;
+    row.style.setProperty("--effect-chip-color", span.style?.color || "#ffd447");
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "effect-span-select";
+    const title = document.createElement("strong");
+    title.textContent = span.text;
+    const meta = document.createElement("span");
+    meta.textContent = `${effectLabel(span.style?.effect)} · ${Number(span.style?.font_scale || 1.18).toFixed(2)}×`;
+    select.append(title, meta);
+    select.addEventListener("click", () => {
+      effectCreationMode = false;
+      selectedEffectSpanId = span.id;
+      renderEffectSpanList(overlay);
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "effect-span-remove";
+    remove.textContent = "移除";
+    remove.setAttribute("aria-label", `移除重點字 ${span.text}`);
+    remove.addEventListener("click", () => {
+      pushHistory();
+      overlay.effect_spans = spans.filter((item) => item.id !== span.id);
+      overlay.emphasis = overlay.effect_spans.map((item) => item.text);
+      selectedEffectSpanId = overlay.effect_spans[0]?.id || null;
+      markDirty("已移除重點字");
+      renderEffectSpanList(overlay);
+      renderPreviewOverlays(true);
+    });
+    row.append(select, remove);
+    elements["effect-span-list"].append(row);
+  });
+}
+
+function addEffectSpan() {
+  const overlay = currentOverlay();
+  if (!overlay || !["caption", "emphasis"].includes(overlay.type) || overlay.design_role) return;
+  const input = elements["overlay-text"];
+  const start = input.selectionStart;
+  const end = input.selectionEnd;
+  const text = input.value.slice(start, end);
+  if (!text.trim() || end <= start) {
+    showToast("請先在字幕文字中選取要強調的字詞", "error");
+    input.focus();
+    return;
+  }
+  const spans = Array.isArray(overlay.effect_spans) ? overlay.effect_spans : [];
+  if (spans.some((span) => start < span.end_char && end > span.start_char)) {
+    showToast("這段文字已和另一個重點字重疊", "error");
+    return;
+  }
+  pushHistory();
+  const span = {
+    id: `fx-${Date.now().toString(36)}`,
+    text,
+    start_char: start,
+    end_char: end,
+    style: {
+      effect: elements["effect-style"].value,
+      color: elements["effect-color"].value,
+      font_scale: Number(elements["effect-scale"].value),
+    },
+  };
+  overlay.effect_spans = [...spans, span].sort((a, b) => a.start_char - b.start_char);
+  overlay.emphasis = overlay.effect_spans.map((item) => item.text);
+  effectCreationMode = false;
+  selectedEffectSpanId = span.id;
+  markDirty("已加入可輸出的重點字");
+  renderEffectSpanList(overlay);
+  renderPreviewOverlays(true);
+}
+
+function prepareEffectCreation() {
+  const input = elements["overlay-text"];
+  if (input.selectionEnd <= input.selectionStart) return;
+  effectCreationMode = true;
+  selectedEffectSpanId = null;
+  elements["effect-span-list"].querySelectorAll(".effect-span-row").forEach((row) => row.classList.remove("is-selected"));
+}
+
+function reconcileEffectSpans(overlay, nextText) {
+  const spans = Array.isArray(overlay.effect_spans) ? overlay.effect_spans : [];
+  const occupied = [];
+  overlay.effect_spans = spans.flatMap((span) => {
+    let start = span.start_char;
+    let end = span.end_char;
+    if (nextText.slice(start, end) !== span.text) {
+      const first = nextText.indexOf(span.text);
+      const unique = first >= 0 && nextText.indexOf(span.text, first + 1) < 0;
+      if (!unique) return [];
+      start = first;
+      end = first + span.text.length;
+    }
+    if (occupied.some(([usedStart, usedEnd]) => start < usedEnd && end > usedStart)) return [];
+    occupied.push([start, end]);
+    return [{ ...span, start_char: start, end_char: end }];
+  }).sort((a, b) => a.start_char - b.start_char);
+  overlay.emphasis = overlay.effect_spans.map((span) => span.text);
+}
+
+function layoutBoxForOverlay(overlay) {
+  const source = overlay.design_role ? (overlay.layout || ROLE_LAYOUTS[overlay.design_role]) : (overlay.style || {});
+  const x = Number(source?.x ?? 50);
+  const y = Number(source?.y ?? (overlay.type === "caption" ? 76 : 50));
+  if (overlay.design_role) {
+    return { x, y, width: Number(source?.width ?? 84), height: Number(source?.height ?? 24) };
+  }
+  if (["image", "gif", "video"].includes(overlay.type)) {
+    const width = Number(source?.width ?? 32);
+    return { x, y, width, height: width * 0.7 };
+  }
+  const width = Number(source?.max_width ?? 84);
+  const canvasWidth = Math.max(1, Number(state.canvas.width || 1080));
+  const canvasHeight = Math.max(1, Number(state.canvas.height || 1920));
+  const fontSize = Number(source?.font_size ?? 58);
+  const charactersPerLine = Math.max(1, Math.floor((canvasWidth * width / 100) / Math.max(1, fontSize * 0.95)));
+  const lines = Math.max(1, Math.ceil(String(overlay.text || "").length / charactersPerLine));
+  const height = Math.min(100, (lines * fontSize * 1.35 / canvasHeight) * 100);
+  return { x, y, width, height };
+}
+
+function boxesOverlap(a, b) {
+  return Math.abs(a.x - b.x) * 2 < a.width + b.width
+    && Math.abs(a.y - b.y) * 2 < a.height + b.height;
+}
+
+function renderLayoutWarning() {
+  const overlay = currentOverlay();
+  if (!overlay || !elements["layout-warning"]) return;
+  const box = layoutBoxForOverlay(overlay);
+  const preset = projectPayload?.platform_presets?.[state.canvas.platform_id];
+  const safe = preset?.safe || { top: 8, right: 8, bottom: 18, left: 8 };
+  const warnings = [];
+  const left = box.x - box.width / 2;
+  const right = box.x + box.width / 2;
+  const top = box.y - box.height / 2;
+  const bottom = box.y + box.height / 2;
+  if (left < safe.left || right > 100 - safe.right || top < safe.top || bottom > 100 - safe.bottom) {
+    warnings.push("超出平台安全框");
+  }
+  const conflicts = state.overlays.filter((item) => item.id !== overlay.id
+    && item.visible !== false
+    && Number(item.end) > Number(overlay.start)
+    && Number(item.start) < Number(overlay.end)
+    && !(isFullScreenHook(item) && ["caption", "emphasis"].includes(overlay.type))
+    && !(isFullScreenHook(overlay) && ["caption", "emphasis"].includes(item.type))
+    && boxesOverlap(box, layoutBoxForOverlay(item)))
+    .slice(0, 3)
+    .map((item) => layerLabel(item));
+  if (conflicts.length) warnings.push(`與 ${conflicts.join("、")} 重疊`);
+  elements["layout-warning"].classList.toggle("is-warning", warnings.length > 0);
+  elements["layout-warning"].textContent = warnings.length
+    ? `版面警示：${warnings.join("；")}。可拖曳預覽圖層或調整下方位置與尺寸。`
+    : "目前位置在安全範圍內，且沒有和同時間圖層重疊。";
+}
+
+function enableOverlayDrag(node, overlay) {
+  node.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    pushHistory();
+    const target = editableLayout(overlay);
+    const origin = { x: Number(target.x ?? 50), y: Number(target.y ?? 50), clientX: event.clientX, clientY: event.clientY };
+    node.classList.add("is-dragging");
+    node.setPointerCapture(event.pointerId);
+    const move = (moveEvent) => {
+      const bounds = elements["stage-frame"].getBoundingClientRect();
+      target.x = Math.max(0, Math.min(100, origin.x + (moveEvent.clientX - origin.clientX) / bounds.width * 100));
+      target.y = Math.max(0, Math.min(100, origin.y + (moveEvent.clientY - origin.clientY) / bounds.height * 100));
+      node.style.left = `${target.x}%`;
+      node.style.top = `${target.y}%`;
+      elements["position-x"].value = String(Math.round(target.x));
+      elements["position-y"].value = String(Math.round(target.y));
+      elements["position-x-output"].value = `${Math.round(target.x)}%`;
+      elements["position-y-output"].value = `${Math.round(target.y)}%`;
+      renderLayoutWarning();
+    };
+    const stop = () => {
+      node.classList.remove("is-dragging");
+      node.removeEventListener("pointermove", move);
+      node.removeEventListener("pointerup", stop);
+      node.removeEventListener("pointercancel", stop);
+      markDirty("位置已拖曳更新");
+    };
+    node.addEventListener("pointermove", move);
+    node.addEventListener("pointerup", stop);
+    node.addEventListener("pointercancel", stop);
   });
 }
 
@@ -698,35 +1016,51 @@ function renderInspector() {
     return;
   }
   const assetType = ["image", "gif", "video"].includes(overlay.type);
+  const designCard = Boolean(overlay.design_role);
   const style = overlay.style || (overlay.style = deepCopy(state.caption_defaults));
+  const position = designCard ? editableLayout(overlay) : style;
   elements["inspector-empty"].hidden = true;
   elements["layer-form"].hidden = false;
   elements["selected-type"].textContent = overlay.type.toUpperCase();
   elements["selected-name"].textContent = layerLabel(overlay);
   elements["text-field"].hidden = assetType;
+  elements["effect-editor"].hidden = !["caption", "emphasis"].includes(overlay.type) || designCard;
   elements["overlay-text"].value = overlay.text || "";
   elements["overlay-start"].value = overlay.start;
   elements["overlay-end"].value = overlay.end;
   elements["font-family"].value = style.font_family || "PingFang TC";
+  elements["font-family"].closest("label").hidden = assetType || designCard;
   elements["font-size"].value = style.font_size || 58;
   elements["font-size-output"].value = style.font_size || 58;
-  elements["font-size"].closest("label").hidden = assetType;
+  elements["font-size"].closest("label").hidden = assetType || designCard;
   elements["asset-width-row"].hidden = !assetType;
   elements["asset-width"].value = style.width || 32;
   elements["asset-width-output"].value = `${style.width || 32}%`;
   elements["font-color"].value = style.color || "#f7f2e8";
   elements["emphasis-color"].value = style.emphasis_color || "#ffd447";
-  elements["font-color"].closest(".field-pair").hidden = assetType;
-  elements["position-x"].value = style.x ?? 50;
-  elements["position-x-output"].value = `${style.x ?? 50}%`;
-  elements["position-y"].value = style.y ?? 76;
-  elements["position-y-output"].value = `${style.y ?? 76}%`;
+  elements["font-color"].closest(".field-pair").hidden = assetType || designCard;
+  elements["overlay-max-width-row"].hidden = assetType;
+  elements["overlay-max-width-label"].firstChild.textContent = designCard ? "圖卡寬度 " : "字幕最大寬度 ";
+  elements["overlay-max-width"].value = designCard ? (position.width ?? 84) : (style.max_width ?? 84);
+  elements["overlay-max-width-output"].value = `${designCard ? (position.width ?? 84) : (style.max_width ?? 84)}%`;
+  elements["card-height-row"].hidden = !designCard;
+  elements["card-height"].value = position.height ?? 24;
+  elements["card-height-output"].value = `${position.height ?? 24}%`;
+  elements["position-x"].value = position.x ?? 50;
+  elements["position-x-output"].value = `${position.x ?? 50}%`;
+  elements["position-y"].value = position.y ?? (designCard ? 50 : 76);
+  elements["position-y-output"].value = `${position.y ?? (designCard ? 50 : 76)}%`;
   elements["overlay-animation"].value = style.animation || "none";
+  elements["overlay-animation"].closest("label").hidden = assetType || designCard;
   elements["overlay-visible"].checked = overlay.visible !== false;
+  if (!elements["effect-editor"].hidden) renderEffectSpanList(overlay);
+  renderLayoutWarning();
 }
 
 function selectOverlay(id, seek = false) {
   selectedOverlayId = id;
+  selectedEffectSpanId = null;
+  effectCreationMode = false;
   state.review = state.review || {};
   state.review.selected_overlay_id = id;
   const overlay = currentOverlay();
@@ -751,6 +1085,7 @@ function addOverlay(type, source = null) {
     id, type, start, end: Math.max(end, start + 0.2), text: defaults[type] || "", emphasis: [],
     visible: true, locked: false, z_index: ["image", "gif", "video"].includes(type) ? 10 : 30,
     style, source, provenance: source ? "user-uploaded-through-local-editor" : "manual editor layer",
+    highlight_id: activeHighlight()?.id || null,
   });
   selectOverlay(id, true);
   markDirty("新增圖層，儲存中…");
@@ -772,7 +1107,11 @@ function updateOverlayFromForm() {
   const overlay = currentOverlay();
   if (!overlay) return;
   const style = overlay.style || (overlay.style = {});
-  overlay.text = elements["overlay-text"].value;
+  const designCard = Boolean(overlay.design_role);
+  const position = editableLayout(overlay);
+  const nextText = elements["overlay-text"].value;
+  if (nextText !== overlay.text) reconcileEffectSpans(overlay, nextText);
+  overlay.text = nextText;
   overlay.start = Math.max(0, Number(elements["overlay-start"].value) || 0);
   overlay.end = Math.min(duration(), Math.max(overlay.start + 0.01, Number(elements["overlay-end"].value) || overlay.start + 0.01));
   style.font_family = elements["font-family"].value;
@@ -780,15 +1119,35 @@ function updateOverlayFromForm() {
   style.width = Number(elements["asset-width"].value);
   style.color = elements["font-color"].value;
   style.emphasis_color = elements["emphasis-color"].value;
-  style.x = Number(elements["position-x"].value);
-  style.y = Number(elements["position-y"].value);
+  position.x = Number(elements["position-x"].value);
+  position.y = Number(elements["position-y"].value);
+  if (designCard) {
+    position.width = Number(elements["overlay-max-width"].value);
+    position.height = Number(elements["card-height"].value);
+  } else {
+    style.max_width = Number(elements["overlay-max-width"].value);
+  }
   style.animation = elements["overlay-animation"].value;
+  const selectedSpan = effectCreationMode
+    ? null
+    : (overlay.effect_spans || []).find((span) => span.id === selectedEffectSpanId);
+  if (selectedSpan) {
+    selectedSpan.style = selectedSpan.style || {};
+    selectedSpan.style.effect = elements["effect-style"].value;
+    selectedSpan.style.color = elements["effect-color"].value;
+    selectedSpan.style.font_scale = Number(elements["effect-scale"].value);
+  }
   overlay.visible = elements["overlay-visible"].checked;
   elements["font-size-output"].value = style.font_size;
   elements["asset-width-output"].value = `${style.width}%`;
-  elements["position-x-output"].value = `${style.x}%`;
-  elements["position-y-output"].value = `${style.y}%`;
+  elements["overlay-max-width-output"].value = `${designCard ? position.width : style.max_width}%`;
+  elements["card-height-output"].value = `${position.height ?? 24}%`;
+  elements["position-x-output"].value = `${position.x}%`;
+  elements["position-y-output"].value = `${position.y}%`;
+  elements["effect-scale-output"].value = `${Number(elements["effect-scale"].value).toFixed(2)}×`;
   markDirty("圖層變更，儲存中…");
+  if (!elements["effect-editor"].hidden) renderEffectSpanList(overlay);
+  renderLayoutWarning();
 }
 
 function timelineWidth() {
@@ -883,6 +1242,7 @@ function renderTimeline() {
     } else {
       state.overlays.filter((overlay) =>
         group.types.includes(overlay.type)
+        && overlayBelongsToHighlight(overlay)
         && overlay.end > bounds.start
         && overlay.start < bounds.end
       ).forEach((overlay) => {
@@ -1128,6 +1488,11 @@ function renderDeliveryQa(receipt = projectPayload?.delivery_qa || {}) {
     && projectPayload?.approval_current?.final !== false
   );
   const warnings = Array.isArray(receipt?.warnings) ? receipt.warnings : [];
+  const visual = receipt?.visual_quality || {};
+  const visualPassed = visual.contract_applies !== true || visual.status === "pass";
+  const visualSummary = visual.contract_applies === true
+    ? `視覺契約：${visual.designed_card_count || 0} 張圖卡、覆蓋 ${Math.round((visual.designed_coverage_ratio || 0) * 100)}%`
+    : "";
 
   elements["qa-contact-link"].hidden = !hasReceipt || !receipt.contact_sheet;
   if (!elements["qa-contact-link"].hidden) {
@@ -1143,11 +1508,13 @@ function renderDeliveryQa(receipt = projectPayload?.delivery_qa || {}) {
   } else if (!isCurrent) {
     elements["delivery-qa-status"].textContent = "QA 成片對應舊時間軸，請重新輸出。";
   } else if (isApproved) {
-    elements["delivery-qa-status"].textContent = "機械 QA 與人工檢查均已通過。";
+    elements["delivery-qa-status"].textContent = `媒體 QA、視覺契約與人工檢查均已通過。${visualSummary ? ` ${visualSummary}。` : ""}`;
+  } else if (!visualPassed) {
+    elements["delivery-qa-status"].textContent = "媒體檔可播放，但視覺契約未通過，不能核可成片。";
   } else {
     elements["delivery-qa-status"].textContent = warnings.length
-      ? `機械 QA 通過；有 ${warnings.length} 項提醒，請查看九宮格與完整播放。`
-      : "機械 QA 通過；請查看九宮格並完整播放後再核可。";
+      ? `媒體 QA 與視覺契約通過；${visualSummary}。另有 ${warnings.length} 項提醒，請查看九宮格與完整播放。`
+      : `媒體 QA 與視覺契約通過；${visualSummary || "請查看九宮格"}，完整播放後再核可。`;
   }
 
   if (isApproved && receipt.output) {
@@ -1313,7 +1680,7 @@ function renderSourceWarning() {
   if (report.scene_pacing?.ok === false) warnings.push("有鏡頭節奏警告");
   const stages = projectPayload.manifest?.stages || {};
   const hasDraftPlans = state.overlays.some((overlay) =>
-    ["working/emphasis_plan.json", "working/visual_plan.json"].includes(overlay.source)
+    ["working/emphasis_plan.json", "working/visual_plan.json", "working/highlight_visual_plan.json"].includes(overlay.source)
   );
   if (stages.edit_review === "needs_review" || hasDraftPlans) {
     warnings.push("逐字稿與自動重點／字卡待校對");
@@ -1422,6 +1789,10 @@ function bindEvents() {
   elements["asset-input"].addEventListener("change", () => uploadAsset(elements["asset-input"].files[0]));
   elements["delete-layer"].addEventListener("click", deleteSelectedOverlay);
   elements["layer-form"].addEventListener("input", updateOverlayFromForm);
+  elements["add-effect-span"].addEventListener("click", addEffectSpan);
+  ["select", "mouseup", "keyup"].forEach((eventName) => {
+    elements["overlay-text"].addEventListener(eventName, prepareEffectCreation);
+  });
   elements["style-tab"].addEventListener("click", () => switchInspectorTab("style"));
   elements["publish-tab"].addEventListener("click", () => switchInspectorTab("publish"));
   elements["generate-copy"].addEventListener("click", generateCopy);

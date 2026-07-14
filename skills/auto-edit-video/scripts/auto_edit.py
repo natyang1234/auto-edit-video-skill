@@ -24,6 +24,7 @@ from highlight_planner import (
     build_highlight_plan,
     validate_highlight_plan,
 )
+from visual_quality import build_highlight_design_overlays
 
 
 SCHEMA_VERSION = 1
@@ -1355,12 +1356,18 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
     transcript = read_json(project_dir / "working/transcript_words.json")
     manifest = read_json(project_dir / "project.json")
     try:
-        from editor_server import DIRECTOR_PRESETS, editor_state_revision
+        from editor_server import (
+            DIRECTOR_PRESETS,
+            caption_effect_spans,
+            editor_state_revision,
+            effect_keywords_for_caption,
+        )
     except ImportError as exc:
         raise ValueError(f"cannot load editor transcript bridge: {exc}") from exc
     director_id = str(state.get("director_style") or "teacher-punch")
     director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
     caption_style = dict(state.get("caption_defaults") or director["caption"])
+    emphasis_plan = read_json(project_dir / "working/emphasis_plan.json")
     preserved = [
         overlay
         for overlay in state.get("overlays", [])
@@ -1375,14 +1382,25 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
         text = str(segment.get("text", "")).strip()
         if not text:
             continue
+        segment_start = round(float(segment.get("start", 0.0)), 3)
+        segment_end = round(float(segment.get("end", 0.0)), 3)
+        effects = caption_effect_spans(
+            emphasis_plan,
+            text,
+            segment_start,
+            segment_end,
+            str(caption_style.get("emphasis_color") or "#ffd447"),
+            effect_keywords_for_caption(state, segment_start, segment_end),
+        )
         captions.append(
             {
                 "id": f"caption-{index:04d}",
                 "type": "caption",
-                "start": round(float(segment.get("start", 0.0)), 3),
-                "end": round(float(segment.get("end", 0.0)), 3),
+                "start": segment_start,
+                "end": segment_end,
                 "text": text,
-                "emphasis": [],
+                "emphasis": [item["text"] for item in effects],
+                "effect_spans": effects,
                 "visible": True,
                 "locked": False,
                 "z_index": 20,
@@ -1433,17 +1451,51 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
         caption_style = dict(DIRECTOR_PRESETS[director_id]["caption"])
         state["director_style"] = director_id
         state["caption_defaults"] = caption_style
-        generated_sources = {
-            "working/transcript_words.json",
-            "working/emphasis_plan.json",
-            "working/visual_plan.json",
-        }
+        generated_sources = {"working/transcript_words.json"}
         for overlay in state.get("overlays", []):
             if not isinstance(overlay, dict) or overlay.get("source") not in generated_sources:
                 continue
-            if overlay.get("type") not in {"caption", "emphasis", "title", "card", "animation"}:
+            if overlay.get("type") != "caption":
                 continue
             overlay["style"] = {**dict(overlay.get("style") or {}), **caption_style}
+        preserved = [
+            overlay
+            for overlay in state.get("overlays", [])
+            if not (
+                isinstance(overlay, dict)
+                and overlay.get("type") != "caption"
+                and overlay.get("source")
+                in {
+                    "working/emphasis_plan.json",
+                    "working/visual_plan.json",
+                    "working/highlight_visual_plan.json",
+                }
+            )
+        ]
+        transcript = read_json(project_dir / "working/transcript_words.json")
+        design_overlays: list[dict[str, Any]] = []
+        for highlight in highlights:
+            design_overlays.extend(
+                build_highlight_design_overlays(
+                    transcript,
+                    highlight,
+                    caption_style,
+                    director_id,
+                )
+            )
+        state["overlays"] = preserved + design_overlays
+        state.setdefault("canvas", {})["fit"] = "contain"
+        state["visual_quality_mode"] = "designed"
+        state["graphic_package_style"] = "craft-stack"
+        write_json(
+            project_dir / "working/highlight_visual_plan.json",
+            {
+                "schema_version": 1,
+                "generator": "highlight-scoped-designed-cards-v1",
+                "highlight_plan_revision": plan.get("plan_revision"),
+                "items": design_overlays,
+            },
+        )
     state["editing_brief"] = str(configuration.get("editing_brief", ""))[:2000]
     state["updated_at"] = now_utc()
     state["revision"] = editor_state_revision(state)

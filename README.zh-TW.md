@@ -31,6 +31,8 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 瀏覽器只把選定的本機 File 傳給 loopback Studio。Studio 會驗證影片、建立不可變的 owned copy、執行本機 Whisper，再依平台短／中／長、剪輯重點與五種確定性導演策略產生最多十段有原文證據的精華。使用者可逐段保留／排除、改標題與起訖、校正字幕、加入字卡／動畫／授權素材、預覽並分別輸出。
 
+字幕可直接選取句內字詞，套用可輸出的彈出、螢光或底線效果；字幕與設計圖卡可拖曳，並可調整位置、寬度／高度。GUI 會即時提示平台安全框與同時段圖層重疊。設計模式會把字幕、重點字與圖卡烘焙進同一份 HTML／GSAP graphic package，避免預覽能調、MP4 卻落回另一套字幕 renderer。
+
 人工閘依序為 `destructive_edit` → `highlight_selection` → `timeline` → `final`，每一閘都綁定當下 revision。正式輸出會自動建立 frozen snapshot、SHA-256 receipt、機械 QA 與九宮格；只有目前版本通過 QA 且人工核可後才顯示下載。頁面 renderer 目前不會悄悄忽略 interior delete：若審查決定含 `delete`，正式輸出會 fail closed，必須先走 `render_cut.py`，或把該提案改為 keep。
 
 ## 平台時長預設

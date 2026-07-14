@@ -16,8 +16,16 @@ plans, source QA, and `working/editor_state.json`.
 - Up to ten transcript-grounded semantic highlights with source timing,
   evidence, score, strategy, per-clip keep/reject, title/range editing, and a
   clip-scoped timeline.
-- Font family, size, fill/accent color, X/Y position, visibility, timing, and
-  `none` / `fade` / `pop` / `slide-up` motion.
+- Font family, size, fill/accent color, X/Y position, maximum width,
+  visibility, timing, and `none` / `fade` / `pop` / `slide-up` motion.
+- Character-range caption effects: select exact text and add editable
+  `pop`, `highlight`, or `underline` spans with color and scale controls.
+- Drag-to-position for the selected caption/card layer, card width/height
+  controls, and live safe-zone/timed-layer collision warnings.
+- Designed-mode captions and effect spans are compiled into the same
+  HTML/GSAP package as the five visual cards. Full-screen hook cards replace
+  their overlapping caption interval instead of drawing two text systems on
+  top of one another.
 - Text, emphasis, title, card, image, GIF, and inserted-video layers.
 - Instagram Reels, YouTube Shorts, YouTube 16:9, TikTok, and two editorial
   Xiaohongshu working presets with platform safe-zone guides.
@@ -78,8 +86,9 @@ non-loopback bind requires `--allow-remote` and a trusted network.
 3. Review all highlight candidates, mark at least one keep, reject the rest, and
    approve the current highlight-selection revision.
 4. Review auto emphasis/title/card layers; remove claims created from bad ASR.
-5. Pick the social canvas, inspect its safe zone, and adjust typography,
-   positions, motions, and licensed assets.
+5. Pick the social canvas, inspect its safe zone and collision status, select
+   any inline emphasis words, then adjust typography, positions, card size,
+   motions, and licensed assets.
 6. Render and watch a versioned preview MP4 for the selected clip.
 7. Approve the current timeline revision, then render final.
 8. Inspect the full final playback and QA contact sheet. Approve final only when

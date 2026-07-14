@@ -260,8 +260,9 @@ Keep translations semantically faithful and preserve names, figures, units, and
 claims. The audio/final transcript remains the timing truth.
 
 Write `working/emphasis_plan.json`. Emphasize meaningful nouns, figures,
-contrasts, promises, and conclusions. Default to at most one emphasized phrase
-per caption line; do not animate every word.
+contrasts, promises, and conclusions. Default to one emphasized phrase per
+caption line and allow at most two when both are essential to the idea; do not
+animate every word.
 
 Run `plan-overlays` for the conservative local baseline. It derives sparse
 numeric/contrast emphasis, one opening title proposal, and a few transcript-
@@ -295,9 +296,11 @@ Read [references/PAGE_EDITOR.md](references/PAGE_EDITOR.md), then launch `editor
 Use `studio` to import a new A-roll or `editor` to reopen an existing project.
 Both are loopback-only by default. The editor supports reviewed semantic
 highlights, clip-scoped video/timeline preview, font/color/size and position
-controls, text motions, PNG/JPG/WEBP/GIF/MP4/MOV layers, platform safe zones,
-local publishing-copy drafts, cover frames, preview render, QA-bound final
-render, contact-sheet review, and approved download.
+controls, selectable inline caption effects, drag-to-position caption/card
+layers, card width/height, timed overlap warnings, text motions,
+PNG/JPG/WEBP/GIF/MP4/MOV layers, platform safe zones, local publishing-copy
+drafts, cover frames, preview render, QA-bound final render, contact-sheet
+review, and approved download.
 
 Treat the HTML preview as an editing surface, then render an MP4 preview for
 truth checking. Highlight, timeline, and final approvals are bound to their
