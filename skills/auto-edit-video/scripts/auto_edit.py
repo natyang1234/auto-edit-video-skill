@@ -539,9 +539,9 @@ def normalize_transcription_glossary(values: Any) -> list[str]:
 def normalize_transcription_calibrations(values: Any) -> list[dict[str, Any]]:
     """Normalize explicit, auditable ASR alias rules.
 
-    Rules use ``canonical=alias|alias``.  Aliases must be the same character
-    length as the canonical spelling so applying a rule never changes the
-    word-timing boundaries imported from Whisper.
+    Rules use ``canonical=alias|alias``.  Canonical text may be longer or
+    shorter than the ASR alias; applying a rule preserves the matched source
+    time span and reuses the original Whisper word boundaries where possible.
     """
     if values is None:
         return []
@@ -587,10 +587,6 @@ def normalize_transcription_calibrations(values: Any) -> list[dict[str, Any]]:
                 raise ValueError(
                     "transcription calibration aliases must be 1-80 characters"
                 )
-            if len(alias) != len(canonical):
-                raise ValueError(
-                    "transcription calibration aliases must match canonical character length"
-                )
             alias_key = alias.casefold()
             if alias_key == canonical.casefold() or alias_key in local_seen:
                 continue
@@ -635,7 +631,7 @@ def apply_transcription_calibrations(
     data: dict[str, Any],
     calibrations: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Apply exact equal-length aliases while preserving every word timestamp."""
+    """Apply exact aliases while preserving each matched source time span."""
     candidates = sorted(
         (
             (
@@ -663,8 +659,8 @@ def apply_transcription_calibrations(
         for token in original_tokens:
             boundaries.append((cursor, cursor + len(token)))
             cursor += len(token)
-        characters = list(combined)
         occupied: set[int] = set()
+        replacements: list[dict[str, Any]] = []
         for alias, canonical, scope_start, scope_end in candidates:
             for match in re.finditer(re.escape(alias), combined, flags=re.IGNORECASE):
                 start, end = match.span()
@@ -686,22 +682,81 @@ def apply_transcription_calibrations(
                     continue
                 if scope_end is not None and match_start >= float(scope_end):
                     continue
-                characters[start:end] = list(canonical)
                 occupied.update(range(start, end))
+                replacement = {
+                    "segment_id": segment.get("id", segment_index),
+                    "from": matched,
+                    "to": canonical,
+                    "start": match_start,
+                    "end": match_end,
+                    "source_word_count": len(word_indexes),
+                    "timing_mode": (
+                        "word_boundaries_preserved"
+                        if len(matched) == len(canonical)
+                        else "source_span_preserved"
+                    ),
+                    "character_start": start,
+                    "character_end": end,
+                    "word_indexes": word_indexes,
+                }
+                replacements.append(replacement)
                 corrections.append(
                     {
-                        "segment_id": segment.get("id", segment_index),
-                        "from": matched,
-                        "to": canonical,
-                        "start": match_start,
-                        "end": match_end,
+                        key: value
+                        for key, value in replacement.items()
+                        if key not in {"character_start", "character_end", "word_indexes"}
                     }
                 )
         if not occupied:
             continue
-        corrected = "".join(characters)
-        for raw_word, (start, end) in zip(raw_words, boundaries):
-            raw_word["word"] = corrected[start:end]
+
+        output_tokens = ["" for _item in raw_words]
+
+        def append_original(start: int, end: int) -> None:
+            for index, (word_start, word_end) in enumerate(boundaries):
+                if word_end <= start:
+                    continue
+                if word_start >= end:
+                    break
+                slice_start = max(start, word_start)
+                slice_end = min(end, word_end)
+                if slice_start < slice_end:
+                    output_tokens[index] += combined[slice_start:slice_end]
+
+        def replacement_chunks(text: str, count: int) -> list[str]:
+            if count <= 1:
+                return [text]
+            if len(text) >= count:
+                return [
+                    text[index * len(text) // count : (index + 1) * len(text) // count]
+                    for index in range(count)
+                ]
+            chunks = ["" for _index in range(count)]
+            if len(text) == 1:
+                chunks[0] = text
+                return chunks
+            positions = [
+                round(index * (count - 1) / (len(text) - 1))
+                for index in range(len(text))
+            ]
+            for character, position in zip(text, positions):
+                chunks[position] += character
+            return chunks
+
+        cursor = 0
+        for replacement in sorted(replacements, key=lambda item: item["character_start"]):
+            start = int(replacement["character_start"])
+            end = int(replacement["character_end"])
+            append_original(cursor, start)
+            word_indexes = list(replacement["word_indexes"])
+            chunks = replacement_chunks(str(replacement["to"]), len(word_indexes))
+            for word_index, chunk in zip(word_indexes, chunks):
+                output_tokens[word_index] += chunk
+            cursor = end
+        append_original(cursor, len(combined))
+
+        for raw_word, corrected_token in zip(raw_words, output_tokens):
+            raw_word["word"] = corrected_token
         segment["text"] = join_caption_words(
             [{"text": raw_word.get("word", "")} for raw_word in raw_words]
         )
@@ -1803,13 +1858,16 @@ def build_transcript_review(
     for word in transcript.get("words", []):
         confidence = word.get("confidence")
         text = str(word.get("text", ""))
-        latin_core = "".join(re.findall(r"[A-Za-z]+", text)).casefold()
+        latin_words = [item.casefold() for item in re.findall(r"[A-Za-z]+", text)]
+        unknown_latin_words = [
+            item
+            for item in latin_words
+            if item not in glossary_words and item not in {"ok", "so"}
+        ]
         if (
             isinstance(confidence, (int, float))
             and float(confidence) < 0.35
-            and re.search(r"[A-Za-z]", text)
-            and latin_core not in glossary_words
-            and latin_core not in {"ok", "so"}
+            and unknown_latin_words
         ):
             issues.append(
                 {

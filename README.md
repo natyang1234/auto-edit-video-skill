@@ -54,8 +54,9 @@ English hint cannot degrade adjacent Chinese recognition. The project stores a
 transcript-review report, applies conservative spelling/split-token corrections,
 and generates readable timed captions instead of exposing 30-second Whisper
 blocks in the GUI. A separate calibration field accepts audited rules such as
-`複數=富數; 雪茄=學家|雪家; cigar=ciger`. These replacements keep word timestamps,
-write a correction audit, and may be time-scoped in the manifest. A zero
+`複數=富數; It is=意思; 例句=音譽句`. Canonical text and aliases may have different
+lengths; replacements preserve the matched source interval, reuse Whisper word
+boundaries where possible, write a correction audit, and may be time-scoped in the manifest. A zero
 mechanical-warning count is never presented as semantic review; calibration
 remains `applied_needs_review` until a person checks the captions.
 

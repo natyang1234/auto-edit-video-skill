@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.1 - 2026-07-14
+
+### Variable-length semantic calibration
+
+- Allow audited calibration rules whose canonical phrase and ASR alias have
+  different character lengths, including Chinese/English code switches such as
+  `It is=意思` and phrase repairs such as `例句=音譽句`.
+- Preserve the full matched Whisper source interval, reuse existing word
+  boundaries when possible, and label each audit entry as either
+  `word_boundaries_preserved` or `source_span_preserved`.
+- Treat a low-confidence multiword English correction as glossary-known when
+  each component word is declared, avoiding a false warning for `It is`.
+- Add public CLI regression coverage for `It is`, `不定詞片語`, and `例句`, and
+  update Studio guidance so these corrections happen before SRT, highlights,
+  cards, and GUI captions are generated.
+
 ## 1.6.0 - 2026-07-14
 
 ### Auditable semantic subtitle calibration

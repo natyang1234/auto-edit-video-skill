@@ -80,9 +80,9 @@ strategies, not five autonomous LLM agents.
 Studio source language includes `zh-en` for Chinese/English code switching and
 an optional semicolon-separated terminology glossary. The separate subtitle
 calibration field accepts audited `canonical=alias|alias` rules such as
-`複數=富數;雪茄=學家|雪家;cigar=ciger`; equal-length replacements preserve word
-timestamps and optional manifest `start`/`end` scopes constrain ambiguous
-aliases. Auto and Chinese source modes also prompt local Whisper to retain
+`複數=富數;It is=意思;例句=音譽句`; replacements preserve the matched source time
+span, reuse Whisper word boundaries where possible, and optional manifest
+`start`/`end` scopes constrain ambiguous aliases. Auto and Chinese source modes also prompt local Whisper to retain
 incidental English spelling. Import writes both
 `working/transcript_review.json` and `working/transcript_calibration.json`,
 bounds the prompt and excludes long glossary sentences so English hints do not

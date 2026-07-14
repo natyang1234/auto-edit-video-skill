@@ -622,6 +622,95 @@ payload = {
         self.assertEqual(review["semantic_calibration"]["status"], "applied_needs_review")
         self.assertEqual(review["risk_status"], "review_required")
 
+    def test_semantic_calibration_repairs_variable_length_code_switch_and_phrase_aliases(self) -> None:
+        project = self.root / "semantic-calibration-variable-length"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "It is",
+            "--transcription-calibration",
+            "It is=意思;不定詞片語=不定詞騙於;例句=音譽句",
+        )
+        whisper_json = self.root / "semantic-calibration-variable-length.json"
+        source_words = [
+            {"word": "老師用", "start": 0.02, "end": 0.20, "probability": 0.96},
+            {"word": "意思", "start": 0.20, "end": 0.40, "probability": 0.22},
+            {"word": "的原因。", "start": 0.40, "end": 0.58, "probability": 0.98},
+            {"word": "他代替不定詞騙於。", "start": 0.60, "end": 0.80, "probability": 0.74},
+            {"word": "我們直接來看", "start": 0.82, "end": 1.00, "probability": 0.97},
+            {"word": "音", "start": 1.00, "end": 1.08, "probability": 0.08},
+            {"word": "譽", "start": 1.08, "end": 1.16, "probability": 0.33},
+            {"word": "句。", "start": 1.16, "end": 1.24, "probability": 0.76},
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "".join(item["word"] for item in source_words),
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "id": 3,
+                            "start": 0.02,
+                            "end": 1.24,
+                            "text": "".join(item["word"] for item in source_words),
+                            "words": source_words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        calibration = json.loads(
+            (project / "working/transcript_calibration.json").read_text(encoding="utf-8")
+        )
+        review = json.loads(
+            (project / "working/transcript_review.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn("老師用 It is 的原因", transcript["text"])
+        self.assertIn("他代替不定詞片語", transcript["text"])
+        self.assertIn("我們直接來看例句", transcript["text"])
+        self.assertNotRegex(transcript["text"], r"老師用意思|不定詞騙於|音譽句")
+        it_is_word = next(item for item in transcript["words"] if item["text"] == "It is")
+        self.assertEqual((it_is_word["start"], it_is_word["end"]), (0.20, 0.40))
+        example_words = [
+            item
+            for item in transcript["words"]
+            if item["start"] >= 1.00 and item["end"] <= 1.24
+        ]
+        self.assertEqual("".join(item["text"] for item in example_words), "例句。")
+        self.assertEqual(example_words[0]["start"], 1.00)
+        self.assertEqual(example_words[-1]["end"], 1.24)
+        self.assertEqual(calibration["correction_count"], 3)
+        corrections = {
+            (item["from"], item["to"]): item for item in calibration["corrections"]
+        }
+        self.assertEqual(corrections[("意思", "It is")]["start"], 0.20)
+        self.assertEqual(corrections[("意思", "It is")]["end"], 0.40)
+        self.assertEqual(corrections[("音譽句", "例句")]["start"], 1.00)
+        self.assertEqual(corrections[("音譽句", "例句")]["end"], 1.24)
+        self.assertEqual(review["mechanical_issue_count"], 0)
+
     def test_chinese_transcript_without_calibration_is_not_reported_semantically_clear(self) -> None:
         project = self.root / "semantic-calibration-not-configured"
         self.run_cli(

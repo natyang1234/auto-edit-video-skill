@@ -74,9 +74,11 @@ Never let a draft script overwrite something actually spoken.
 
 ### `transcript_calibration.json`
 
-Calibration never implies human approval. Rules use equal-length aliases so
-the imported word timing remains unchanged; optional `start`/`end` values
-scope an otherwise ambiguous alias to a reviewed source interval.
+Calibration never implies human approval. Canonical text and aliases may have
+different character lengths. Equal-length replacements retain each imported
+word boundary; variable-length replacements retain the complete matched source
+interval and reuse Whisper boundaries where possible. Optional `start`/`end`
+values scope an otherwise ambiguous alias to a reviewed source interval.
 
 ```json
 {
@@ -86,10 +88,18 @@ scope an otherwise ambiguous alias to a reviewed source interval.
   "correction_count": 1,
   "human_review_required": true,
   "rules": [
-    {"canonical": "雪茄", "aliases": ["學家", "雪家"]}
+    {"canonical": "例句", "aliases": ["音譽句"]}
   ],
   "corrections": [
-    {"segment_id": 10, "from": "學家", "to": "雪茄", "start": 195.44, "end": 196.06}
+    {
+      "segment_id": 10,
+      "from": "音譽句",
+      "to": "例句",
+      "start": 32.56,
+      "end": 32.96,
+      "source_word_count": 3,
+      "timing_mode": "source_span_preserved"
+    }
   ]
 }
 ```
