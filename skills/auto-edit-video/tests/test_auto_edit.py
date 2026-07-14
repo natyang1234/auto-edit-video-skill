@@ -104,7 +104,28 @@ class AutoEditVoiceTests(unittest.TestCase):
                 "y": 76,
                 "max_width": 86,
             },
-            "overlays": [],
+            "overlays": [
+                {
+                    "id": "manual-emphasis",
+                    "type": "emphasis",
+                    "start": 0.04,
+                    "end": 0.16,
+                    "text": "三倍",
+                    "source": None,
+                    "provenance": "manual editor layer",
+                    "highlight_id": "old-highlight",
+                },
+                {
+                    "id": "manual-outside",
+                    "type": "title",
+                    "start": 0.37,
+                    "end": 0.39,
+                    "text": "片尾",
+                    "source": None,
+                    "provenance": "manual editor layer",
+                    "highlight_id": "old-highlight",
+                },
+            ],
             "publishing": {},
             "review": {"selected_overlay_id": None},
         }
@@ -199,6 +220,11 @@ payload = {
                 {item["design_role"] for item in cards},
                 {"hook", "concept", "rule", "memory", "recap"},
             )
+        current_highlight_ids = {item["id"] for item in synced_state["highlights"]}
+        manual = next(item for item in synced_state["overlays"] if item["id"] == "manual-emphasis")
+        outside = next(item for item in synced_state["overlays"] if item["id"] == "manual-outside")
+        self.assertIn(manual["highlight_id"], current_highlight_ids)
+        self.assertNotIn("highlight_id", outside)
 
     def test_mixed_zh_en_transcription_preserves_glossary_terms(self) -> None:
         project = self.root / "mixed-language-pipeline"

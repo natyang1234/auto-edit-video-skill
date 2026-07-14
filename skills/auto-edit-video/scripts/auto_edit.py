@@ -2057,6 +2057,34 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
         }
         for item in plan.get("items", [])[:10]
     ]
+    current_highlight_ids = {item["id"] for item in highlights}
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict):
+            continue
+        scoped_id = str(overlay.get("highlight_id") or "")
+        if not scoped_id or scoped_id in current_highlight_ids:
+            continue
+        try:
+            overlay_start = float(overlay.get("start"))
+            overlay_end = float(overlay.get("end"))
+        except (TypeError, ValueError):
+            overlay.pop("highlight_id", None)
+            continue
+        best_highlight: dict[str, Any] | None = None
+        best_overlap = 0.0
+        for highlight in highlights:
+            overlap = max(
+                0.0,
+                min(overlay_end, float(highlight["end"]))
+                - max(overlay_start, float(highlight["start"])),
+            )
+            if overlap > best_overlap:
+                best_highlight = highlight
+                best_overlap = overlap
+        if best_highlight is None:
+            overlay.pop("highlight_id", None)
+        else:
+            overlay["highlight_id"] = best_highlight["id"]
     state["highlights"] = highlights
     state["highlight_plan_revision"] = plan.get("plan_revision")
     state["source_sha256"] = manifest.get("source", {}).get("sha256")
