@@ -536,6 +536,184 @@ def normalize_transcription_glossary(values: Any) -> list[str]:
     return terms
 
 
+def normalize_transcription_calibrations(values: Any) -> list[dict[str, Any]]:
+    """Normalize explicit, auditable ASR alias rules.
+
+    Rules use ``canonical=alias|alias``.  Aliases must be the same character
+    length as the canonical spelling so applying a rule never changes the
+    word-timing boundaries imported from Whisper.
+    """
+    if values is None:
+        return []
+    raw_values = [values] if isinstance(values, (str, dict)) else list(values)
+    raw_rules: list[Any] = []
+    for raw_value in raw_values:
+        if isinstance(raw_value, dict):
+            raw_rules.append(raw_value)
+        else:
+            raw_rules.extend(
+                item for item in re.split(r"[;；\n]+", str(raw_value)) if item.strip()
+            )
+    rules: list[dict[str, Any]] = []
+    seen_aliases: dict[str, str] = {}
+    total_aliases = 0
+    total_characters = 0
+    for raw_rule in raw_rules:
+        if isinstance(raw_rule, dict):
+            canonical = re.sub(r"\s+", " ", str(raw_rule.get("canonical", ""))).strip()
+            raw_aliases = raw_rule.get("aliases", [])
+            aliases_source = [raw_aliases] if isinstance(raw_aliases, str) else list(raw_aliases or [])
+            raw_scope_start = raw_rule.get("start")
+            raw_scope_end = raw_rule.get("end")
+        else:
+            if "=" not in str(raw_rule):
+                raise ValueError(
+                    "transcription calibration rules must use canonical=alias|alias"
+                )
+            canonical, aliases_text = str(raw_rule).split("=", 1)
+            canonical = re.sub(r"\s+", " ", canonical).strip()
+            aliases_source = aliases_text.split("|")
+            raw_scope_start = None
+            raw_scope_end = None
+        if not canonical or len(canonical) > 80:
+            raise ValueError(
+                "transcription calibration canonical terms must be 1-80 characters"
+            )
+        aliases: list[str] = []
+        local_seen: set[str] = set()
+        for raw_alias in aliases_source:
+            alias = re.sub(r"\s+", " ", str(raw_alias)).strip()
+            if not alias or len(alias) > 80:
+                raise ValueError(
+                    "transcription calibration aliases must be 1-80 characters"
+                )
+            if len(alias) != len(canonical):
+                raise ValueError(
+                    "transcription calibration aliases must match canonical character length"
+                )
+            alias_key = alias.casefold()
+            if alias_key == canonical.casefold() or alias_key in local_seen:
+                continue
+            prior = seen_aliases.get(alias_key)
+            if prior is not None and prior.casefold() != canonical.casefold():
+                raise ValueError(
+                    f"transcription calibration alias has conflicting targets: {alias}"
+                )
+            seen_aliases[alias_key] = canonical
+            local_seen.add(alias_key)
+            aliases.append(alias)
+        if not aliases:
+            continue
+        scope: dict[str, float] = {}
+        for name, raw_value in (("start", raw_scope_start), ("end", raw_scope_end)):
+            if raw_value is None:
+                continue
+            if isinstance(raw_value, bool):
+                raise ValueError("transcription calibration time scopes must be finite numbers")
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "transcription calibration time scopes must be finite numbers"
+                ) from exc
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    "transcription calibration time scopes must be finite non-negative numbers"
+                )
+            scope[name] = round(value, 3)
+        if "start" in scope and "end" in scope and scope["end"] <= scope["start"]:
+            raise ValueError("transcription calibration end must be after start")
+        rules.append({"canonical": canonical, "aliases": aliases, **scope})
+        total_aliases += len(aliases)
+        total_characters += len(canonical) + sum(len(alias) for alias in aliases)
+    if len(rules) > 64 or total_aliases > 256 or total_characters > 2400:
+        raise ValueError("transcription calibration rules are too large")
+    return rules
+
+
+def apply_transcription_calibrations(
+    data: dict[str, Any],
+    calibrations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply exact equal-length aliases while preserving every word timestamp."""
+    candidates = sorted(
+        (
+            (
+                alias,
+                str(rule["canonical"]),
+                rule.get("start"),
+                rule.get("end"),
+            )
+            for rule in calibrations
+            for alias in rule.get("aliases", [])
+        ),
+        key=lambda item: (-len(item[0]), item[0].casefold()),
+    )
+    corrections: list[dict[str, Any]] = []
+    for segment_index, segment in enumerate(data.get("segments", [])):
+        raw_words = segment.get("words")
+        if not isinstance(raw_words, list) or not raw_words:
+            continue
+        original_tokens = [str(item.get("word", "")) for item in raw_words]
+        combined = "".join(original_tokens)
+        if not combined:
+            continue
+        boundaries: list[tuple[int, int]] = []
+        cursor = 0
+        for token in original_tokens:
+            boundaries.append((cursor, cursor + len(token)))
+            cursor += len(token)
+        characters = list(combined)
+        occupied: set[int] = set()
+        for alias, canonical, scope_start, scope_end in candidates:
+            for match in re.finditer(re.escape(alias), combined, flags=re.IGNORECASE):
+                start, end = match.span()
+                if any(index in occupied for index in range(start, end)):
+                    continue
+                matched = combined[start:end]
+                if matched.casefold() == canonical.casefold():
+                    continue
+                word_indexes = [
+                    index
+                    for index, (word_start, word_end) in enumerate(boundaries)
+                    if word_start < end and word_end > start
+                ]
+                first_word = raw_words[word_indexes[0]] if word_indexes else {}
+                last_word = raw_words[word_indexes[-1]] if word_indexes else first_word
+                match_start = float(first_word.get("start", segment.get("start", 0.0)))
+                match_end = float(last_word.get("end", segment.get("end", match_start)))
+                if scope_start is not None and match_end <= float(scope_start):
+                    continue
+                if scope_end is not None and match_start >= float(scope_end):
+                    continue
+                characters[start:end] = list(canonical)
+                occupied.update(range(start, end))
+                corrections.append(
+                    {
+                        "segment_id": segment.get("id", segment_index),
+                        "from": matched,
+                        "to": canonical,
+                        "start": match_start,
+                        "end": match_end,
+                    }
+                )
+        if not occupied:
+            continue
+        corrected = "".join(characters)
+        for raw_word, (start, end) in zip(raw_words, boundaries):
+            raw_word["word"] = corrected[start:end]
+        segment["text"] = join_caption_words(
+            [{"text": raw_word.get("word", "")} for raw_word in raw_words]
+        )
+    if corrections:
+        data["text"] = " ".join(
+            str(segment.get("text", "")).strip()
+            for segment in data.get("segments", [])
+            if str(segment.get("text", "")).strip()
+        )
+    return corrections
+
+
 TRANSCRIPTION_PROMPT_MAX_CHARS = 180
 TRANSCRIPTION_PROMPT_MAX_TERMS = 12
 
@@ -1026,6 +1204,7 @@ def initialize_project(
     *,
     source_language: str = "auto",
     transcription_glossary: list[str] | None = None,
+    transcription_calibrations: list[Any] | None = None,
     subtitle_mode: str = "source",
     target_language: str | None = None,
     platform: str = "auto",
@@ -1087,6 +1266,7 @@ def initialize_project(
         raise ValueError("source_sha256 must be a lowercase SHA-256 digest")
     target_language = target_language or default_target(source_language)
     glossary = normalize_transcription_glossary(transcription_glossary)
+    calibrations = normalize_transcription_calibrations(transcription_calibrations)
     created = now_utc()
     stage_state = {stage: "pending" for stage in STAGES}
     stage_state["ingest"] = "complete"
@@ -1127,6 +1307,7 @@ def initialize_project(
             "source_language": source_language,
             "target_language": target_language,
             "glossary": glossary,
+            "calibrations": calibrations,
             "translation_variant": "zh-Hant" if subtitle_mode in {"zh", "bilingual"} else None,
             "style": "rail",
             "emphasis_enabled": emphasis != "off",
@@ -1185,6 +1366,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             project_dir,
             source_language=args.source_language,
             transcription_glossary=args.transcription_glossary,
+            transcription_calibrations=args.transcription_calibration,
             subtitle_mode=args.subtitle_mode,
             target_language=args.target_language,
             platform=args.platform,
@@ -1599,6 +1781,7 @@ def build_transcript_review(
     transcript: dict[str, Any],
     source_language_mode: str,
     glossary: list[str],
+    semantic_calibration: dict[str, Any],
 ) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     transcript_text = normalized_token(str(transcript.get("text", "")))
@@ -1647,15 +1830,27 @@ def build_transcript_review(
                 "message": "Mixed Chinese/English mode has no project terminology glossary",
             }
         )
+    chinese_or_auto = source_language_mode in {"auto", "zh-TW", "zh-CN", "zh-en"}
+    semantic_status = str(semantic_calibration.get("status", "not_configured"))
+    if issues:
+        risk_status = "warning"
+    elif chinese_or_auto and semantic_status == "not_configured":
+        risk_status = "semantic_review_required"
+    elif chinese_or_auto:
+        risk_status = "review_required"
+    else:
+        risk_status = "clear"
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "needs_review",
-        "risk_status": "warning" if issues else "clear",
+        "risk_status": risk_status,
         "human_review_required": True,
         "source_language_mode": source_language_mode,
         "glossary": glossary,
+        "mechanical_issue_count": len(issues),
         "issue_count": len(issues),
         "issues": issues,
+        "semantic_calibration": semantic_calibration,
         "generated_at": now_utc(),
     }
 
@@ -1936,9 +2131,13 @@ def import_whisper_artifacts(
     glossary = normalize_transcription_glossary(
         manifest.get("subtitles", {}).get("glossary", [])
     )
+    calibrations = normalize_transcription_calibrations(
+        manifest.get("subtitles", {}).get("calibrations", [])
+    )
     data = read_json(whisper_path)
     if not isinstance(data.get("segments"), list):
         raise ValueError("Whisper JSON must contain a segments array")
+    semantic_corrections = apply_transcription_calibrations(data, calibrations)
     glossary_corrections = apply_glossary_corrections(data, glossary)
     duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
     transcript, compatibility = whisper_payload(data, duration_s)
@@ -1946,12 +2145,31 @@ def import_whisper_artifacts(
     transcript_path = project_dir / "working/transcript_words.json"
     compatibility_path = project_dir / "working/subtitles_words.json"
     review_path = project_dir / "working/transcript_review.json"
+    calibration_path = project_dir / "working/transcript_calibration.json"
+    semantic_calibration = {
+        "status": "applied_needs_review" if calibrations else "not_configured",
+        "rule_count": len(calibrations),
+        "correction_count": len(semantic_corrections),
+        "human_review_required": True,
+        "artifact": "working/transcript_calibration.json",
+    }
+    write_json(
+        calibration_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            **semantic_calibration,
+            "rules": calibrations,
+            "corrections": semantic_corrections,
+            "generated_at": now_utc(),
+        },
+    )
     write_json(transcript_path, transcript)
     write_json(compatibility_path, compatibility)
     transcript_review = build_transcript_review(
         transcript,
         source_language_mode,
         glossary,
+        semantic_calibration,
     )
     write_json(review_path, transcript_review)
     if srt_path is not None:
@@ -1965,6 +2183,9 @@ def import_whisper_artifacts(
         "working/subtitles_words.json"
     )
     manifest["artifacts"]["transcript_review"] = "working/transcript_review.json"
+    manifest["artifacts"]["transcript_calibration"] = (
+        "working/transcript_calibration.json"
+    )
     manifest["transcription"] = {
         "engine": "openai-whisper",
         "model": model,
@@ -1972,6 +2193,9 @@ def import_whisper_artifacts(
         "source_language_mode": source_language_mode,
         "code_switching": source_language_mode == "zh-en",
         "glossary": glossary,
+        "semantic_calibration_status": semantic_calibration["status"],
+        "semantic_calibration_rule_count": len(calibrations),
+        "semantic_calibration_correction_count": len(semantic_corrections),
         "review_status": transcript_review["status"],
         "review_issue_count": transcript_review["issue_count"],
         "glossary_correction_count": len(glossary_corrections),
@@ -1995,6 +2219,8 @@ def import_whisper_artifacts(
         "compatibility": str(compatibility_path),
         "transcript_review": str(review_path),
         "transcript_review_issues": transcript_review["issue_count"],
+        "semantic_calibration_status": semantic_calibration["status"],
+        "semantic_calibration_corrections": len(semantic_corrections),
         "glossary_corrections": len(glossary_corrections),
         "words": len(transcript["words"]),
         "segments": len(transcript["segments"]),
@@ -2989,6 +3215,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Comma/semicolon-separated terms whose spelling Whisper should preserve",
+    )
+    init.add_argument(
+        "--transcription-calibration",
+        action="append",
+        default=[],
+        help="Semicolon-separated exact ASR aliases using canonical=alias|alias",
     )
     init.add_argument("--subtitle-mode", choices=SUBTITLE_MODES, default="source")
     init.add_argument("--target-language")

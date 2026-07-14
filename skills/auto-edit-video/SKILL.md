@@ -78,12 +78,16 @@ preview, and separate clip rendering. These profiles are tested heuristic
 strategies, not five autonomous LLM agents.
 
 Studio source language includes `zh-en` for Chinese/English code switching and
-an optional semicolon-separated terminology glossary. Auto and Chinese source
-modes also prompt local Whisper to retain incidental English spelling. Import
-writes `working/transcript_review.json`, bounds the prompt and excludes long
-glossary sentences so English hints do not degrade adjacent Chinese, safely
-repairs close spellings or split tokens, and creates readable caption chunks
-from word timings.
+an optional semicolon-separated terminology glossary. The separate subtitle
+calibration field accepts audited `canonical=alias|alias` rules such as
+`複數=富數;雪茄=學家|雪家;cigar=ciger`; equal-length replacements preserve word
+timestamps and optional manifest `start`/`end` scopes constrain ambiguous
+aliases. Auto and Chinese source modes also prompt local Whisper to retain
+incidental English spelling. Import writes both
+`working/transcript_review.json` and `working/transcript_calibration.json`,
+bounds the prompt and excludes long glossary sentences so English hints do not
+degrade adjacent Chinese, safely repairs close spellings or split tokens, and
+creates readable caption chunks from word timings.
 
 Director profiles control copy, captions, cards, and motion language. The
 separate video-template selector controls source framing and compositing: three
@@ -216,8 +220,12 @@ Defaults are deliberately conservative:
 Transcribe locally with AutoClip/Whisper or HyperFrames Whisper. Always pin a
 multilingual model for non-English audio; never use `small.en` on Chinese.
 For Chinese/English teaching or interview footage, use source language `zh-en`
-and supply known English terms through `--transcription-glossary`. Do not treat
-the local transcript as reviewed merely because glossary checks are clear.
+and supply known English terms through `--transcription-glossary`. When exact
+ASR homophones are known, add `--transcription-calibration
+"複數=富數;雪茄=學家|雪家"`. A mechanical issue count of zero is not semantic
+clearance: `not_configured`, `applied_needs_review`, and human approval are
+separate states. Do not treat the local transcript as reviewed merely because
+glossary checks are clear or calibration rules were applied.
 
 Apply [references/EDITING_RULES.md](references/EDITING_RULES.md). If
 `chengfeng-cut-narration` is installed, its review UI may be used, but do not use
@@ -227,6 +235,8 @@ audio to that service.
 Write:
 
 - `working/transcript_words.json`
+- `working/transcript_calibration.json`
+- `working/transcript_review.json`
 - `working/edit_candidates.json`
 - `working/edit_decisions.json`
 

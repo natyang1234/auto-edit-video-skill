@@ -225,6 +225,7 @@ class StudioServerTests(unittest.TestCase):
                 "settings": {
                     "source_language": "zh-en",
                     "transcription_glossary": "It; to V; cigar; cigarette",
+                    "transcription_calibration": "複數=富數;雪茄=學家|雪家;cigar=ciger",
                     "subtitle_mode": "source",
                     "platform": "youtube-shorts",
                     "duration_profile": "short",
@@ -247,6 +248,14 @@ class StudioServerTests(unittest.TestCase):
         self.assertEqual(
             manifest["subtitles"]["glossary"],
             ["It", "to V", "cigar", "cigarette"],
+        )
+        self.assertEqual(
+            manifest["subtitles"]["calibrations"],
+            [
+                {"canonical": "複數", "aliases": ["富數"]},
+                {"canonical": "雪茄", "aliases": ["學家", "雪家"]},
+                {"canonical": "cigar", "aliases": ["ciger"]},
+            ],
         )
 
     def test_import_rejects_bad_metadata_cross_site_and_oversize(self) -> None:

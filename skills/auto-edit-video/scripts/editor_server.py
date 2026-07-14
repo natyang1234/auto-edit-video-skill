@@ -1574,6 +1574,24 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "voice_catalog": self.server.voice_catalog,
                 "edit_candidates": read_json(project / "working/edit_candidates.json", {"items": []}),
                 "edit_decisions": read_json(project / "working/edit_decisions.json", {"items": []}),
+                "transcript_review": read_json(
+                    project / "working/transcript_review.json",
+                    {
+                        "status": "needs_review",
+                        "risk_status": "semantic_review_required",
+                        "mechanical_issue_count": 0,
+                        "semantic_calibration": {"status": "not_configured"},
+                    },
+                ),
+                "transcript_calibration": read_json(
+                    project / "working/transcript_calibration.json",
+                    {
+                        "status": "not_configured",
+                        "rule_count": 0,
+                        "correction_count": 0,
+                        "human_review_required": True,
+                    },
+                ),
                 "highlight_plan": read_json(project / "working/highlight_plan.json", {}),
                 "pipeline_status": read_json(
                     project / "working/pipeline_status.json",

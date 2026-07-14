@@ -101,6 +101,27 @@ class EditorServerTests(unittest.TestCase):
             },
         )
         self.write_json(
+            "working/transcript_calibration.json",
+            {
+                "status": "applied_needs_review",
+                "rule_count": 2,
+                "correction_count": 3,
+                "human_review_required": True,
+            },
+        )
+        self.write_json(
+            "working/transcript_review.json",
+            {
+                "status": "needs_review",
+                "risk_status": "review_required",
+                "mechanical_issue_count": 0,
+                "semantic_calibration": {
+                    "status": "applied_needs_review",
+                    "correction_count": 3,
+                },
+            },
+        )
+        self.write_json(
             "working/edit_candidates.json",
             {
                 "items": [
@@ -163,6 +184,7 @@ class EditorServerTests(unittest.TestCase):
         script = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
         for element_id in (
             "source-file-name",
+            "transcript-calibration-status",
             "highlight-list",
             "highlight-editor",
             "approve-highlights",
@@ -206,6 +228,7 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("effect_spans", script)
         self.assertIn("enableOverlayDrag", script)
         self.assertIn("renderLayoutWarning", script)
+        self.assertIn("renderTranscriptStatus", script)
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -274,6 +297,8 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(caption["effect_spans"][0]["style"]["effect"], "pop")
         self.assertEqual(payload["state"]["editing_brief"], "")
         self.assertIn("highlight_plan", payload)
+        self.assertEqual(payload["transcript_calibration"]["correction_count"], 3)
+        self.assertEqual(payload["transcript_review"]["risk_status"], "review_required")
         self.assertEqual(payload["pipeline_status"]["state"], "not_started")
         self.assertEqual(
             {preset["label"] for preset in payload["director_presets"].values()},

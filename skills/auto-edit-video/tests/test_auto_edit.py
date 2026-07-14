@@ -501,6 +501,159 @@ payload = {
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertFalse(manifest["approvals"]["destructive_edit"]["approved"])
 
+    def test_semantic_calibration_repairs_declared_homophones_without_moving_words(self) -> None:
+        project = self.root / "semantic-calibration"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "cigar; cigarette",
+            "--transcription-calibration",
+            "複數=富數;雪茄=學家|雪家;大支=大汁;小支=小汁;小知識=小汁式;cigar=ciger",
+        )
+        whisper_json = self.root / "semantic-calibration.json"
+        manifest_path = project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["subtitles"]["calibrations"].append(
+            {"canonical": "菸", "aliases": ["腰"], "start": 1.51, "end": 1.61}
+        )
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        source_words = [
+            {"word": "單數還是富數。", "start": 0.02, "end": 0.30, "probability": 0.96},
+            {"word": " ciger", "start": 0.31, "end": 0.44, "probability": 0.94},
+            {"word": " 是學家，", "start": 0.45, "end": 0.62, "probability": 0.95},
+            {"word": "雪茄是大汁，", "start": 0.63, "end": 0.82, "probability": 0.93},
+            {"word": "小汁的叫 cigarette。", "start": 0.83, "end": 1.08, "probability": 0.92},
+            {"word": "這叫做小汁式。", "start": 1.09, "end": 1.30, "probability": 0.91},
+            {"word": "雪家不好。", "start": 1.31, "end": 1.50, "probability": 0.90},
+            {"word": "腰", "start": 1.51, "end": 1.60, "probability": 0.70},
+            {"word": "腰", "start": 1.62, "end": 1.70, "probability": 0.70},
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "".join(item["word"] for item in source_words),
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "id": 9,
+                            "start": 0.02,
+                            "end": 1.50,
+                            "text": "".join(item["word"] for item in source_words),
+                            "words": source_words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        corrected_words = transcript["words"]
+
+        self.assertIn("單數還是複數", transcript["text"])
+        self.assertIn("cigar 是雪茄", transcript["text"])
+        self.assertIn("雪茄是大支", transcript["text"])
+        self.assertIn("小支的叫 cigarette", transcript["text"])
+        self.assertIn("這叫做小知識", transcript["text"])
+        self.assertIn("雪茄不好", transcript["text"])
+        self.assertTrue(transcript["text"].endswith("菸腰"))
+        self.assertNotRegex(transcript["text"], r"富數|學家|雪家|大汁|小汁|ciger")
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in corrected_words],
+            [(item["start"], item["end"]) for item in source_words],
+        )
+        calibration = json.loads(
+            (project / "working/transcript_calibration.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(calibration["status"], "applied_needs_review")
+        self.assertEqual(calibration["correction_count"], 8)
+        self.assertEqual(payload["semantic_calibration_corrections"], 8)
+        review = json.loads(
+            (project / "working/transcript_review.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(review["semantic_calibration"]["status"], "applied_needs_review")
+        self.assertEqual(review["risk_status"], "review_required")
+
+    def test_chinese_transcript_without_calibration_is_not_reported_semantically_clear(self) -> None:
+        project = self.root / "semantic-calibration-not-configured"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-TW",
+        )
+        whisper_json = self.root / "semantic-calibration-not-configured.json"
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "這是字幕。",
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.30,
+                            "text": "這是字幕。",
+                            "words": [
+                                {
+                                    "word": "這是字幕。",
+                                    "start": 0.02,
+                                    "end": 0.30,
+                                    "probability": 0.96,
+                                }
+                            ],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        review = json.loads(
+            (project / "working/transcript_review.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(payload["transcript_review_issues"], 0)
+        self.assertEqual(review["mechanical_issue_count"], 0)
+        self.assertEqual(review["semantic_calibration"]["status"], "not_configured")
+        self.assertEqual(review["risk_status"], "semantic_review_required")
+        self.assertTrue(review["human_review_required"])
+
     def test_glossary_fuzzy_correction_repairs_close_english_spellings(self) -> None:
         project = self.root / "mixed-language-fuzzy-glossary"
         self.run_cli(

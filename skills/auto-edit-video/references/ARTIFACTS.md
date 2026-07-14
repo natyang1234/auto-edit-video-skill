@@ -16,6 +16,8 @@ PROJECT/
 ├── source/                         # immutable source links/copies
 ├── working/
 │   ├── transcript_words.json       # original word timings
+│   ├── transcript_calibration.json # exact homophone/spelling replacements
+│   ├── transcript_review.json      # mechanical issues + semantic status
 │   ├── edit_candidates.json        # machine proposals
 │   ├── edit_decisions.json         # approved keep/delete decisions
 │   ├── pipeline_status.json        # local Studio processing state
@@ -69,6 +71,32 @@ for the same truth without recording them in `project.json.artifacts`.
 Never let a draft script overwrite something actually spoken.
 
 ## Artifact schemas
+
+### `transcript_calibration.json`
+
+Calibration never implies human approval. Rules use equal-length aliases so
+the imported word timing remains unchanged; optional `start`/`end` values
+scope an otherwise ambiguous alias to a reviewed source interval.
+
+```json
+{
+  "schema_version": 1,
+  "status": "not_configured|applied_needs_review",
+  "rule_count": 1,
+  "correction_count": 1,
+  "human_review_required": true,
+  "rules": [
+    {"canonical": "雪茄", "aliases": ["學家", "雪家"]}
+  ],
+  "corrections": [
+    {"segment_id": 10, "from": "學家", "to": "雪茄", "start": 195.44, "end": 196.06}
+  ]
+}
+```
+
+`transcript_review.json.issue_count` is the mechanical issue count. Read
+`semantic_calibration.status` and `risk_status` separately; zero mechanical
+issues must not be described as semantically clear.
 
 ### `edit_candidates.json`
 

@@ -38,6 +38,7 @@ from auto_edit import (
     SOURCE_LANGUAGES,
     SUBTITLE_MODES,
     initialize_project,
+    normalize_transcription_calibrations,
     normalize_transcription_glossary,
     probe_media,
 )
@@ -605,11 +606,15 @@ class StudioHandler(BaseHTTPRequestHandler):
             transcription_glossary = normalize_transcription_glossary(
                 settings.get("transcription_glossary", "")
             )
+            transcription_calibrations = normalize_transcription_calibrations(
+                settings.get("transcription_calibration", "")
+            )
         except ValueError as exc:
             raise StudioRequestError(422, "invalid_settings", str(exc)) from exc
         normalized_settings = {
             "source_language": str(settings.get("source_language", "auto")),
             "transcription_glossary": transcription_glossary,
+            "transcription_calibrations": transcription_calibrations,
             "subtitle_mode": str(settings.get("subtitle_mode", "source")),
             "platform": str(settings.get("platform", "auto")),
             "duration_profile": str(settings.get("duration_profile", "auto")),
@@ -755,6 +760,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                 creating,
                 source_language=settings["source_language"],
                 transcription_glossary=settings["transcription_glossary"],
+                transcription_calibrations=settings["transcription_calibrations"],
                 subtitle_mode=settings["subtitle_mode"],
                 platform=settings["platform"],
                 duration_profile=settings["duration_profile"],

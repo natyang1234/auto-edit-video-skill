@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0 - 2026-07-14
+
+### Auditable semantic subtitle calibration
+
+- Add explicit `canonical=alias|alias` transcription calibration rules for
+  Chinese homophones and exact English misspellings. Equal-length replacements
+  preserve every imported Whisper word timestamp, and optional time scopes
+  safely handle ambiguous aliases only inside a reviewed source interval.
+- Write `working/transcript_calibration.json` with every applied source span,
+  replacement, timestamp, and rule; propagate corrected copy into canonical
+  SRT, GUI captions, highlight titles, and designed cards.
+- Separate mechanical glossary warnings from semantic calibration state.
+  Chinese transcripts without rules now report `semantic_review_required`;
+  applied rules report `applied_needs_review` and never imply human approval.
+- Add the calibration field to loopback Studio import, regression coverage for
+  homophones, English spelling, exact timestamp preservation, time scoping,
+  and semantic-status reporting. The full suite now contains 89 tests.
+
 ## 1.5.1 - 2026-07-14
 
 ### Mixed-language accuracy regression

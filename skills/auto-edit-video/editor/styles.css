@@ -1863,6 +1863,56 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.transcript-calibration-status {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px;
+  color: var(--ink-1);
+  background: color-mix(in srgb, var(--amber) 9%, var(--paper-0));
+  border: 1px solid color-mix(in srgb, var(--amber) 38%, var(--line));
+  border-radius: 8px;
+}
+
+.transcript-calibration-status.is-applied {
+  background: color-mix(in srgb, var(--green) 9%, var(--paper-0));
+  border-color: color-mix(in srgb, var(--green) 38%, var(--line));
+}
+
+.transcript-status-mark {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  color: var(--paper-0);
+  background: var(--amber);
+  border-radius: 50%;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.is-applied .transcript-status-mark {
+  background: var(--green);
+}
+
+.transcript-calibration-status strong,
+.transcript-calibration-status div > span {
+  display: block;
+}
+
+.transcript-calibration-status strong {
+  font-size: 0.72rem;
+}
+
+.transcript-calibration-status div > span {
+  margin-top: 2px;
+  color: var(--ink-2);
+  font-size: 0.64rem;
+  line-height: 1.35;
+}
+
 .icon-button {
   min-width: 36px;
   min-height: 36px;

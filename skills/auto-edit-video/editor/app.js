@@ -49,6 +49,7 @@ function cacheElements() {
     "template-background-button", "template-background-input", "template-background-status",
     "template-capability-note", "template-background-image", "template-background-video",
     "render-button", "source-file-name", "source-file-detail", "source-preview-button",
+    "transcript-calibration-status", "transcript-calibration-title", "transcript-calibration-copy",
     "highlight-count", "highlight-list", "editing-brief", "director-grid", "candidate-count",
     "highlight-editor", "highlight-title", "highlight-start", "highlight-end", "replan-highlights",
     "keep-highlight", "reject-highlight", "approve-highlights",
@@ -101,6 +102,32 @@ function setSaveState(label, mode = "dirty") {
   elements["save-state"].classList.toggle("is-saved", mode === "saved");
   elements["save-state"].classList.toggle("is-error", mode === "error");
   elements["save-state"].querySelector("span:last-child").textContent = label;
+}
+
+function renderTranscriptStatus() {
+  const container = elements["transcript-calibration-status"];
+  const calibration = projectPayload?.transcript_calibration || {};
+  const review = projectPayload?.transcript_review || {};
+  const semantic = review.semantic_calibration || {};
+  const status = String(calibration.status || semantic.status || "not_configured");
+  const correctionCount = Number(calibration.correction_count || semantic.correction_count || 0);
+  const mechanicalCount = Number(review.mechanical_issue_count ?? review.issue_count ?? 0);
+  container.classList.remove("is-applied", "is-pending", "is-warning");
+  if (status === "applied_needs_review") {
+    container.classList.add("is-applied");
+    elements["transcript-calibration-title"].textContent = "字幕語義校準已套用";
+    elements["transcript-calibration-copy"].textContent = `${correctionCount} 處已更正；仍需逐段抽查。`;
+    return;
+  }
+  if (status === "not_configured") {
+    container.classList.add("is-warning");
+    elements["transcript-calibration-title"].textContent = "字幕尚未語義校準";
+    elements["transcript-calibration-copy"].textContent = `機械警示 ${mechanicalCount} 項；0 項也不代表語意正確。`;
+    return;
+  }
+  container.classList.add("is-pending");
+  elements["transcript-calibration-title"].textContent = "字幕校準待確認";
+  elements["transcript-calibration-copy"].textContent = `目前狀態：${status}`;
 }
 
 function formatTime(seconds) {
@@ -2159,6 +2186,7 @@ async function initialize() {
     const stagedName = String(source.staged_path || source.original_path || "source video").split("/").pop();
     elements["source-file-name"].textContent = stagedName;
     elements["source-file-detail"].textContent = `${source.width || "?"}×${source.height || "?"} · ${source.fps || "?"}fps · ${formatClipTime(Number(source.duration_s || 0))}`;
+    renderTranscriptStatus();
     elements["editing-brief"].value = state.editing_brief || "";
     populatePresets();
     if (sourceMediaUrl) {

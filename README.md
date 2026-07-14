@@ -53,7 +53,11 @@ The prompt is deliberately bounded and excludes long glossary sentences so an
 English hint cannot degrade adjacent Chinese recognition. The project stores a
 transcript-review report, applies conservative spelling/split-token corrections,
 and generates readable timed captions instead of exposing 30-second Whisper
-blocks in the GUI.
+blocks in the GUI. A separate calibration field accepts audited rules such as
+`複數=富數; 雪茄=學家|雪家; cigar=ciger`. These replacements keep word timestamps,
+write a correction audit, and may be time-scoped in the manifest. A zero
+mechanical-warning count is never presented as semantic review; calibration
+remains `applied_needs_review` until a person checks the captions.
 
 Video layout is selected independently from the director profile. The editor
 ships three fixed-camera templates, two opt-in dynamic-camera templates, and
@@ -95,7 +99,8 @@ repeated, stretched, or speed-adjusted merely to hit the target.
 - Explicit `destructive_edit`, `highlight_selection`, `timeline`, and `final` approval gates.
 - Approved-cut FFmpeg renderer and mandatory re-transcription workflow.
 - Chinese, English, bilingual, or hidden subtitle modes.
-- Mixed Chinese/English transcription with a project glossary and local review report.
+- Mixed Chinese/English transcription with a project glossary, auditable
+  homophone calibration, and separate mechanical/semantic review states.
 - Loopback Studio import plus a local page editor with semantic highlights,
   timed text/media layers, and social canvas presets.
 - Deterministic MP4/cover rendering plus mechanical QA and a contact sheet.
@@ -180,6 +185,7 @@ python3 "$SKILL/scripts/auto_edit.py" init \
   --platform youtube-shorts \
   --duration-profile long \
   --source-language zh-TW \
+  --transcription-calibration "複數=富數;雪茄=學家|雪家;cigar=ciger" \
   --subtitle-mode zh
 
 python3 "$SKILL/scripts/auto_edit.py" import-whisper \
