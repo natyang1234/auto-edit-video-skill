@@ -27,9 +27,12 @@ localized.
 For Chinese speech that switches into English, set source language to `zh-en`
 and provide known terms through the Studio glossary or CLI
 `--transcription-glossary`. Auto and Chinese modes still use an English-
-preservation prompt. The local correction pass is intentionally conservative:
-it may repair close glossary spellings and split English subwords, but it never
-turns a draft transcript into an approved subtitle without human review.
+preservation prompt. Keep that prompt bounded: use short glossary terms and do
+not inject full example sentences, because excessive English conditioning can
+degrade nearby Chinese homophones on small Whisper models. The local correction
+pass is intentionally conservative: it may repair close glossary spellings and
+split English subwords, but it never turns a draft transcript into an approved
+subtitle without human review.
 
 ## Voice engines
 

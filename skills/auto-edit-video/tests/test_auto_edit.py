@@ -275,6 +275,95 @@ payload = {
             ["It", "to V", "cigar", "cigarette"],
         )
 
+    def test_mixed_language_long_glossary_uses_bounded_prompt_to_protect_chinese(self) -> None:
+        project = self.root / "mixed-language-bounded-prompt"
+        glossary = (
+            "It; to V; for example; It is fun to play with puppies; "
+            "play with puppies; cigar; cigarette; "
+            "It is bad for you to smoke a cigar; "
+            "It is bad for you to smoke a cigarette; "
+            "to get good grades; good grades; I study hard; "
+            "to go to bed early; to sleep well; to lose weight; "
+            "stay away from the smoke; I walked away"
+        )
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            glossary,
+        )
+        manifest_path = project / "project.json"
+        fake_whisper = self.root / "fake-whisper-bounded-prompt"
+        fake_whisper.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[sys.argv.index('--output_dir') + 1])
+output.mkdir(parents=True, exist_ok=True)
+prompt = sys.argv[sys.argv.index('--initial_prompt') + 1] if '--initial_prompt' in sys.argv else ''
+(output / 'captured-prompt.txt').write_text(prompt, encoding='utf-8')
+safe = (
+    len(prompt) <= 180
+    and 'It' in prompt
+    and 'to V' in prompt
+    and 'cigar' in prompt
+    and 'cigarette' in prompt
+    and 'It is bad for you to smoke a cigarette' not in prompt
+)
+text = (
+    'It is fun to play with puppies，這個怎麼翻譯呢？玩小狗很有趣。'
+    if safe
+    else 'It is fun to play with puppies，這個怎麼翻譯呢？玩小狗和柚去。'
+)
+payload = {
+    'text': text,
+    'language': 'zh',
+    'segments': [{
+        'start': 0.02,
+        'end': 0.60,
+        'text': text,
+        'words': [{'word': text, 'start': 0.02, 'end': 0.60, 'probability': 0.92}],
+    }],
+}
+(output / f'{source.stem}.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+(output / f'{source.stem}.srt').write_text(f'1\\n00:00:00,020 --> 00:00:00,600\\n{text}\\n', encoding='utf-8')
+""",
+            encoding="utf-8",
+        )
+        fake_whisper.chmod(0o755)
+
+        self.run_cli(
+            "transcribe-local",
+            "--manifest",
+            str(manifest_path),
+            "--model",
+            "base",
+            "--timeout",
+            "30",
+            extra_env={"WHISPER_BIN": str(fake_whisper)},
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        prompt_path = Path(manifest["transcription"]["source_json"]).with_name(
+            "captured-prompt.txt"
+        )
+        prompt = prompt_path.read_text(encoding="utf-8")
+
+        self.assertLessEqual(len(prompt), 180)
+        self.assertNotIn("It is bad for you to smoke a cigarette", prompt)
+        self.assertIn("玩小狗很有趣", transcript["text"])
+        self.assertNotIn("和柚去", transcript["text"])
+
     def test_auto_language_preserves_incidental_english_without_glossary(self) -> None:
         project = self.root / "auto-language-code-switch"
         self.run_cli(
@@ -362,16 +451,16 @@ payload = {
         whisper_json.write_text(
             json.dumps(
                 {
-                    "text": "Ed 作虛主詞，想到圖筆。",
+                    "text": "Ex 作虛主詞，想到圖筆。",
                     "language": "zh",
                     "segments": [
                         {
                             "start": 0.02,
                             "end": 0.36,
-                            "text": "Ed 作虛主詞，想到圖筆。",
+                            "text": "Ex 作虛主詞，想到圖筆。",
                             "words": [
                                 {
-                                    "word": "Ed",
+                                    "word": "Ex",
                                     "start": 0.02,
                                     "end": 0.09,
                                     "probability": 0.08,
@@ -484,6 +573,201 @@ payload = {
         self.assertIn("cigarette", canonical_srt)
         self.assertIn("good grades", canonical_srt)
         self.assertNotIn("sigarette", canonical_srt)
+
+    def test_glossary_repairs_split_first_word_in_multiword_phrase(self) -> None:
+        project = self.root / "mixed-language-split-phrase"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "stay away from the smoke",
+        )
+        whisper_json = self.root / "mixed-language-split-phrase.json"
+        tokens = ["St", "ay", " away", " from", " the", " smoke"]
+        words = [
+            {
+                "word": token,
+                "start": 0.02 + index * 0.05,
+                "end": 0.07 + index * 0.05,
+                "probability": 0.95,
+            }
+            for index, token in enumerate(tokens)
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "Stay away from the smoke",
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.32,
+                            "text": "Stay away from the smoke",
+                            "words": words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(transcript["text"].casefold(), "stay away from the smoke")
+        self.assertNotIn("st stay", transcript["text"].casefold())
+        self.assertEqual(payload["glossary_corrections"], 1)
+        self.assertEqual(payload["transcript_review_issues"], 0)
+
+    def test_glossary_repairs_low_confidence_it_alias_without_rewriting_names(self) -> None:
+        project = self.root / "mixed-language-it-alias"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "It",
+        )
+        whisper_json = self.root / "mixed-language-it-alias.json"
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "Ed 作虛主詞，Ed 是人名。",
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.60,
+                            "text": "Ed 作虛主詞，Ed 是人名。",
+                            "words": [
+                                {
+                                    "word": "Ed",
+                                    "start": 0.02,
+                                    "end": 0.09,
+                                    "probability": 0.08,
+                                },
+                                {
+                                    "word": " 作虛主詞，",
+                                    "start": 0.09,
+                                    "end": 0.30,
+                                    "probability": 0.95,
+                                },
+                                {
+                                    "word": "Ed",
+                                    "start": 0.30,
+                                    "end": 0.38,
+                                    "probability": 0.96,
+                                },
+                                {
+                                    "word": " 是人名。",
+                                    "start": 0.38,
+                                    "end": 0.60,
+                                    "probability": 0.95,
+                                },
+                            ],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn("It 作虛主詞", transcript["text"])
+        self.assertIn("Ed 是人名", transcript["text"])
+        self.assertEqual(payload["glossary_corrections"], 1)
+
+    def test_glossary_repairs_it_alias_only_in_local_grammar_context(self) -> None:
+        project = self.root / "mixed-language-it-context"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "It; to V",
+        )
+        whisper_json = self.root / "mixed-language-it-context.json"
+        words = [
+            {"word": "Ed", "start": 0.02, "end": 0.09, "probability": 0.96},
+            {"word": " 是虛主詞，", "start": 0.09, "end": 0.25, "probability": 0.95},
+            {"word": "Ed", "start": 0.25, "end": 0.33, "probability": 0.96},
+            {"word": " 是人名。", "start": 0.33, "end": 0.50, "probability": 0.95},
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "Ed 是虛主詞，Ed 是人名。",
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.50,
+                            "text": "Ed 是虛主詞，Ed 是人名。",
+                            "words": words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn("It 是虛主詞", transcript["text"])
+        self.assertIn("Ed 是人名", transcript["text"])
+        self.assertEqual(payload["glossary_corrections"], 1)
 
     def test_long_whisper_segment_becomes_readable_gui_captions(self) -> None:
         project = self.root / "mixed-caption-chunks"

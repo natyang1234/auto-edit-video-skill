@@ -49,9 +49,11 @@ graphic package used by the rendered MP4.
 For mixed Chinese/English footage, select `Chinese + English` and optionally
 enter semicolon-separated terminology such as `It; to V; cigarette`. Auto and
 Chinese modes also tell local Whisper to preserve incidental English spelling.
-The project stores a transcript-review report, applies only high-similarity
-glossary corrections, and generates readable timed captions instead of exposing
-30-second Whisper blocks in the GUI.
+The prompt is deliberately bounded and excludes long glossary sentences so an
+English hint cannot degrade adjacent Chinese recognition. The project stores a
+transcript-review report, applies conservative spelling/split-token corrections,
+and generates readable timed captions instead of exposing 30-second Whisper
+blocks in the GUI.
 
 Video layout is selected independently from the director profile. The editor
 ships three fixed-camera templates, two opt-in dynamic-camera templates, and

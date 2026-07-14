@@ -80,8 +80,10 @@ strategies, not five autonomous LLM agents.
 Studio source language includes `zh-en` for Chinese/English code switching and
 an optional semicolon-separated terminology glossary. Auto and Chinese source
 modes also prompt local Whisper to retain incidental English spelling. Import
-writes `working/transcript_review.json`, conservatively repairs only close
-glossary spellings, and creates readable caption chunks from word timings.
+writes `working/transcript_review.json`, bounds the prompt and excludes long
+glossary sentences so English hints do not degrade adjacent Chinese, safely
+repairs close spellings or split tokens, and creates readable caption chunks
+from word timings.
 
 Director profiles control copy, captions, cards, and motion language. The
 separate video-template selector controls source framing and compositing: three

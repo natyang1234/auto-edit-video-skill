@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.5.1 - 2026-07-14
+
+### Mixed-language accuracy regression
+
+- Bound Whisper's mixed-language initial prompt to 180 characters, keep at
+  most 12 short glossary terms, and exclude long example sentences that can
+  over-bias the `base` model and degrade adjacent Chinese homophones.
+- Repair the common `It`/`Ed` code-switch confusion only when `It` is in the
+  project glossary and the token is low-confidence or locally tied to `to V`
+  or `虛主詞`; preserve high-confidence person names outside that context.
+- Merge a split first English word inside a multiword glossary phrase, such as
+  `St` + `ay away from the smoke`, without leaving a duplicate fragment.
+- Add differential and safety regression coverage for bounded prompts,
+  Chinese preservation, contextual aliases, real names, and split phrases;
+  the full local suite now contains 87 passing tests.
+
 ## 1.5.0 - 2026-07-14
 
 ### Mixed Chinese/English transcription

@@ -536,20 +536,50 @@ def normalize_transcription_glossary(values: Any) -> list[str]:
     return terms
 
 
+TRANSCRIPTION_PROMPT_MAX_CHARS = 180
+TRANSCRIPTION_PROMPT_MAX_TERMS = 12
+
+
+def compact_transcription_prompt_terms(glossary: list[str]) -> list[str]:
+    candidates: list[tuple[int, str, int]] = []
+    for index, term in enumerate(glossary):
+        latin_words = re.findall(r"[A-Za-z]+", term)
+        if not latin_words or len(latin_words) > 5 or len(term) > 36:
+            continue
+        candidates.append((index, term, len(latin_words)))
+    candidates.sort(key=lambda item: (item[2], len(item[1]), item[0]))
+    return [
+        term
+        for _index, term, _word_count in candidates[:TRANSCRIPTION_PROMPT_MAX_TERMS]
+    ]
+
+
 def transcription_initial_prompt(source_language: str, glossary: list[str]) -> str | None:
     chinese_or_auto = source_language in {"auto", "zh-TW", "zh-CN", "zh-en"}
     if not chinese_or_auto and not glossary:
         return None
     if chinese_or_auto:
-        prompt = (
-            "這是逐字稿，內容可能包含中文與英文。英文、英文字母、縮寫、公式與例句"
-            "請保留英文拼寫，不要轉寫成中文音譯。"
-        )
+        prompt = "中英逐字稿。英文請保留拼寫，不要中文音譯。"
+        glossary_prefix = "英文詞彙："
     else:
-        prompt = "This is a verbatim transcript. Preserve the original spelling of these terms."
-    if glossary:
-        prompt += "請使用這些原文詞彙：" + ", ".join(glossary) + "。"
+        prompt = "Verbatim transcript. Preserve original spelling."
+        glossary_prefix = " Terms: "
+    prompt_terms = compact_transcription_prompt_terms(glossary)
+    selected: list[str] = []
+    for term in prompt_terms:
+        candidate_terms = selected + [term]
+        candidate = prompt + glossary_prefix + ", ".join(candidate_terms) + "。"
+        if len(candidate) > TRANSCRIPTION_PROMPT_MAX_CHARS:
+            continue
+        selected = candidate_terms
+    if selected:
+        prompt += glossary_prefix + ", ".join(selected) + "。"
     return prompt
+
+
+LOW_CONFIDENCE_GLOSSARY_ALIASES = {
+    "it": {"ed"},
+}
 
 
 def apply_glossary_corrections(
@@ -585,7 +615,7 @@ def apply_glossary_corrections(
                 if canonical_size == 1:
                     window_sizes = range(1, min(len(parsed) - start, 4) + 1)
                 else:
-                    allowed_sizes = [canonical_size]
+                    allowed_sizes = [canonical_size, canonical_size + 1]
                     if any(word.casefold() in {"a", "an", "the"} for word in canonical_words):
                         allowed_sizes.append(canonical_size - 1)
                     window_sizes = [
@@ -600,12 +630,50 @@ def apply_glossary_corrections(
                         continue
                     if any((parsed[index] or ("", "", ""))[2] for index in range(start, end - 1)):
                         continue
+                    if (
+                        canonical_size > 1
+                        and window_size == canonical_size + 1
+                        and (parsed[start + 1] or ("", "", ""))[0]
+                    ):
+                        continue
                     candidate = (parsed[start] or ("", "", ""))[1]
                     for index in range(start + 1, end):
                         prefix, core, _suffix = parsed[index] or ("", "", "")
                         candidate += (" " if prefix else "") + core
                     if canonical_size == 1 and len(canonical_text) < 4:
-                        score = 1.0 if candidate.casefold() == canonical_text.casefold() else 0.0
+                        candidate_key = candidate.casefold()
+                        canonical_key = canonical_text.casefold()
+                        confidence = raw_words[start].get(
+                            "probability", raw_words[start].get("confidence")
+                        )
+                        alias_match = candidate_key in LOW_CONFIDENCE_GLOSSARY_ALIASES.get(
+                            canonical_key, set()
+                        )
+                        forward_context = "".join(
+                            str(raw_words[index].get("word", ""))
+                            for index in range(start, min(len(raw_words), end + 4))
+                        )
+                        local_grammar_context = (
+                            canonical_key == "it"
+                            and re.search(
+                                r"虛\s*主\s*詞|to\s*V",
+                                forward_context,
+                                flags=re.IGNORECASE,
+                            )
+                            is not None
+                        )
+                        trusted_alias = alias_match and (
+                            (
+                                isinstance(confidence, (int, float))
+                                and float(confidence) < 0.35
+                            )
+                            or local_grammar_context
+                        )
+                        score = (
+                            1.0
+                            if candidate_key == canonical_key or trusted_alias
+                            else 0.0
+                        )
                         threshold = 1.0
                     else:
                         score = SequenceMatcher(
@@ -625,7 +693,14 @@ def apply_glossary_corrections(
                     continue
                 _score, end, candidate = best
                 window_size = end - start
-                if canonical_size >= window_size:
+                split_first_word = (
+                    canonical_size > 1
+                    and window_size == canonical_size + 1
+                    and not (parsed[start + 1] or ("", "", ""))[0]
+                )
+                if split_first_word:
+                    assignments = [canonical_words[0], ""] + canonical_words[1:]
+                elif canonical_size >= window_size:
                     assignments = canonical_words[: window_size - 1] + [
                         " ".join(canonical_words[window_size - 1 :])
                     ]
@@ -641,6 +716,8 @@ def apply_glossary_corrections(
                     prefix = (parsed[index] or ("", "", ""))[0]
                     suffix = final_suffix if offset == last_nonempty else ""
                     raw_words[index]["word"] = prefix + assignment + suffix if assignment else ""
+                    if split_first_word and offset == 0:
+                        raw_words[index]["end"] = raw_words[index + 1].get("end")
                     if offset == last_nonempty:
                         raw_words[index]["end"] = final_end
                     occupied.add(index)
