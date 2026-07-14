@@ -46,6 +46,13 @@ animations or licensed media, preview one clip, and render it separately. In
 designed mode, captions and effect spans are baked into the same HTML/GSAP
 graphic package used by the rendered MP4.
 
+For mixed Chinese/English footage, select `Chinese + English` and optionally
+enter semicolon-separated terminology such as `It; to V; cigarette`. Auto and
+Chinese modes also tell local Whisper to preserve incidental English spelling.
+The project stores a transcript-review report, applies only high-similarity
+glossary corrections, and generates readable timed captions instead of exposing
+30-second Whisper blocks in the GUI.
+
 Video layout is selected independently from the director profile. The editor
 ships three fixed-camera templates, two opt-in dynamic-camera templates, and
 three local subject-cutout templates for solid, project-owned image, or
@@ -86,6 +93,7 @@ repeated, stretched, or speed-adjusted merely to hit the target.
 - Explicit `destructive_edit`, `highlight_selection`, `timeline`, and `final` approval gates.
 - Approved-cut FFmpeg renderer and mandatory re-transcription workflow.
 - Chinese, English, bilingual, or hidden subtitle modes.
+- Mixed Chinese/English transcription with a project glossary and local review report.
 - Loopback Studio import plus a local page editor with semantic highlights,
   timed text/media layers, and social canvas presets.
 - Deterministic MP4/cover rendering plus mechanical QA and a contact sheet.

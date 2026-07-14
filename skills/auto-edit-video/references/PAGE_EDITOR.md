@@ -8,6 +8,9 @@ plans, source QA, and `working/editor_state.json`.
 
 - Loopback-only new-project Studio with local File import, owned immutable copy,
   media validation, local Whisper, and visible pipeline progress.
+- Chinese/English code-switch mode with an optional terminology glossary,
+  conservative close-spelling repair, readable word-timed caption chunks, and
+  a project-local transcript review report.
 - Live source-video preview with timed editable layers.
 - Hybrid editorial workstation: warm source/inspector panels, dark preview and
   multitrack timeline, with vermilion actions and amber emphasis.

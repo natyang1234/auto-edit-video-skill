@@ -161,6 +161,68 @@ class HighlightPlannerTests(unittest.TestCase):
             self.assertIn(item["boundary"]["raw_start"], valid_boundaries)
             self.assertIn(item["boundary"]["raw_end"], valid_boundaries)
 
+    def test_mixed_language_highlight_titles_preserve_english_word_spaces(self) -> None:
+        tokens = ["It", "is", "fun", "to", "play", "with", "very", "extraordinary", "puppies。", "完整例句。"]
+        words = [
+            {
+                "id": f"word-{index + 1:05d}",
+                "text": token,
+                "start": index * 1.0,
+                "end": index * 1.0 + 0.8,
+                "confidence": 0.94,
+                "segment_id": "segment-0001",
+            }
+            for index, token in enumerate(tokens)
+        ]
+        transcript = {
+            "schema_version": 1,
+            "language": "zh",
+            "duration_s": 10.0,
+            "text": "It is fun to play with very extraordinary puppies。完整例句。",
+            "segments": [
+                {
+                    "id": "segment-0001",
+                    "start": 0.0,
+                    "end": 9.8,
+                    "text": "It is fun to play with very extraordinary puppies。完整例句。",
+                    "words": words,
+                }
+            ],
+            "words": words,
+        }
+        manifest = {
+            **self.manifest,
+            "source": {**self.manifest["source"], "duration_s": 10.0},
+            "output_target": {
+                **self.manifest["output_target"],
+                "min_seconds": 4,
+                "target_seconds": 8,
+                "max_seconds": 10,
+            },
+        }
+
+        plan = build_highlight_plan(
+            transcript,
+            manifest,
+            director_profile="teacher-punch",
+            requested_count=1,
+            editing_brief="保留完整英文例句",
+        )
+
+        self.assertEqual(len(plan["items"]), 1)
+        self.assertIn("It is fun", plan["items"][0]["evidence"]["text"])
+        self.assertIn("It is fun", plan["items"][0]["title"])
+        self.assertNotIn("Itisfun", plan["items"][0]["title"])
+        title = plan["items"][0]["title"]
+        evidence = plan["items"][0]["evidence"]["text"]
+        if len(title) < len(evidence):
+            self.assertFalse(
+                title[-1].isascii()
+                and title[-1].isalnum()
+                and evidence[len(title)].isascii()
+                and evidence[len(title)].isalnum()
+            )
+
     def test_invalid_count_and_plan_values_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             build_highlight_plan(

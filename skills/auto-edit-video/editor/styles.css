@@ -1553,6 +1553,7 @@ h2 {
 .import-settings { margin-top: 1.15rem; display: grid; gap: 1rem; }
 .import-settings label { display: grid; gap: 0.42rem; }
 .import-settings label > span { color: oklch(0.46 0.02 63); font-size: 0.74rem; font-weight: 800; letter-spacing: 0.025em; }
+.import-settings label > small { color: oklch(0.55 0.02 63); font-size: 0.72rem; line-height: 1.45; }
 .import-settings input,
 .import-settings select,
 .import-settings textarea { width: 100%; min-height: 2.75rem; border-color: oklch(0.8 0.025 72); background: oklch(0.99 0.007 75); }

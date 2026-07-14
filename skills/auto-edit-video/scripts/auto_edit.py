@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from difflib import SequenceMatcher
 import hashlib
 import importlib.util
 import json
@@ -280,6 +281,7 @@ STAGES = (
 
 GATES = ("destructive_edit", "highlight_selection", "timeline", "final")
 SUBTITLE_MODES = ("source", "zh", "en", "bilingual", "off")
+SOURCE_LANGUAGES = ("auto", "zh-TW", "zh-CN", "en-US", "en-GB", "zh-en")
 VOICE_LANGUAGES = tuple(VOICE_PRESETS)
 VOICE_PROVIDERS = ("rumi", "edge", "auto", "heygen", "elevenlabs", "kokoro")
 
@@ -401,6 +403,40 @@ def write_json(path: Path, payload: Any) -> None:
     os.replace(temporary, path)
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def srt_timestamp(seconds: float) -> str:
+    milliseconds = max(0, round(float(seconds) * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{millis:03d}"
+
+
+def write_transcript_srt(path: Path, transcript: dict[str, Any]) -> None:
+    source_segments = transcript.get("caption_segments") or transcript.get("segments", [])
+    blocks = []
+    for index, segment in enumerate(source_segments, start=1):
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        blocks.append(
+            "\n".join(
+                [
+                    str(index),
+                    f"{srt_timestamp(segment['start'])} --> {srt_timestamp(segment['end'])}",
+                    text,
+                ]
+            )
+        )
+    write_text_atomic(path, "\n\n".join(blocks) + ("\n" if blocks else ""))
+
+
 def parse_rate(value: str | None) -> float | None:
     if not value or value == "0/0":
         return None
@@ -468,11 +504,166 @@ def probe_media(path: Path) -> dict[str, Any]:
 def language_family(language: str | None) -> str | None:
     if not language or language == "auto":
         return None
+    if language.lower() == "zh-en":
+        return "mixed"
     if language.lower().startswith("zh"):
         return "zh"
     if language.lower().startswith("en"):
         return "en"
     return language.split("-", 1)[0].lower()
+
+
+def normalize_transcription_glossary(values: Any) -> list[str]:
+    if values is None:
+        return []
+    raw_values = [values] if isinstance(values, str) else list(values)
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        for raw_term in re.split(r"[,;；\n]+", str(raw_value)):
+            term = re.sub(r"\s+", " ", raw_term).strip()
+            if not term:
+                continue
+            if len(term) > 80:
+                raise ValueError("transcription glossary terms must be 80 characters or fewer")
+            key = term.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(term)
+    if len(terms) > 64 or sum(len(term) for term in terms) > 1200:
+        raise ValueError("transcription glossary is too large")
+    return terms
+
+
+def transcription_initial_prompt(source_language: str, glossary: list[str]) -> str | None:
+    chinese_or_auto = source_language in {"auto", "zh-TW", "zh-CN", "zh-en"}
+    if not chinese_or_auto and not glossary:
+        return None
+    if chinese_or_auto:
+        prompt = (
+            "這是逐字稿，內容可能包含中文與英文。英文、英文字母、縮寫、公式與例句"
+            "請保留英文拼寫，不要轉寫成中文音譯。"
+        )
+    else:
+        prompt = "This is a verbatim transcript. Preserve the original spelling of these terms."
+    if glossary:
+        prompt += "請使用這些原文詞彙：" + ", ".join(glossary) + "。"
+    return prompt
+
+
+def apply_glossary_corrections(
+    data: dict[str, Any],
+    glossary: list[str],
+) -> list[dict[str, Any]]:
+    glossary_tokens = [
+        (term, re.findall(r"[A-Za-z]+", term))
+        for term in glossary
+        if re.search(r"[A-Za-z]", term)
+    ]
+    glossary_tokens.sort(key=lambda item: (-len(item[1]), -len(item[0])))
+    corrections: list[dict[str, Any]] = []
+    for segment in data.get("segments", []):
+        raw_words = segment.get("words")
+        if not isinstance(raw_words, list) or not raw_words:
+            continue
+        parsed: list[tuple[str, str, str] | None] = []
+        for raw_word in raw_words:
+            raw_text = str(raw_word.get("word", ""))
+            match = re.fullmatch(r"(\s*)([A-Za-z]+)([^A-Za-z]*)", raw_text)
+            parsed.append(match.groups() if match else None)
+        occupied: set[int] = set()
+        for canonical, canonical_words in glossary_tokens:
+            canonical_size = len(canonical_words)
+            if canonical_size == 0:
+                continue
+            canonical_text = " ".join(canonical_words)
+            for start in range(len(parsed)):
+                if start in occupied or parsed[start] is None:
+                    continue
+                best: tuple[float, int, str] | None = None
+                if canonical_size == 1:
+                    window_sizes = range(1, min(len(parsed) - start, 4) + 1)
+                else:
+                    allowed_sizes = [canonical_size]
+                    if any(word.casefold() in {"a", "an", "the"} for word in canonical_words):
+                        allowed_sizes.append(canonical_size - 1)
+                    window_sizes = [
+                        size
+                        for size in allowed_sizes
+                        if size > 0 and start + size <= len(parsed)
+                    ]
+                for window_size in window_sizes:
+                    end = start + window_size
+                    indexes = range(start, end)
+                    if any(index in occupied or parsed[index] is None for index in indexes):
+                        continue
+                    if any((parsed[index] or ("", "", ""))[2] for index in range(start, end - 1)):
+                        continue
+                    candidate = (parsed[start] or ("", "", ""))[1]
+                    for index in range(start + 1, end):
+                        prefix, core, _suffix = parsed[index] or ("", "", "")
+                        candidate += (" " if prefix else "") + core
+                    if canonical_size == 1 and len(canonical_text) < 4:
+                        score = 1.0 if candidate.casefold() == canonical_text.casefold() else 0.0
+                        threshold = 1.0
+                    else:
+                        score = SequenceMatcher(
+                            None,
+                            candidate.casefold(),
+                            canonical_text.casefold(),
+                        ).ratio()
+                        if canonical_size == 1:
+                            threshold = 0.86
+                        elif canonical_size == 2:
+                            threshold = 0.84
+                        else:
+                            threshold = 0.90
+                    if score >= threshold and (best is None or score > best[0]):
+                        best = (score, end, candidate)
+                if best is None:
+                    continue
+                _score, end, candidate = best
+                window_size = end - start
+                if canonical_size >= window_size:
+                    assignments = canonical_words[: window_size - 1] + [
+                        " ".join(canonical_words[window_size - 1 :])
+                    ]
+                else:
+                    assignments = canonical_words + [""] * (window_size - canonical_size)
+                last_nonempty = max(
+                    index for index, assignment in enumerate(assignments) if assignment
+                )
+                final_suffix = (parsed[end - 1] or ("", "", ""))[2]
+                final_end = raw_words[end - 1].get("end")
+                for offset, assignment in enumerate(assignments):
+                    index = start + offset
+                    prefix = (parsed[index] or ("", "", ""))[0]
+                    suffix = final_suffix if offset == last_nonempty else ""
+                    raw_words[index]["word"] = prefix + assignment + suffix if assignment else ""
+                    if offset == last_nonempty:
+                        raw_words[index]["end"] = final_end
+                    occupied.add(index)
+                changed = candidate.casefold() != canonical_text.casefold() or window_size != canonical_size
+                if changed:
+                    corrections.append(
+                        {
+                            "from": candidate,
+                            "to": canonical_text,
+                            "start": raw_words[start].get("start"),
+                            "end": final_end,
+                        }
+                    )
+        segment["text"] = join_caption_words(
+            [{"text": raw_word.get("word", "")} for raw_word in raw_words]
+        )
+    if corrections:
+        data["text"] = " ".join(
+            str(segment.get("text", "")).strip()
+            for segment in data.get("segments", [])
+            if str(segment.get("text", "")).strip()
+        )
+    return corrections
 
 
 def edge_voice(language: str, gender: str) -> str:
@@ -757,6 +948,7 @@ def initialize_project(
     project_dir: Path,
     *,
     source_language: str = "auto",
+    transcription_glossary: list[str] | None = None,
     subtitle_mode: str = "source",
     target_language: str | None = None,
     platform: str = "auto",
@@ -789,6 +981,8 @@ def initialize_project(
         raise ValueError(f"input video not found: {source}")
     if subtitle_mode not in SUBTITLE_MODES:
         raise ValueError(f"unsupported subtitle mode: {subtitle_mode}")
+    if source_language not in SOURCE_LANGUAGES:
+        raise ValueError(f"unsupported source language: {source_language}")
     if edit_preset not in EDIT_PRESETS:
         raise ValueError(f"unsupported edit preset: {edit_preset}")
     if emphasis not in {"off", "sparse", "balanced", "dense"}:
@@ -815,6 +1009,7 @@ def initialize_project(
     if not re.fullmatch(r"[0-9a-f]{64}", checksum):
         raise ValueError("source_sha256 must be a lowercase SHA-256 digest")
     target_language = target_language or default_target(source_language)
+    glossary = normalize_transcription_glossary(transcription_glossary)
     created = now_utc()
     stage_state = {stage: "pending" for stage in STAGES}
     stage_state["ingest"] = "complete"
@@ -854,6 +1049,7 @@ def initialize_project(
             "mode": subtitle_mode,
             "source_language": source_language,
             "target_language": target_language,
+            "glossary": glossary,
             "translation_variant": "zh-Hant" if subtitle_mode in {"zh", "bilingual"} else None,
             "style": "rail",
             "emphasis_enabled": emphasis != "off",
@@ -911,6 +1107,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             source,
             project_dir,
             source_language=args.source_language,
+            transcription_glossary=args.transcription_glossary,
             subtitle_mode=args.subtitle_mode,
             target_language=args.target_language,
             platform=args.platform,
@@ -1253,6 +1450,139 @@ def normalized_token(text: str) -> str:
     return re.sub(r"[\s，。！？、,.!?：:；;\-—…]+", "", text).lower()
 
 
+def caption_display_units(text: str) -> int:
+    return sum(2 if ord(character) > 127 else 1 for character in text)
+
+
+def join_caption_words(words: list[dict[str, Any]]) -> str:
+    result = ""
+    no_space_before = set("，。！？、,.!?：:；;％%）)]}〉》」』…")
+    no_space_after = set("（([{〈《「『")
+    for word in words:
+        token = str(word.get("text", "")).strip()
+        if not token:
+            continue
+        if not result:
+            result = token
+            continue
+        previous = result[-1]
+        current = token[0]
+        if current in no_space_before or previous in no_space_after:
+            result += token
+        elif previous.isascii() or current.isascii():
+            result += " " + token
+        else:
+            result += token
+    return result.strip()
+
+
+def readable_caption_segments(
+    segments: list[dict[str, Any]],
+    words: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not words:
+        return [dict(segment) for segment in segments]
+    captions: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        captions.append(
+            {
+                "id": f"caption-segment-{len(captions) + 1:04d}",
+                "start": round(float(current[0]["start"]), 3),
+                "end": round(float(current[-1]["end"]), 3),
+                "text": join_caption_words(current),
+                "word_ids": [str(item["id"]) for item in current],
+            }
+        )
+        current.clear()
+
+    for word in words:
+        if current:
+            gap = float(word["start"]) - float(current[-1]["end"])
+            candidate = current + [word]
+            candidate_duration = float(word["end"]) - float(current[0]["start"])
+            candidate_units = caption_display_units(join_caption_words(candidate))
+            if gap >= 0.7 or candidate_duration > 5.5 or candidate_units > 56:
+                flush()
+        current.append(word)
+        text = join_caption_words(current)
+        duration = float(current[-1]["end"]) - float(current[0]["start"])
+        if re.search(r"[。！？!?]\s*$", text) and duration >= 0.8:
+            flush()
+        elif re.search(r"[，,；;：:]\s*$", text) and duration >= 2.4:
+            flush()
+    flush()
+    return captions
+
+
+def build_transcript_review(
+    transcript: dict[str, Any],
+    source_language_mode: str,
+    glossary: list[str],
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    transcript_text = normalized_token(str(transcript.get("text", "")))
+    glossary_words = {
+        word.casefold()
+        for term in glossary
+        for word in re.findall(r"[A-Za-z]+", term)
+    }
+    for term in glossary:
+        if normalized_token(term) not in transcript_text:
+            issues.append(
+                {
+                    "code": "missing_glossary_term",
+                    "severity": "warning",
+                    "term": term,
+                    "message": f"Glossary term was not found in the transcript: {term}",
+                }
+            )
+    for word in transcript.get("words", []):
+        confidence = word.get("confidence")
+        text = str(word.get("text", ""))
+        latin_core = "".join(re.findall(r"[A-Za-z]+", text)).casefold()
+        if (
+            isinstance(confidence, (int, float))
+            and float(confidence) < 0.35
+            and re.search(r"[A-Za-z]", text)
+            and latin_core not in glossary_words
+            and latin_core not in {"ok", "so"}
+        ):
+            issues.append(
+                {
+                    "code": "low_confidence_latin_token",
+                    "severity": "warning",
+                    "text": text,
+                    "start": word.get("start"),
+                    "end": word.get("end"),
+                    "confidence": confidence,
+                    "message": "Low-confidence Latin token may be an English code-switch error",
+                }
+            )
+    if source_language_mode == "zh-en" and not glossary:
+        issues.append(
+            {
+                "code": "mixed_language_without_glossary",
+                "severity": "notice",
+                "message": "Mixed Chinese/English mode has no project terminology glossary",
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "needs_review",
+        "risk_status": "warning" if issues else "clear",
+        "human_review_required": True,
+        "source_language_mode": source_language_mode,
+        "glossary": glossary,
+        "issue_count": len(issues),
+        "issues": issues,
+        "generated_at": now_utc(),
+    }
+
+
 def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     segments: list[dict[str, Any]] = []
     flat_words: list[dict[str, Any]] = []
@@ -1326,6 +1656,7 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
             }
         )
 
+    caption_segments = readable_caption_segments(segments, flat_words)
     transcript = {
         "schema_version": SCHEMA_VERSION,
         "engine": "openai-whisper",
@@ -1333,6 +1664,7 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
         "duration_s": round(duration_s, 3),
         "text": str(data.get("text", "")).strip(),
         "segments": segments,
+        "caption_segments": caption_segments,
         "words": flat_words,
     }
     return transcript, compatibility
@@ -1389,7 +1721,8 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
         )
     ]
     captions: list[dict[str, Any]] = []
-    for index, segment in enumerate(transcript.get("segments", []), start=1):
+    source_segments = transcript.get("caption_segments") or transcript.get("segments", [])
+    for index, segment in enumerate(source_segments, start=1):
         text = str(segment.get("text", "")).strip()
         if not text:
             continue
@@ -1522,39 +1855,59 @@ def import_whisper_artifacts(
     model: str,
 ) -> dict[str, Any]:
     manifest = read_json(manifest_path)
+    source_language_mode = str(manifest.get("subtitles", {}).get("source_language", "auto"))
+    glossary = normalize_transcription_glossary(
+        manifest.get("subtitles", {}).get("glossary", [])
+    )
     data = read_json(whisper_path)
     if not isinstance(data.get("segments"), list):
         raise ValueError("Whisper JSON must contain a segments array")
+    glossary_corrections = apply_glossary_corrections(data, glossary)
     duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
     transcript, compatibility = whisper_payload(data, duration_s)
     project_dir = manifest_path.parent
     transcript_path = project_dir / "working/transcript_words.json"
     compatibility_path = project_dir / "working/subtitles_words.json"
+    review_path = project_dir / "working/transcript_review.json"
     write_json(transcript_path, transcript)
     write_json(compatibility_path, compatibility)
+    transcript_review = build_transcript_review(
+        transcript,
+        source_language_mode,
+        glossary,
+    )
+    write_json(review_path, transcript_review)
     if srt_path is not None:
         srt_path = srt_path.expanduser().resolve()
         if not srt_path.is_file():
             raise ValueError(f"SRT not found: {srt_path}")
-        shutil.copy2(srt_path, project_dir / "subtitles/source.srt")
+    write_transcript_srt(project_dir / "subtitles/source.srt", transcript)
     manifest.setdefault("stages", {})["transcribe"] = "complete"
     manifest["stages"]["edit_analysis"] = "pending"
     manifest.setdefault("artifacts", {})["transcript_compatibility"] = (
         "working/subtitles_words.json"
     )
+    manifest["artifacts"]["transcript_review"] = "working/transcript_review.json"
     manifest["transcription"] = {
         "engine": "openai-whisper",
         "model": model,
         "language": data.get("language"),
+        "source_language_mode": source_language_mode,
+        "code_switching": source_language_mode == "zh-en",
+        "glossary": glossary,
+        "review_status": transcript_review["status"],
+        "review_issue_count": transcript_review["issue_count"],
+        "glossary_correction_count": len(glossary_corrections),
         "word_count": len(transcript["words"]),
         "segment_count": len(transcript["segments"]),
+        "caption_count": len(transcript["caption_segments"]),
         "source_json": str(whisper_path),
         "imported_at": now_utc(),
     }
     manifest["updated_at"] = now_utc()
     invalidate_approvals(
         manifest,
-        ("highlight_selection", "timeline", "final"),
+        ("destructive_edit", "highlight_selection", "timeline", "final"),
         "Invalidated because the source transcript changed",
     )
     write_json(manifest_path, manifest)
@@ -1563,9 +1916,13 @@ def import_whisper_artifacts(
         "ok": True,
         "transcript": str(transcript_path),
         "compatibility": str(compatibility_path),
+        "transcript_review": str(review_path),
+        "transcript_review_issues": transcript_review["issue_count"],
+        "glossary_corrections": len(glossary_corrections),
         "words": len(transcript["words"]),
         "segments": len(transcript["segments"]),
         "synced_editor_captions": synced,
+        "code_switching": source_language_mode == "zh-en",
     }
 
 
@@ -1614,7 +1971,17 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
     run_dir = manifest_path.parent / "working/whisper-local" / uuid.uuid4().hex
     run_dir.mkdir(parents=True, exist_ok=False)
     language = str(manifest.get("subtitles", {}).get("source_language", "auto"))
-    language_map = {"zh-TW": "zh", "zh-CN": "zh", "en-US": "en", "en-GB": "en"}
+    glossary = normalize_transcription_glossary(
+        manifest.get("subtitles", {}).get("glossary", [])
+    )
+    initial_prompt = transcription_initial_prompt(language, glossary)
+    language_map = {
+        "zh-TW": "zh",
+        "zh-CN": "zh",
+        "zh-en": "zh",
+        "en-US": "en",
+        "en-GB": "en",
+    }
     command = [
         whisper,
         str(source),
@@ -1633,6 +2000,8 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
     ]
     if language in language_map:
         command.extend(["--language", language_map[language]])
+    if initial_prompt:
+        command.extend(["--initial_prompt", initial_prompt])
     manifest.setdefault("stages", {})["transcribe"] = "in_progress"
     manifest["updated_at"] = now_utc()
     write_json(manifest_path, manifest)
@@ -2537,7 +2906,13 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="Create a non-destructive auto-edit project")
     init.add_argument("--input", required=True)
     init.add_argument("--project-dir", required=True)
-    init.add_argument("--source-language", default="auto")
+    init.add_argument("--source-language", choices=SOURCE_LANGUAGES, default="auto")
+    init.add_argument(
+        "--transcription-glossary",
+        action="append",
+        default=[],
+        help="Comma/semicolon-separated terms whose spelling Whisper should preserve",
+    )
     init.add_argument("--subtitle-mode", choices=SUBTITLE_MODES, default="source")
     init.add_argument("--target-language")
     init.add_argument("--platform", choices=PLATFORMS, default="auto")

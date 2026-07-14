@@ -140,6 +140,45 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", "", str(value)).strip()
 
 
+def join_transcript_parts(parts: list[str]) -> str:
+    result = ""
+    no_space_before = set("，。！？、,.!?：:；;％%）)]}〉》」』…")
+    no_space_after = set("（([{〈《「『")
+    for raw_part in parts:
+        part = str(raw_part).strip()
+        if not part:
+            continue
+        if not result:
+            result = part
+            continue
+        previous = result[-1]
+        current = part[0]
+        if current in no_space_before or previous in no_space_after:
+            result += part
+        elif previous.isascii() or current.isascii():
+            result += " " + part
+        else:
+            result += part
+    return result.strip()
+
+
+def transcript_title_excerpt(text: str, max_chars: int = 36) -> str:
+    if len(text) <= max_chars:
+        return text
+    excerpt = text[:max_chars]
+    if (
+        excerpt[-1].isascii()
+        and excerpt[-1].isalnum()
+        and text[max_chars].isascii()
+        and text[max_chars].isalnum()
+    ):
+        boundaries = [excerpt.rfind(character) for character in " ，。！？、,.!?：:；;—-"]
+        boundary = max(boundaries)
+        if boundary >= max_chars // 2:
+            excerpt = excerpt[:boundary]
+    return excerpt.rstrip()
+
+
 def char_ngrams(value: str, width: int = 3) -> set[str]:
     text = clean_text(value).lower()
     if not text:
@@ -203,7 +242,9 @@ def _clause_from_words(words: list[dict[str, Any]], segment: dict[str, Any]) -> 
     return {
         "start": float(words[0].get("start", segment.get("start", 0.0))),
         "end": float(words[-1].get("end", segment.get("end", 0.0))),
-        "text": "".join(str(word.get("text", "")) for word in words).strip(),
+        "text": join_transcript_parts(
+            [str(word.get("text", "")) for word in words]
+        ),
         "segment_ids": [str(segment.get("id", ""))],
         "word_ids": [str(word.get("id", "")) for word in words if word.get("id")],
         "confidence": confidences,
@@ -343,7 +384,7 @@ def candidate_windows(
                 break
             if clip_duration + 0.05 < minimum:
                 continue
-            evidence = "".join(str(item["text"]) for item in group).strip()
+            evidence = join_transcript_parts([str(item["text"]) for item in group])
             if len(clean_text(evidence)) < 8:
                 continue
             start, end = frame_bounds(raw_start, raw_end, fps, duration_s)
@@ -361,7 +402,7 @@ def candidate_windows(
                 risk_flags.append("sensitive_claim_requires_fact_check")
             if known_confidence and sum(known_confidence) / len(known_confidence) < 0.55:
                 risk_flags.append("low_asr_confidence")
-            title = evidence[: min(36, len(evidence))]
+            title = transcript_title_excerpt(evidence)
             item_id = "highlight-" + canonical_hash(
                 {
                     **stable_seed,

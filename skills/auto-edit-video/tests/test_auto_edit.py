@@ -200,6 +200,367 @@ payload = {
                 {"hook", "concept", "rule", "memory", "recap"},
             )
 
+    def test_mixed_zh_en_transcription_preserves_glossary_terms(self) -> None:
+        project = self.root / "mixed-language-pipeline"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "It; to V; cigar; cigarette",
+        )
+        manifest_path = project / "project.json"
+        fake_whisper = self.root / "fake-whisper-mixed"
+        fake_whisper.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[sys.argv.index('--output_dir') + 1])
+output.mkdir(parents=True, exist_ok=True)
+prompt = sys.argv[sys.argv.index('--initial_prompt') + 1] if '--initial_prompt' in sys.argv else ''
+language = sys.argv[sys.argv.index('--language') + 1] if '--language' in sys.argv else 'auto'
+preserved = language == 'zh' and all(term.lower() in prompt.lower() for term in ('It', 'to V', 'cigar', 'cigarette'))
+text = 'It 作虛主詞，看到 It，想到 to V。' if preserved else 'Ed 作虛主詞，看到 Ed，想到圖筆。'
+payload = {
+    'text': text,
+    'language': 'zh',
+    'segments': [{
+        'start': 0.02,
+        'end': 0.36,
+        'text': text,
+        'words': [
+            {'word': 'It', 'start': 0.02, 'end': 0.09, 'probability': 0.95},
+            {'word': ' 作虛主詞，', 'start': 0.09, 'end': 0.20, 'probability': 0.95},
+            {'word': '看到 It，想到 to V。', 'start': 0.20, 'end': 0.36, 'probability': 0.94},
+        ],
+    }],
+}
+(output / f'{source.stem}.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+(output / f'{source.stem}.srt').write_text(f'1\\n00:00:00,020 --> 00:00:00,360\\n{text}\\n', encoding='utf-8')
+""",
+            encoding="utf-8",
+        )
+        fake_whisper.chmod(0o755)
+
+        result = self.run_cli(
+            "transcribe-local",
+            "--manifest",
+            str(manifest_path),
+            "--model",
+            "base",
+            "--timeout",
+            "30",
+            extra_env={"WHISPER_BIN": str(fake_whisper)},
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertIn("It 作虛主詞", transcript["text"])
+        self.assertIn("to V", transcript["text"])
+        self.assertNotIn("圖筆", transcript["text"])
+        self.assertTrue(payload["code_switching"])
+        self.assertEqual(manifest["subtitles"]["source_language"], "zh-en")
+        self.assertEqual(
+            manifest["subtitles"]["glossary"],
+            ["It", "to V", "cigar", "cigarette"],
+        )
+
+    def test_auto_language_preserves_incidental_english_without_glossary(self) -> None:
+        project = self.root / "auto-language-code-switch"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "auto",
+        )
+        manifest_path = project / "project.json"
+        fake_whisper = self.root / "fake-whisper-auto-code-switch"
+        fake_whisper.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[sys.argv.index('--output_dir') + 1])
+output.mkdir(parents=True, exist_ok=True)
+prompt = sys.argv[sys.argv.index('--initial_prompt') + 1] if '--initial_prompt' in sys.argv else ''
+text = '看到 It，想到 to V。' if '中文音譯' in prompt and '英文' in prompt else '看到 Ed，想到圖筆。'
+payload = {
+    'text': text,
+    'language': 'zh',
+    'segments': [{
+        'start': 0.02,
+        'end': 0.36,
+        'text': text,
+        'words': [{'word': text, 'start': 0.02, 'end': 0.36, 'probability': 0.92}],
+    }],
+}
+(output / f'{source.stem}.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+(output / f'{source.stem}.srt').write_text(f'1\\n00:00:00,020 --> 00:00:00,360\\n{text}\\n', encoding='utf-8')
+""",
+            encoding="utf-8",
+        )
+        fake_whisper.chmod(0o755)
+
+        self.run_cli(
+            "transcribe-local",
+            "--manifest",
+            str(manifest_path),
+            "--model",
+            "base",
+            "--timeout",
+            "30",
+            extra_env={"WHISPER_BIN": str(fake_whisper)},
+        )
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("It", transcript["text"])
+        self.assertIn("to V", transcript["text"])
+        self.assertNotIn("圖筆", transcript["text"])
+
+    def test_mixed_transcript_flags_low_confidence_and_missing_terms(self) -> None:
+        project = self.root / "mixed-language-review"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "It; to V",
+        )
+        manifest_path = project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["approvals"]["destructive_edit"] = {
+            "approved": True,
+            "confirmed_by": "test",
+            "at": "2026-01-01T00:00:00+00:00",
+            "note": "approval tied to the prior transcript",
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        whisper_json = self.root / "mixed-language-review.json"
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "Ed 作虛主詞，想到圖筆。",
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.36,
+                            "text": "Ed 作虛主詞，想到圖筆。",
+                            "words": [
+                                {
+                                    "word": "Ed",
+                                    "start": 0.02,
+                                    "end": 0.09,
+                                    "probability": 0.08,
+                                },
+                                {
+                                    "word": " 作虛主詞，想到圖筆。",
+                                    "start": 0.09,
+                                    "end": 0.36,
+                                    "probability": 0.91,
+                                },
+                            ],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        review_path = Path(payload["transcript_review"])
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        codes = {item["code"] for item in review["issues"]}
+
+        self.assertEqual(review["status"], "needs_review")
+        self.assertIn("low_confidence_latin_token", codes)
+        self.assertIn("missing_glossary_term", codes)
+        self.assertGreaterEqual(payload["transcript_review_issues"], 3)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertFalse(manifest["approvals"]["destructive_edit"]["approved"])
+
+    def test_glossary_fuzzy_correction_repairs_close_english_spellings(self) -> None:
+        project = self.root / "mixed-language-fuzzy-glossary"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "cigarette; good grades",
+        )
+        whisper_json = self.root / "mixed-language-fuzzy-glossary.json"
+        tokens = ["s", "ig", "arette", "，", "good", " grace"]
+        words = [
+            {
+                "word": token,
+                "start": 0.02 + index * 0.05,
+                "end": 0.07 + index * 0.05,
+                "probability": 0.92,
+            }
+            for index, token in enumerate(tokens)
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "sigarette，good grace",
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.36,
+                            "text": "sigarette，good grace",
+                            "words": words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        whisper_srt = self.root / "mixed-language-fuzzy-glossary.srt"
+        whisper_srt.write_text(
+            "1\n00:00:00,020 --> 00:00:00,360\nsigarette，good grace\n",
+            encoding="utf-8",
+        )
+
+        self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--srt",
+            str(whisper_srt),
+            "--model",
+            "base",
+        )
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        corrected_words = " ".join(item["text"] for item in transcript["words"])
+
+        self.assertIn("cigarette", transcript["text"])
+        self.assertIn("good grades", transcript["text"])
+        self.assertNotIn("sigarette", corrected_words)
+        self.assertNotIn("grace", corrected_words)
+        canonical_srt = (project / "subtitles/source.srt").read_text(encoding="utf-8")
+        self.assertIn("cigarette", canonical_srt)
+        self.assertIn("good grades", canonical_srt)
+        self.assertNotIn("sigarette", canonical_srt)
+
+    def test_long_whisper_segment_becomes_readable_gui_captions(self) -> None:
+        project = self.root / "mixed-caption-chunks"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--transcription-glossary",
+            "It; to V; play with puppies",
+        )
+        manifest_path = project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        state = {
+            "schema_version": 1,
+            "project_id": manifest["project_id"],
+            "canvas": {"platform_id": "instagram-reels", "width": 1080, "height": 1920},
+            "director_style": "teacher-punch",
+            "editing_brief": "",
+            "caption_defaults": {"font_size": 58, "x": 50, "y": 76, "max_width": 86},
+            "overlays": [],
+            "publishing": {},
+            "review": {"selected_overlay_id": None},
+        }
+        (project / "working/editor_state.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        fake_whisper = self.root / "fake-whisper-long-mixed"
+        fake_whisper.write_text(
+            """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[sys.argv.index('--output_dir') + 1])
+output.mkdir(parents=True, exist_ok=True)
+tokens = ['It', ' 作', ' 虛', ' 主詞，', ' 看到', ' It，', ' 想到', ' to', ' V，', ' 後面', ' 真正', ' 主詞', ' 是', ' to', ' play', ' with', ' puppies。']
+words = []
+for index, token in enumerate(tokens):
+    words.append({'word': token, 'start': index * 0.5, 'end': (index + 1) * 0.5, 'probability': 0.95})
+text = 'It 作虛主詞，看到 It，想到 to V，後面真正主詞是 to play with puppies。'
+payload = {'text': text, 'language': 'zh', 'segments': [{'start': 0.0, 'end': 8.5, 'text': text, 'words': words}]}
+(output / f'{source.stem}.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+(output / f'{source.stem}.srt').write_text(f'1\\n00:00:00,000 --> 00:00:08,500\\n{text}\\n', encoding='utf-8')
+""",
+            encoding="utf-8",
+        )
+        fake_whisper.chmod(0o755)
+
+        result = self.run_cli(
+            "transcribe-local",
+            "--manifest",
+            str(manifest_path),
+            "--model",
+            "base",
+            "--timeout",
+            "30",
+            extra_env={"WHISPER_BIN": str(fake_whisper)},
+        )
+        payload = json.loads(result.stdout)
+        state = json.loads((project / "working/editor_state.json").read_text(encoding="utf-8"))
+        captions = [item for item in state["overlays"] if item["type"] == "caption"]
+
+        self.assertGreater(len(captions), 1)
+        self.assertTrue(all(item["end"] - item["start"] <= 5.5 for item in captions))
+        self.assertEqual(payload["synced_editor_captions"], len(captions))
+        expected = "It 作虛主詞，看到 It，想到 to V，後面真正主詞是 to play with puppies。"
+        self.assertEqual(
+            "".join(item["text"].replace(" ", "") for item in captions),
+            expected.replace(" ", ""),
+        )
+
     def init_project(self, name: str, language: str, gender: str) -> tuple[Path, dict]:
         project = self.root / name
         self.run_cli(

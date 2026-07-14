@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.0 - 2026-07-14
+
+### Mixed Chinese/English transcription
+
+- Add `zh-en` Studio/CLI source mode and an optional project terminology
+  glossary. Chinese and auto-detected transcripts now prompt local Whisper to
+  retain English spelling instead of producing Chinese phonetic text.
+- Add conservative glossary correction for close English spellings and split
+  subword tokens, canonical readable SRT generation, and a transcript-review
+  artifact for missing terminology or unknown low-confidence Latin tokens.
+- Split long Whisper segments into readable timed GUI captions while retaining
+  original word timing and transcript evidence.
+
+### Review integrity and tests
+
+- Preserve English spaces and word boundaries in transcript-grounded highlight
+  titles, including safe truncation that never cuts an English word in half.
+- Invalidate all four review gates when the source transcript changes; prior
+  versioned MP4s remain untouched.
+- Expand the full local GUI, security, renderer, transcription, and browser
+  regression suite to 83 passing tests.
+
 ## 1.4.0 - 2026-07-14
 
 ### Multi-template video composition

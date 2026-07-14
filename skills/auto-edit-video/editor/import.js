@@ -78,6 +78,7 @@ async function createImportSession() {
       },
       settings: {
         source_language: byId("import-language").value,
+        transcription_glossary: byId("import-transcription-glossary").value.trim(),
         subtitle_mode: "source",
         platform: byId("import-platform").value,
         duration_profile: byId("import-duration").value,

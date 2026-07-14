@@ -210,6 +210,45 @@ class StudioServerTests(unittest.TestCase):
         second_status, _headers, second_body = self.upload(import_payload, self.source_bytes)
         self.assertEqual(second_status, 409, second_body)
 
+    def test_import_accepts_mixed_zh_en_with_transcription_glossary(self) -> None:
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {
+                "project_name": "Crystal 中英教學",
+                "file": {
+                    "name": self.source.name,
+                    "size_bytes": len(self.source_bytes),
+                    "last_modified_ms": int(self.source_stat.st_mtime * 1000),
+                    "type": "video/mp4",
+                },
+                "settings": {
+                    "source_language": "zh-en",
+                    "transcription_glossary": "It; to V; cigar; cigarette",
+                    "subtitle_mode": "source",
+                    "platform": "youtube-shorts",
+                    "duration_profile": "short",
+                    "edit_preset": "balanced",
+                    "director_profile": "teacher-punch",
+                    "editing_brief": "保留英文術語原文。",
+                },
+            },
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 201, payload)
+        import_payload = payload["import"]
+        upload_status, _headers, body = self.upload(import_payload, self.source_bytes)
+        response = json.loads(body.decode("utf-8"))
+        self.assertEqual(upload_status, 201, response)
+
+        project = self.projects_root / response["project"]["id"]
+        manifest = json.loads((project / "project.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["subtitles"]["source_language"], "zh-en")
+        self.assertEqual(
+            manifest["subtitles"]["glossary"],
+            ["It", "to V", "cigar", "cigarette"],
+        )
+
     def test_import_rejects_bad_metadata_cross_site_and_oversize(self) -> None:
         status, payload = self.json_response(
             "POST",

@@ -24,6 +24,13 @@ split at the same semantic boundary. Preserve terminology with a project glossar
 Do not translate brand names, model names, URLs, or numbers unless explicitly
 localized.
 
+For Chinese speech that switches into English, set source language to `zh-en`
+and provide known terms through the Studio glossary or CLI
+`--transcription-glossary`. Auto and Chinese modes still use an English-
+preservation prompt. The local correction pass is intentionally conservative:
+it may repair close glossary spellings and split English subwords, but it never
+turns a draft transcript into an approved subtitle without human review.
+
 ## Voice engines
 
 | Selection | Behavior |

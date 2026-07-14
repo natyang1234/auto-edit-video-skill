@@ -65,6 +65,7 @@
             <span>影片語言</span>
             <select id="import-language">
               <option value="auto">自動判斷</option>
+              <option value="zh-en">中英混合（教學／訪談）</option>
               <option value="zh-TW">繁體中文</option>
               <option value="zh-CN">簡體中文</option>
               <option value="en-US">英文</option>
@@ -110,6 +111,11 @@
             </select>
           </label>
         </div>
+        <label>
+          <span>英文術語與專有名詞（選填）</span>
+          <input id="import-transcription-glossary" type="text" maxlength="1200" placeholder="例如：It; to V; cigar; cigarette">
+          <small>用分號分隔；轉錄時會保留英文拼寫，不做中文音譯。</small>
+        </label>
         <label>
           <span>想強調的風格與重點（選填）</span>
           <textarea id="import-brief" maxlength="2000" rows="4" placeholder="例如：保留 Crystal 談創業失敗與轉折的段落，節奏俐落但不要過度聳動。"></textarea>

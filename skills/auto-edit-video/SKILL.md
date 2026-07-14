@@ -77,6 +77,12 @@ title/cards/animations and licensed project assets, clip-scoped timeline
 preview, and separate clip rendering. These profiles are tested heuristic
 strategies, not five autonomous LLM agents.
 
+Studio source language includes `zh-en` for Chinese/English code switching and
+an optional semicolon-separated terminology glossary. Auto and Chinese source
+modes also prompt local Whisper to retain incidental English spelling. Import
+writes `working/transcript_review.json`, conservatively repairs only close
+glossary spellings, and creates readable caption chunks from word timings.
+
 Director profiles control copy, captions, cards, and motion language. The
 separate video-template selector controls source framing and compositing: three
 templates are fixed (`camera_motion=none`), two opt into reframe/punch motion,
@@ -207,6 +213,9 @@ Defaults are deliberately conservative:
 
 Transcribe locally with AutoClip/Whisper or HyperFrames Whisper. Always pin a
 multilingual model for non-English audio; never use `small.en` on Chinese.
+For Chinese/English teaching or interview footage, use source language `zh-en`
+and supply known English terms through `--transcription-glossary`. Do not treat
+the local transcript as reviewed merely because glossary checks are clear.
 
 Apply [references/EDITING_RULES.md](references/EDITING_RULES.md). If
 `chengfeng-cut-narration` is installed, its review UI may be used, but do not use

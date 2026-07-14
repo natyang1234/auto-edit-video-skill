@@ -35,8 +35,10 @@ from auto_edit import (
     DURATION_PROFILES,
     EDIT_PRESETS,
     PLATFORMS,
+    SOURCE_LANGUAGES,
     SUBTITLE_MODES,
     initialize_project,
+    normalize_transcription_glossary,
     probe_media,
 )
 from editor_server import EDITOR_DIR, EditorServer, atomic_write_json
@@ -62,7 +64,6 @@ SOURCE_MIME_TYPES = {
     ".m4v": {"video/x-m4v", "video/mp4"},
     ".webm": {"video/webm"},
 }
-SOURCE_LANGUAGES = {"auto", "zh-TW", "zh-CN", "en-US", "en-GB"}
 AUTO_EDIT_SCRIPT = Path(__file__).with_name("auto_edit.py")
 
 
@@ -600,8 +601,15 @@ class StudioHandler(BaseHTTPRequestHandler):
         settings = body.get("settings") or {}
         if not isinstance(settings, dict):
             raise StudioRequestError(422, "invalid_settings", "settings must be an object")
+        try:
+            transcription_glossary = normalize_transcription_glossary(
+                settings.get("transcription_glossary", "")
+            )
+        except ValueError as exc:
+            raise StudioRequestError(422, "invalid_settings", str(exc)) from exc
         normalized_settings = {
             "source_language": str(settings.get("source_language", "auto")),
+            "transcription_glossary": transcription_glossary,
             "subtitle_mode": str(settings.get("subtitle_mode", "source")),
             "platform": str(settings.get("platform", "auto")),
             "duration_profile": str(settings.get("duration_profile", "auto")),
@@ -746,6 +754,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                 incoming,
                 creating,
                 source_language=settings["source_language"],
+                transcription_glossary=settings["transcription_glossary"],
                 subtitle_mode=settings["subtitle_mode"],
                 platform=settings["platform"],
                 duration_profile=settings["duration_profile"],
