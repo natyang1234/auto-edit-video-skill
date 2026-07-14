@@ -35,6 +35,8 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 中英混合影片可選「中英混合」並用分號填入術語，例如 `It; to V; cigarette`。即使維持自動或中文模式，本機 Whisper 也會收到「英文保留原文、不做中文音譯」提示；提示會限制長度並排除過長例句，避免英文偏置反而降低相鄰中文準確度。另可填入經確認的正字規則，例如 `複數=富數;It is=意思;例句=音譽句`；正字與誤字可不同長度，系統會保留完整來源時間範圍並盡量沿用 word boundaries，必要時可在 manifest 加 `start`／`end` 限定歧義詞的時間範圍。專案會分開儲存機械檢查與語義校準報告；機械警示為 0 不代表語義已審核，套用規則後仍是 `applied_needs_review`，並把過長 Whisper 段落切成 GUI 可讀的定時字幕。
 
+語義與英文術語校準完成後，系統會在寫入 SRT、GUI 字幕、重點字、字卡及精華標題之前統一正體。`zh-TW`、`zh-en` 與自動辨識到的中文都使用技能內附的 OpenCC 台灣詞彙字典；只有明確選擇 `zh-CN` 才保留簡體。英文、數字、標點與逐字時間碼不會被改動，轉換紀錄保存在 `working/transcript_orthography.json`。
+
 畫面模板與導演策略彼此獨立。編輯器內建 3 種固定鏡位、2 種可選動態鏡位，以及純色／專案圖片／循環影片背景共 3 種本機人物去背模板。固定模板不會輸出任何來源畫面的縮放或重新取景 tween；去背模板可調人物 X／Y／大小，最終時間軸仍使用原片音軌。瀏覽器畫布會明確標示為人物定位預覽，真實去背邊緣以輸出的預覽 MP4 為準。
 
 人工閘依序為 `destructive_edit` → `highlight_selection` → `timeline` → `final`，每一閘都綁定當下 revision。正式輸出會自動建立 frozen snapshot、SHA-256 receipt、機械 QA 與九宮格；只有目前版本通過 QA 且人工核可後才顯示下載。頁面 renderer 目前不會悄悄忽略 interior delete：若審查決定含 `delete`，正式輸出會 fail closed，必須先走 `render_cut.py`，或把該提案改為 keep。

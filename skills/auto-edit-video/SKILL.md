@@ -84,10 +84,15 @@ calibration field accepts audited `canonical=alias|alias` rules such as
 span, reuse Whisper word boundaries where possible, and optional manifest
 `start`/`end` scopes constrain ambiguous aliases. Auto and Chinese source modes also prompt local Whisper to retain
 incidental English spelling. Import writes both
-`working/transcript_review.json` and `working/transcript_calibration.json`,
+`working/transcript_review.json`, `working/transcript_calibration.json`, and
+`working/transcript_orthography.json`,
 bounds the prompt and excludes long glossary sentences so English hints do not
 degrade adjacent Chinese, safely repairs close spellings or split tokens, and
-creates readable caption chunks from word timings.
+creates readable caption chunks from word timings. After semantic/glossary
+correction and before any SRT, GUI, highlight, or card artifact is built,
+`zh-TW`, `zh-en`, and auto-detected Chinese transcripts are normalized with the
+vendored OpenCC `s2twp` Taiwan dictionary. Latin text and word timings remain
+unchanged. Explicit `zh-CN` is the supported opt-out.
 
 Director profiles control copy, captions, cards, and motion language. The
 separate video-template selector controls source framing and compositing: three
@@ -236,6 +241,7 @@ Write:
 
 - `working/transcript_words.json`
 - `working/transcript_calibration.json`
+- `working/transcript_orthography.json`
 - `working/transcript_review.json`
 - `working/edit_candidates.json`
 - `working/edit_decisions.json`

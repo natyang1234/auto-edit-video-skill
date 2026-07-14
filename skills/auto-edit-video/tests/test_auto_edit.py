@@ -711,6 +711,92 @@ payload = {
         self.assertEqual(corrections[("音譽句", "例句")]["end"], 1.24)
         self.assertEqual(review["mechanical_issue_count"], 0)
 
+    def test_whisper_import_normalizes_chinese_to_taiwan_traditional(self) -> None:
+        project = self.root / "taiwan-traditional-normalization"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-en",
+            "--target-language",
+            "zh-TW",
+        )
+        whisper_json = self.root / "taiwan-traditional-normalization.json"
+        source_words = [
+            {"word": "老师说", "start": 0.02, "end": 0.10, "probability": 0.97},
+            {"word": "这个软件", "start": 0.10, "end": 0.18, "probability": 0.96},
+            {"word": "在互联网很好，", "start": 0.18, "end": 0.27, "probability": 0.95},
+            {"word": "cigar 还是 cigar。", "start": 0.27, "end": 0.36, "probability": 0.94},
+        ]
+        whisper_json.write_text(
+            json.dumps(
+                {
+                    "text": "".join(item["word"] for item in source_words),
+                    "language": "zh",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.36,
+                            "text": "".join(item["word"] for item in source_words),
+                            "words": source_words,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "import-whisper",
+            "--manifest",
+            str(project / "project.json"),
+            "--whisper-json",
+            str(whisper_json),
+            "--model",
+            "base",
+        )
+        payload = json.loads(result.stdout)
+        transcript = json.loads(
+            (project / "working/transcript_words.json").read_text(encoding="utf-8")
+        )
+        compatibility = json.loads(
+            (project / "working/subtitles_words.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (project / "project.json").read_text(encoding="utf-8")
+        )
+        expected = "老師說這個軟體在網際網路很好，cigar 還是 cigar。"
+
+        self.assertEqual(transcript["text"], expected)
+        self.assertEqual(
+            transcript["segments"][0]["text"].replace("， ", "，"),
+            expected,
+        )
+        self.assertEqual(
+            "".join(item["text"] for item in transcript["words"]),
+            expected,
+        )
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in transcript["words"]],
+            [(item["start"], item["end"]) for item in source_words],
+        )
+        self.assertEqual(
+            "".join(item["text"] for item in compatibility if not item["isGap"]),
+            expected,
+        )
+        source_srt = (project / "subtitles/source.srt").read_text(encoding="utf-8")
+        self.assertIn(expected, source_srt.replace("， ", "，"))
+        self.assertIn("00:00:00,020 --> 00:00:00,360", source_srt)
+        self.assertNotRegex(source_srt, r"老师|这个|软件|互联网|还是")
+        self.assertEqual(payload["orthography_variant"], "zh-TW")
+        self.assertGreater(payload["orthography_conversions"], 0)
+        self.assertEqual(manifest["subtitles"]["source_variant"], "zh-TW")
+        self.assertEqual(manifest["transcription"]["orthography_variant"], "zh-TW")
+
     def test_chinese_transcript_without_calibration_is_not_reported_semantically_clear(self) -> None:
         project = self.root / "semantic-calibration-not-configured"
         self.run_cli(

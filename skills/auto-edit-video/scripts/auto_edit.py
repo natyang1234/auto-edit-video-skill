@@ -27,6 +27,11 @@ from highlight_planner import (
 )
 from visual_quality import build_highlight_design_overlays
 from template_catalog import cutout_capability
+from traditional_chinese import (
+    ORTHOGRAPHY_VARIANT,
+    normalize_whisper_orthography,
+    should_normalize_taiwan_traditional,
+)
 
 
 SCHEMA_VERSION = 1
@@ -2225,13 +2230,30 @@ def import_whisper_artifacts(
         raise ValueError("Whisper JSON must contain a segments array")
     semantic_corrections = apply_transcription_calibrations(data, calibrations)
     glossary_corrections = apply_glossary_corrections(data, glossary)
+    orthography_enabled = should_normalize_taiwan_traditional(
+        manifest,
+        data.get("language"),
+    )
+    orthography = (
+        normalize_whisper_orthography(data)
+        if orthography_enabled
+        else {
+            "variant": None,
+            "configuration": None,
+            "backend": None,
+            "changed_strings": 0,
+            "changed_characters": 0,
+        }
+    )
     duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
     transcript, compatibility = whisper_payload(data, duration_s)
+    transcript["orthography_variant"] = orthography["variant"]
     project_dir = manifest_path.parent
     transcript_path = project_dir / "working/transcript_words.json"
     compatibility_path = project_dir / "working/subtitles_words.json"
     review_path = project_dir / "working/transcript_review.json"
     calibration_path = project_dir / "working/transcript_calibration.json"
+    orthography_path = project_dir / "working/transcript_orthography.json"
     semantic_calibration = {
         "status": "applied_needs_review" if calibrations else "not_configured",
         "rule_count": len(calibrations),
@@ -2246,6 +2268,16 @@ def import_whisper_artifacts(
             **semantic_calibration,
             "rules": calibrations,
             "corrections": semantic_corrections,
+            "generated_at": now_utc(),
+        },
+    )
+    write_json(
+        orthography_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "applied" if orthography_enabled else "not_requested",
+            **orthography,
+            "source_language_mode": source_language_mode,
             "generated_at": now_utc(),
         },
     )
@@ -2272,6 +2304,11 @@ def import_whisper_artifacts(
     manifest["artifacts"]["transcript_calibration"] = (
         "working/transcript_calibration.json"
     )
+    manifest["artifacts"]["transcript_orthography"] = (
+        "working/transcript_orthography.json"
+    )
+    if orthography_enabled:
+        manifest.setdefault("subtitles", {})["source_variant"] = ORTHOGRAPHY_VARIANT
     manifest["transcription"] = {
         "engine": "openai-whisper",
         "model": model,
@@ -2282,6 +2319,9 @@ def import_whisper_artifacts(
         "semantic_calibration_status": semantic_calibration["status"],
         "semantic_calibration_rule_count": len(calibrations),
         "semantic_calibration_correction_count": len(semantic_corrections),
+        "orthography_variant": orthography["variant"],
+        "orthography_backend": orthography["backend"],
+        "orthography_conversion_count": orthography["changed_strings"],
         "review_status": transcript_review["status"],
         "review_issue_count": transcript_review["issue_count"],
         "glossary_correction_count": len(glossary_corrections),
@@ -2308,6 +2348,8 @@ def import_whisper_artifacts(
         "semantic_calibration_status": semantic_calibration["status"],
         "semantic_calibration_corrections": len(semantic_corrections),
         "glossary_corrections": len(glossary_corrections),
+        "orthography_variant": orthography["variant"],
+        "orthography_conversions": orthography["changed_strings"],
         "words": len(transcript["words"]),
         "segments": len(transcript["segments"]),
         "synced_editor_captions": synced,

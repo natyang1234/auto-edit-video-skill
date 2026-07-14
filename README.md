@@ -60,6 +60,12 @@ boundaries where possible, write a correction audit, and may be time-scoped in t
 mechanical-warning count is never presented as semantic review; calibration
 remains `applied_needs_review` until a person checks the captions.
 
+After those corrections, Chinese transcript truth is normalized before SRT,
+GUI, emphasis, card, and highlight generation. `zh-TW`, `zh-en`, and
+auto-detected Chinese use a bundled OpenCC Taiwan phrase dictionary, while an
+explicit `zh-CN` source remains Simplified. English tokens and all word timings
+are preserved, and `working/transcript_orthography.json` records the conversion.
+
 Video layout is selected independently from the director profile. The editor
 ships three fixed-camera templates, two opt-in dynamic-camera templates, and
 three local subject-cutout templates for solid, project-owned image, or

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.2 - 2026-07-14
+
+### Taiwan Traditional subtitle normalization
+
+- Normalize `zh-TW`, `zh-en`, and auto-detected Chinese transcript truth with
+  the bundled OpenCC Taiwan phrase dictionaries before writing SRT, GUI
+  captions, emphasis, cards, or highlights. An explicit `zh-CN` source remains
+  the supported opt-out.
+- Convert complete timed Whisper word streams before projecting text back onto
+  their original boundaries, so split phrases keep context (`联` + `系` becomes
+  Taiwan `聯絡`) while English spelling and timestamps remain unchanged.
+- Record the orthography backend and conversion counts in
+  `working/transcript_orthography.json`, and ship the Apache-2.0 dictionary
+  subset plus third-party notices inside the portable skill.
+
 ## 1.6.1 - 2026-07-14
 
 ### Variable-length semantic calibration

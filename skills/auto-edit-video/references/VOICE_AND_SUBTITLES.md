@@ -13,7 +13,7 @@
 
 | Mode | Output |
 |---|---|
-| `source` | Corrected subtitles in the spoken language |
+| `source` | Corrected subtitles in the spoken language; Chinese defaults to Taiwan Traditional unless explicitly `zh-CN` |
 | `zh` | Traditional Chinese subtitle track |
 | `en` | English subtitle track |
 | `bilingual` | Paired Chinese/English lines on one timing rail |
@@ -33,6 +33,14 @@ degrade nearby Chinese homophones on small Whisper models. The local correction
 pass is intentionally conservative: it may repair close glossary spellings and
 split English subwords, but it never turns a draft transcript into an approved
 subtitle without human review.
+
+Chinese orthography is normalized after glossary/semantic calibration and
+before transcript, SRT, GUI caption, emphasis, card, or highlight artifacts are
+written. `zh-TW`, `zh-en`, and auto-detected Chinese use the portable OpenCC
+`s2twp` Taiwan phrase dictionary. English spelling, punctuation, numbers, word
+timestamps, and source timing are preserved. Select `zh-CN` explicitly when the
+source subtitle track must remain Simplified Chinese. The auditable result is
+stored in `working/transcript_orthography.json`.
 
 ## Voice engines
 

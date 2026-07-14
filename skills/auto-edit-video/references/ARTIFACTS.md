@@ -17,6 +17,7 @@ PROJECT/
 ├── working/
 │   ├── transcript_words.json       # original word timings
 │   ├── transcript_calibration.json # exact homophone/spelling replacements
+│   ├── transcript_orthography.json # Taiwan Traditional conversion audit
 │   ├── transcript_review.json      # mechanical issues + semantic status
 │   ├── edit_candidates.json        # machine proposals
 │   ├── edit_decisions.json         # approved keep/delete decisions
@@ -107,6 +108,28 @@ values scope an otherwise ambiguous alias to a reviewed source interval.
 `transcript_review.json.issue_count` is the mechanical issue count. Read
 `semantic_calibration.status` and `risk_status` separately; zero mechanical
 issues must not be described as semantically clear.
+
+### `transcript_orthography.json`
+
+This artifact records deterministic orthography normalization separately from
+semantic calibration. For `zh-TW`, `zh-en`, and auto-detected Chinese, the
+vendored OpenCC `s2twp` dictionaries run after calibration but before any
+downstream subtitle or visual artifact. `changed_strings` is an audit count,
+not a quality score. Explicit `zh-CN` records `not_requested` and preserves the
+source orthography.
+
+```json
+{
+  "schema_version": 1,
+  "status": "applied|not_requested",
+  "variant": "zh-TW",
+  "configuration": "s2twp",
+  "backend": "vendored-opencc-python-reimplemented-0.1.7",
+  "changed_strings": 42,
+  "changed_characters": 97,
+  "source_language_mode": "zh-en"
+}
+```
 
 ### `edit_candidates.json`
 
