@@ -1,6 +1,6 @@
 # Auto Edit Video Skill
 
-A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic A-roll video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. An optional loopback-only Studio adds local video import, editing intent, five deterministic director profiles, up to ten transcript-grounded highlights, editable captions/layers, preview, final QA, and reviewed download.
+A portable [Agent Skill](https://agentskills.io/) for reviewed, non-destructive automatic A-roll video editing. Give a local agent one source video; the agent creates its own local word-timed transcript and project, then produces cut proposals, an edited MP4, and delivery QA. An optional loopback-only Studio adds local video import, editing intent, five deterministic director profiles, up to ten transcript-grounded highlights, editable captions/layers, preview, and approval-bound single or batch final downloads.
 
 [繁體中文](README.zh-TW.md)
 
@@ -44,7 +44,8 @@ five deterministic director profiles, keep or reject clips, correct caption
 text/timing, select words inside a caption for exportable pop/highlight/
 underline effects, drag caption/card layers, adjust their width/height, and see
 safe-zone or timed-layer collision warnings. Users can also add title/cards/
-animations or licensed media, preview one clip, and render it separately. In
+animations or licensed media, preview or render one clip, and batch-render all
+approved highlights in one queue. In
 designed mode, captions and effect spans are baked into the same HTML/GSAP
 graphic package used by the rendered MP4.
 
@@ -91,8 +92,10 @@ rendered preview MP4.
 Approvals are revision-bound and ordered:
 `destructive_edit` → `highlight_selection` → `timeline` → `final`. Final render
 automatically creates a frozen render snapshot, SHA-256 receipt, mechanical QA
-report, and contact sheet. Download is exposed only after the current QA result
-and final artifact are manually approved. Reviewed interior delete decisions
+report, and contact sheet. Batch final repeats that contract for every approved
+highlight, then creates a hash-bound ZIP and aggregate receipt. Single or batch
+downloads are exposed only after the current QA result and final artifact set
+are manually approved. Reviewed interior delete decisions
 are intentionally fail-closed in the page renderer; use `render_cut.py` first,
 or mark those proposals keep, until the two render paths are composed.
 
@@ -123,7 +126,8 @@ repeated, stretched, or speed-adjusted merely to hit the target.
   homophone calibration, and separate mechanical/semantic review states.
 - Loopback Studio import plus a local page editor with semantic highlights,
   timed text/media layers, and social canvas presets.
-- Deterministic MP4/cover rendering plus mechanical QA and a contact sheet.
+- Deterministic single/batch MP4 and cover rendering, mechanical QA, contact
+  sheets, and approval-gated ZIP download.
 - Optional Edge, Rumi/Fish, HyperFrames, premium captions, and visual-card integrations when those tools are already installed.
 
 The skill never invokes CapCut. It does not include API keys, private voices, media, creator profiles, or machine-specific configuration.

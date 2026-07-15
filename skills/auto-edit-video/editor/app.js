@@ -15,6 +15,8 @@ let stateDirty = false;
 let selectedEffectSpanId = null;
 let effectCreationMode = false;
 let activeTemplateGroup = "fixed";
+let batchRenderActive = false;
+let renderBusy = false;
 
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
@@ -69,6 +71,10 @@ function cacheElements() {
     "publish-title", "publish-body", "publish-hashtags", "cover-text", "cover-time",
     "cover-time-output", "generate-cover", "cover-preview", "approve-timeline", "render-final",
     "delivery-qa-status", "qa-contact-link", "approve-final",
+    "render-batch-final", "batch-retained-count", "batch-render-progress",
+    "batch-progress-label", "batch-progress-value", "batch-progress-bar",
+    "batch-delivery-qa", "batch-qa-status", "batch-qa-grid",
+    "batch-downloads", "download-batch-archive", "batch-output-list",
     "voice-enabled", "voice-language", "voice-gender", "voice-id", "voice-mode",
     "voice-speed", "save-voice", "voice-status",
     "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output"
@@ -180,6 +186,26 @@ function activeHighlight() {
   const activeId = state?.active_highlight_id;
   if (!activeId || !Array.isArray(state?.highlights)) return null;
   return state.highlights.find((item) => String(item.id) === String(activeId)) || null;
+}
+
+function retainedHighlights() {
+  if (!Array.isArray(state?.highlights)) return [];
+  return state.highlights.filter((item) => item.review_status === "approved");
+}
+
+function updateBatchRetainedCount() {
+  const count = retainedHighlights().length;
+  elements["batch-retained-count"].textContent = `已保留 ${count} 段`;
+  elements["render-batch-final"].textContent = `批次輸出已保留精華（${count}）`;
+  elements["render-batch-final"].disabled = renderBusy || batchRenderActive || count === 0;
+}
+
+function setRenderBusy(isBusy) {
+  renderBusy = Boolean(isBusy);
+  elements["render-button"].disabled = renderBusy;
+  elements["render-final"].disabled = renderBusy;
+  if (renderBusy) elements["approve-final"].disabled = true;
+  updateBatchRetainedCount();
 }
 
 function overlayBelongsToHighlight(overlay, highlight = activeHighlight()) {
@@ -632,6 +658,7 @@ function deriveHighlightSegments() {
 function renderHighlightList() {
   highlightSegments = deriveHighlightSegments();
   elements["highlight-count"].textContent = String(highlightSegments.length);
+  updateBatchRetainedCount();
   elements["highlight-list"].replaceChildren();
   if (!highlightSegments.length) {
     const empty = document.createElement("div");
@@ -1743,8 +1770,166 @@ function artifactUrl(relative) {
   return `/${normalized.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+function isBatchDeliveryReceipt(receipt = {}) {
+  return receipt?.kind === "batch"
+    || receipt?.delivery_kind === "batch"
+    || (Number(receipt?.schema_version || 0) >= 2 && Array.isArray(receipt?.items))
+    || Array.isArray(receipt?.qa?.items);
+}
+
+function batchReceiptItems(receipt = {}) {
+  if (Array.isArray(receipt?.items)) return receipt.items;
+  if (Array.isArray(receipt?.qa?.items)) return receipt.qa.items;
+  return [];
+}
+
+function batchReceiptFromStatus(status = {}) {
+  const aggregate = status?.qa && typeof status.qa === "object" ? status.qa : {};
+  const items = Array.isArray(aggregate.items) && aggregate.items.length
+    ? aggregate.items
+    : Array.isArray(status.items) ? status.items : [];
+  return {
+    ...aggregate,
+    schema_version: Number(aggregate.schema_version || 2),
+    kind: "batch",
+    state_revision: aggregate.state_revision || status.state_revision || state?.revision || "",
+    status: aggregate.status || (status.state === "complete" ? "pass" : "fail"),
+    item_count: Number(aggregate.item_count || status.total_count || status.total_clips || items.length),
+    items,
+    archive: status.archive || aggregate.archive || status.output || "",
+    archive_download_name: status.archive_download_name
+      || aggregate.archive_download_name
+      || status.download_name
+      || "",
+  };
+}
+
+function batchClipTitle(clipId, index) {
+  const highlight = (state?.highlights || []).find((item) => String(item.id) === String(clipId));
+  return highlight?.title || `精華片段 ${index + 1}`;
+}
+
+function renderBatchProgress(status = {}) {
+  const total = Math.max(0, Number(status.total_count || status.total_clips || retainedHighlights().length || 0));
+  const rawCompleted = Number(status.completed_count || status.completed_clips || 0);
+  const completed = Math.max(0, Math.min(total || rawCompleted, rawCompleted));
+  const currentId = status.current_clip_id;
+  const currentIndex = (state?.highlights || []).findIndex((item) => String(item.id) === String(currentId));
+  const currentTitle = currentId ? batchClipTitle(currentId, Math.max(0, currentIndex)) : "";
+  const stateLabel = status.state === "complete"
+    ? "整批輸出與 QA 已完成"
+    : status.state === "qa_failed"
+      ? "整批 QA 未通過"
+      : status.state === "failed"
+        ? "整批輸出失敗"
+        : currentTitle ? `正在輸出：${currentTitle}` : "正在準備批次輸出";
+  elements["batch-render-progress"].hidden = false;
+  elements["batch-progress-label"].textContent = status.message || stateLabel;
+  elements["batch-progress-value"].textContent = `${completed} / ${total}`;
+  elements["batch-progress-bar"].max = Math.max(1, total);
+  elements["batch-progress-bar"].value = completed;
+}
+
+function renderBatchQa(receipt = {}, canDownload = false) {
+  const items = batchReceiptItems(receipt);
+  const total = Number(receipt.item_count || items.length);
+  const passed = items.filter((item) => item?.status === "pass").length;
+  elements["batch-delivery-qa"].hidden = items.length === 0;
+  elements["batch-qa-status"].textContent = items.length
+    ? `逐段 QA：${passed} / ${total || items.length} 通過。請逐段查看九宮格與完整播放。`
+    : "尚未取得逐段 QA。";
+  elements["batch-qa-grid"].replaceChildren();
+
+  items.forEach((item, index) => {
+    const passedQa = item?.status === "pass";
+    const card = document.createElement("article");
+    card.className = `batch-qa-card${passedQa ? "" : " is-failed"}`;
+    card.dataset.clipId = String(item?.clip_id || "");
+
+    const heading = document.createElement("div");
+    heading.className = "batch-qa-card-heading";
+    const title = document.createElement("strong");
+    title.textContent = `${String(index + 1).padStart(2, "0")} · ${batchClipTitle(item?.clip_id, index)}`;
+    const chip = document.createElement("span");
+    chip.className = "batch-qa-chip";
+    chip.textContent = passedQa ? "QA 通過" : "QA 未通過";
+    heading.append(title, chip);
+    card.append(heading);
+
+    const warnings = Array.isArray(item?.warnings) ? item.warnings : [];
+    const summary = document.createElement("p");
+    summary.textContent = warnings.length
+      ? `${warnings.length} 項提醒；核可前請完整播放。`
+      : "機械檢查完成；核可前仍需人工觀看。";
+    card.append(summary);
+
+    const links = document.createElement("div");
+    links.className = "batch-qa-links";
+    const contactSheet = item?.contact_sheet || item?.qa_contact;
+    const report = item?.report || item?.qa_report;
+    if (contactSheet) {
+      const contactLink = document.createElement("a");
+      contactLink.href = artifactUrl(contactSheet);
+      contactLink.target = "_blank";
+      contactLink.rel = "noopener";
+      contactLink.textContent = "查看 QA 九宮格";
+      links.append(contactLink);
+    }
+    if (report) {
+      const reportLink = document.createElement("a");
+      reportLink.href = artifactUrl(report);
+      reportLink.target = "_blank";
+      reportLink.rel = "noopener";
+      reportLink.textContent = "查看 QA 報告";
+      links.append(reportLink);
+    }
+    if (item?.output) {
+      const playbackButton = document.createElement("button");
+      playbackButton.type = "button";
+      playbackButton.className = "batch-playback-button";
+      playbackButton.textContent = "在主預覽播放";
+      playbackButton.addEventListener("click", () => {
+        const video = elements["preview-video"];
+        video.src = `${artifactUrl(item.output)}?v=${Date.now()}`;
+        video.load();
+        showingRenderedMedia = true;
+        elements["overlay-layer"].hidden = true;
+        video.play().catch(() => {});
+      });
+      links.append(playbackButton);
+    }
+    if (links.childElementCount) card.append(links);
+    elements["batch-qa-grid"].append(card);
+  });
+
+  elements["batch-downloads"].hidden = !canDownload;
+  elements["batch-output-list"].replaceChildren();
+  const archive = receipt.archive;
+  elements["download-batch-archive"].hidden = !canDownload || !archive;
+  if (canDownload && archive) {
+    elements["download-batch-archive"].href = artifactUrl(archive);
+    elements["download-batch-archive"].download = receipt.archive_download_name
+      || String(archive).split("/").pop()
+      || "auto-edit-highlights.zip";
+  } else {
+    elements["download-batch-archive"].href = "#";
+    elements["download-batch-archive"].removeAttribute("download");
+  }
+  if (canDownload) {
+    items.forEach((item, index) => {
+      if (!item?.output) return;
+      const link = document.createElement("a");
+      link.href = artifactUrl(item.output);
+      link.download = item.download_name || String(item.output).split("/").pop() || `highlight-${index + 1}.mp4`;
+      link.textContent = `下載 ${String(index + 1).padStart(2, "0")} · ${batchClipTitle(item.clip_id, index)} MP4`;
+      elements["batch-output-list"].append(link);
+    });
+  }
+}
+
 function renderDeliveryQa(receipt = projectPayload?.delivery_qa || {}) {
   projectPayload.delivery_qa = receipt || {};
+  const isBatch = isBatchDeliveryReceipt(receipt);
   const hasReceipt = receipt && receipt.status === "pass";
   const isCurrent = hasReceipt && receipt.state_revision === state?.revision;
   const approval = projectPayload?.manifest?.approvals?.final || {};
@@ -1761,14 +1946,46 @@ function renderDeliveryQa(receipt = projectPayload?.delivery_qa || {}) {
     ? `視覺契約：${visual.designed_card_count || 0} 張圖卡、覆蓋 ${Math.round((visual.designed_coverage_ratio || 0) * 100)}%`
     : "";
 
-  elements["qa-contact-link"].hidden = !hasReceipt || !receipt.contact_sheet;
+  elements["qa-contact-link"].hidden = isBatch || !hasReceipt || !receipt.contact_sheet;
   if (!elements["qa-contact-link"].hidden) {
     elements["qa-contact-link"].href = artifactUrl(receipt.contact_sheet);
   }
-  elements["approve-final"].disabled = !isCurrent || isApproved;
+  elements["approve-final"].disabled = renderBusy || !isCurrent || isApproved;
   elements["approve-final"].textContent = isApproved
-    ? "最終成片已核可"
-    : "檢查完成，核可最終成片";
+    ? isBatch ? "整批成片已核可" : "最終成片已核可"
+    : isBatch ? "逐段檢查完成，核可整批成片" : "檢查完成，核可最終成片";
+
+  if (isBatch) {
+    const items = batchReceiptItems(receipt);
+    const total = Number(receipt.item_count || items.length);
+    const passed = items.filter((item) => item?.status === "pass").length;
+    renderBatchProgress({
+      state: hasReceipt ? "complete" : "qa_failed",
+      completed_count: items.length,
+      total_count: total,
+      message: hasReceipt ? "整批輸出與 QA 已完成" : "整批 QA 未通過",
+    });
+    renderBatchQa(receipt, Boolean(isApproved && isCurrent && hasReceipt));
+    if (!hasReceipt) {
+      elements["delivery-qa-status"].textContent = items.length
+        ? `整批 QA 未通過：${passed} / ${total || items.length} 段通過，不能核可或下載。`
+        : "尚未執行整批最終輸出 QA。";
+    } else if (!isCurrent) {
+      elements["delivery-qa-status"].textContent = "整批 QA 對應舊時間軸，請重新輸出。";
+    } else if (isApproved) {
+      elements["delivery-qa-status"].textContent = `整批 ${total || items.length} 段的媒體 QA 與人工檢查均已通過。`;
+    } else {
+      elements["delivery-qa-status"].textContent = `整批 QA 通過 ${passed} / ${total || items.length} 段；請逐段查看九宮格與完整播放後再核可。`;
+    }
+    if (elements["download-output"].dataset.quality === "final") {
+      elements["download-output"].hidden = true;
+    }
+    return;
+  }
+
+  elements["batch-delivery-qa"].hidden = true;
+  elements["batch-downloads"].hidden = true;
+  elements["batch-qa-grid"].replaceChildren();
 
   if (!hasReceipt) {
     elements["delivery-qa-status"].textContent = "尚未執行最終輸出 QA。";
@@ -1804,6 +2021,7 @@ async function approveFinal() {
     if (receipt.status !== "pass" || receipt.state_revision !== state.revision) {
       throw new Error("請先完成目前版本的最終輸出與 QA");
     }
+    const isBatch = isBatchDeliveryReceipt(receipt);
     const result = await request("/api/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1811,25 +2029,65 @@ async function approveFinal() {
         gate: "final",
         expected_revision: projectPayload.approval_revisions.final,
         confirmed_by: "local-editor-user",
-        note: "Reviewed final playback and QA contact sheet in Auto Edit Studio",
+        note: isBatch
+          ? "Reviewed every batch clip playback and QA contact sheet in Auto Edit Studio"
+          : "Reviewed final playback and QA contact sheet in Auto Edit Studio",
       }),
     });
     projectPayload.manifest.approvals.final = result.approval;
     projectPayload.approval_revisions = result.approval_revisions;
     projectPayload.approval_current = result.approval_current || projectPayload.approval_current || {};
     renderDeliveryQa();
-    showToast("最終成片已核可，可以下載", "success");
+    showToast(isBatch ? "整批成片已核可，可以下載 ZIP 與各段 MP4" : "最終成片已核可，可以下載", "success");
   } catch (error) {
     showToast(`最終核可失敗：${error.message}`, "error");
     renderDeliveryQa();
   }
 }
 
-async function startRender(quality = "preview") {
-  await saveState(false);
-  const button = quality === "preview" ? elements["render-button"] : elements["render-final"];
-  button.disabled = true;
+async function startBatchRender() {
+  setRenderBusy(true);
   try {
+    await saveState(false);
+    if (stateDirty) throw new Error("目前時間軸尚未成功儲存");
+    const count = retainedHighlights().length;
+    if (!count) throw new Error("請先保留至少一段精華");
+    const result = await request("/api/render-batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        quality: "final",
+        expected_revision: state.revision,
+      }),
+    });
+    batchRenderActive = true;
+    projectPayload.approval_current = projectPayload.approval_current || {};
+    projectPayload.approval_current.final = false;
+    renderDeliveryQa(projectPayload.delivery_qa || {});
+    updateBatchRetainedCount();
+    const accepted = result.status || {};
+    renderBatchProgress({
+      mode: "batch",
+      state: accepted.state || "running",
+      completed_count: accepted.completed_count || accepted.completed_clips || 0,
+      total_count: accepted.total_count || accepted.total_clips || count,
+      current_clip_id: accepted.current_clip_id,
+      message: accepted.message || `準備輸出 ${count} 段精華`,
+    });
+    showToast(accepted.message || `已開始批次輸出 ${count} 段精華`);
+    pollRenderStatus("batch");
+  } catch (error) {
+    batchRenderActive = false;
+    setRenderBusy(false);
+    renderDeliveryQa(projectPayload?.delivery_qa || {});
+    showToast(`批次輸出未開始：${error.message}`, "error");
+  }
+}
+
+async function startRender(quality = "preview") {
+  setRenderBusy(true);
+  try {
+    await saveState(false);
     if (stateDirty) throw new Error("目前時間軸尚未成功儲存");
     const result = await request("/api/render", {
       method: "POST",
@@ -1841,24 +2099,54 @@ async function startRender(quality = "preview") {
       }),
     });
     showToast(result.status.message);
-    pollRenderStatus(button);
+    pollRenderStatus("single");
   } catch (error) {
-    button.disabled = false;
+    setRenderBusy(false);
+    renderDeliveryQa(projectPayload?.delivery_qa || {});
     showToast(`輸出未開始：${error.message}`, "error");
   }
 }
 
-function pollRenderStatus(button) {
+function pollRenderStatus(expectedMode = "single") {
   clearInterval(renderPollTimer);
   renderPollTimer = setInterval(async () => {
     try {
       const status = await request("/api/render-status");
+      const isBatch = status.mode === "batch" || expectedMode === "batch";
       if (status.state === "running") {
+        if (isBatch) renderBatchProgress(status);
         setSaveState(status.message, "dirty");
         return;
       }
       clearInterval(renderPollTimer);
-      button.disabled = false;
+      setRenderBusy(false);
+      renderDeliveryQa(projectPayload?.delivery_qa || {});
+      if (isBatch) {
+        batchRenderActive = false;
+        updateBatchRetainedCount();
+        renderBatchProgress(status);
+        if (["complete", "qa_failed", "failed"].includes(status.state)) {
+          projectPayload.delivery_qa = batchReceiptFromStatus(status);
+          projectPayload.approval_revisions = status.approval_revisions || projectPayload.approval_revisions;
+          if (projectPayload?.manifest?.approvals?.final) {
+            projectPayload.manifest.approvals.final.approved = false;
+          }
+          projectPayload.approval_current = projectPayload.approval_current || {};
+          projectPayload.approval_current.final = false;
+          renderDeliveryQa(projectPayload.delivery_qa);
+        }
+        if (status.state === "complete") {
+          setSaveState("整批輸出完成", "saved");
+          showToast(status.message || "整批輸出與 QA 已完成", "success");
+        } else if (status.state === "qa_failed") {
+          setSaveState("整批 QA 未通過", "error");
+          showToast(status.message || "整批 QA 未通過，請查看逐段結果", "error");
+        } else {
+          setSaveState("整批輸出失敗", "error");
+          showToast(`整批輸出失敗：${status.message || "未知錯誤"}`, "error");
+        }
+        return;
+      }
       if (status.state === "complete" && status.output) {
         const video = elements["preview-video"];
         const cacheBusted = `${status.output}?v=${Date.now()}`;
@@ -1899,7 +2187,8 @@ function pollRenderStatus(button) {
       }
     } catch (error) {
       clearInterval(renderPollTimer);
-      button.disabled = false;
+      setRenderBusy(false);
+      renderDeliveryQa(projectPayload?.delivery_qa || {});
       showToast(`無法取得輸出狀態：${error.message}`, "error");
     }
   }, 900);
@@ -2036,6 +2325,7 @@ function bindEvents() {
   elements["save-button"].addEventListener("click", () => saveState(true));
   elements["render-button"].addEventListener("click", () => startRender("preview"));
   elements["render-final"].addEventListener("click", () => startRender("final"));
+  elements["render-batch-final"].addEventListener("click", startBatchRender);
   elements["approve-cuts"].addEventListener("click", approveCuts);
   elements["approve-highlights"].addEventListener("click", approveHighlights);
   elements["replan-highlights"].addEventListener("click", replanHighlights);
@@ -2251,11 +2541,13 @@ async function initialize() {
     updateScrubberBounds();
     renderVoicePanel();
     if (projectPayload.render_status?.state === "running") {
-      const runningButton = projectPayload.render_status.quality === "final"
-        ? elements["render-final"]
-        : elements["render-button"];
-      runningButton.disabled = true;
-      pollRenderStatus(runningButton);
+      const isBatch = projectPayload.render_status.mode === "batch";
+      if (isBatch) {
+        batchRenderActive = true;
+        renderBatchProgress(projectPayload.render_status);
+      }
+      setRenderBusy(true);
+      pollRenderStatus(isBatch ? "batch" : "single");
     }
     if (["pending", "running"].includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();
   } catch (error) {

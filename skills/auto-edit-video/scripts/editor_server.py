@@ -18,10 +18,10 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 import urllib.parse
 import uuid
 import webbrowser
+import zipfile
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -476,11 +476,66 @@ def approved_destructive_deletes(project_dir: Path) -> list[str]:
     ]
 
 
+def approved_highlights_in_plan_order(
+    project_dir: Path,
+    state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return the server-derived approved batch in the current plan's order."""
+    errors: list[str] = []
+    highlights = (
+        state.get("highlights", [])
+        if isinstance(state.get("highlights"), list)
+        else []
+    )
+    approved = [
+        item
+        for item in highlights
+        if isinstance(item, dict) and item.get("review_status") == "approved"
+    ]
+    plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
+    plan_items = [
+        item for item in plan.get("items", []) if isinstance(item, dict)
+    ]
+    plan_ids = [str(item.get("id") or "") for item in plan_items]
+    if not approved:
+        return [], ["at least one approved highlight is required for batch render"]
+    if any(not item_id for item_id in plan_ids) or len(set(plan_ids)) != len(plan_ids):
+        errors.append("highlight plan contains invalid or duplicate clip identities")
+        return [], errors
+
+    by_plan_id: dict[str, dict[str, Any]] = {}
+    for item in approved:
+        plan_id = str(item.get("plan_item_id") or "")
+        clip_id = str(item.get("id") or "")
+        if plan_id not in plan_ids:
+            errors.append(f"approved highlight {clip_id or '<unknown>'} is outside the current plan")
+            continue
+        if plan_id in by_plan_id:
+            errors.append(f"multiple approved highlights reference plan item {plan_id}")
+            continue
+        by_plan_id[plan_id] = item
+    ordered = [by_plan_id[item_id] for item_id in plan_ids if item_id in by_plan_id]
+    if len(ordered) != len(approved):
+        errors.append("approved highlight set could not be resolved one-to-one from the current plan")
+    return ordered, errors
+
+
 def delivery_qa_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
     """Verify that the final gate is tied to current, untampered delivery artifacts."""
     receipt = read_json(project_dir / LATEST_DELIVERY_QA_REL, None)
     if not isinstance(receipt, dict):
         return ["a successful delivery QA receipt is required before final approval"]
+    if receipt.get("schema_version") == 2:
+        return batch_delivery_qa_errors(project_dir, state, receipt)
+    return single_delivery_qa_errors(project_dir, state, receipt)
+
+
+def single_delivery_qa_errors(
+    project_dir: Path,
+    state: dict[str, Any],
+    receipt: dict[str, Any],
+) -> list[str]:
+    """Validate the backward-compatible schema-v1 single-clip delivery receipt."""
     errors: list[str] = []
     if receipt.get("schema_version") != 1 or receipt.get("status") != "pass":
         errors.append("delivery QA must pass before final approval")
@@ -559,6 +614,193 @@ def delivery_qa_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
             )
         ):
             errors.append("delivery QA visual-quality contract does not match the current timeline")
+    return errors
+
+
+def batch_delivery_qa_errors(
+    project_dir: Path,
+    state: dict[str, Any],
+    receipt: dict[str, Any],
+) -> list[str]:
+    """Validate every clip and archive member in a schema-v2 batch delivery."""
+    errors: list[str] = []
+    if (
+        receipt.get("kind") != "batch"
+        or receipt.get("delivery_kind") != "batch"
+        or receipt.get("quality") != "final"
+        or receipt.get("status") != "pass"
+    ):
+        errors.append("batch delivery QA must be a passing final delivery")
+    batch_id = str(receipt.get("batch_id") or "")
+    if not re.fullmatch(r"batch_[0-9a-f]{32}", batch_id):
+        errors.append("batch delivery identity is invalid")
+    state_revision = editor_state_revision(state)
+    if receipt.get("state_revision") != state_revision:
+        errors.append("batch delivery QA does not match the current editor revision")
+
+    expected_clips, clip_errors = approved_highlights_in_plan_order(project_dir, state)
+    errors.extend(clip_errors)
+    expected_ids = [str(item.get("id") or "") for item in expected_clips]
+    declared_ids = receipt.get("clip_ids")
+    if not isinstance(declared_ids, list) or declared_ids != expected_ids:
+        errors.append("batch delivery clip set does not match all currently approved highlights")
+
+    items = receipt.get("items")
+    if not isinstance(items, list):
+        errors.append("batch delivery items contract is missing")
+        items = []
+    if receipt.get("item_count") != len(expected_ids) or len(items) != len(expected_ids):
+        errors.append("batch delivery item count does not match the approved clip set")
+    item_ids = [str(item.get("clip_id") or "") for item in items if isinstance(item, dict)]
+    if len(item_ids) != len(items) or item_ids != expected_ids or len(set(item_ids)) != len(item_ids):
+        errors.append("batch delivery items do not match the approved clip order")
+
+    manifest = read_json(project_dir / "project.json", {}) or {}
+    clips_by_id = {str(item.get("id") or ""): item for item in expected_clips}
+    archive_members: dict[str, str] = {}
+    render_ids: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append(f"batch delivery item {index} is invalid")
+            continue
+        clip_id = str(item.get("clip_id") or "")
+        render_id = str(item.get("render_id") or "")
+        if (
+            item.get("schema_version") != 1
+            or item.get("batch_id") != batch_id
+            or item.get("quality") != "final"
+            or item.get("status") != "pass"
+            or item.get("state_revision") != state_revision
+        ):
+            errors.append(f"batch delivery item {clip_id or index} is not a passing current final render")
+        if not render_id or render_id in render_ids:
+            errors.append(f"batch delivery item {clip_id or index} has an invalid render identity")
+        render_ids.add(render_id)
+
+        artifact_contracts = (
+            ("output", "output_sha256", "renders"),
+            ("report", "report_sha256", "qa"),
+            ("contact_sheet", "contact_sheet_sha256", "qa"),
+            ("render_receipt", "render_receipt_sha256", "working/render_receipts"),
+        )
+        resolved: dict[str, Path] = {}
+        for path_key, digest_key, scope in artifact_contracts:
+            relative = str(item.get(path_key) or "")
+            declared = str(item.get(digest_key) or "")
+            if not relative or not re.fullmatch(r"[0-9a-f]{64}", declared):
+                errors.append(f"batch item {clip_id or index} {path_key} contract is incomplete")
+                continue
+            try:
+                entry = project_dir / Path(relative)
+                if entry.is_symlink():
+                    raise ValueError(f"{path_key} must not be a symlink")
+                path = scoped_project_path(project_dir, relative, scope)
+            except ValueError:
+                errors.append(f"batch item {clip_id or index} {path_key} escapes its project scope")
+                continue
+            if not path.is_file():
+                errors.append(f"batch item {clip_id or index} {path_key} is missing")
+                continue
+            if file_sha256(path) != declared:
+                errors.append(f"batch item {clip_id or index} {path_key} changed after verification")
+                continue
+            resolved[path_key] = path
+
+        report = read_json(resolved.get("report", Path("/nonexistent")), None)
+        if not isinstance(report, dict) or report.get("status") != "pass":
+            errors.append(f"batch item {clip_id or index} QA report is not passing")
+        render_receipt = read_json(
+            resolved.get("render_receipt", Path("/nonexistent")),
+            None,
+        )
+        if not isinstance(render_receipt, dict):
+            errors.append(f"batch item {clip_id or index} render receipt is unreadable")
+        else:
+            if render_receipt.get("render_id") != render_id:
+                errors.append(f"batch item {clip_id or index} render identities differ")
+            if render_receipt.get("batch_id") != batch_id:
+                errors.append(f"batch item {clip_id or index} render receipt batch differs")
+            if render_receipt.get("clip_id") != clip_id:
+                errors.append(f"batch item {clip_id or index} render receipt clip differs")
+            if render_receipt.get("quality") != "final":
+                errors.append(f"batch item {clip_id or index} is not attached to a final render")
+            if render_receipt.get("state_revision") != state_revision:
+                errors.append(f"batch item {clip_id or index} render receipt is stale")
+            if render_receipt.get("output_sha256") != item.get("output_sha256"):
+                errors.append(f"batch item {clip_id or index} output digests differ")
+            if render_receipt.get("output") != item.get("output"):
+                errors.append(f"batch item {clip_id or index} output paths differ")
+
+        clip = clips_by_id.get(clip_id)
+        expected_visual = visual_quality_report(state, manifest, clip)
+        receipt_visual = item.get("visual_quality")
+        if expected_visual.get("contract_applies"):
+            if not isinstance(receipt_visual, dict) or receipt_visual.get("status") != "pass":
+                errors.append(f"batch item {clip_id or index} visual-quality contract must pass")
+            elif any(
+                receipt_visual.get(key) != expected_visual.get(key)
+                for key in (
+                    "mode",
+                    "clip_id",
+                    "designed_card_count",
+                    "designed_roles",
+                    "designed_types",
+                    "designed_coverage_ratio",
+                )
+            ):
+                errors.append(f"batch item {clip_id or index} visual-quality contract is stale")
+
+        archive_name = str(item.get("archive_name") or "")
+        if (
+            not archive_name
+            or Path(archive_name).name != archive_name
+            or archive_name in archive_members
+        ):
+            errors.append(f"batch item {clip_id or index} archive member is invalid")
+        else:
+            archive_members[archive_name] = str(item.get("output_sha256") or "")
+
+    archive_rel = str(receipt.get("archive") or "")
+    archive_sha = str(receipt.get("archive_sha256") or "")
+    archive_download_name = str(receipt.get("archive_download_name") or "")
+    archive_path: Path | None = None
+    if not archive_rel or not re.fullmatch(r"[0-9a-f]{64}", archive_sha):
+        errors.append("batch delivery archive contract is incomplete")
+    elif archive_download_name != Path(archive_rel).name:
+        errors.append("batch delivery archive download name is inconsistent")
+    else:
+        try:
+            archive_entry = project_dir / Path(archive_rel)
+            if archive_entry.is_symlink():
+                raise ValueError("archive must not be a symlink")
+            archive_path = scoped_project_path(project_dir, archive_rel, "renders")
+        except ValueError:
+            errors.append("batch delivery archive escapes its project scope")
+        else:
+            if not archive_path.is_file():
+                errors.append("batch delivery archive is missing")
+                archive_path = None
+            elif file_sha256(archive_path) != archive_sha:
+                errors.append("batch delivery archive changed after verification")
+                archive_path = None
+    if archive_path is not None:
+        try:
+            with zipfile.ZipFile(archive_path, "r") as bundle:
+                infos = bundle.infolist()
+                names = [info.filename for info in infos if not info.is_dir()]
+                if len(names) != len(set(names)) or set(names) != set(archive_members):
+                    errors.append("batch delivery archive members do not match the receipt")
+                for name, expected_digest in archive_members.items():
+                    if name not in names:
+                        continue
+                    digest = hashlib.sha256()
+                    with bundle.open(name, "r") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if digest.hexdigest() != expected_digest:
+                        errors.append(f"batch delivery archive member {name} changed after verification")
+        except (OSError, zipfile.BadZipFile, KeyError, RuntimeError):
+            errors.append("batch delivery archive is unreadable")
     return errors
 
 
@@ -2011,6 +2253,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/render":
             self.handle_render()
             return
+        if path == "/api/render-batch":
+            self.handle_render_batch()
+            return
         if path == "/api/cover":
             self.handle_cover()
             return
@@ -2459,6 +2704,638 @@ class EditorHandler(BaseHTTPRequestHandler):
             daemon=True,
         ).start()
         self.send_json({"ok": True, "status": self.server.render_status}, status=202)
+
+    def handle_render_batch(self) -> None:
+        """Queue one atomic final-delivery batch for all approved highlights."""
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if not isinstance(body, dict) or str(body.get("quality", "final")) != "final":
+            self.send_json(
+                {"ok": False, "error": "batch render supports final quality only"},
+                status=422,
+            )
+            return
+        expected_revision = str(body.get("expected_revision", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            self.send_json(
+                {"ok": False, "error": "expected_revision is required for batch render"},
+                status=409,
+            )
+            return
+
+        with self.server.project_lock:
+            manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+            current_revision = editor_state_revision(state)
+            if expected_revision != current_revision:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "batch render revision is stale; save and reload before rendering",
+                        "current_revision": current_revision,
+                    },
+                    status=409,
+                )
+                return
+            try:
+                actual_assets = referenced_asset_digests(self.server.project_dir, state)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=409)
+                return
+            if actual_assets != (state.get("asset_digests") or {}):
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "a referenced asset changed after the editor state was saved",
+                    },
+                    status=409,
+                )
+                return
+
+            template_state = state.get("video_template")
+            if isinstance(template_state, dict):
+                readiness = template_readiness_errors(template_state)
+                if readiness:
+                    self.send_json(
+                        {"ok": False, "error": "; ".join(readiness)},
+                        status=409,
+                    )
+                    return
+                template_id = str(template_state.get("id") or "")
+                if template_id.startswith("cutout-"):
+                    capability = cutout_capability()
+                    if not capability.get("available"):
+                        self.send_json(
+                            {
+                                "ok": False,
+                                "error": str(
+                                    capability.get("reason")
+                                    or "local subject cutout is unavailable"
+                                ),
+                            },
+                            status=409,
+                        )
+                        return
+
+            if approved_destructive_deletes(self.server.project_dir):
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            "reviewed delete decisions are not applied by the page-editor renderer; "
+                            "set them to keep or use the destructive cut renderer first"
+                        ),
+                    },
+                    status=409,
+                )
+                return
+            clips, clip_errors = approved_highlights_in_plan_order(
+                self.server.project_dir,
+                state,
+            )
+            prerequisite_errors = approval_prerequisite_errors(
+                self.server.project_dir,
+                manifest,
+                state,
+                "timeline",
+            )
+            if not approval_is_current(
+                self.server.project_dir,
+                manifest,
+                "timeline",
+                state,
+            ):
+                prerequisite_errors.append(
+                    "current timeline revision must be approved before batch render"
+                )
+            prerequisite_errors.extend(clip_errors)
+            for clip in clips:
+                prerequisite_errors.extend(
+                    f"{clip.get('id')}: {error}"
+                    for error in visual_quality_errors(state, manifest, clip)
+                )
+            if prerequisite_errors:
+                self.send_json(
+                    {"ok": False, "error": "; ".join(dict.fromkeys(prerequisite_errors))},
+                    status=409,
+                )
+                return
+
+            batch_id = f"batch_{uuid.uuid4().hex}"
+            jobs: list[dict[str, Any]] = []
+            for index, clip in enumerate(clips, start=1):
+                render_id = f"render_{uuid.uuid4().hex}"
+                clip_snapshot = {
+                    key: clip.get(key)
+                    for key in (
+                        "id",
+                        "plan_item_id",
+                        "start",
+                        "end",
+                        "title",
+                        "review_status",
+                    )
+                }
+                snapshot = {
+                    "schema_version": 1,
+                    "render_id": render_id,
+                    "batch_id": batch_id,
+                    "batch_index": index,
+                    "created_at": now_utc(),
+                    "quality": "final",
+                    "project_id": manifest.get("project_id"),
+                    "state_revision": current_revision,
+                    "approval_revisions": approval_revisions(
+                        self.server.project_dir,
+                        state,
+                    ),
+                    "clip": clip_snapshot,
+                    "visual_quality": visual_quality_report(
+                        state,
+                        manifest,
+                        clip_snapshot,
+                    ),
+                    "manifest": manifest,
+                    "state": state,
+                    "authorization": {
+                        gate: manifest.get("approvals", {}).get(gate, {})
+                        for gate in GATES
+                    },
+                }
+                snapshot_path = (
+                    self.server.project_dir
+                    / "working/render_snapshots"
+                    / f"{render_id}.json"
+                )
+                atomic_write_json(snapshot_path, snapshot)
+                clip_id = str(clip.get("id") or "")
+                safe_clip = re.sub(r"[^A-Za-z0-9_-]", "-", clip_id)[:80]
+                output_name = f"{index:02d}-{safe_clip}-{render_id[-8:]}-final.mp4"
+                jobs.append(
+                    {
+                        "index": index,
+                        "clip_id": clip_id,
+                        "render_id": render_id,
+                        "snapshot_path": snapshot_path,
+                        "output_name": output_name,
+                    }
+                )
+
+            with self.server.render_lock:
+                if self.server.render_status.get("state") == "running":
+                    self.send_json(
+                        {"ok": False, "error": "a render is already running"},
+                        status=409,
+                    )
+                    return
+                self.server.render_status = {
+                    "state": "running",
+                    "mode": "batch",
+                    "message": f"正在批次輸出 0/{len(jobs)}…",
+                    "quality": "final",
+                    "batch_id": batch_id,
+                    "state_revision": current_revision,
+                    "clip_ids": [str(item.get("id") or "") for item in clips],
+                    "current_clip_id": None,
+                    "completed_clips": 0,
+                    "total_clips": len(jobs),
+                    "items": [],
+                    "output": None,
+                    "started_at": now_utc(),
+                }
+        threading.Thread(
+            target=self.render_batch_worker,
+            args=(batch_id, jobs, current_revision),
+            daemon=True,
+        ).start()
+        self.send_json({"ok": True, "status": self.server.render_status}, status=202)
+
+    def render_batch_item(
+        self,
+        batch_id: str,
+        job: dict[str, Any],
+        state_revision: str,
+    ) -> dict[str, Any]:
+        """Render and QA one frozen final snapshot without publishing it as latest."""
+        render_id = str(job["render_id"])
+        clip_id = str(job["clip_id"])
+        snapshot_path = Path(job["snapshot_path"])
+        output_name = str(job["output_name"])
+        output = self.server.project_dir / "renders" / output_name
+        temporary = output.parent / f".{output.stem}.{render_id}.part.mp4"
+        qa_report = self.server.project_dir / "qa" / f"{render_id}-qa-report.json"
+        qa_contact = self.server.project_dir / "qa" / f"{render_id}-contact.png"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            snapshot_payload = read_json(snapshot_path, {}) or {}
+            visual_quality = (
+                snapshot_payload.get("visual_quality")
+                if isinstance(snapshot_payload.get("visual_quality"), dict)
+                else {}
+            )
+            command = [
+                sys.executable,
+                str(SKILL_DIR / "scripts/render_editor_timeline.py"),
+                "--project-dir",
+                str(self.server.project_dir),
+                "--snapshot",
+                str(snapshot_path),
+                "--quality",
+                "final",
+                "--output",
+                str(temporary),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=2 * 60 * 60,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("batch clip render timed out") from exc
+            if (
+                result.returncode != 0
+                or not temporary.is_file()
+                or not ffprobe_has_visual_stream(temporary)
+            ):
+                raise RuntimeError(
+                    (result.stderr or result.stdout or "batch clip render failed")
+                    .strip()[-1200:]
+                )
+
+            qa_command = [
+                sys.executable,
+                str(SKILL_DIR / "scripts/qa_video.py"),
+                "--video",
+                str(temporary),
+                "--report",
+                str(qa_report),
+                "--contact",
+                str(qa_contact),
+            ]
+            try:
+                qa_result = subprocess.run(
+                    qa_command,
+                    text=True,
+                    capture_output=True,
+                    timeout=10 * 60,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("delivery QA failed: batch clip QA timed out") from exc
+            qa_payload = read_json(qa_report, {}) or {}
+            qa_payload["visual_quality"] = visual_quality
+            atomic_write_json(qa_report, qa_payload)
+            if qa_result.returncode != 0 or qa_payload.get("status") != "pass":
+                failure_receipt = {
+                    "schema_version": 1,
+                    "batch_id": batch_id,
+                    "render_id": render_id,
+                    "quality": "final",
+                    "clip_id": clip_id,
+                    "state_revision": state_revision,
+                    "status": "fail",
+                    "report": str(qa_report.relative_to(self.server.project_dir)),
+                    "contact_sheet": str(qa_contact.relative_to(self.server.project_dir))
+                    if qa_contact.is_file()
+                    else None,
+                    "failures": qa_payload.get("failures", []),
+                    "warnings": qa_payload.get("warnings", []),
+                    "visual_quality": visual_quality,
+                    "completed_at": now_utc(),
+                }
+                atomic_write_json(
+                    self.server.project_dir
+                    / "working/delivery_qa"
+                    / f"{render_id}-failed.json",
+                    failure_receipt,
+                )
+                detail = "; ".join(str(item) for item in qa_payload.get("failures", []))
+                raise RuntimeError(
+                    "delivery QA failed: "
+                    + (
+                        detail
+                        or (qa_result.stderr or qa_result.stdout or "batch clip QA failed")
+                        .strip()[-1100:]
+                    )
+                )
+
+            output_sha = file_sha256(temporary)
+            os.replace(temporary, output)
+            render_receipt = {
+                "schema_version": 1,
+                "batch_id": batch_id,
+                "render_id": render_id,
+                "quality": "final",
+                "clip_id": clip_id,
+                "state_revision": state_revision,
+                "snapshot": str(snapshot_path.relative_to(self.server.project_dir)),
+                "snapshot_sha256": file_sha256(snapshot_path),
+                "output": str(output.relative_to(self.server.project_dir)),
+                "output_sha256": output_sha,
+                "bytes": output.stat().st_size,
+                "completed_at": now_utc(),
+            }
+            render_receipt_path = (
+                self.server.project_dir
+                / "working/render_receipts"
+                / f"{render_id}.json"
+            )
+            atomic_write_json(render_receipt_path, render_receipt)
+            qa_payload["video"] = str(output)
+            atomic_write_json(qa_report, qa_payload)
+            delivery = {
+                "schema_version": 1,
+                "batch_id": batch_id,
+                "render_id": render_id,
+                "quality": "final",
+                "clip_id": clip_id,
+                "state_revision": state_revision,
+                "status": "pass",
+                "output": str(output.relative_to(self.server.project_dir)),
+                "output_sha256": output_sha,
+                "report": str(qa_report.relative_to(self.server.project_dir)),
+                "report_sha256": file_sha256(qa_report),
+                "contact_sheet": str(qa_contact.relative_to(self.server.project_dir)),
+                "contact_sheet_sha256": file_sha256(qa_contact),
+                "render_receipt": str(render_receipt_path.relative_to(self.server.project_dir)),
+                "render_receipt_sha256": file_sha256(render_receipt_path),
+                "warnings": qa_payload.get("warnings", []),
+                "failures": qa_payload.get("failures", []),
+                "visual_quality": visual_quality,
+                "human_review_required": True,
+                "completed_at": now_utc(),
+            }
+            atomic_write_json(
+                self.server.project_dir / "working/delivery_qa" / f"{render_id}.json",
+                delivery,
+            )
+            return delivery
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def render_batch_worker(
+        self,
+        batch_id: str,
+        jobs: list[dict[str, Any]],
+        state_revision: str,
+    ) -> None:
+        """Render a batch transaction and publish latest_final_qa only on full success."""
+        completed: list[dict[str, Any]] = []
+        archive_name = f"{batch_id}-final.zip"
+        archive = self.server.project_dir / "renders" / archive_name
+        archive_temporary = archive.parent / f".{archive_name}.{uuid.uuid4().hex}.part"
+        current_clip_id: str | None = None
+        try:
+            for index, job in enumerate(jobs, start=1):
+                current_clip_id = str(job["clip_id"])
+                self.server.render_status.update(
+                    {
+                        "message": f"正在批次輸出 {index}/{len(jobs)}：{current_clip_id}",
+                        "current_clip_id": current_clip_id,
+                        "current_index": index,
+                    }
+                )
+                item = self.render_batch_item(batch_id, job, state_revision)
+                item["archive_name"] = f"{index:02d}-{Path(str(item['output'])).name}"
+                completed.append(item)
+                self.server.render_status.update(
+                    {
+                        "completed_clips": len(completed),
+                        "items": [
+                            {
+                                "clip_id": entry["clip_id"],
+                                "output": "/" + urllib.parse.quote(
+                                    str(entry["output"]),
+                                    safe="/",
+                                ),
+                                "qa_report": "/" + urllib.parse.quote(
+                                    str(entry["report"]),
+                                    safe="/",
+                                ),
+                                "qa_contact": "/" + urllib.parse.quote(
+                                    str(entry["contact_sheet"]),
+                                    safe="/",
+                                ),
+                            }
+                            for entry in completed
+                        ],
+                    }
+                )
+
+            with zipfile.ZipFile(
+                archive_temporary,
+                "w",
+                compression=zipfile.ZIP_STORED,
+                allowZip64=True,
+            ) as bundle:
+                for item in completed:
+                    output = scoped_project_path(
+                        self.server.project_dir,
+                        str(item["output"]),
+                        "renders",
+                    )
+                    if file_sha256(output) != item["output_sha256"]:
+                        raise RuntimeError(
+                            f"batch output changed before packaging: {item['clip_id']}"
+                        )
+                    bundle.write(output, arcname=str(item["archive_name"]))
+            os.replace(archive_temporary, archive)
+            batch_receipt = {
+                "schema_version": 2,
+                "kind": "batch",
+                "delivery_kind": "batch",
+                "batch_id": batch_id,
+                "quality": "final",
+                "state_revision": state_revision,
+                "status": "pass",
+                "clip_ids": [str(job["clip_id"]) for job in jobs],
+                "item_count": len(completed),
+                "items": completed,
+                "archive": str(archive.relative_to(self.server.project_dir)),
+                "archive_sha256": file_sha256(archive),
+                "archive_download_name": archive_name,
+                "warnings": [
+                    {"clip_id": item["clip_id"], "items": item.get("warnings", [])}
+                    for item in completed
+                    if item.get("warnings")
+                ],
+                "failures": [],
+                "human_review_required": True,
+                "completed_at": now_utc(),
+            }
+            versioned_receipt = (
+                self.server.project_dir / "working/delivery_qa" / f"{batch_id}.json"
+            )
+
+            with self.server.project_lock:
+                current_state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                manifest_path = self.server.project_dir / "project.json"
+                manifest = read_json(manifest_path, {}) or {}
+                authorization_errors: list[str] = []
+                if editor_state_revision(current_state) != state_revision:
+                    authorization_errors.append("editor state changed during batch render")
+                current_clips, current_clip_errors = approved_highlights_in_plan_order(
+                    self.server.project_dir,
+                    current_state,
+                )
+                authorization_errors.extend(current_clip_errors)
+                if [str(item.get("id") or "") for item in current_clips] != [
+                    str(job["clip_id"]) for job in jobs
+                ]:
+                    authorization_errors.append(
+                        "approved highlight set changed during batch render"
+                    )
+                for gate in ("destructive_edit", "highlight_selection", "timeline"):
+                    if not approval_is_current(
+                        self.server.project_dir,
+                        manifest,
+                        gate,
+                        current_state,
+                    ):
+                        authorization_errors.append(
+                            f"{gate} approval changed during batch render"
+                        )
+                if approved_destructive_deletes(self.server.project_dir):
+                    authorization_errors.append(
+                        "reviewed delete decisions changed during batch render"
+                    )
+                try:
+                    current_assets = referenced_asset_digests(
+                        self.server.project_dir,
+                        current_state,
+                    )
+                except ValueError as exc:
+                    authorization_errors.append(str(exc))
+                else:
+                    if current_assets != (current_state.get("asset_digests") or {}):
+                        authorization_errors.append(
+                            "a referenced asset changed during batch render"
+                        )
+                if authorization_errors:
+                    raise RuntimeError(
+                        "; ".join(dict.fromkeys(authorization_errors))
+                        + "; previous delivery was preserved"
+                    )
+                atomic_write_json(versioned_receipt, batch_receipt)
+                final_approval = manifest.setdefault("approvals", {}).get("final")
+                if isinstance(final_approval, dict) and final_approval.get("approved"):
+                    manifest["approvals"]["final"] = {
+                        "approved": False,
+                        "confirmed_by": None,
+                        "at": None,
+                        "note": "Invalidated because a new final batch delivery was rendered",
+                        "invalidated_at": now_utc(),
+                    }
+                stages = manifest.setdefault("stages", {})
+                stages["render"] = "complete"
+                stages["qa"] = "needs_review"
+                manifest["updated_at"] = now_utc()
+                atomic_write_json(manifest_path, manifest)
+                revisions = approval_revisions(self.server.project_dir, current_state)
+                revisions["final"] = canonical_revision(
+                    {
+                        "editor_state_revision": state_revision,
+                        "delivery_qa": batch_receipt,
+                    }
+                )
+                atomic_write_json(
+                    self.server.project_dir / LATEST_DELIVERY_QA_REL,
+                    batch_receipt,
+                )
+
+            self.server.render_status = {
+                "state": "complete",
+                "mode": "batch",
+                "message": f"{len(completed)} 支最終影片與 QA 已完成，請逐支檢查後核可",
+                "quality": "final",
+                "batch_id": batch_id,
+                "state_revision": state_revision,
+                "current": True,
+                "clip_ids": [str(job["clip_id"]) for job in jobs],
+                "current_clip_id": None,
+                "completed_clips": len(completed),
+                "total_clips": len(jobs),
+                "items": self.server.render_status.get("items", []),
+                "output": f"/renders/{urllib.parse.quote(archive_name)}",
+                "download_name": archive_name,
+                "output_sha256": batch_receipt["archive_sha256"],
+                "qa": batch_receipt,
+                "approval_revisions": revisions,
+                "finished_at": now_utc(),
+            }
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+            diagnostic_items = list(completed)
+            if current_clip_id:
+                failed_job = next(
+                    (
+                        job
+                        for job in jobs
+                        if str(job.get("clip_id") or "") == current_clip_id
+                    ),
+                    None,
+                )
+                if isinstance(failed_job, dict):
+                    failed_render_id = str(failed_job.get("render_id") or "")
+                    failed_item = read_json(
+                        self.server.project_dir
+                        / "working/delivery_qa"
+                        / f"{failed_render_id}-failed.json",
+                        None,
+                    )
+                    if isinstance(failed_item, dict):
+                        diagnostic_items.append(failed_item)
+            failure = {
+                "schema_version": 2,
+                "kind": "batch",
+                "delivery_kind": "batch",
+                "batch_id": batch_id,
+                "quality": "final",
+                "state_revision": state_revision,
+                "status": "fail",
+                "clip_ids": [str(job["clip_id"]) for job in jobs],
+                "item_count": len(jobs),
+                "items": diagnostic_items,
+                "failed_clip_id": current_clip_id,
+                "completed_clips": len(completed),
+                "total_clips": len(jobs),
+                "error": str(exc)[-1200:],
+                "previous_latest_preserved": True,
+                "completed_at": now_utc(),
+            }
+            try:
+                atomic_write_json(
+                    self.server.project_dir
+                    / "working/delivery_qa"
+                    / f"{batch_id}-failed.json",
+                    failure,
+                )
+            except OSError:
+                pass
+            self.server.render_status = {
+                "state": "qa_failed"
+                if str(exc).startswith("delivery QA failed")
+                else "failed",
+                "mode": "batch",
+                "message": str(exc)[-1200:],
+                "quality": "final",
+                "batch_id": batch_id,
+                "state_revision": state_revision,
+                "clip_ids": [str(job["clip_id"]) for job in jobs],
+                "failed_clip_id": current_clip_id,
+                "completed_clips": len(completed),
+                "total_clips": len(jobs),
+                "items": diagnostic_items,
+                "qa": failure,
+                "output": None,
+                "previous_latest_preserved": True,
+                "finished_at": now_utc(),
+            }
+        finally:
+            archive_temporary.unlink(missing_ok=True)
 
     def render_worker(
         self,

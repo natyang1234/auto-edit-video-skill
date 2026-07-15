@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.8.0 - 2026-07-15
+
+### Approval-bound batch highlight export
+
+- Add a server-owned final-render queue for every highlight explicitly marked
+  approved. The browser cannot inject or omit clip IDs, and pending/rejected
+  proposals never enter the batch.
+- Reuse the frozen per-clip renderer, mechanical QA, contact sheet, and
+  SHA-256 receipt for every item. A failed item preserves the previous good
+  delivery contract and prevents the partial batch from becoming approvable.
+- Add a schema-v2 aggregate delivery receipt whose clip set and every MP4, QA
+  report, contact sheet, render receipt, and ZIP archive are hash-verified by
+  the existing final gate.
+- Add GUI batch progress, per-clip QA links, and approval-gated ZIP/individual
+  downloads while preserving the existing single-clip preview/final workflow.
+
 ## 1.7.0 - 2026-07-14
 
 ### Whole-transcript contextual semantic calibration

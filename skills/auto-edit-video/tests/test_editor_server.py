@@ -10,8 +10,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -233,6 +235,10 @@ class EditorServerTests(unittest.TestCase):
             "layer-list",
             "timeline-tracks",
             "render-button",
+            "render-batch-final",
+            "batch-render-progress",
+            "batch-delivery-qa",
+            "download-batch-archive",
             "download-output",
             "approve-final",
             "delivery-qa-status",
@@ -311,6 +317,158 @@ class EditorServerTests(unittest.TestCase):
             request_headers,
         )
         return status, json.loads(body.decode("utf-8"))
+
+    def write_approved_highlight_plan(self) -> list[str]:
+        clip_ids = ["highlight-plan-first", "highlight-plan-second"]
+        self.write_json(
+            "working/highlight_plan.json",
+            {
+                "schema_version": 1,
+                "plan_revision": "c" * 64,
+                "items": [
+                    {
+                        "id": clip_ids[0],
+                        "start": 0.1,
+                        "end": 0.9,
+                        "title": "第一段精華",
+                        "review_status": "approved",
+                        "score": 0.9,
+                    },
+                    {
+                        "id": "highlight-plan-pending",
+                        "start": 0.3,
+                        "end": 0.7,
+                        "title": "尚待確認",
+                        "review_status": "pending",
+                        "score": 0.85,
+                    },
+                    {
+                        "id": clip_ids[1],
+                        "start": 0.9,
+                        "end": 1.7,
+                        "title": "第二段精華",
+                        "review_status": "approved",
+                        "score": 0.8,
+                    },
+                    {
+                        "id": "highlight-plan-rejected",
+                        "start": 1.1,
+                        "end": 1.5,
+                        "title": "已排除",
+                        "review_status": "rejected",
+                        "score": 0.7,
+                    },
+                ],
+            },
+        )
+        (self.project / "working/editor_state.json").unlink(missing_ok=True)
+        return clip_ids
+
+    def approve_batch_prerequisites(self) -> tuple[dict[str, object], list[str]]:
+        clip_ids = self.write_approved_highlight_plan()
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        status, decisions = self.json_request(
+            "PUT",
+            "/api/edit-decisions",
+            {
+                "approved": True,
+                "items": [{"candidate_id": "edit-0001", "action": "keep"}],
+            },
+        )
+        self.assertEqual(status, 200, decisions)
+        status, destructive = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "destructive_edit",
+                "expected_revision": decisions["approval_revision"],
+            },
+        )
+        self.assertEqual(status, 200, destructive)
+        status, highlights = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "highlight_selection",
+                "expected_revision": destructive["approval_revisions"]["highlight_selection"],
+            },
+        )
+        self.assertEqual(status, 200, highlights)
+        status, timeline = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "timeline",
+                "expected_revision": highlights["approval_revisions"]["timeline"],
+            },
+        )
+        self.assertEqual(status, 200, timeline)
+        return state, clip_ids
+
+    def wait_for_render_terminal(self, timeout: float = 5.0) -> dict[str, object]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = dict(self.server.render_status)
+            if status.get("state") != "running":
+                return status
+            time.sleep(0.01)
+        self.fail(f"render did not finish: {self.server.render_status}")
+
+    def fake_batch_subprocess(
+        self,
+        *,
+        fail_render_number: int | None = None,
+        fail_qa_number: int | None = None,
+        after_render: object | None = None,
+    ):
+        render_count = 0
+        qa_count = 0
+
+        def fake_run(command, **_kwargs):
+            nonlocal render_count, qa_count
+            script_name = Path(str(command[1])).name
+            if script_name == "render_editor_timeline.py":
+                render_count += 1
+                if fail_render_number == render_count:
+                    return subprocess.CompletedProcess(command, 1, "", "synthetic render failure")
+                output = Path(command[command.index("--output") + 1])
+                snapshot = Path(command[command.index("--snapshot") + 1])
+                clip_id = json.loads(snapshot.read_text(encoding="utf-8"))["clip"]["id"]
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(f"fake-mp4:{clip_id}".encode("utf-8"))
+                if callable(after_render):
+                    after_render(render_count)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if script_name == "qa_video.py":
+                qa_count += 1
+                report = Path(command[command.index("--report") + 1])
+                contact = Path(command[command.index("--contact") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                qa_failed = fail_qa_number == qa_count
+                report.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "status": "fail" if qa_failed else "pass",
+                            "warnings": [],
+                            "failures": ["synthetic QA failure"] if qa_failed else [],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                contact.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic-contact")
+                return subprocess.CompletedProcess(
+                    command,
+                    2 if qa_failed else 0,
+                    "",
+                    "synthetic QA failure" if qa_failed else "",
+                )
+            raise AssertionError(f"unexpected subprocess: {command}")
+
+        return fake_run
 
     def test_project_bootstrap_exposes_presets_and_caption_layer(self) -> None:
         status, headers, body = self.request("GET", "/api/project")
@@ -932,6 +1090,339 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         bootstrap = json.loads(body.decode("utf-8"))
         self.assertFalse(bootstrap["approval_current"]["final"])
+
+    def test_batch_render_requires_cas_and_current_human_gates(self) -> None:
+        self.write_approved_highlight_plan()
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+
+        status, missing_cas = self.json_request(
+            "POST",
+            "/api/render-batch",
+            {"quality": "final"},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("expected_revision", str(missing_cas["error"]))
+
+        status, blocked = self.json_request(
+            "POST",
+            "/api/render-batch",
+            {"quality": "final", "expected_revision": state["revision"]},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("destructive_edit", str(blocked["error"]))
+        self.assertEqual(self.server.render_status["state"], "idle")
+
+    def test_batch_render_checks_visual_contract_for_every_approved_clip(self) -> None:
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        manifest["source"]["duration_s"] = 40.0
+        self.write_json("project.json", manifest)
+        clip_ids = ["highlight-visual-first", "highlight-visual-second"]
+        self.write_json(
+            "working/highlight_plan.json",
+            {
+                "schema_version": 1,
+                "plan_revision": "d" * 64,
+                "items": [
+                    {
+                        "id": clip_ids[0],
+                        "start": 0.1,
+                        "end": 16.1,
+                        "title": "第一段有完整視覺",
+                        "review_status": "approved",
+                    },
+                    {
+                        "id": clip_ids[1],
+                        "start": 16.2,
+                        "end": 32.2,
+                        "title": "第二段缺少視覺",
+                        "review_status": "approved",
+                    },
+                ],
+            },
+        )
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["overlays"] = [
+            item
+            for item in state["overlays"]
+            if item.get("highlight_id") != clip_ids[1]
+        ]
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+        status, decisions = self.json_request(
+            "PUT",
+            "/api/edit-decisions",
+            {
+                "approved": True,
+                "items": [{"candidate_id": "edit-0001", "action": "keep"}],
+            },
+        )
+        self.assertEqual(status, 200, decisions)
+        status, destructive = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "destructive_edit",
+                "expected_revision": decisions["approval_revision"],
+            },
+        )
+        self.assertEqual(status, 200, destructive)
+        status, highlights = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "highlight_selection",
+                "expected_revision": destructive["approval_revisions"]["highlight_selection"],
+            },
+        )
+        self.assertEqual(status, 200, highlights)
+        status, timeline = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "timeline",
+                "expected_revision": highlights["approval_revisions"]["timeline"],
+            },
+        )
+        self.assertEqual(status, 200, timeline)
+
+        status, blocked = self.json_request(
+            "POST",
+            "/api/render-batch",
+            {"quality": "final", "expected_revision": saved["revision"]},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn(clip_ids[1], str(blocked["error"]))
+        self.assertIn("five", str(blocked["error"]))
+
+    def test_batch_render_aggregates_every_clip_and_tampering_fails_closed(self) -> None:
+        state, clip_ids = self.approve_batch_prerequisites()
+        fake_run = self.fake_batch_subprocess()
+        with (
+            patch("editor_server.subprocess.run", side_effect=fake_run),
+            patch("editor_server.ffprobe_has_visual_stream", return_value=True),
+        ):
+            status, accepted = self.json_request(
+                "POST",
+                "/api/render-batch",
+                {"quality": "final", "expected_revision": state["revision"]},
+            )
+            self.assertEqual(status, 202, accepted)
+            self.assertEqual(accepted["status"]["clip_ids"], clip_ids)
+            completed = self.wait_for_render_terminal()
+
+        self.assertEqual(completed["state"], "complete", completed)
+        self.assertEqual(completed["completed_clips"], 2)
+        delivery = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(delivery["schema_version"], 2)
+        self.assertEqual(delivery["kind"], "batch")
+        self.assertEqual(delivery["delivery_kind"], "batch")
+        self.assertEqual(delivery["clip_ids"], clip_ids)
+        self.assertEqual(delivery["item_count"], 2)
+        self.assertEqual([item["clip_id"] for item in delivery["items"]], clip_ids)
+        self.assertEqual(len(delivery["items"]), 2)
+        for item in delivery["items"]:
+            self.assertTrue((self.project / item["output"]).is_file())
+            self.assertTrue((self.project / item["report"]).is_file())
+            self.assertTrue((self.project / item["contact_sheet"]).is_file())
+            self.assertTrue((self.project / item["render_receipt"]).is_file())
+        archive = self.project / delivery["archive"]
+        self.assertTrue(archive.is_file())
+        self.assertEqual(delivery["archive_download_name"], archive.name)
+        with zipfile.ZipFile(archive, "r") as bundle:
+            self.assertEqual(
+                bundle.namelist(),
+                [item["archive_name"] for item in delivery["items"]],
+            )
+
+        final_revision = gate_revision(self.project, "final", state)
+        status, approved = self.json_request(
+            "POST",
+            "/api/approve",
+            {
+                "gate": "final",
+                "expected_revision": final_revision,
+                "confirmed_by": "unit-test",
+            },
+        )
+        self.assertEqual(status, 200, approved)
+
+        second_output = self.project / delivery["items"][1]["output"]
+        original_output = second_output.read_bytes()
+        second_output.write_bytes(b"tampered-batch-output")
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "final", "expected_revision": final_revision},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("changed after verification", str(rejected["error"]))
+        second_output.write_bytes(original_output)
+
+        second_contact = self.project / delivery["items"][1]["contact_sheet"]
+        original_contact = second_contact.read_bytes()
+        second_contact.write_bytes(original_contact + b"tampered")
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "final", "expected_revision": final_revision},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("contact_sheet changed after verification", str(rejected["error"]))
+        second_contact.write_bytes(original_contact)
+
+        second_report = self.project / delivery["items"][1]["report"]
+        original_report = second_report.read_bytes()
+        second_report.write_bytes(original_report + b"tampered")
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "final", "expected_revision": final_revision},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("report changed after verification", str(rejected["error"]))
+        second_report.write_bytes(original_report)
+
+        second_receipt = self.project / delivery["items"][1]["render_receipt"]
+        original_receipt = second_receipt.read_bytes()
+        second_receipt.write_bytes(original_receipt + b"tampered")
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "final", "expected_revision": final_revision},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("render_receipt changed after verification", str(rejected["error"]))
+        second_receipt.write_bytes(original_receipt)
+
+        original_archive = archive.read_bytes()
+        archive.write_bytes(original_archive + b"tampered")
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "final", "expected_revision": final_revision},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("archive changed after verification", str(rejected["error"]))
+        archive.write_bytes(original_archive)
+
+        delivery["clip_ids"] = list(reversed(delivery["clip_ids"]))
+        self.write_json("working/latest_final_qa.json", delivery)
+        tampered_revision = gate_revision(self.project, "final", state)
+        status, rejected = self.json_request(
+            "POST",
+            "/api/approve",
+            {"gate": "final", "expected_revision": tampered_revision},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("clip set", str(rejected["error"]))
+
+    def test_failed_batch_preserves_previous_latest_delivery(self) -> None:
+        state, _clip_ids = self.approve_batch_prerequisites()
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "previous-latest-must-survive",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        fake_run = self.fake_batch_subprocess(fail_render_number=2)
+        with (
+            patch("editor_server.subprocess.run", side_effect=fake_run),
+            patch("editor_server.ffprobe_has_visual_stream", return_value=True),
+        ):
+            status, accepted = self.json_request(
+                "POST",
+                "/api/render-batch",
+                {"quality": "final", "expected_revision": state["revision"]},
+            )
+            self.assertEqual(status, 202, accepted)
+            failed = self.wait_for_render_terminal()
+
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertEqual(failed["completed_clips"], 1)
+        self.assertTrue(failed["previous_latest_preserved"])
+        persisted = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted, previous)
+
+    def test_qa_failed_batch_reports_attempted_items_and_preserves_previous_latest(self) -> None:
+        state, clip_ids = self.approve_batch_prerequisites()
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "previous-latest-must-survive-qa-failure",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        fake_run = self.fake_batch_subprocess(fail_qa_number=2)
+        with (
+            patch("editor_server.subprocess.run", side_effect=fake_run),
+            patch("editor_server.ffprobe_has_visual_stream", return_value=True),
+        ):
+            status, accepted = self.json_request(
+                "POST",
+                "/api/render-batch",
+                {"quality": "final", "expected_revision": state["revision"]},
+            )
+            self.assertEqual(status, 202, accepted)
+            failed = self.wait_for_render_terminal()
+
+        self.assertEqual(failed["state"], "qa_failed", failed)
+        self.assertEqual(failed["completed_clips"], 1)
+        self.assertEqual(failed["failed_clip_id"], clip_ids[1])
+        self.assertEqual(
+            [item["status"] for item in failed["qa"]["items"]],
+            ["pass", "fail"],
+        )
+        self.assertEqual(failed["qa"]["item_count"], 2)
+        persisted = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted, previous)
+
+    def test_batch_authorization_change_during_render_preserves_previous_latest(self) -> None:
+        state, _clip_ids = self.approve_batch_prerequisites()
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "previous-latest-must-survive-gate-change",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+
+        def change_edit_decision(render_number: int) -> None:
+            if render_number != 1:
+                return
+            decisions = json.loads(
+                (self.project / "working/edit_decisions.json").read_text(encoding="utf-8")
+            )
+            decisions["items"][0]["action"] = "delete"
+            self.write_json("working/edit_decisions.json", decisions)
+
+        fake_run = self.fake_batch_subprocess(after_render=change_edit_decision)
+        with (
+            patch("editor_server.subprocess.run", side_effect=fake_run),
+            patch("editor_server.ffprobe_has_visual_stream", return_value=True),
+        ):
+            status, accepted = self.json_request(
+                "POST",
+                "/api/render-batch",
+                {"quality": "final", "expected_revision": state["revision"]},
+            )
+            self.assertEqual(status, 202, accepted)
+            failed = self.wait_for_render_terminal()
+
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertIn("destructive_edit approval changed", failed["message"])
+        self.assertTrue(failed["previous_latest_preserved"])
+        persisted = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted, previous)
 
 
 class EditorRendererTests(unittest.TestCase):

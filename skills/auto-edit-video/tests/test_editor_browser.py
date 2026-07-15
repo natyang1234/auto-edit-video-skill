@@ -213,6 +213,168 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             self.assertEqual(state["video_template"]["background"]["color"], "#2557a7")
         self.assertEqual(console_errors, [])
 
+    def test_batch_render_shows_per_clip_qa_and_gates_all_downloads(self) -> None:
+        host, port = self.server.server_address
+        submitted: dict[str, object] = {}
+        restored: dict[str, object] = {}
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1100}, device_scale_factor=1)
+            console_errors: list[str] = []
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+
+            def accept_batch(route: object) -> None:
+                request = route.request
+                submitted.update(request.post_data_json)
+                route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "ok": True,
+                            "status": {
+                                "mode": "batch",
+                                "quality": "final",
+                                "state": "running",
+                                "completed_clips": 0,
+                                "total_clips": 1,
+                                "message": "準備整批輸出",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+            def complete_batch(route: object) -> None:
+                revision = str(submitted.get("expected_revision") or "")
+                item = {
+                    "clip_id": "highlight-browser",
+                    "status": "pass",
+                    "output": "renders/highlight-browser-final.mp4",
+                    "download_name": "highlight-browser-final.mp4",
+                    "contact_sheet": "qa/highlight-browser-contact.png",
+                    "report": "qa/highlight-browser-report.json",
+                    "warnings": [],
+                }
+                receipt = {
+                    "schema_version": 2,
+                    "delivery_kind": "batch",
+                    "state_revision": revision,
+                    "status": "pass",
+                    "item_count": 1,
+                    "items": [item],
+                    "archive": "renders/browser-smoke-highlights.zip",
+                    "archive_download_name": "browser-smoke-highlights.zip",
+                    "human_review_required": True,
+                }
+                restored["receipt"] = receipt
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "mode": "batch",
+                            "quality": "final",
+                            "state": "complete",
+                            "state_revision": revision,
+                            "completed_clips": 1,
+                            "total_clips": 1,
+                            "message": "整批輸出完成",
+                            "items": [item],
+                            "output": "/renders/browser-smoke-highlights.zip",
+                            "download_name": "browser-smoke-highlights.zip",
+                            "qa": receipt,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+            def restore_project(route: object) -> None:
+                response = route.fetch()
+                payload = response.json()
+                receipt = restored.get("receipt")
+                if isinstance(receipt, dict):
+                    receipt = dict(receipt)
+                    receipt["state_revision"] = payload["state"]["revision"]
+                    payload["delivery_qa"] = receipt
+                    final_revision = payload["approval_revisions"]["final"]
+                    payload.setdefault("manifest", {}).setdefault("approvals", {})["final"] = {
+                        "approved": True,
+                        "state_revision": final_revision,
+                    }
+                    payload.setdefault("approval_current", {})["final"] = True
+                route.fulfill(
+                    status=response.status,
+                    content_type="application/json",
+                    body=json.dumps(payload, ensure_ascii=False),
+                )
+
+            def approve_batch(route: object) -> None:
+                payload = route.request.post_data_json
+                revision = payload["expected_revision"]
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "ok": True,
+                            "approval": {"approved": True, "state_revision": revision},
+                            "approval_revisions": {"final": revision},
+                            "approval_current": {"final": True},
+                        }
+                    ),
+                )
+
+            page.route("**/api/project", restore_project)
+            page.route("**/api/render-batch", accept_batch)
+            page.route("**/api/render-status", complete_batch)
+            page.route("**/api/approve", approve_batch)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+
+            self.assertEqual(page.locator("#batch-retained-count").inner_text(), "已保留 1 段")
+            page.locator("#publish-tab").click()
+            page.locator("#render-batch-final").click()
+            self.assertTrue(page.locator("#render-button").is_disabled())
+            self.assertTrue(page.locator("#render-final").is_disabled())
+            self.assertTrue(page.locator("#render-batch-final").is_disabled())
+            self.assertTrue(page.locator("#approve-final").is_disabled())
+            page.locator("#batch-qa-grid .batch-qa-card").wait_for()
+            self.assertEqual(submitted["quality"], "final")
+            self.assertTrue(bool(submitted["expected_revision"]))
+            self.assertEqual(page.locator("#batch-progress-value").inner_text(), "1 / 1")
+            self.assertEqual(page.locator("#batch-qa-grid .batch-qa-card").count(), 1)
+            self.assertIn("查看 QA 九宮格", page.locator("#batch-qa-grid").inner_text())
+            self.assertTrue(page.locator("#batch-downloads").is_hidden())
+            self.assertEqual(page.locator("#batch-output-list a").count(), 0)
+            page.locator("#batch-qa-grid .batch-playback-button").click()
+            self.assertIn(
+                "highlight-browser-final.mp4",
+                page.locator("#preview-video").get_attribute("src") or "",
+            )
+
+            page.locator("#approve-final").click()
+            page.locator("#batch-downloads").wait_for(state="visible")
+            self.assertTrue(page.locator("#download-batch-archive").is_visible())
+            self.assertEqual(page.locator("#batch-output-list a").count(), 1)
+            self.assertIn(
+                "browser-smoke-highlights.zip",
+                page.locator("#download-batch-archive").get_attribute("href") or "",
+            )
+            self.assertIn(
+                "highlight-browser-final.mp4",
+                page.locator("#batch-output-list a").get_attribute("href") or "",
+            )
+
+            page.reload(wait_until="networkidle")
+            page.locator("#publish-tab").click()
+            page.locator("#batch-downloads").wait_for(state="visible")
+            self.assertEqual(page.locator("#batch-progress-value").inner_text(), "1 / 1")
+            self.assertEqual(page.locator("#batch-qa-grid .batch-qa-card").count(), 1)
+            self.assertEqual(page.locator("#batch-output-list a").count(), 1)
+            browser.close()
+
+        self.assertEqual(console_errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

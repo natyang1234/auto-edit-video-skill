@@ -414,12 +414,37 @@
           <div class="publish-divider"></div>
           <button class="button button-primary full-width" id="approve-timeline" type="button">核可時間軸</button>
           <button class="button button-secondary full-width" id="render-final" type="button">輸出最終影片</button>
+          <section class="batch-export" aria-labelledby="batch-export-title">
+            <div class="batch-export-heading">
+              <div>
+                <p class="eyebrow">BATCH DELIVERY</p>
+                <h3 id="batch-export-title">一次輸出全部精華</h3>
+              </div>
+              <span class="batch-retained-count" id="batch-retained-count">已保留 0 段</span>
+            </div>
+            <button class="button button-secondary full-width" id="render-batch-final" type="button" disabled>批次輸出已保留精華（0）</button>
+            <div class="batch-render-progress" id="batch-render-progress" aria-live="polite" hidden>
+              <div class="batch-progress-copy">
+                <strong id="batch-progress-label">準備批次輸出</strong>
+                <span id="batch-progress-value">0 / 0</span>
+              </div>
+              <progress id="batch-progress-bar" value="0" max="1" aria-label="批次輸出進度"></progress>
+            </div>
+          </section>
           <section class="delivery-qa" aria-labelledby="delivery-qa-status">
             <p id="delivery-qa-status" role="status">尚未執行最終輸出 QA。</p>
             <a id="qa-contact-link" href="#" target="_blank" rel="noopener" hidden>查看 QA 九宮格</a>
           </section>
+          <section class="batch-delivery-qa" id="batch-delivery-qa" aria-labelledby="batch-qa-status" hidden>
+            <p class="batch-qa-status" id="batch-qa-status" role="status">尚未取得逐段 QA。</p>
+            <div class="batch-qa-grid" id="batch-qa-grid"></div>
+          </section>
           <button class="button button-primary full-width" id="approve-final" type="button" disabled>檢查完成，核可最終成片</button>
           <a class="button button-secondary full-width download-output" id="download-output" href="#" download hidden>下載輸出 MP4</a>
+          <section class="batch-downloads" id="batch-downloads" aria-label="已核可批次輸出下載" hidden>
+            <a class="button button-primary full-width" id="download-batch-archive" href="#" download hidden>下載全部 ZIP</a>
+            <div class="batch-output-list" id="batch-output-list"></div>
+          </section>
         </section>
       </aside>
 

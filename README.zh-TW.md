@@ -1,6 +1,6 @@
 # Auto Edit Video 自動剪輯 Skill
 
-這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個 A-roll／口播影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。另提供選配的 loopback-only Studio，可從本機匯入影片、描述剪輯需求、選擇五種確定性導演策略、產生最多十段語意精華，並逐段改字幕／圖層、預覽、QA、核可與下載。
+這是一個可攜式 [Agent Skill](https://agentskills.io/)。使用者只要交給本機 Agent 一個 A-roll／口播影片檔，Agent 就自行建立本機單字時間碼轉錄與專案，提出保守刪剪、輸出新的 MP4 並執行 QA。另提供選配的 loopback-only Studio，可從本機匯入影片、描述剪輯需求、選擇五種確定性導演策略、產生最多十段語意精華，並逐段改字幕／圖層、預覽，再以單段或整批方式 QA、核可與下載。
 
 [English](README.md)
 
@@ -29,7 +29,7 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
   --port 8765 --open
 ```
 
-瀏覽器只把選定的本機 File 傳給 loopback Studio。Studio 會驗證影片、建立不可變的 owned copy、執行本機 Whisper，預設再用 loopback-only Ollama 逐句參照前後文校準整份字幕，完整覆蓋後才依平台短／中／長、剪輯重點與五種確定性導演策略產生最多十段有原文證據的精華。使用者可逐段保留／排除、改標題與起訖、校正字幕、加入字卡／動畫／授權素材、預覽並分別輸出。
+瀏覽器只把選定的本機 File 傳給 loopback Studio。Studio 會驗證影片、建立不可變的 owned copy、執行本機 Whisper，預設再用 loopback-only Ollama 逐句參照前後文校準整份字幕，完整覆蓋後才依平台短／中／長、剪輯重點與五種確定性導演策略產生最多十段有原文證據的精華。使用者可逐段保留／排除、改標題與起訖、校正字幕、加入字卡／動畫／授權素材、單段預覽，或一次批次輸出全部已保留精華。
 
 字幕可直接選取句內字詞，套用可輸出的彈出、螢光或底線效果；字幕與設計圖卡可拖曳，並可調整位置、寬度／高度。GUI 會即時提示平台安全框與同時段圖層重疊。設計模式會把字幕、重點字與圖卡烘焙進同一份 HTML／GSAP graphic package，避免預覽能調、MP4 卻落回另一套字幕 renderer。
 
@@ -41,7 +41,7 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 畫面模板與導演策略彼此獨立。編輯器內建 3 種固定鏡位、2 種可選動態鏡位，以及純色／專案圖片／循環影片背景共 3 種本機人物去背模板。固定模板不會輸出任何來源畫面的縮放或重新取景 tween；去背模板可調人物 X／Y／大小，最終時間軸仍使用原片音軌。瀏覽器畫布會明確標示為人物定位預覽，真實去背邊緣以輸出的預覽 MP4 為準。
 
-人工閘依序為 `destructive_edit` → `highlight_selection` → `timeline` → `final`，每一閘都綁定當下 revision。正式輸出會自動建立 frozen snapshot、SHA-256 receipt、機械 QA 與九宮格；只有目前版本通過 QA 且人工核可後才顯示下載。頁面 renderer 目前不會悄悄忽略 interior delete：若審查決定含 `delete`，正式輸出會 fail closed，必須先走 `render_cut.py`，或把該提案改為 keep。
+人工閘依序為 `destructive_edit` → `highlight_selection` → `timeline` → `final`，每一閘都綁定當下 revision。正式輸出會自動建立 frozen snapshot、SHA-256 receipt、機械 QA 與九宮格；批次模式會對每段重複同一套驗證，全部通過後才建立綁定雜湊的 ZIP 與整批收據。只有目前版本通過 QA 且人工核可後才顯示單檔或整批下載。頁面 renderer 目前不會悄悄忽略 interior delete：若審查決定含 `delete`，正式輸出會 fail closed，必須先走 `render_cut.py`，或把該提案改為 keep。
 
 ## 平台時長預設
 
@@ -66,7 +66,7 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 - 繁中、英文、中英雙語或關閉可見字幕。
 - 中英混合辨識、專案詞彙表、可稽核同音字校準，以及分離的機械／語義審核狀態。
 - loopback Studio 匯入、本機頁面編輯器、語意精華、定時文字／媒體圖層與社群畫布。
-- MP4／封面確定性輸出、機械 QA 與 contact sheet。
+- 單段／批次 MP4 與封面確定性輸出、機械 QA、contact sheet 與核可後 ZIP 下載。
 - 已安裝時才啟用 Edge、Rumi/Fish、HyperFrames、進階字幕與視覺字卡整合。
 
 本 Skill 永不呼叫 CapCut，也不包含 API 金鑰、私有聲音、影片素材、創作者個資或單機路徑設定。

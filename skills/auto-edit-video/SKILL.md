@@ -11,7 +11,8 @@ description: >-
   custom-second targets without hard-coding 30 seconds. When the user asks for
   an interface, launch the loopback Studio for local import, editing intent,
   five deterministic director profiles, up to ten reviewed highlights,
-  captions/layers, preview, QA-bound final approval, and download. Never uploads
+  captions/layers, preview, QA-bound single or batch final approval, and
+  download. Never uploads
   externally by default and never uses CapCut.
 ---
 
@@ -75,7 +76,8 @@ The GUI supports platform and duration presets, a natural-language editing
 brief, five deterministic strategy profiles, up to ten sourced highlight
 proposals, per-clip keep/reject and timing/title edits, editable captions,
 title/cards/animations and licensed project assets, clip-scoped timeline
-preview, and separate clip rendering. These profiles are tested heuristic
+preview, separate clip rendering, and one-queue final rendering for every
+explicitly approved highlight. These profiles are tested heuristic
 strategies, not five autonomous LLM agents.
 
 Studio source language includes `zh-en` for Chinese/English code switching and
@@ -118,8 +120,11 @@ Keep the approval order:
 uses the server-provided current revision. A final render freezes state/source/
 asset/clip/approval hashes, renders to an atomic versioned MP4, normalizes
 audible audio, runs mechanical QA, and creates a contact sheet. The GUI exposes
-the final download only after the current delivery receipt and contact sheet are
-human-approved. If reviewed decisions contain interior `delete` actions, the
+single or batch final downloads only after the current delivery receipt and
+contact sheets are human-approved. Batch final derives its clip set from the
+approved server state, validates every clip separately, and exposes a hash-bound
+ZIP only after the aggregate receipt passes the same final gate. If reviewed
+decisions contain interior `delete` actions, the
 page renderer fails closed; run `render_cut.py` first or change those decisions
 to keep.
 
@@ -349,8 +354,8 @@ highlights, clip-scoped video/timeline preview, font/color/size and position
 controls, selectable inline caption effects, drag-to-position caption/card
 layers, card width/height, timed overlap warnings, text motions,
 PNG/JPG/WEBP/GIF/MP4/MOV layers, platform safe zones, local publishing-copy
-drafts, cover frames, preview render, QA-bound final render, contact-sheet
-review, and approved download.
+drafts, cover frames, preview render, QA-bound single or batch final render,
+contact-sheet review, and approved MP4/ZIP download.
 
 Treat the HTML preview as an editing surface, then render an MP4 preview for
 truth checking. Highlight, timeline, and final approvals are bound to their

@@ -52,9 +52,10 @@ plans, source QA, and `working/editor_state.json`.
 - Five-track source/animation/card/subtitle/audio timeline. Clicking a
   text block selects its timed layer and focuses the subtitle editor.
 - Deterministic transcript-based publishing-copy draft and cover-frame render.
-- Versioned per-clip preview/final MP4s, audible-audio normalization, frozen
-  render snapshots, SHA-256 receipts, automatic QA/contact sheet, and approved
-  final download.
+- Versioned per-clip preview/final MP4s plus one-queue final rendering for all
+  approved highlights, audible-audio normalization, frozen render snapshots,
+  SHA-256 receipts, automatic QA/contact sheets, and approval-gated individual
+  or ZIP downloads.
 - Revision-bound `destructive_edit` → `highlight_selection` → `timeline` →
   `final` gates with stale-write rejection and downstream invalidation.
 
@@ -108,9 +109,11 @@ non-loopback bind requires `--allow-remote` and a trusted network.
    any inline emphasis words, then adjust typography, positions, card size,
    motions, and licensed assets.
 7. Render and watch a versioned preview MP4 for the selected clip.
-8. Approve the current timeline revision, then render final.
-9. Inspect the full final playback and QA contact sheet. Approve final only when
-   QA is current and the output is correct; download then becomes available.
+8. Approve the current timeline revision, then render the selected final clip
+   or batch-render every highlight marked keep.
+9. Inspect every final playback and QA contact sheet. Approve final only when
+   the single or aggregate QA contract is current and every output is correct;
+   individual MP4 and batch ZIP downloads then become available.
 
 Changing render-affecting state automatically invalidates affected highlight,
 timeline, and final approvals. Publishing text or merely selecting a clip/layer
@@ -133,15 +136,17 @@ final approval even if the timeline did not change.
   symlinked assets fail closed before render.
 - Cloud TTS is never invoked by opening the editor. Rumi/Edge voice generation
   remains an explicit opt-in workflow.
-- Final approval validates current output, render receipt, QA report, and
-  contact-sheet hashes; changed artifacts make the approval non-current.
+- Final approval validates every current output, render receipt, QA report,
+  contact-sheet hash, and the batch ZIP when applicable; changed artifacts make
+  the approval non-current.
 
 ## Known boundaries
 
 - The Studio creates semantic proposals, not guaranteed editorial truth. Local
   Whisper errors and strategy scores require human review.
-- Studio can propose up to ten highlights, but renders one selected clip at a
-  time. Batch-exporting all ten in one click is not implemented yet.
+- Batch final renders only highlights explicitly marked keep. Pending or
+  rejected proposals remain outside the queue, and any failed item prevents a
+  partial batch from replacing the previous successful delivery contract.
 - Reviewed interior delete decisions must use the destructive cut renderer
   before page-editor final render; the page renderer fails closed instead of
   silently ignoring them.

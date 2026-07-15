@@ -31,7 +31,7 @@ PROJECT/
 │   ├── visual_plan.json            # timed cards/assets/animations
 │   ├── render_snapshots/           # frozen render inputs/authorization
 │   ├── render_receipts/            # output SHA/bytes/snapshot identity
-│   ├── delivery_qa/                # per-render pass/fail receipts
+│   ├── delivery_qa/                # per-render and aggregate batch receipts
 │   └── latest_final_qa.json        # current successful final QA contract
 ├── review/
 │   ├── edit-review.html
@@ -52,7 +52,8 @@ PROJECT/
 │   ├── source_cut.mp4
 │   ├── preview.mp4
 │   ├── <clip>-<version>-preview.mp4
-│   └── <clip>-<version>-final.mp4
+│   ├── <clip>-<version>-final.mp4
+│   └── <batch>-final.zip
 └── qa/
     ├── <render-id>-contact.png
     └── <render-id>-qa-report.json
@@ -276,8 +277,13 @@ must be transcript extracts; strategy scores never replace source evidence.
 
 ### `latest_final_qa.json`
 
-This is the current delivery contract used by the `final` gate. Every referenced
-artifact must remain inside its project scope and match its declared SHA-256.
+This is the current single- or batch-delivery contract used by the `final`
+gate. Every referenced artifact must remain inside its project scope and match
+its declared SHA-256. Schema version 1 represents one clip. Schema version 2
+uses both `kind: "batch"` and `delivery_kind: "batch"`, requires the exact
+current set of approved highlight IDs, stores one complete schema-v1-style QA
+item per clip, and adds a hash-bound ZIP archive. A partial or failed batch
+never replaces the prior successful file.
 
 ```json
 {

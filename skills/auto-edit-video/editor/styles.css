@@ -1109,6 +1109,175 @@ h2 {
   display: none;
 }
 
+.batch-export {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: color-mix(in oklab, var(--paper-1) 88%, var(--blue) 12%);
+  border: 1px solid color-mix(in oklab, var(--line) 72%, var(--blue) 28%);
+}
+
+.batch-export-heading,
+.batch-progress-copy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.batch-export-heading h3 {
+  margin-top: var(--space-1);
+  font-size: 0.94rem;
+}
+
+.batch-retained-count {
+  flex: 0 0 auto;
+  padding: 0.28rem 0.48rem;
+  color: var(--blue);
+  background: color-mix(in oklab, var(--paper-0) 75%, var(--blue) 25%);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+.batch-render-progress {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.batch-render-progress[hidden],
+.batch-delivery-qa[hidden],
+.batch-downloads[hidden] {
+  display: none;
+}
+
+.batch-progress-copy {
+  color: var(--ink-2);
+  font-size: 0.72rem;
+}
+
+.batch-progress-copy strong {
+  color: var(--ink-1);
+}
+
+.batch-render-progress progress {
+  width: 100%;
+  height: 0.48rem;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line);
+  accent-color: var(--vermilion);
+}
+
+.batch-render-progress progress::-webkit-progress-bar {
+  background: var(--line);
+  border-radius: 999px;
+}
+
+.batch-render-progress progress::-webkit-progress-value {
+  background: linear-gradient(90deg, var(--vermilion), var(--amber));
+  border-radius: 999px;
+}
+
+.batch-delivery-qa {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.batch-qa-status {
+  color: var(--ink-1);
+  font-size: 0.76rem;
+  font-weight: 760;
+  line-height: 1.45;
+}
+
+.batch-qa-grid {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.batch-qa-card {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--paper-1);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--green);
+}
+
+.batch-qa-card.is-failed {
+  border-left-color: var(--danger);
+}
+
+.batch-qa-card-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.batch-qa-card-heading strong {
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.batch-qa-chip {
+  flex: 0 0 auto;
+  color: var(--green);
+  font-size: 0.64rem;
+  font-weight: 820;
+}
+
+.batch-qa-card.is-failed .batch-qa-chip {
+  color: var(--danger);
+}
+
+.batch-qa-card p {
+  color: var(--ink-2);
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
+.batch-qa-links,
+.batch-output-list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.batch-qa-links {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.batch-qa-links a,
+.batch-playback-button {
+  color: var(--blue);
+  font-size: 0.68rem;
+  font-weight: 760;
+  text-underline-offset: 3px;
+}
+
+.batch-playback-button {
+  padding: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.batch-downloads {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.batch-output-list a {
+  color: var(--blue);
+  font-size: 0.72rem;
+  font-weight: 760;
+  text-decoration: none;
+}
+
 .cover-preview {
   width: min(100%, 230px);
   max-height: 330px;
