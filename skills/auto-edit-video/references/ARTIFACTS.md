@@ -75,6 +75,26 @@ Never let a draft script overwrite something actually spoken.
 
 ## Artifact schemas
 
+Formal machine-checkable contracts for these artifacts live in
+`contracts/schemas/` (validated by `scripts/contract_registry.py validate`);
+the prose below records intent and edge rules the schemas cannot express.
+
+### `editor_state.json` (schema_version 2)
+
+The render timeline truth. Version 2 adds the unified-timeline fields
+(`contracts/policies/UNIFIED_TIMELINE.md`):
+
+- `segments` — ordered source segments; the only cut/reorder truth. A fresh or
+  migrated project gets one full-length segment (`origin: default_full_source`).
+- `variants` — output variant states (empty until the variant composer lands).
+- `rights` — local rights assertion status; final gating consumes it.
+- `migrated_from` — audit record written by the one-way v1→v2 migration.
+
+Loading a v1 state migrates it in place and explicitly voids all four approval
+gates (`contracts/policies/EDITOR_STATE_V2_MIGRATION.md`); clients that submit
+a v1 state are rejected and must reload. `revision` hashes only render-affecting
+fields (now including `segments`) and every approval gate binds to it.
+
 ### `transcript_calibration.json`
 
 Calibration never implies human approval. Canonical text and aliases may have
