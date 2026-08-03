@@ -1,0 +1,98 @@
+{
+ "$id": "auto-edit-video/contracts/folder_inventory",
+ "title": "folder_inventory",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "project_id": {
+   "type": "string",
+   "minLength": 1
+  },
+  "scanned_at": {
+   "type": "string",
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+  },
+  "root_display_name": {
+   "type": "string"
+  },
+  "files": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "minLength": 1
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "video",
+       "image",
+       "gif",
+       "audio",
+       "font",
+       "subtitle",
+       "document",
+       "other"
+      ]
+     },
+     "bytes": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "mime": {
+      "type": "string"
+     },
+     "role": {
+      "type": "string",
+      "enum": [
+       "main_video",
+       "broll",
+       "asset",
+       "font",
+       "transcript",
+       "ignored"
+      ]
+     }
+    },
+    "required": [
+     "bytes",
+     "kind",
+     "mime",
+     "path",
+     "role",
+     "sha256"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "main_video_path": {
+   "type": "string",
+   "minLength": 1
+  },
+  "warnings": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ },
+ "required": [
+  "files",
+  "main_video_path",
+  "project_id",
+  "root_display_name",
+  "scanned_at",
+  "schema_version",
+  "warnings"
+ ],
+ "additionalProperties": false
+}

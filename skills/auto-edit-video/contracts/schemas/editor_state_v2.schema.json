@@ -1,0 +1,123 @@
+{
+ "$id": "auto-edit-video/contracts/editor_state_v2",
+ "title": "editor_state_v2",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 2
+  },
+  "project_id": {
+   "type": "string",
+   "minLength": 1
+  },
+  "source_sha256": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "segments": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^segment-[0-9a-f]{8,}$"
+     },
+     "source_start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "source_end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "origin": {
+      "type": "string",
+      "enum": [
+       "narrative",
+       "manual",
+       "legacy_import",
+       "default_full_source"
+      ]
+     }
+    },
+    "required": [
+     "id",
+     "origin",
+     "source_end",
+     "source_start"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 1
+  },
+  "variants": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": true
+   }
+  },
+  "rights": {
+   "type": "object",
+   "properties": {
+    "asserted": {
+     "type": "boolean"
+    },
+    "assertion_revision": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "asserted",
+    "assertion_revision"
+   ],
+   "additionalProperties": false
+  },
+  "migrated_from": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "properties": {
+    "schema_version": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "at": {
+     "type": "string",
+     "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+    },
+    "reason": {
+     "type": "string",
+     "minLength": 1
+    },
+    "previous_revision": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "schema_version",
+    "at",
+    "reason",
+    "previous_revision"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "required": [
+  "schema_version",
+  "project_id",
+  "source_sha256",
+  "segments",
+  "variants",
+  "rights"
+ ],
+ "additionalProperties": true
+}

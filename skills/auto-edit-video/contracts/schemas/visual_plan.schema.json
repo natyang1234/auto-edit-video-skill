@@ -1,0 +1,107 @@
+{
+ "$id": "auto-edit-video/contracts/visual_plan",
+ "title": "visual_plan",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "highlight_plan_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "items": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^visual-beat-[0-9a-f]{8,}$"
+     },
+     "highlight_id": {
+      "type": "string",
+      "pattern": "^highlight-[0-9a-f]{8,}$"
+     },
+     "start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "beat": {
+      "type": "string",
+      "enum": [
+       "keep_aroll",
+       "broll",
+       "image",
+       "svg",
+       "title",
+       "stat",
+       "chart",
+       "dynamic_list",
+       "animation"
+      ]
+     },
+     "structured_layer_id": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "selected_asset": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "conceptual_only": {
+      "type": "boolean"
+     },
+     "evidence_ids": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "pattern": "^evidence-[0-9a-f]{8,}$"
+      }
+     },
+     "review_status": {
+      "type": "string",
+      "enum": [
+       "pending",
+       "approved",
+       "rejected"
+      ]
+     }
+    },
+    "required": [
+     "beat",
+     "conceptual_only",
+     "end",
+     "evidence_ids",
+     "highlight_id",
+     "id",
+     "review_status",
+     "selected_asset",
+     "start",
+     "structured_layer_id"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "highlight_plan_revision",
+  "items",
+  "revision",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

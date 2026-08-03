@@ -1,0 +1,13 @@
+{
+ "schema_version": 1,
+ "session_id": "s1",
+ "csrf_bound": false,
+ "staging_dir": ".creating-s1",
+ "limits": {
+  "max_files": 5000,
+  "max_total_bytes": 53687091200,
+  "max_video_bytes": 21474836480,
+  "max_file_bytes": 2147483648
+ },
+ "state": "open"
+}

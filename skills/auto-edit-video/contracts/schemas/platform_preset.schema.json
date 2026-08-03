@@ -1,0 +1,110 @@
+{
+ "$id": "auto-edit-video/contracts/platform_preset",
+ "title": "platform_preset",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "presets": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "label": {
+      "type": "string",
+      "minLength": 1
+     },
+     "width": {
+      "type": "integer",
+      "minimum": 16
+     },
+     "height": {
+      "type": "integer",
+      "minimum": 16
+     },
+     "aspect": {
+      "type": "string",
+      "pattern": "^\\d+:\\d+$"
+     },
+     "fps": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "safe": {
+      "type": "object",
+      "properties": {
+       "top": {
+        "type": "number",
+        "minimum": 0
+       },
+       "right": {
+        "type": "number",
+        "minimum": 0
+       },
+       "bottom": {
+        "type": "number",
+        "minimum": 0
+       },
+       "left": {
+        "type": "number",
+        "minimum": 0
+       }
+      },
+      "required": [
+       "bottom",
+       "left",
+       "right",
+       "top"
+      ],
+      "additionalProperties": false
+     },
+     "source_url": {
+      "type": "string",
+      "minLength": 1
+     },
+     "source_checked_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+     },
+     "status": {
+      "type": "string",
+      "enum": [
+       "verified",
+       "working"
+      ]
+     },
+     "review_due_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+     }
+    },
+    "required": [
+     "aspect",
+     "fps",
+     "height",
+     "id",
+     "label",
+     "review_due_at",
+     "safe",
+     "source_checked_at",
+     "source_url",
+     "status",
+     "width"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 1
+  }
+ },
+ "required": [
+  "presets",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

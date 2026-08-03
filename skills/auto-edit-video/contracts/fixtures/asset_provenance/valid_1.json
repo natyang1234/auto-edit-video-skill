@@ -1,0 +1,20 @@
+{
+ "schema_version": 1,
+ "items": [
+  {
+   "asset_id": "asset-1",
+   "path": "assets/a.png",
+   "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "origin": "folder-import",
+   "provider_id": null,
+   "source_url": null,
+   "license": {
+    "spdx": "CC0-1.0",
+    "attribution_required": false,
+    "attribution_text": "",
+    "verified_at": "2026-08-04T03:00:00"
+   },
+   "review_status": "approved"
+  }
+ ]
+}

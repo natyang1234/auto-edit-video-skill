@@ -1,0 +1,23 @@
+{
+ "schema_version": 1,
+ "providers": [
+  {
+   "id": "openverse",
+   "kind": "image",
+   "consent_required": true,
+   "cost_class": "free",
+   "idempotency_key_fields": [
+    "query",
+    "page"
+   ],
+   "license_class": "open",
+   "offline_fallback": "skip",
+   "preflight": {
+    "required": true,
+    "checks": [
+     "reachability"
+    ]
+   }
+  }
+ ]
+}

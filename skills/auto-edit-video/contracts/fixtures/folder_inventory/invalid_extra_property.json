@@ -1,0 +1,19 @@
+{
+ "schema_version": 1,
+ "project_id": "p1",
+ "scanned_at": "2026-08-04T03:00:00",
+ "root_display_name": "素材夾",
+ "files": [
+  {
+   "path": "main.mp4",
+   "kind": "video",
+   "bytes": 100,
+   "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "mime": "video/mp4",
+   "role": "main_video"
+  }
+ ],
+ "main_video_path": "main.mp4",
+ "warnings": [],
+ "surprise": 1
+}

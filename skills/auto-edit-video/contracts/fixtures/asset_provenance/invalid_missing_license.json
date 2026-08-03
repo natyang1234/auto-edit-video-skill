@@ -1,0 +1,14 @@
+{
+ "schema_version": 1,
+ "items": [
+  {
+   "asset_id": "asset-1",
+   "path": "assets/a.png",
+   "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "origin": "folder-import",
+   "provider_id": null,
+   "source_url": null,
+   "review_status": "approved"
+  }
+ ]
+}

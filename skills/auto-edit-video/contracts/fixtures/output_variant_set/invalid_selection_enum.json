@@ -1,0 +1,38 @@
+{
+ "schema_version": 1,
+ "master_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "highlight_modes": [
+  {
+   "highlight_id": "highlight-abcdef012345",
+   "mode_id": "teacher-punch",
+   "mode_selection": "auto",
+   "style_pack": {
+    "id": "dark-data-presenter",
+    "selection": "random"
+   }
+  }
+ ],
+ "outputs": [
+  {
+   "preset_id": "instagram-reels",
+   "orientation": "portrait",
+   "enabled": true
+  }
+ ],
+ "variants": [
+  {
+   "variant_id": "variant-abcdef01",
+   "highlight_id": "highlight-abcdef012345",
+   "preset_id": "instagram-reels",
+   "state": "planned",
+   "overrides": [
+    {
+     "path": "caption.y",
+     "kind": "caption_layout",
+     "value": 0.8
+    }
+   ]
+  }
+ ],
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

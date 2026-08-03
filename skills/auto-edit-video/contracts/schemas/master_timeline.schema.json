@@ -1,0 +1,81 @@
+{
+ "$id": "auto-edit-video/contracts/master_timeline",
+ "title": "master_timeline",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "project_id": {
+   "type": "string",
+   "minLength": 1
+  },
+  "source_sha256": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "narrative_plan_hash": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "segments": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^segment-[0-9a-f]{8,}$"
+     },
+     "source_start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "source_end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "origin": {
+      "type": "string",
+      "enum": [
+       "narrative",
+       "manual",
+       "legacy_import"
+      ]
+     },
+     "label": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "label",
+     "origin",
+     "source_end",
+     "source_start"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 1
+  },
+  "post_cut_duration_s": {
+   "type": "number",
+   "minimum": 0
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "narrative_plan_hash",
+  "post_cut_duration_s",
+  "project_id",
+  "revision",
+  "schema_version",
+  "segments",
+  "source_sha256"
+ ],
+ "additionalProperties": false
+}

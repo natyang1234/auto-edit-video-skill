@@ -1,0 +1,86 @@
+{
+ "$id": "auto-edit-video/contracts/director_mode",
+ "title": "director_mode",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "modes": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "version": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "envelope": {
+      "type": "object",
+      "properties": {
+       "cut_density": {
+        "type": "string",
+        "enum": [
+         "low",
+         "medium",
+         "high"
+        ]
+       },
+       "motion_intensity": {
+        "type": "string",
+        "enum": [
+         "low",
+         "medium",
+         "high"
+        ]
+       },
+       "caption_style_scope": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "caption_style_scope",
+       "cut_density",
+       "motion_intensity"
+      ],
+      "additionalProperties": false
+     },
+     "constraints": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": true
+     },
+     "auto_select_rules": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "auto_select_rules",
+     "constraints",
+     "envelope",
+     "id",
+     "version"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 1
+  }
+ },
+ "required": [
+  "modes",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

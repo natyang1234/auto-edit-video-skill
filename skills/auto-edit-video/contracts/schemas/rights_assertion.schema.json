@@ -1,0 +1,65 @@
+{
+ "$id": "auto-edit-video/contracts/rights_assertion",
+ "title": "rights_assertion",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "items": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "asset_id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "asserted": {
+      "type": "boolean"
+     },
+     "asserted_by": {
+      "type": "string",
+      "minLength": 1
+     },
+     "asserted_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+     },
+     "basis": {
+      "type": "string",
+      "enum": [
+       "own_work",
+       "licensed",
+       "public_domain",
+       "other"
+      ]
+     },
+     "note": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "asserted",
+     "asserted_at",
+     "asserted_by",
+     "asset_id",
+     "basis",
+     "note"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "items",
+  "revision",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

@@ -1,0 +1,102 @@
+{
+ "$id": "auto-edit-video/contracts/asset_provenance",
+ "title": "asset_provenance",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "items": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "asset_id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "path": {
+      "type": "string",
+      "minLength": 1
+     },
+     "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "origin": {
+      "type": "string",
+      "enum": [
+       "user-upload",
+       "folder-import",
+       "provider",
+       "generated"
+      ]
+     },
+     "provider_id": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "source_url": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "license": {
+      "type": "object",
+      "properties": {
+       "spdx": {
+        "type": "string",
+        "minLength": 1
+       },
+       "attribution_required": {
+        "type": "boolean"
+       },
+       "attribution_text": {
+        "type": "string"
+       },
+       "verified_at": {
+        "type": "string",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+       }
+      },
+      "required": [
+       "attribution_required",
+       "attribution_text",
+       "spdx",
+       "verified_at"
+      ],
+      "additionalProperties": false
+     },
+     "review_status": {
+      "type": "string",
+      "enum": [
+       "pending",
+       "approved",
+       "rejected"
+      ]
+     }
+    },
+    "required": [
+     "asset_id",
+     "license",
+     "origin",
+     "path",
+     "provider_id",
+     "review_status",
+     "sha256",
+     "source_url"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ "required": [
+  "items",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

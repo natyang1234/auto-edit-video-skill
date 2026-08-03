@@ -1,0 +1,25 @@
+{
+ "schema_version": 1,
+ "content_analysis_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "evidence_map_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "policy_version": "v1",
+ "candidates": [
+  {
+   "idea_id": "idea-abcdef01",
+   "formula": "clickbait",
+   "scores": {
+    "hook": 0.8
+   },
+   "integrity_gate": "pass",
+   "segment_order": [
+    "segment-abcdef01"
+   ],
+   "warnings": []
+  }
+ ],
+ "selected": {
+  "idea_id": "idea-abcdef01",
+  "formula": "result_first"
+ },
+ "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

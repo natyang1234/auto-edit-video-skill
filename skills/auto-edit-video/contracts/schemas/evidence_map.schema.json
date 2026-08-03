@@ -1,0 +1,87 @@
+{
+ "$id": "auto-edit-video/contracts/evidence_map",
+ "title": "evidence_map",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "source_sha256": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "transcript_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "items": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^evidence-[0-9a-f]{8,}$"
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "quote",
+       "number",
+       "claim",
+       "visual"
+      ]
+     },
+     "literal": {
+      "type": "string",
+      "minLength": 1
+     },
+     "start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+     },
+     "review_status": {
+      "type": "string",
+      "enum": [
+       "pending",
+       "approved",
+       "rejected"
+      ]
+     }
+    },
+    "required": [
+     "confidence",
+     "end",
+     "id",
+     "kind",
+     "literal",
+     "review_status",
+     "start"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "items",
+  "revision",
+  "schema_version",
+  "source_sha256",
+  "transcript_revision"
+ ],
+ "additionalProperties": false
+}

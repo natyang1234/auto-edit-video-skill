@@ -1,0 +1,346 @@
+{
+ "$id": "auto-edit-video/contracts/content_analysis",
+ "title": "content_analysis",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "source_sha256": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "engine": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string",
+     "minLength": 1
+    },
+    "kind": {
+     "type": "string",
+     "enum": [
+      "agent",
+      "local_llm"
+     ]
+    },
+    "model": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    },
+    "prompt_policy_version": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "required": [
+    "id",
+    "kind",
+    "model",
+    "prompt_policy_version",
+    "version"
+   ],
+   "additionalProperties": false
+  },
+  "generated_at": {
+   "type": "string",
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+  },
+  "frozen": {
+   "const": true
+  },
+  "truth_map": {
+   "type": "object",
+   "properties": {
+    "main_topics": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "minLength": 1
+       },
+       "evidence_ids": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^evidence-[0-9a-f]{8,}$"
+        }
+       }
+      },
+      "required": [
+       "evidence_ids",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "target_audience": {
+     "type": "object",
+     "properties": {
+      "text": {
+       "type": "string",
+       "minLength": 1
+      },
+      "evidence_ids": {
+       "type": "array",
+       "items": {
+        "type": "string",
+        "pattern": "^evidence-[0-9a-f]{8,}$"
+       }
+      }
+     },
+     "required": [
+      "evidence_ids",
+      "text"
+     ],
+     "additionalProperties": false
+    },
+    "promises": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "minLength": 1
+       },
+       "evidence_ids": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^evidence-[0-9a-f]{8,}$"
+        }
+       }
+      },
+      "required": [
+       "evidence_ids",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "methods": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "minLength": 1
+       },
+       "evidence_ids": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^evidence-[0-9a-f]{8,}$"
+        }
+       }
+      },
+      "required": [
+       "evidence_ids",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "proofs": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "minLength": 1
+       },
+       "evidence_ids": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^evidence-[0-9a-f]{8,}$"
+        }
+       }
+      },
+      "required": [
+       "evidence_ids",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "stories": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "minLength": 1
+       },
+       "evidence_ids": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^evidence-[0-9a-f]{8,}$"
+        }
+       }
+      },
+      "required": [
+       "evidence_ids",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "cta": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "minLength": 1
+       },
+       "evidence_ids": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^evidence-[0-9a-f]{8,}$"
+        }
+       }
+      },
+      "required": [
+       "evidence_ids",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    }
+   },
+   "required": [
+    "cta",
+    "main_topics",
+    "methods",
+    "promises",
+    "proofs",
+    "stories",
+    "target_audience"
+   ],
+   "additionalProperties": false
+  },
+  "retention_risks": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "slow_open",
+       "repetition",
+       "tangent",
+       "late_payoff",
+       "abstract",
+       "static_visual",
+       "unsupported_claim"
+      ]
+     },
+     "note": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "start",
+     "end",
+     "kind"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "idea_candidates": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^idea-[0-9a-f]{8,}$"
+     },
+     "thesis": {
+      "type": "string",
+      "minLength": 1
+     },
+     "source_ranges": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "start": {
+         "type": "number",
+         "minimum": 0
+        },
+        "end": {
+         "type": "number",
+         "minimum": 0
+        }
+       },
+       "required": [
+        "start",
+        "end"
+       ],
+       "additionalProperties": false
+      },
+      "minItems": 1
+     },
+     "payoff": {
+      "type": "string",
+      "minLength": 1
+     },
+     "evidence_ids": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "pattern": "^evidence-[0-9a-f]{8,}$"
+      }
+     }
+    },
+    "required": [
+     "evidence_ids",
+     "id",
+     "payoff",
+     "source_ranges",
+     "thesis"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "engine",
+  "frozen",
+  "generated_at",
+  "idea_candidates",
+  "retention_risks",
+  "revision",
+  "schema_version",
+  "source_sha256",
+  "truth_map"
+ ],
+ "additionalProperties": false
+}

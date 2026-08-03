@@ -1,0 +1,250 @@
+{
+ "$id": "auto-edit-video/contracts/video_analysis",
+ "title": "video_analysis",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "source_sha256": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "engines": {
+   "type": "object",
+   "properties": {
+    "ffprobe": {
+     "type": "object",
+     "properties": {
+      "name": {
+       "type": "string",
+       "minLength": 1
+      },
+      "version": {
+       "type": "string"
+      },
+      "status": {
+       "type": "string",
+       "enum": [
+        "present",
+        "not_configured"
+       ]
+      }
+     },
+     "required": [
+      "name",
+      "status",
+      "version"
+     ],
+     "additionalProperties": false
+    },
+    "asr": {
+     "type": "object",
+     "properties": {
+      "name": {
+       "type": "string",
+       "minLength": 1
+      },
+      "version": {
+       "type": "string"
+      },
+      "status": {
+       "type": "string",
+       "enum": [
+        "present",
+        "not_configured"
+       ]
+      }
+     },
+     "required": [
+      "name",
+      "status",
+      "version"
+     ],
+     "additionalProperties": false
+    },
+    "ocr": {
+     "type": "object",
+     "properties": {
+      "name": {
+       "type": "string",
+       "minLength": 1
+      },
+      "version": {
+       "type": "string"
+      },
+      "status": {
+       "type": "string",
+       "enum": [
+        "present",
+        "not_configured"
+       ]
+      }
+     },
+     "required": [
+      "name",
+      "status",
+      "version"
+     ],
+     "additionalProperties": false
+    },
+    "shot_detector": {
+     "type": "object",
+     "properties": {
+      "name": {
+       "type": "string",
+       "minLength": 1
+      },
+      "version": {
+       "type": "string"
+      },
+      "status": {
+       "type": "string",
+       "enum": [
+        "present",
+        "not_configured"
+       ]
+      }
+     },
+     "required": [
+      "name",
+      "status",
+      "version"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "asr",
+    "ffprobe",
+    "ocr",
+    "shot_detector"
+   ],
+   "additionalProperties": false
+  },
+  "duration_s": {
+   "type": "number",
+   "minimum": 0
+  },
+  "width": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "height": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "fps": {
+   "type": "number",
+   "minimum": 1
+  },
+  "loudness_lufs": {
+   "type": "number"
+  },
+  "silences": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "end": {
+      "type": "number",
+      "minimum": 0
+     }
+    },
+    "required": [
+     "start",
+     "end"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "shots": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "aroll",
+       "screen_share",
+       "demo",
+       "slide",
+       "product",
+       "unknown"
+      ]
+     }
+    },
+    "required": [
+     "start",
+     "end",
+     "kind"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "ocr_spans": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "text": {
+      "type": "string"
+     },
+     "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+     }
+    },
+    "required": [
+     "start",
+     "end",
+     "text",
+     "confidence"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "duration_s",
+  "engines",
+  "fps",
+  "height",
+  "loudness_lufs",
+  "ocr_spans",
+  "revision",
+  "schema_version",
+  "shots",
+  "silences",
+  "source_sha256",
+  "width"
+ ],
+ "additionalProperties": false
+}

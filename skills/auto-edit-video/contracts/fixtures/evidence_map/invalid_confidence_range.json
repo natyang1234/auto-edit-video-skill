@@ -1,0 +1,17 @@
+{
+ "schema_version": 1,
+ "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "transcript_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "items": [
+  {
+   "id": "evidence-abcdef01",
+   "kind": "quote",
+   "literal": "原話",
+   "start": 1.0,
+   "end": 2.0,
+   "confidence": 1.5,
+   "review_status": "approved"
+  }
+ ],
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

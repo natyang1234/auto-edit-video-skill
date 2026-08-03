@@ -1,0 +1,38 @@
+{
+ "schema_version": 1,
+ "caption_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "grapheme_contract": "icu-latest",
+ "items": [
+  {
+   "caption_item_id": "c1",
+   "clusters": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ]
+   ],
+   "glyph_runs": [
+    {
+     "font_asset_id": "font-noto",
+     "cluster_start": 0,
+     "cluster_end": 2
+    }
+   ],
+   "artifact": {
+    "rgba_path": "working/captions/c1.rgba",
+    "artifact_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "width": 1080,
+    "height": 200
+   }
+  }
+ ],
+ "receipt": {
+  "shaping_engine": "pinned-shaper",
+  "shaping_engine_version": "1.0"
+ },
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

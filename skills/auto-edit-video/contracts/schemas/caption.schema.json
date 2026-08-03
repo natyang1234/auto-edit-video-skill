@@ -1,0 +1,149 @@
+{
+ "$id": "auto-edit-video/contracts/caption",
+ "title": "caption",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "project_font_binding": {
+   "type": "object",
+   "properties": {
+    "font_asset_id": {
+     "type": "string",
+     "minLength": 1
+    },
+    "fallback_chain": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    }
+   },
+   "required": [
+    "fallback_chain",
+    "font_asset_id"
+   ],
+   "additionalProperties": false
+  },
+  "tracks": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "single",
+       "selection",
+       "track"
+      ]
+     },
+     "items": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "id": {
+         "type": "string",
+         "minLength": 1
+        },
+        "start": {
+         "type": "number",
+         "minimum": 0
+        },
+        "end": {
+         "type": "number",
+         "minimum": 0
+        },
+        "text": {
+         "type": "string"
+        },
+        "style": {
+         "type": "object",
+         "properties": {},
+         "required": [],
+         "additionalProperties": true
+        },
+        "effect_spans": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "properties": {
+           "start_char": {
+            "type": "integer",
+            "minimum": 0
+           },
+           "end_char": {
+            "type": "integer",
+            "minimum": 0
+           },
+           "effect": {
+            "type": "string",
+            "enum": [
+             "pop",
+             "highlight",
+             "underline"
+            ]
+           },
+           "color": {
+            "type": "string",
+            "pattern": "^#[0-9A-Fa-f]{6}$"
+           },
+           "font_scale": {
+            "type": "number",
+            "minimum": 0.5,
+            "maximum": 3
+           }
+          },
+          "required": [
+           "color",
+           "effect",
+           "end_char",
+           "font_scale",
+           "start_char"
+          ],
+          "additionalProperties": false
+         },
+         "minItems": 0,
+         "maxItems": 50
+        }
+       },
+       "required": [
+        "effect_spans",
+        "end",
+        "id",
+        "start",
+        "style",
+        "text"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "id",
+     "items",
+     "scope"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "project_font_binding",
+  "revision",
+  "schema_version",
+  "tracks"
+ ],
+ "additionalProperties": false
+}

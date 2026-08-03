@@ -1,0 +1,17 @@
+{
+ "schema_version": 2,
+ "project_id": "p1",
+ "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "segments": [],
+ "variants": [],
+ "rights": {
+  "asserted": false,
+  "assertion_revision": null
+ },
+ "migrated_from": {
+  "schema_version": 1,
+  "at": "2026-08-04T03:00:00",
+  "reason": "editor_state v1->v2 migration",
+  "previous_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ }
+}

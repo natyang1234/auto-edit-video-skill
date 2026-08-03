@@ -1,0 +1,103 @@
+{
+ "$id": "auto-edit-video/contracts/provider_interface",
+ "title": "provider_interface",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "providers": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "image",
+       "svg",
+       "font",
+       "generation",
+       "motion"
+      ]
+     },
+     "consent_required": {
+      "type": "boolean"
+     },
+     "cost_class": {
+      "type": "string",
+      "enum": [
+       "free",
+       "metered",
+       "subscription"
+      ]
+     },
+     "idempotency_key_fields": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "minItems": 1
+     },
+     "license_class": {
+      "type": "string",
+      "enum": [
+       "open",
+       "source-bound",
+       "generated"
+      ]
+     },
+     "offline_fallback": {
+      "type": "string",
+      "enum": [
+       "skip",
+       "queue",
+       "fail"
+      ]
+     },
+     "preflight": {
+      "type": "object",
+      "properties": {
+       "required": {
+        "type": "boolean"
+       },
+       "checks": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "checks",
+       "required"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "consent_required",
+     "cost_class",
+     "id",
+     "idempotency_key_fields",
+     "kind",
+     "license_class",
+     "offline_fallback",
+     "preflight"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 1
+  }
+ },
+ "required": [
+  "providers",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

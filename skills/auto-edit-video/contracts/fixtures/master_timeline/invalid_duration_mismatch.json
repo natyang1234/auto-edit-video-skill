@@ -1,0 +1,17 @@
+{
+ "schema_version": 1,
+ "project_id": "p1",
+ "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "narrative_plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "segments": [
+  {
+   "id": "segment-abcdef01",
+   "source_start": 10.0,
+   "source_end": 15.0,
+   "origin": "narrative",
+   "label": "hook"
+  }
+ ],
+ "post_cut_duration_s": 99.0,
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

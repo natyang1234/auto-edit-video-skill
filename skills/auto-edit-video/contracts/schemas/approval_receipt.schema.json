@@ -1,0 +1,84 @@
+{
+ "$id": "auto-edit-video/contracts/approval_receipt",
+ "title": "approval_receipt",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "gate": {
+   "type": "string",
+   "enum": [
+    "destructive_edit",
+    "highlight_selection",
+    "timeline",
+    "final"
+   ]
+  },
+  "scope": {
+   "type": "object",
+   "properties": {
+    "variant_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "variant_id"
+   ],
+   "additionalProperties": false
+  },
+  "state_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "approved": {
+   "type": "boolean"
+  },
+  "approved_at": {
+   "type": "string",
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+  },
+  "approved_preview_artifact_hash": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "migration": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "properties": {
+    "reason": {
+     "type": "string",
+     "minLength": 1
+    },
+    "at": {
+     "type": "string",
+     "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+    }
+   },
+   "required": [
+    "reason",
+    "at"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "required": [
+  "approved",
+  "approved_at",
+  "approved_preview_artifact_hash",
+  "gate",
+  "migration",
+  "schema_version",
+  "scope",
+  "state_revision"
+ ],
+ "additionalProperties": false
+}

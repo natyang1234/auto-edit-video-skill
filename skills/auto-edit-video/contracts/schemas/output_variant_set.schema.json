@@ -1,0 +1,182 @@
+{
+ "$id": "auto-edit-video/contracts/output_variant_set",
+ "title": "output_variant_set",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "master_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "highlight_modes": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "highlight_id": {
+      "type": "string",
+      "pattern": "^highlight-[0-9a-f]{8,}$"
+     },
+     "mode_id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "mode_selection": {
+      "type": "string",
+      "enum": [
+       "project-default",
+       "user",
+       "auto"
+      ]
+     },
+     "style_pack": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string",
+        "minLength": 1
+       },
+       "selection": {
+        "type": "string",
+        "enum": [
+         "project-default",
+         "user",
+         "auto"
+        ]
+       }
+      },
+      "required": [
+       "id",
+       "selection"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "highlight_id",
+     "mode_id",
+     "mode_selection",
+     "style_pack"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "outputs": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "preset_id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "orientation": {
+      "type": "string",
+      "enum": [
+       "landscape",
+       "portrait",
+       "square"
+      ]
+     },
+     "enabled": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "enabled",
+     "orientation",
+     "preset_id"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "variants": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "variant_id": {
+      "type": "string",
+      "pattern": "^variant-[0-9a-f]{8,}$"
+     },
+     "highlight_id": {
+      "type": "string"
+     },
+     "preset_id": {
+      "type": "string"
+     },
+     "state": {
+      "type": "string",
+      "enum": [
+       "planned",
+       "preview_rendered",
+       "approved",
+       "final_rendered",
+       "failed"
+      ]
+     },
+     "overrides": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "minLength": 1
+        },
+        "kind": {
+         "type": "string",
+         "enum": [
+          "layout",
+          "caption_layout",
+          "frame"
+         ]
+        },
+        "value": {
+         "type": [
+          "string",
+          "number",
+          "object",
+          "boolean"
+         ]
+        }
+       },
+       "required": [
+        "kind",
+        "path",
+        "value"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "highlight_id",
+     "overrides",
+     "preset_id",
+     "state",
+     "variant_id"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 0,
+   "maxItems": 80
+  },
+  "revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "highlight_modes",
+  "master_revision",
+  "outputs",
+  "revision",
+  "schema_version",
+  "variants"
+ ],
+ "additionalProperties": false
+}

@@ -1,0 +1,56 @@
+{
+ "x_schema_version": 1,
+ "note": "文字樣本，供 sanitizer 測試；不得直接開啟",
+ "cases": [
+  {
+   "id": "script-tag",
+   "svg": "<svg><script>alert(1)</script></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "event-handler",
+   "svg": "<svg onload=\"alert(1)\"><rect/></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "foreign-object",
+   "svg": "<svg><foreignObject><body/></foreignObject></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "external-href",
+   "svg": "<svg><image href=\"https://evil/x.png\"/></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "external-use",
+   "svg": "<svg><use href=\"https://evil/x.svg#a\"/></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "data-uri-script",
+   "svg": "<svg><a href=\"data:text/html,<script>1</script>\"><rect/></a></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "entity-expansion",
+   "svg": "<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY a \"aaaa\"><!ENTITY b \"&a;&a;&a;\">]><svg>&b;</svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "css-import",
+   "svg": "<svg><style>@import url(https://evil/a.css);</style><rect/></svg>",
+   "expect": "reject"
+  },
+  {
+   "id": "plain-icon",
+   "svg": "<svg viewBox=\"0 0 24 24\"><path d=\"M4 4h16v16H4z\"/></svg>",
+   "expect": "accept"
+  },
+  {
+   "id": "local-gradient",
+   "svg": "<svg><defs><linearGradient id=\"g\"/></defs><rect fill=\"url(#g)\"/></svg>",
+   "expect": "accept"
+  }
+ ]
+}

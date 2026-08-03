@@ -1,0 +1,12 @@
+{
+ "schema_version": 1,
+ "gate": "final",
+ "scope": {
+  "variant_id": "variant-abcdef01"
+ },
+ "state_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "approved": true,
+ "approved_at": "2026-08-04T03:00:00",
+ "approved_preview_artifact_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "migration": null
+}

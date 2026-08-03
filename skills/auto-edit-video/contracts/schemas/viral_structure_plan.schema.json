@@ -1,0 +1,111 @@
+{
+ "$id": "auto-edit-video/contracts/viral_structure_plan",
+ "title": "viral_structure_plan",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "content_analysis_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "evidence_map_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "policy_version": {
+   "type": "string",
+   "minLength": 1
+  },
+  "candidates": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "idea_id": {
+      "type": "string",
+      "pattern": "^idea-[0-9a-f]{8,}$"
+     },
+     "formula": {
+      "type": "string",
+      "enum": [
+       "result_first",
+       "pain_solution",
+       "contrarian",
+       "story_turn",
+       "list_value",
+       "clean_complete_idea"
+      ]
+     },
+     "scores": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": true
+     },
+     "integrity_gate": {
+      "type": "string",
+      "enum": [
+       "pass",
+       "fail"
+      ]
+     },
+     "segment_order": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "pattern": "^segment-[0-9a-f]{8,}$"
+      }
+     },
+     "warnings": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "formula",
+     "idea_id",
+     "integrity_gate",
+     "scores",
+     "segment_order",
+     "warnings"
+    ],
+    "additionalProperties": false
+   }
+  },
+  "selected": {
+   "type": "object",
+   "properties": {
+    "idea_id": {
+     "type": "string"
+    },
+    "formula": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "formula",
+    "idea_id"
+   ],
+   "additionalProperties": false
+  },
+  "plan_hash": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  }
+ },
+ "required": [
+  "candidates",
+  "content_analysis_revision",
+  "evidence_map_revision",
+  "plan_hash",
+  "policy_version",
+  "schema_version",
+  "selected"
+ ],
+ "additionalProperties": false
+}

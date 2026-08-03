@@ -1,0 +1,56 @@
+{
+ "x_schema_version": 1,
+ "contract": "grapheme_cluster_v1",
+ "cases": [
+  {
+   "text": "你好世界",
+   "clusters": 4,
+   "note": "CJK basic"
+  },
+  {
+   "text": "café",
+   "clusters": 4,
+   "note": "combining acute (NFC)"
+  },
+  {
+   "text": "é",
+   "clusters": 1,
+   "note": "combining acute (NFD) = one cluster"
+  },
+  {
+   "text": "👩‍👩‍👧‍👦",
+   "clusters": 1,
+   "note": "ZWJ family emoji = one cluster"
+  },
+  {
+   "text": "👍🏽",
+   "clusters": 1,
+   "note": "emoji + skin tone modifier"
+  },
+  {
+   "text": "中English混排ok",
+   "clusters": 13,
+   "note": "zh-en code switch"
+  },
+  {
+   "text": "ㄅㄆㄇ",
+   "clusters": 3,
+   "note": "bopomofo"
+  },
+  {
+   "text": "台灣No.1！",
+   "clusters": 9,
+   "note": "fullwidth punctuation"
+  },
+  {
+   "text": "🇹🇼",
+   "clusters": 1,
+   "note": "regional indicator pair"
+  },
+  {
+   "text": "a\r\nb",
+   "clusters": 3,
+   "note": "CRLF is a single cluster"
+  }
+ ]
+}

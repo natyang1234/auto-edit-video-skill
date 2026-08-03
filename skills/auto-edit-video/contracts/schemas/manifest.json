@@ -1,0 +1,27 @@
+{
+ "x_schema_version": 1,
+ "required_schemas": [
+  "approval_receipt",
+  "asset_provenance",
+  "caption",
+  "caption_render_plan",
+  "content_analysis",
+  "director_mode",
+  "editor_state_v2",
+  "evidence_map",
+  "folder_import_session",
+  "folder_inventory",
+  "master_timeline",
+  "narrative_edit_plan",
+  "output_variant_set",
+  "platform_preset",
+  "provider_interface",
+  "rights_assertion",
+  "structured_layer",
+  "structured_layer_artifacts",
+  "style_pack",
+  "video_analysis",
+  "viral_structure_plan",
+  "visual_plan"
+ ]
+}

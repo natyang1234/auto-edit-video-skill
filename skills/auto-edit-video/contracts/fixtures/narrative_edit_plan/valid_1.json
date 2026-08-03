@@ -1,0 +1,20 @@
+{
+ "schema_version": 1,
+ "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "segments": [
+  {
+   "id": "segment-abcdef01",
+   "source_start": 10.0,
+   "source_end": 15.0,
+   "purpose": "hook"
+  }
+ ],
+ "reorder": true,
+ "risk": "low",
+ "reanchor": {
+  "status": "anchored",
+  "transcript_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ },
+ "warnings": []
+}

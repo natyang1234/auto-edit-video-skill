@@ -1,0 +1,33 @@
+{
+ "schema_version": 1,
+ "id": "dark-data-presenter",
+ "version": 1,
+ "tokens": {
+  "palette": {
+   "bg": "#101418"
+  },
+  "typography": {
+   "title": "font-noto"
+  },
+  "spacing": {
+   "unit": 8
+  }
+ },
+ "components": [
+  {
+   "id": "hero-stat",
+   "kind": "confetti",
+   "layout": "center",
+   "motion": {
+    "preset": "count-up",
+    "enter": "fade",
+    "exit": "fade",
+    "duration_range": [
+     0.4,
+     1.2
+    ]
+   }
+  }
+ ],
+ "license": "internal-original"
+}

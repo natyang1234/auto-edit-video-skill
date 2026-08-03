@@ -1,0 +1,70 @@
+{
+ "$id": "auto-edit-video/contracts/folder_import_session",
+ "title": "folder_import_session",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "session_id": {
+   "type": "string",
+   "minLength": 1
+  },
+  "csrf_bound": {
+   "const": true
+  },
+  "staging_dir": {
+   "type": "string",
+   "minLength": 1
+  },
+  "limits": {
+   "type": "object",
+   "properties": {
+    "max_files": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 5000
+    },
+    "max_total_bytes": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "max_video_bytes": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "max_file_bytes": {
+     "type": "integer",
+     "minimum": 1
+    }
+   },
+   "required": [
+    "max_file_bytes",
+    "max_files",
+    "max_total_bytes",
+    "max_video_bytes"
+   ],
+   "additionalProperties": false
+  },
+  "state": {
+   "type": "string",
+   "enum": [
+    "open",
+    "importing",
+    "completed",
+    "aborted",
+    "expired"
+   ]
+  }
+ },
+ "required": [
+  "csrf_bound",
+  "limits",
+  "schema_version",
+  "session_id",
+  "staging_dir",
+  "state"
+ ],
+ "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+ "schema_version": 1,
+ "presets": [
+  {
+   "id": "instagram-reels",
+   "label": "IG Reels",
+   "width": 1080,
+   "height": 1920,
+   "aspect": "vertical",
+   "fps": 30,
+   "safe": {
+    "top": 8,
+    "right": 8,
+    "bottom": 18,
+    "left": 8
+   },
+   "source_url": "https://developers.facebook.com",
+   "source_checked_at": "2026-08-04T03:00:00",
+   "status": "verified",
+   "review_due_at": "2026-11-02T00:00:00"
+  }
+ ]
+}

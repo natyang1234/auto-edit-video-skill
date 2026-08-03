@@ -1,0 +1,108 @@
+{
+ "$id": "auto-edit-video/contracts/narrative_edit_plan",
+ "title": "narrative_edit_plan",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "source_sha256": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "plan_hash": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "segments": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^segment-[0-9a-f]{8,}$"
+     },
+     "source_start": {
+      "type": "number",
+      "minimum": 0
+     },
+     "source_end": {
+      "type": "number",
+      "minimum": 0
+     },
+     "purpose": {
+      "type": "string",
+      "enum": [
+       "hook",
+       "context",
+       "method",
+       "proof",
+       "payoff",
+       "cta",
+       "other"
+      ]
+     }
+    },
+    "required": [
+     "id",
+     "purpose",
+     "source_end",
+     "source_start"
+    ],
+    "additionalProperties": false
+   },
+   "minItems": 1
+  },
+  "reorder": {
+   "type": "boolean"
+  },
+  "risk": {
+   "type": "string",
+   "enum": [
+    "low",
+    "high"
+   ]
+  },
+  "reanchor": {
+   "type": "object",
+   "properties": {
+    "status": {
+     "type": "string",
+     "enum": [
+      "anchored",
+      "stale",
+      "failed"
+     ]
+    },
+    "transcript_revision": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": [
+    "status",
+    "transcript_revision"
+   ],
+   "additionalProperties": false
+  },
+  "warnings": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ },
+ "required": [
+  "plan_hash",
+  "reanchor",
+  "reorder",
+  "risk",
+  "schema_version",
+  "segments",
+  "source_sha256",
+  "warnings"
+ ],
+ "additionalProperties": false
+}

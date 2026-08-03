@@ -1,0 +1,21 @@
+{
+ "schema_version": 1,
+ "highlight_plan_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "items": [
+  {
+   "id": "visual-beat-abcdef01",
+   "highlight_id": "highlight-abcdef012345",
+   "start": 1.0,
+   "end": 3.0,
+   "beat": "stat",
+   "structured_layer_id": "structured-layer-abcdef01",
+   "selected_asset": null,
+   "conceptual_only": false,
+   "evidence_ids": [
+    "evidence-abcdef01"
+   ],
+   "review_status": "pending"
+  }
+ ],
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

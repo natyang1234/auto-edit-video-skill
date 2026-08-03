@@ -1,0 +1,67 @@
+{
+ "$id": "auto-edit-video/contracts/structured_layer_artifacts",
+ "title": "structured_layer_artifacts",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "items": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "structured_layer_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "evidence_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "mode_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "style_pack_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "resolved_motion_plan_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "compiler_version": {
+      "type": "string",
+      "minLength": 1
+     },
+     "artifact_id": {
+      "type": "string",
+      "minLength": 1
+     },
+     "artifact_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     }
+    },
+    "required": [
+     "artifact_hash",
+     "artifact_id",
+     "compiler_version",
+     "evidence_revision",
+     "mode_hash",
+     "resolved_motion_plan_hash",
+     "structured_layer_hash",
+     "style_pack_hash"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ "required": [
+  "items",
+  "schema_version"
+ ],
+ "additionalProperties": false
+}

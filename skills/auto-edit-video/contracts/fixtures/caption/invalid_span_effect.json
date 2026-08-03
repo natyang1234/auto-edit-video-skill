@@ -1,0 +1,36 @@
+{
+ "schema_version": 1,
+ "project_font_binding": {
+  "font_asset_id": "font-noto",
+  "fallback_chain": [
+   "font-noto"
+  ]
+ },
+ "tracks": [
+  {
+   "id": "t1",
+   "scope": "track",
+   "items": [
+    {
+     "id": "c1",
+     "start": 0.0,
+     "end": 2.0,
+     "text": "你好世界",
+     "style": {
+      "color": "#FFFFFF"
+     },
+     "effect_spans": [
+      {
+       "start_char": 0,
+       "end_char": 2,
+       "effect": "rainbow",
+       "color": "#FF5533",
+       "font_scale": 1.2
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
