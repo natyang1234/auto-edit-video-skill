@@ -1,0 +1,70 @@
+{
+ "schema_version": 1,
+ "policy_version": "p1-2026-08-04",
+ "weights": {
+  "source_completeness": 0.15,
+  "hook_clarity": 0.15,
+  "audience_specificity": 0.05,
+  "promise_payoff": 0.15,
+  "proof_strength": 0.2,
+  "info_density": 0.1,
+  "emotion_novelty": 0.05,
+  "platform_length_fit": 0.1,
+  "cta_fit": 0.05,
+  "reorder_penalty": 0.0
+ },
+ "formulas": [
+  {
+   "id": "result_first",
+   "structure": "結果/反差 hook → 問題 → 方法 → proof → takeaway/CTA",
+   "eligibility": {
+    "proof_strength": 0.4,
+    "promise_payoff": 1.0
+   }
+  },
+  {
+   "id": "pain_solution",
+   "structure": "痛點 → 代價 → 承諾 → 步驟/示範 → proof → CTA",
+   "eligibility": {
+    "promise_payoff": 1.0
+   }
+  },
+  {
+   "id": "contrarian",
+   "structure": "反直覺主張 → 常見做法為何失效 → evidence → 新做法 → CTA",
+   "eligibility": {
+    "emotion_novelty": 1.0,
+    "proof_strength": 0.2
+   }
+  },
+  {
+   "id": "story_turn",
+   "structure": "conflict → stakes → turning point → lesson/payoff → CTA",
+   "eligibility": {
+    "source_completeness": 1.0
+   }
+  },
+  {
+   "id": "list_value",
+   "structure": "具體收益 hook → numbered value → example → recap → CTA",
+   "eligibility": {
+    "info_density": 0.5
+   }
+  }
+ ],
+ "fallback_formula": "clean_complete_idea",
+ "contrarian_markers": [
+  "其實",
+  "別再",
+  "錯",
+  "不是",
+  "迷思",
+  "真相",
+  "反而"
+ ],
+ "target_duration_s": [
+  15,
+  90
+ ],
+ "tie_break": "lowest_candidate_id"
+}

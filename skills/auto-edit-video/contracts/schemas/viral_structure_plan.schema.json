@@ -96,6 +96,10 @@
   "plan_hash": {
    "type": "string",
    "pattern": "^[0-9a-f]{64}$"
+  },
+  "policy_hash": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
   }
  },
  "required": [
@@ -103,6 +107,7 @@
   "content_analysis_revision",
   "evidence_map_revision",
   "plan_hash",
+  "policy_hash",
   "policy_version",
   "schema_version",
   "selected"

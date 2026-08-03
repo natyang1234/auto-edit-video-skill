@@ -1,0 +1,201 @@
+{
+ "$id": "auto-edit-video/contracts/viral_formula_policy",
+ "title": "viral_formula_policy",
+ "x_schema_version": 1,
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "schema_version",
+  "policy_version",
+  "weights",
+  "formulas",
+  "fallback_formula",
+  "contrarian_markers",
+  "target_duration_s",
+  "tie_break"
+ ],
+ "properties": {
+  "schema_version": {
+   "const": 1
+  },
+  "policy_version": {
+   "type": "string",
+   "minLength": 1
+  },
+  "weights": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "source_completeness",
+    "hook_clarity",
+    "audience_specificity",
+    "promise_payoff",
+    "proof_strength",
+    "info_density",
+    "emotion_novelty",
+    "platform_length_fit",
+    "cta_fit",
+    "reorder_penalty"
+   ],
+   "properties": {
+    "source_completeness": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "hook_clarity": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "audience_specificity": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "promise_payoff": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "proof_strength": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "info_density": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "emotion_novelty": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "platform_length_fit": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "cta_fit": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "reorder_penalty": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    }
+   }
+  },
+  "formulas": {
+   "type": "array",
+   "minItems": 1,
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "structure",
+     "eligibility"
+    ],
+    "properties": {
+     "id": {
+      "enum": [
+       "result_first",
+       "pain_solution",
+       "contrarian",
+       "story_turn",
+       "list_value"
+      ]
+     },
+     "structure": {
+      "type": "string",
+      "minLength": 1
+     },
+     "eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+       "source_completeness": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "hook_clarity": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "audience_specificity": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "promise_payoff": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "proof_strength": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "info_density": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "emotion_novelty": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "platform_length_fit": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "cta_fit": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       },
+       "reorder_penalty": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+       }
+      }
+     }
+    }
+   }
+  },
+  "fallback_formula": {
+   "const": "clean_complete_idea"
+  },
+  "contrarian_markers": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "minLength": 1
+   }
+  },
+  "target_duration_s": {
+   "type": "array",
+   "minItems": 2,
+   "maxItems": 2,
+   "items": {
+    "type": "number",
+    "minimum": 1
+   }
+  },
+  "tie_break": {
+   "const": "lowest_candidate_id"
+  }
+ }
+}

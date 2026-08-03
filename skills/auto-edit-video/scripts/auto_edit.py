@@ -1466,6 +1466,86 @@ FOLDER_ROLE_BY_KIND = {
 FOLDER_IMPORT_MAX_FILES = 5000
 
 
+def cmd_build_evidence_index(args: argparse.Namespace) -> int:
+    """Tool-side evidence authority: derive citable evidence from transcript."""
+    try:
+        import narrative_engine
+    except ImportError as exc:
+        return die(f"cannot load narrative engine: {exc}")
+    try:
+        evidence_map = narrative_engine.build_evidence_index(
+            Path(args.project_dir).expanduser().resolve()
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "items": len(evidence_map["items"]),
+                "revision": evidence_map["revision"],
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_freeze_content_analysis(args: argparse.Namespace) -> int:
+    """Validate and freeze an agent-authored content analysis draft."""
+    try:
+        import narrative_engine
+    except ImportError as exc:
+        return die(f"cannot load narrative engine: {exc}")
+    draft_path = Path(args.input).expanduser()
+    try:
+        draft = read_json(draft_path)
+        analysis = narrative_engine.freeze_content_analysis(
+            Path(args.project_dir).expanduser().resolve(),
+            draft,
+            engine_id=args.engine_id,
+            prompt_policy_version=args.prompt_policy_version,
+            generated_at=now_utc(),
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    print(json.dumps({"ok": True, "revision": analysis["revision"]}, ensure_ascii=False))
+    return 0
+
+
+def cmd_plan_narrative(args: argparse.Namespace) -> int:
+    """Deterministic formula routing + low-risk narrative plan generation."""
+    try:
+        import narrative_engine
+    except ImportError as exc:
+        return die(f"cannot load narrative engine: {exc}")
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    try:
+        structure = narrative_engine.route_formulas(project_dir)
+        plan = narrative_engine.build_narrative_plan(project_dir)
+    except ValueError as exc:
+        return die(str(exc))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "selected": structure["selected"],
+                "plan_hash": plan["plan_hash"],
+                "segments": len(plan["segments"]),
+                "risk": plan["risk"],
+                "warnings": plan["warnings"] + [
+                    w for c in structure["candidates"] for w in c["warnings"]
+                ],
+                "next": "auto_edit.py apply-narrative-plan --project-dir ... "
+                        "--plan working/narrative_edit_plan.json",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_analyze_video(args: argparse.Namespace) -> int:
     """Whole-video technical analysis with stage-level checkpoint cache."""
     try:
@@ -4061,6 +4141,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_video.add_argument("--project-dir", required=True)
     analyze_video.set_defaults(func=cmd_analyze_video)
+
+    evidence = sub.add_parser(
+        "build-evidence-index",
+        help="Derive the citable evidence index from the word-timed transcript",
+    )
+    evidence.add_argument("--project-dir", required=True)
+    evidence.set_defaults(func=cmd_build_evidence_index)
+
+    freeze = sub.add_parser(
+        "freeze-content-analysis",
+        help="Validate an agent-authored content analysis and freeze it",
+    )
+    freeze.add_argument("--project-dir", required=True)
+    freeze.add_argument("--input", required=True)
+    freeze.add_argument("--engine-id", default="claude-agent")
+    freeze.add_argument("--prompt-policy-version", default="content-analysis-guide-v1")
+    freeze.set_defaults(func=cmd_freeze_content_analysis)
+
+    plan_narrative = sub.add_parser(
+        "plan-narrative",
+        help="Run the deterministic formula router and emit a low-risk narrative plan",
+    )
+    plan_narrative.add_argument("--project-dir", required=True)
+    plan_narrative.set_defaults(func=cmd_plan_narrative)
 
     narrative = sub.add_parser(
         "apply-narrative-plan",
