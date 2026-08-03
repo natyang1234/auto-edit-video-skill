@@ -9,10 +9,13 @@
 | deterministic | ocr_spans | **optional capability**：`engines.ocr.status=not_configured|present` | present 時 version pin |
 | 語意 | truth_map/retention_risks/idea_candidates/視覺語意標籤 | primary＝**agent-managed session**；optional＝loopback Ollama | 不要求跨次 bit-identical |
 
-## OCR optional capability（Codex 預審 B2 處置）
-Phase 0 只固定資料形狀：`status=not_configured` 時 `ocr_spans` 必須為空陣列、不得由其他
-來源冒充；依賴 OCR 的下游（burned-caption 偵測）標 `unavailable`。正式選型
-（tesseract／macOS Vision）＝Phase 1a 開工決策，選定後補 version pin。
+## OCR optional capability（選型已定，nat 2026-08-04 核可）
+選型：**primary＝macOS Vision**（`VNRecognizeTextRequest`，經 pyobjc 呼叫；繁中影片畫面
+準確率與速度均優、零安裝），**fallback＝tesseract＋chi_tra**（跨平台散佈用）。兩者皆不可用
+→ `status=not_configured`。Version pin：Vision 記「macOS 版本＋Vision revision」，OS 升級＝
+新 engine version＝新 analysis revision，走正常 invalidation，不追求跨 OS bit-identical；
+tesseract 記版本＋traineddata hash。`status=not_configured` 時 `ocr_spans` 必須為空陣列、
+不得由其他來源冒充；依賴 OCR 的下游（burned-caption 偵測）標 `unavailable`。
 
 ## Frozen artifact 與 determinism 邊界
 語意欄位寫入 `content_analysis.json`（schema 強制 `frozen:true`＋engine id/model/
