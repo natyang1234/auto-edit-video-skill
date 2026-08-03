@@ -1000,6 +1000,15 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
         state = json.loads(body.decode("utf-8"))["state"]
+        # This test targets delivery-QA tampering; drop effect spans so the
+        # Phase 1a effect-span final gate (tested separately) stays out of the way.
+        for overlay in state.get("overlays", []):
+            overlay.pop("effect_spans", None)
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
         status, decisions = self.json_request(
             "PUT",
             "/api/edit-decisions",
@@ -1767,6 +1776,57 @@ class EditorServerTests(unittest.TestCase):
         revisions = json.loads(body.decode("utf-8"))["revisions"]
         self.assertEqual(revisions["timeline"], "unmigrated-editor-state-v1")
 
+    def test_effect_span_final_gate_blocks_basic_route(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("viral_structure_plan", payload)
+        self.assertIn("narrative_plan", payload)
+        has_spans = any(
+            overlay.get("effect_spans") for overlay in state.get("overlays", [])
+        )
+        self.assertTrue(has_spans, "default state should carry effect spans")
+        errors = editor_server.effect_span_final_errors(state, None)
+        self.assertTrue(errors and "effect spans" in errors[0])
+        stripped = json.loads(json.dumps(state))
+        for overlay in stripped.get("overlays", []):
+            overlay.pop("effect_spans", None)
+        self.assertEqual(editor_server.effect_span_final_errors(stripped, None), [])
+
+    def test_platform_presets_come_from_validated_registry(self) -> None:
+        registry = json.loads(
+            (SKILL_DIR / "contracts/instances/platform_preset__registry.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        registry_ids = {preset["id"] for preset in registry["presets"]}
+        self.assertEqual(set(editor_server.PLATFORM_PRESETS), registry_ids)
+        for preset in registry["presets"]:
+            runtime = editor_server.PLATFORM_PRESETS[preset["id"]]
+            for key in ("label", "width", "height", "aspect", "fps", "safe",
+                        "cover_width", "cover_height", "review_due_at"):
+                self.assertEqual(runtime[key], preset[key], f"{preset['id']}.{key}")
+
+    def test_director_registry_matches_code_presets(self) -> None:
+        registry = json.loads(
+            (SKILL_DIR / "contracts/instances/director_mode__registry.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        by_id = {mode["id"]: mode for mode in registry["modes"]}
+        self.assertEqual(set(by_id), set(editor_server.DIRECTOR_PRESETS))
+        for mode_id, preset in editor_server.DIRECTOR_PRESETS.items():
+            self.assertEqual(
+                by_id[mode_id]["constraints"], preset,
+                f"director registry drifted from code for {mode_id}; "
+                "regenerate contracts/instances/director_mode__registry.json",
+            )
+
+    def test_editor_ui_renders_formula_panel_and_stale_marker(self) -> None:
+        app_js = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
+        self.assertIn("renderFormulaPanel(projectPayload)", app_js)
+        self.assertIn("evidence re-anchor", app_js)
+        self.assertIn("規格待重核", app_js)
 
 
 class EditorRendererTests(unittest.TestCase):

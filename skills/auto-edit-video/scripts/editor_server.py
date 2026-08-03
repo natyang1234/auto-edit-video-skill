@@ -71,74 +71,32 @@ GATES = ("destructive_edit", "highlight_selection", "timeline", "final")
 VOICE_LANGUAGES = {"zh-TW", "zh-CN", "en-US", "en-GB"}
 VOICE_GENDERS = {"female", "male"}
 
-PLATFORM_PRESETS: dict[str, dict[str, Any]] = {
-    "instagram-reels": {
-        "label": "Instagram Reels",
-        "width": 1080,
-        "height": 1920,
-        "aspect": "9:16",
-        "fps": 30,
-        "cover_width": 420,
-        "cover_height": 654,
-        "basis": "Meta allows 1.91:1–9:16; this is the editor's full-screen preset",
-        "safe": {"top": 8, "right": 8, "bottom": 18, "left": 8},
-    },
-    "youtube-shorts": {
-        "label": "YouTube Shorts",
-        "width": 1080,
-        "height": 1920,
-        "aspect": "9:16",
-        "fps": 30,
-        "cover_width": 1080,
-        "cover_height": 1920,
-        "basis": "YouTube classifies square or vertical videos up to 3 minutes as Shorts",
-        "safe": {"top": 7, "right": 11, "bottom": 17, "left": 7},
-    },
-    "youtube-landscape": {
-        "label": "YouTube 16:9",
-        "width": 1920,
-        "height": 1080,
-        "aspect": "16:9",
-        "fps": 30,
-        "cover_width": 1280,
-        "cover_height": 720,
-        "basis": "YouTube's standard desktop aspect ratio is 16:9",
-        "safe": {"top": 6, "right": 6, "bottom": 10, "left": 6},
-    },
-    "tiktok": {
-        "label": "TikTok",
-        "width": 1080,
-        "height": 1920,
-        "aspect": "9:16",
-        "fps": 30,
-        "cover_width": 1080,
-        "cover_height": 1920,
-        "basis": "TikTok recommends full-screen 9:16 and at least 720p",
-        "safe": {"top": 8, "right": 14, "bottom": 20, "left": 8},
-    },
-    "xiaohongshu-portrait": {
-        "label": "小紅書 3:4",
-        "width": 1080,
-        "height": 1440,
-        "aspect": "3:4",
-        "fps": 30,
-        "cover_width": 1080,
-        "cover_height": 1440,
-        "basis": "editorial working preset; current public official video-post spec not verified",
-        "safe": {"top": 7, "right": 8, "bottom": 14, "left": 8},
-    },
-    "xiaohongshu-full": {
-        "label": "小紅書 9:16",
-        "width": 1080,
-        "height": 1920,
-        "aspect": "9:16",
-        "fps": 30,
-        "cover_width": 1080,
-        "cover_height": 1440,
-        "basis": "editorial working preset; current public official video-post spec not verified",
-        "safe": {"top": 8, "right": 10, "bottom": 18, "left": 8},
-    },
-}
+def _load_platform_presets() -> dict[str, dict[str, Any]]:
+    """Platform presets come from the versioned registry — the ONLY runtime
+    source (unified with contracts; hardcoded dicts were retired in Phase 1a).
+    A missing or invalid registry fails closed instead of silently falling
+    back to stale values."""
+    import contract_registry
+
+    registry_path = (
+        SKILL_DIR / "contracts/instances/platform_preset__registry.json"
+    )
+    try:
+        payload = contract_registry.load_artifact_text(
+            registry_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"platform preset registry unreadable: {exc}") from exc
+    errors = contract_registry.validate_artifact("platform_preset", payload)
+    if errors:
+        raise RuntimeError(
+            "platform preset registry failed contract validation: "
+            + "; ".join(errors)
+        )
+    return {preset["id"]: dict(preset) for preset in payload["presets"]}
+
+
+PLATFORM_PRESETS: dict[str, dict[str, Any]] = _load_platform_presets()
 
 DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
     "teacher-punch": {
@@ -544,6 +502,38 @@ def qa_download_errors(project_dir: Path, relative: str) -> list[str]:
     return ["only current delivery QA evidence can be read after final approval"]
 
 
+def effect_span_final_errors(
+    state: dict[str, Any],
+    clip: dict[str, Any] | None,
+) -> list[str]:
+    """Interim Phase 1a gate mirroring the renderer's effect-span fail-closed.
+
+    The designed route renders spans through the graphic package; every other
+    final route uses drawtext, which drops them silently — block approval so
+    the loss is visible before render time.
+    """
+    spans_present = any(
+        overlay.get("effect_spans")
+        for overlay in state.get("overlays", [])
+        if isinstance(overlay, dict) and overlay.get("visible", True)
+    )
+    if not spans_present:
+        return []
+    if clip is not None and state.get("visual_quality_mode") == "designed":
+        roles = {
+            str(item.get("design_role"))
+            for item in state.get("overlays", [])
+            if isinstance(item, dict) and item.get("design_role")
+        }
+        if {"hook", "concept", "rule", "memory", "recap"}.issubset(roles):
+            return []
+    return [
+        "per-character effect spans are not rendered by the current final route; "
+        "use designed mode with a complete design-role set or remove the effects "
+        "(caption compositor lands in Phase 1b)"
+    ]
+
+
 def approval_prerequisite_errors(
     project_dir: Path,
     manifest: dict[str, Any],
@@ -622,6 +612,7 @@ def approval_prerequisite_errors(
     if gate == "final":
         if not approval_is_current(project_dir, manifest, "timeline", state):
             errors.append("timeline must be approved for its current revision first")
+        errors.extend(effect_span_final_errors(state, active_clip))
         if approved_destructive_deletes(project_dir):
             errors.append(
                 "reviewed delete decisions are not applied by the page-editor renderer; "
@@ -2056,6 +2047,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "state": state,
                 "platform_presets": PLATFORM_PRESETS,
                 "director_presets": DIRECTOR_PRESETS,
+                "viral_structure_plan": read_json(
+                    project / "working/viral_structure_plan.json", None
+                ),
+                "narrative_plan": read_json(
+                    project / "working/narrative_edit_plan.json", None
+                ),
                 "video_templates": public_template_catalog(),
                 "template_capabilities": {
                     "cutout": {

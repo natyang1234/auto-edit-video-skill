@@ -703,6 +703,22 @@ def render_project(
             }
             if set(DESIGN_ROLES).issubset(roles):
                 visual_source = ensure_graphic_package(project_dir, state, manifest, clip)
+        if quality == "final" and visual_source is None:
+            # Interim gate (PRD M6): the drawtext route drops per-character
+            # effect spans entirely. Never let an approved final silently lose
+            # styling the editor showed — fail closed until the caption
+            # compositor (Phase 1b) renders spans on this route.
+            spans_present = any(
+                overlay.get("effect_spans")
+                for overlay in state.get("overlays", [])
+                if isinstance(overlay, dict) and overlay.get("visible", True)
+            )
+            if spans_present:
+                raise ValueError(
+                    "per-character effect spans cannot be rendered by the current "
+                    "final route; switch to designed mode with a complete design-role "
+                    "set, or remove the effects (caption compositor lands in Phase 1b)"
+                )
         command = build_render_command(
             project_dir,
             state,

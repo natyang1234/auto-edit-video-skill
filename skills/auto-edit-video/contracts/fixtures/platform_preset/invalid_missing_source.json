@@ -16,7 +16,10 @@
    },
    "source_checked_at": "2026-08-04T03:00:00",
    "status": "verified",
-   "review_due_at": "2026-11-02T00:00:00"
+   "review_due_at": "2026-11-02T00:00:00",
+   "cover_width": 420,
+   "cover_height": 654,
+   "basis": "test"
   }
  ]
 }

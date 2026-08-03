@@ -1,0 +1,131 @@
+{
+ "schema_version": 1,
+ "presets": [
+  {
+   "id": "instagram-reels",
+   "label": "Instagram Reels",
+   "width": 1080,
+   "height": 1920,
+   "aspect": "9:16",
+   "fps": 30,
+   "cover_width": 420,
+   "cover_height": 654,
+   "basis": "Meta allows 1.91:1–9:16; this is the editor's full-screen preset",
+   "safe": {
+    "top": 8,
+    "right": 8,
+    "bottom": 18,
+    "left": 8
+   },
+   "source_url": "https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media",
+   "source_checked_at": "2026-08-04T08:10:00",
+   "status": "working",
+   "review_due_at": "2026-11-02T00:00:00"
+  },
+  {
+   "id": "youtube-shorts",
+   "label": "YouTube Shorts",
+   "width": 1080,
+   "height": 1920,
+   "aspect": "9:16",
+   "fps": 30,
+   "cover_width": 1080,
+   "cover_height": 1920,
+   "basis": "YouTube classifies square or vertical videos up to 3 minutes as Shorts",
+   "safe": {
+    "top": 7,
+    "right": 11,
+    "bottom": 17,
+    "left": 7
+   },
+   "source_url": "https://support.google.com/youtube/answer/10059070",
+   "source_checked_at": "2026-08-04T08:10:00",
+   "status": "working",
+   "review_due_at": "2026-11-02T00:00:00"
+  },
+  {
+   "id": "youtube-landscape",
+   "label": "YouTube 16:9",
+   "width": 1920,
+   "height": 1080,
+   "aspect": "16:9",
+   "fps": 30,
+   "cover_width": 1280,
+   "cover_height": 720,
+   "basis": "YouTube's standard desktop aspect ratio is 16:9",
+   "safe": {
+    "top": 6,
+    "right": 6,
+    "bottom": 10,
+    "left": 6
+   },
+   "source_url": "https://support.google.com/youtube/answer/6375112",
+   "source_checked_at": "2026-08-04T08:10:00",
+   "status": "working",
+   "review_due_at": "2026-11-02T00:00:00"
+  },
+  {
+   "id": "tiktok",
+   "label": "TikTok",
+   "width": 1080,
+   "height": 1920,
+   "aspect": "9:16",
+   "fps": 30,
+   "cover_width": 1080,
+   "cover_height": 1920,
+   "basis": "TikTok recommends full-screen 9:16 and at least 720p",
+   "safe": {
+    "top": 8,
+    "right": 14,
+    "bottom": 20,
+    "left": 8
+   },
+   "source_url": "https://developers.tiktok.com/doc/content-posting-api-media-transfer-guide",
+   "source_checked_at": "2026-08-04T08:10:00",
+   "status": "working",
+   "review_due_at": "2026-11-02T00:00:00"
+  },
+  {
+   "id": "xiaohongshu-portrait",
+   "label": "小紅書 3:4",
+   "width": 1080,
+   "height": 1440,
+   "aspect": "3:4",
+   "fps": 30,
+   "cover_width": 1080,
+   "cover_height": 1440,
+   "basis": "editorial working preset; current public official video-post spec not verified",
+   "safe": {
+    "top": 7,
+    "right": 8,
+    "bottom": 14,
+    "left": 8
+   },
+   "source_url": "https://open.xiaohongshu.com",
+   "source_checked_at": "2026-08-04T08:10:00",
+   "status": "working",
+   "review_due_at": "2026-11-02T00:00:00"
+  },
+  {
+   "id": "xiaohongshu-full",
+   "label": "小紅書 9:16",
+   "width": 1080,
+   "height": 1920,
+   "aspect": "9:16",
+   "fps": 30,
+   "cover_width": 1080,
+   "cover_height": 1440,
+   "basis": "editorial working preset; current public official video-post spec not verified",
+   "safe": {
+    "top": 8,
+    "right": 10,
+    "bottom": 18,
+    "left": 8
+   },
+   "source_url": "https://open.xiaohongshu.com",
+   "source_checked_at": "2026-08-04T08:10:00",
+   "status": "working",
+   "review_due_at": "2026-11-02T00:00:00"
+  }
+ ]
+}

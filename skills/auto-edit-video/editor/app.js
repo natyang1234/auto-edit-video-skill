@@ -340,7 +340,10 @@ function populatePresets() {
   Object.entries(projectPayload.platform_presets).forEach(([id, preset]) => {
     const option = document.createElement("option");
     option.value = id;
-    option.textContent = preset.label;
+    const stale =
+      preset.review_due_at && Date.parse(preset.review_due_at) < Date.now();
+    option.textContent = stale ? `${preset.label}（規格待重核）` : preset.label;
+    if (stale) option.title = `平台規格核對已過期：${preset.review_due_at}`;
     elements["platform-select"].append(option);
   });
   elements["director-select"].replaceChildren();
@@ -1003,6 +1006,55 @@ function captionReplacedAtTime(overlay, time) {
     && isFullScreenHook(item)
     && time >= Number(item.start)
     && time < Number(item.end));
+}
+
+function renderFormulaPanel(payload) {
+  const host = document.getElementById("highlight-list");
+  if (!host || !payload || !payload.viral_structure_plan) return;
+  const plan = payload.viral_structure_plan;
+  const narrative = payload.narrative_plan;
+  let box = document.getElementById("formula-panel");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "formula-panel";
+    box.style.cssText =
+      "margin:8px 0;padding:8px;border:1px solid var(--line,#8a7f6d);" +
+      "font-size:12px;line-height:1.5;background:rgba(0,0,0,0.04)";
+    host.parentElement.insertBefore(box, host);
+  }
+  const selected = plan.selected || {};
+  const candidate = (plan.candidates || []).find(
+    (item) => item.idea_id === selected.idea_id
+  );
+  const warnings = []
+    .concat(candidate ? candidate.warnings || [] : [])
+    .concat(narrative ? narrative.warnings || [] : []);
+  const reanchor = narrative && narrative.reanchor ? narrative.reanchor.status : null;
+  box.innerHTML = "";
+  const title = document.createElement("strong");
+  title.textContent = `敘事公式：${selected.formula || "—"}`;
+  box.appendChild(title);
+  const meta = document.createElement("div");
+  meta.textContent =
+    `candidate ${selected.idea_id || "—"}｜integrity ` +
+    `${candidate ? candidate.integrity_gate : "—"}` +
+    (reanchor ? `｜evidence re-anchor：${reanchor}` : "");
+  box.appendChild(meta);
+  if (narrative && Array.isArray(narrative.segments)) {
+    const segments = document.createElement("div");
+    segments.textContent =
+      "段落：" +
+      narrative.segments
+        .map((seg) => `${seg.purpose} ${seg.source_start}s–${seg.source_end}s`)
+        .join("｜");
+    box.appendChild(segments);
+  }
+  for (const warning of warnings) {
+    const line = document.createElement("div");
+    line.style.color = "#a33";
+    line.textContent = `⚠ ${warning}`;
+    box.appendChild(line);
+  }
 }
 
 function renderPreviewOverlays(force = false) {
@@ -2526,6 +2578,7 @@ async function initialize() {
   bindEvents();
   try {
     projectPayload = await request("/api/project");
+    renderFormulaPanel(projectPayload);
     state = projectPayload.state;
     selectedOverlayId = state.review?.selected_overlay_id || state.overlays[0]?.id || null;
     sourceMediaUrl = projectPayload.media_url;
