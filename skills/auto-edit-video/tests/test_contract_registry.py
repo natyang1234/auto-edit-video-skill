@@ -16,10 +16,14 @@ from contract_registry import (  # noqa: E402
     load_artifact_text,
     load_manifest,
     load_schemas,
+    run_bundle_suite,
     run_fixture_suite,
     run_instance_suite,
     semantic_approval_receipt,
+    semantic_evidence_references,
     semantic_master_timeline,
+    semantic_structured_layer,
+    semantic_video_analysis,
     semantic_visual_plan,
     validate,
 )
@@ -120,6 +124,100 @@ class SemanticValidatorTests(unittest.TestCase):
         self.assertTrue(semantic_visual_plan(plan, broken_layers))
         self.assertEqual(semantic_visual_plan(plan, good_layers), [])
         self.assertEqual(semantic_visual_plan(plan, None), [])
+
+
+class DiscriminatedPayloadTests(unittest.TestCase):
+    def _layer(self, layer_type: str, payload: dict) -> dict:
+        return {
+            "items": [
+                {
+                    "id": "structured-layer-abcdef01",
+                    "visual_plan_item_id": "visual-beat-abcdef01",
+                    "type": layer_type,
+                    "payload": payload,
+                }
+            ]
+        }
+
+    def test_stat_requires_per_datum_evidence(self) -> None:
+        good = self._layer(
+            "stat",
+            {
+                "value": "87%",
+                "label": "留存",
+                "evidence_id": "evidence-abcdef01",
+                "source_literal": "留存是百分之八十七",
+            },
+        )
+        self.assertEqual(semantic_structured_layer(good), [])
+        bad = self._layer("stat", {"value": "87%", "label": "留存"})
+        self.assertTrue(semantic_structured_layer(bad))
+
+    def test_chart_datums_each_bind_evidence(self) -> None:
+        bad = self._layer(
+            "chart",
+            {
+                "chart_kind": "bar",
+                "datums": [{"label": "Q1", "value": 1.0, "evidence_id": "evidence-x"}],
+            },
+        )
+        self.assertTrue(
+            any("source_literal" in e for e in semantic_structured_layer(bad))
+        )
+
+    def test_dynamic_list_item_needs_evidence_or_conceptual(self) -> None:
+        bad = self._layer("dynamic_list", {"items": [{"text": "第一步"}]})
+        self.assertTrue(semantic_structured_layer(bad))
+        good = self._layer(
+            "dynamic_list", {"items": [{"text": "第一步", "conceptual": True}]}
+        )
+        self.assertEqual(semantic_structured_layer(good), [])
+
+    def test_ocr_spans_forbidden_without_engine(self) -> None:
+        analysis = {
+            "engines": {"ocr": {"status": "not_configured"}},
+            "ocr_spans": [{"start": 0, "end": 1, "text": "x", "confidence": 1.0}],
+        }
+        self.assertTrue(semantic_video_analysis(analysis))
+        analysis["ocr_spans"] = []
+        self.assertEqual(semantic_video_analysis(analysis), [])
+
+    def test_structured_beat_asset_exclusivity(self) -> None:
+        item = {
+            "id": "visual-beat-abcdef01",
+            "start": 1.0,
+            "end": 2.0,
+            "beat": "stat",
+            "structured_layer_id": "structured-layer-abcdef01",
+            "selected_asset": "asset-1",
+            "conceptual_only": True,
+            "evidence_ids": [],
+        }
+        errors = semantic_visual_plan({"items": [item]})
+        self.assertTrue(any("selected_asset" in e for e in errors))
+        item["beat"] = "broll"
+        errors = semantic_visual_plan({"items": [item]})
+        self.assertTrue(any("structured layer" in e for e in errors))
+
+
+class BundleSuiteTests(unittest.TestCase):
+    def test_bundle_suite_is_green(self) -> None:
+        valid_count, invalid_count, failures = run_bundle_suite()
+        self.assertEqual(failures, [])
+        self.assertGreaterEqual(valid_count, 1)
+        self.assertGreaterEqual(invalid_count, 2)
+
+    def test_unknown_evidence_is_rejected_at_bundle_level(self) -> None:
+        evidence_map = {
+            "schema_version": 1,
+            "source_sha256": "a" * 64,
+            "transcript_revision": "a" * 64,
+            "items": [],
+            "revision": "a" * 64,
+        }
+        artifact = {"evidence_ids": ["evidence-nope"]}
+        errors = semantic_evidence_references(artifact, evidence_map)
+        self.assertTrue(any("unknown evidence id" in e for e in errors))
 
 
 class FixtureSuiteTests(unittest.TestCase):

@@ -1,0 +1,53 @@
+{
+ "schema_version": 1,
+ "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "engines": {
+  "ffprobe": {
+   "name": "ffprobe",
+   "version": "7.0",
+   "status": "present"
+  },
+  "asr": {
+   "name": "openai-whisper",
+   "version": "2024",
+   "status": "present"
+  },
+  "ocr": {
+   "name": "none",
+   "version": "",
+   "status": "not_configured"
+  },
+  "shot_detector": {
+   "name": "ffprobe",
+   "version": "7.0",
+   "status": "present"
+  }
+ },
+ "duration_s": 61.9,
+ "width": 384,
+ "height": 848,
+ "fps": 30.0,
+ "loudness_lufs": -16.2,
+ "silences": [
+  {
+   "start": 1.0,
+   "end": 2.0
+  }
+ ],
+ "shots": [
+  {
+   "start": 0,
+   "end": 5,
+   "kind": "aroll"
+  }
+ ],
+ "ocr_spans": [
+  {
+   "start": 0,
+   "end": 1,
+   "text": "幽靈OCR",
+   "confidence": 0.9
+  }
+ ],
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

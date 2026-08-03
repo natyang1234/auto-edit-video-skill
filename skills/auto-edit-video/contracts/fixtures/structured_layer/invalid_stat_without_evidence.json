@@ -10,7 +10,6 @@
    "payload": {
     "value": "87%",
     "label": "留存",
-    "evidence_id": "evidence-abcdef01",
     "source_literal": "我們的留存是百分之八十七"
    },
    "review_status": "pending"

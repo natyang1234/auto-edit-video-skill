@@ -4,14 +4,19 @@
   {
    "id": "structured-layer-abcdef01",
    "visual_plan_item_id": "visual-beat-abcdef01",
-   "type": "stat",
+   "type": "chart",
    "revision": 1,
    "evidence_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
    "payload": {
-    "value": "87%",
-    "label": "留存",
-    "evidence_id": "evidence-abcdef01",
-    "source_literal": "我們的留存是百分之八十七"
+    "chart_kind": "bar",
+    "datums": [
+     {
+      "label": "Q1",
+      "value": 87.0,
+      "evidence_id": "evidence-abcdef01",
+      "source_literal": "Q1 是八十七"
+     }
+    ]
    },
    "review_status": "pending"
   }

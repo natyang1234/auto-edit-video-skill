@@ -169,6 +169,96 @@ def validate(value, schema, path: str = "$") -> list[str]:
 # express. Each returns a list of error strings.
 # ---------------------------------------------------------------------------
 
+STRUCTURED_BEATS = {"title", "stat", "chart", "dynamic_list"}
+TITLE_KINDS = {"full-screen-hook", "section", "lower-third", "quote", "hero-stat"}
+
+
+def _nonempty_str(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def semantic_structured_layer(layers) -> list[str]:
+    """Discriminated payload rules: factual layers bind evidence per datum."""
+    errors = []
+    for index, item in enumerate(layers.get("items", [])):
+        path = f"$.items[{index}].payload"
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            errors.append(f"{path}: must be an object")
+            continue
+        layer_type = item.get("type")
+        if layer_type == "title":
+            if payload.get("title_kind") not in TITLE_KINDS:
+                errors.append(f"{path}.title_kind: must be one of {sorted(TITLE_KINDS)}")
+            if not _nonempty_str(payload.get("title")):
+                errors.append(f"{path}.title: non-empty title required")
+        elif layer_type == "stat":
+            if not _nonempty_str(payload.get("label")):
+                errors.append(f"{path}.label: non-empty label required")
+            value = payload.get("value")
+            if not (_nonempty_str(value) or isinstance(value, (int, float))):
+                errors.append(f"{path}.value: stat value required")
+            if not _nonempty_str(payload.get("evidence_id")):
+                errors.append(f"{path}.evidence_id: every stat must bind evidence")
+            if not _nonempty_str(payload.get("source_literal")):
+                errors.append(f"{path}.source_literal: stat must quote its source")
+        elif layer_type == "chart":
+            if not _nonempty_str(payload.get("chart_kind")):
+                errors.append(f"{path}.chart_kind: required")
+            datums = payload.get("datums")
+            if not isinstance(datums, list) or not datums:
+                errors.append(f"{path}.datums: at least one datum required")
+            else:
+                for datum_index, datum in enumerate(datums):
+                    datum_path = f"{path}.datums[{datum_index}]"
+                    if not isinstance(datum, dict):
+                        errors.append(f"{datum_path}: must be an object")
+                        continue
+                    if not _nonempty_str(datum.get("label")):
+                        errors.append(f"{datum_path}.label: required")
+                    if isinstance(datum.get("value"), bool) or not isinstance(
+                        datum.get("value"), (int, float)
+                    ):
+                        errors.append(f"{datum_path}.value: numeric value required")
+                    if not _nonempty_str(datum.get("evidence_id")):
+                        errors.append(
+                            f"{datum_path}.evidence_id: every chart datum must bind evidence"
+                        )
+                    if not _nonempty_str(datum.get("source_literal")):
+                        errors.append(
+                            f"{datum_path}.source_literal: chart datum must quote its source"
+                        )
+        elif layer_type == "dynamic_list":
+            entries = payload.get("items")
+            if not isinstance(entries, list) or not entries:
+                errors.append(f"{path}.items: at least one list item required")
+            else:
+                for entry_index, entry in enumerate(entries):
+                    entry_path = f"{path}.items[{entry_index}]"
+                    if not isinstance(entry, dict) or not _nonempty_str(entry.get("text")):
+                        errors.append(f"{entry_path}.text: required")
+                        continue
+                    if not _nonempty_str(entry.get("evidence_id")) and entry.get(
+                        "conceptual"
+                    ) is not True:
+                        errors.append(
+                            f"{entry_path}: needs evidence_id or explicit conceptual:true"
+                        )
+    return errors
+
+
+def semantic_video_analysis(analysis) -> list[str]:
+    """OCR is an optional capability: absent engine ⇒ no ocr fields at all."""
+    engines = analysis.get("engines", {})
+    ocr = engines.get("ocr", {}) if isinstance(engines, dict) else {}
+    if ocr.get("status") == "not_configured" and analysis.get("ocr_spans"):
+        return [
+            "$.ocr_spans: must be empty while engines.ocr.status is not_configured "
+            "(contracts/policies/ANALYSIS_ENGINE.md)"
+        ]
+    return []
+
+
 def semantic_visual_plan(visual_plan, structured_layers=None) -> list[str]:
     errors = []
     layer_by_id = None
@@ -182,6 +272,14 @@ def semantic_visual_plan(visual_plan, structured_layers=None) -> list[str]:
         beat = item.get("beat")
         if beat in {"stat", "chart", "dynamic_list"} and not conceptual and not item.get("evidence_ids"):
             errors.append(f"{path}: factual beat requires evidence_ids unless conceptual_only")
+        if beat in STRUCTURED_BEATS:
+            if item.get("structured_layer_id") is None:
+                errors.append(f"{path}: structured beat requires structured_layer_id")
+            if item.get("selected_asset") is not None:
+                errors.append(f"{path}: structured beat must keep selected_asset null")
+        else:
+            if item.get("structured_layer_id") is not None:
+                errors.append(f"{path}: non-structured beat must not bind a structured layer")
         layer_id = item.get("structured_layer_id")
         # Cross-artifact back-reference check only runs when the layer bundle
         # is supplied; standalone fixture validation has no bundle context.
@@ -253,7 +351,39 @@ SEMANTIC_VALIDATORS = {
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
     "master_timeline": semantic_master_timeline,
     "approval_receipt": semantic_approval_receipt,
+    "structured_layer": semantic_structured_layer,
+    "video_analysis": semantic_video_analysis,
 }
+
+
+def validate_bundle(artifacts: dict[str, dict]) -> list[str]:
+    """Cross-artifact validation over a bundle of already-schema-valid artifacts.
+
+    Rules: evidence references must resolve against the bundle's evidence_map;
+    visual_plan ↔ structured_layer back-references must agree (timing SSOT).
+    """
+    errors: list[str] = []
+    for name, artifact in artifacts.items():
+        schema_errors = validate_artifact(name, artifact)
+        errors.extend(f"{name}: {error}" for error in schema_errors)
+    if errors:
+        return errors
+    evidence_map = artifacts.get("evidence_map")
+    if evidence_map is not None:
+        for name in ("content_analysis", "visual_plan", "structured_layer"):
+            artifact = artifacts.get(name)
+            if artifact is not None:
+                errors.extend(
+                    f"{name}: {error}"
+                    for error in semantic_evidence_references(artifact, evidence_map)
+                )
+    visual_plan = artifacts.get("visual_plan")
+    if visual_plan is not None and "structured_layer" in artifacts:
+        errors.extend(
+            f"visual_plan: {error}"
+            for error in semantic_visual_plan(visual_plan, artifacts["structured_layer"])
+        )
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +462,53 @@ def run_fixture_suite() -> tuple[int, int, list[str]]:
     return valid_count, invalid_count, failures
 
 
+BUNDLE_DIR = FIXTURE_DIR / "bundles"
+
+
+def run_bundle_suite() -> tuple[int, int, list[str]]:
+    """Validate cross-artifact bundle fixtures.
+
+    A bundle directory holds one JSON per schema name plus ``expect.json``
+    with {"valid": bool, "error_contains": str}.
+    """
+    failures: list[str] = []
+    valid_count = invalid_count = 0
+    if not BUNDLE_DIR.is_dir():
+        return 0, 0, ["no bundle fixtures directory"]
+    bundle_dirs = sorted(p for p in BUNDLE_DIR.iterdir() if p.is_dir())
+    if not bundle_dirs:
+        failures.append("no bundle fixtures found")
+    for bundle_dir in bundle_dirs:
+        expect_path = bundle_dir / "expect.json"
+        try:
+            expect = load_artifact_text(expect_path.read_text("utf-8"))
+            artifacts = {
+                entry.stem: load_artifact_text(entry.read_text("utf-8"))
+                for entry in sorted(bundle_dir.glob("*.json"))
+                if entry.name != "expect.json"
+            }
+            errors = validate_bundle(artifacts)
+        except (OSError, ValueError) as exc:
+            failures.append(f"{bundle_dir.name}: {exc}")
+            continue
+        if expect.get("valid"):
+            if errors:
+                failures.append(f"{bundle_dir.name}: expected valid, got {errors[0]}")
+            else:
+                valid_count += 1
+        else:
+            needle = str(expect.get("error_contains") or "")
+            if not errors:
+                failures.append(f"{bundle_dir.name}: expected rejection but bundle is clean")
+            elif needle and not any(needle in error for error in errors):
+                failures.append(
+                    f"{bundle_dir.name}: no error mentions {needle!r} (got {errors[0]})"
+                )
+            else:
+                invalid_count += 1
+    return valid_count, invalid_count, failures
+
+
 def run_instance_suite() -> list[str]:
     failures = []
     for instance in sorted(INSTANCE_DIR.glob("*.json")):
@@ -356,10 +533,13 @@ def main(argv: list[str]) -> int:
         print(f"FAIL schema load: {exc}", file=sys.stderr)
         return 1
     valid_count, invalid_count, failures = run_fixture_suite()
+    bundle_valid, bundle_invalid, bundle_failures = run_bundle_suite()
+    failures.extend(bundle_failures)
     failures.extend(run_instance_suite())
     print(
         f"schemas={len(schemas)} valid_fixtures_passed={valid_count} "
-        f"invalid_fixtures_rejected={invalid_count}"
+        f"invalid_fixtures_rejected={invalid_count} "
+        f"bundles_valid={bundle_valid} bundles_rejected={bundle_invalid}"
     )
     if failures:
         for failure in failures:

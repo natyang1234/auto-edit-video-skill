@@ -14,8 +14,12 @@ overlays 且遇已核可 delete 拒繪 final。`source_cut.mp4` timeline rendere
    **post-cut timeline** 表示，renderer 負責映射回 source ranges。
 3. **`render_cut.py` 降級 legacy**：僅保留舊專案相容；不得再產生統一管線讀不到的中間產物
    （`cut_map.json`、`source_cut.mp4` 進入唯讀凍結）。agent-first cut-only 流程改走統一管線。
-4. **單向遷移**：`edit_decisions.json` 的 approved deletes 在 v1→v2 migration 時轉換為
-   segments（刪除段＝不出現在 segments 序列），之後 `edit_decisions.json` 唯讀存查。
+4. **單向遷移（v1→v2 不轉換 deletes）**：migration 一律建立單一全長 segment
+   （`origin: default_full_source`），**不**讀取 `edit_decisions.json`——把 approved deletes
+   正確轉成 segments 需要統一 renderer 的 post-cut 時間軸映射，那是 Phase 1a 的工作。
+   安全性由既有 fail-closed 檢查保證：只要存在 approved delete，editor 渲染路徑就拒絕
+   final（`approved_destructive_deletes` 檢查原樣保留），因此刪除段不可能被靜默重新納入
+   輸出。Phase 1a 落地 segments 轉換後，`edit_decisions.json` 才轉唯讀存查。
 5. **Invalidation**：segments 任何變更→editor_state revision 變更→timeline／final approvals
    失效（沿用既有 revision-bound gate 機制）。
 

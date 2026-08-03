@@ -1,0 +1,94 @@
+{
+ "schema_version": 1,
+ "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "engine": {
+  "id": "claude-agent",
+  "kind": "agent",
+  "model": "claude",
+  "version": "1",
+  "prompt_policy_version": "p1"
+ },
+ "generated_at": "2026-08-04T03:00:00",
+ "frozen": true,
+ "truth_map": {
+  "main_topics": [
+   {
+    "text": "主題",
+    "evidence_ids": [
+     "evidence-abcdef01"
+    ]
+   }
+  ],
+  "target_audience": {
+   "text": "受眾",
+   "evidence_ids": [
+    "evidence-abcdef01"
+   ]
+  },
+  "promises": [
+   {
+    "text": "承諾",
+    "evidence_ids": [
+     "evidence-abcdef01"
+    ]
+   }
+  ],
+  "methods": [
+   {
+    "text": "方法",
+    "evidence_ids": [
+     "evidence-abcdef01"
+    ]
+   }
+  ],
+  "proofs": [
+   {
+    "text": "證據",
+    "evidence_ids": [
+     "evidence-abcdef01"
+    ]
+   }
+  ],
+  "stories": [
+   {
+    "text": "故事",
+    "evidence_ids": [
+     "evidence-abcdef01"
+    ]
+   }
+  ],
+  "cta": [
+   {
+    "text": "CTA",
+    "evidence_ids": [
+     "evidence-abcdef01"
+    ]
+   }
+  ]
+ },
+ "retention_risks": [
+  {
+   "start": 0,
+   "end": 3,
+   "kind": "slow_open",
+   "note": ""
+  }
+ ],
+ "idea_candidates": [
+  {
+   "id": "idea-abcdef01",
+   "thesis": "論點",
+   "source_ranges": [
+    {
+     "start": 0,
+     "end": 9
+    }
+   ],
+   "payoff": "收穫",
+   "evidence_ids": [
+    "evidence-deadbeef"
+   ]
+  }
+ ],
+ "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

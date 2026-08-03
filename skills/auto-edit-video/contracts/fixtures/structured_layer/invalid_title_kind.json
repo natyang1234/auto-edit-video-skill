@@ -4,14 +4,12 @@
   {
    "id": "structured-layer-abcdef01",
    "visual_plan_item_id": "visual-beat-abcdef01",
-   "type": "stat",
+   "type": "title",
    "revision": 1,
    "evidence_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
    "payload": {
-    "value": "87%",
-    "label": "留存",
-    "evidence_id": "evidence-abcdef01",
-    "source_literal": "我們的留存是百分之八十七"
+    "title_kind": "jumbo",
+    "title": "哈"
    },
    "review_status": "pending"
   }

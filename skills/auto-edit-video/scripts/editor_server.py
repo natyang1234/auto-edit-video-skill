@@ -67,7 +67,7 @@ ALLOWED_ASSET_MIME_TYPES = {
 }
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_ASSET_BYTES = 50 * 1024 * 1024
-GATES = {"destructive_edit", "highlight_selection", "timeline", "final"}
+GATES = ("destructive_edit", "highlight_selection", "timeline", "final")
 VOICE_LANGUAGES = {"zh-TW", "zh-CN", "en-US", "en-GB"}
 VOICE_GENDERS = {"female", "male"}
 
@@ -339,6 +339,22 @@ def migrate_editor_state_v1_to_v2(
     """
     if not isinstance(state, dict) or state.get("schema_version") != 1:
         return state, False
+    # Transaction order matters: void the approvals FIRST. If the state write
+    # below fails, the surviving combination is "voided approvals + v1 state",
+    # which the next load retries (voiding again is idempotent). The reverse
+    # order could leave a v2 state with live v1 approvals — a fake-approval
+    # state that no later pass would repair.
+    approvals = manifest.setdefault("approvals", {})
+    for gate in GATES:
+        approvals[gate] = {
+            "approved": False,
+            "confirmed_by": None,
+            "at": None,
+            "note": MIGRATION_REASON,
+            "invalidated_at": now_utc(),
+        }
+    manifest["updated_at"] = now_utc()
+    atomic_write_json(project_dir / "project.json", manifest)
     previous_revision = str(state.get("revision") or "")
     state["schema_version"] = EDITOR_STATE_SCHEMA_VERSION
     state["segments"] = default_source_segments(manifest)
@@ -353,17 +369,6 @@ def migrate_editor_state_v1_to_v2(
     state["updated_at"] = now_utc()
     state["revision"] = editor_state_revision(state)
     atomic_write_json(project_dir / STATE_REL, state)
-    approvals = manifest.setdefault("approvals", {})
-    for gate in GATES:
-        approvals[gate] = {
-            "approved": False,
-            "confirmed_by": None,
-            "at": None,
-            "note": MIGRATION_REASON,
-            "invalidated_at": now_utc(),
-        }
-    manifest["updated_at"] = now_utc()
-    atomic_write_json(project_dir / "project.json", manifest)
     return state, True
 
 
@@ -397,6 +402,11 @@ def gate_revision(
     current_state = state
     if current_state is None:
         current_state = read_json(project_dir / STATE_REL, {}) or {}
+    if current_state.get("schema_version") == 1:
+        raise ValueError(
+            "editor_state schema_version 1 must be migrated first; open the "
+            "editor page once to run the v1→v2 migration"
+        )
     if gate == "highlight_selection":
         return canonical_revision(
             {
@@ -425,10 +435,15 @@ def approval_is_current(
     state: dict[str, Any] | None = None,
 ) -> bool:
     approval = manifest.get("approvals", {}).get(gate, {})
+    try:
+        expected_revision = gate_revision(project_dir, gate, state)
+    except ValueError:
+        # Un-migrated v1 state: no approval can be considered current.
+        return False
     current = bool(
         isinstance(approval, dict)
         and approval.get("approved")
-        and approval.get("state_revision") == gate_revision(project_dir, gate, state)
+        and approval.get("state_revision") == expected_revision
     )
     if current and gate == "final":
         current = not delivery_qa_errors(
@@ -617,8 +632,16 @@ def approval_prerequisite_errors(
 
 
 def approval_revisions(project_dir: Path, state: dict[str, Any] | None = None) -> dict[str, str]:
+    def safe_revision(gate: str) -> str:
+        try:
+            return gate_revision(project_dir, gate, state)
+        except ValueError:
+            # Un-migrated v1 state: expose a non-hex sentinel no approval can
+            # ever match instead of failing the whole status route.
+            return "unmigrated-editor-state-v1"
+
     return {
-        gate: gate_revision(project_dir, gate, state)
+        gate: safe_revision(gate)
         for gate in sorted(GATES)
     }
 

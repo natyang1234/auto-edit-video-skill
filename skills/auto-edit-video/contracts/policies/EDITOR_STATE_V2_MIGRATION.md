@@ -2,8 +2,17 @@
 
 ## 觸發與流程
 EditorServer 載入 `schema_version:1` 的 `editor_state.json` 時呼叫
-`migrate_editor_state_v1_to_v2()`：升級→原子落盤（`atomic_write_json`）→逐 gate 覆寫
-approval→記 `migrated_from`。升級是顯式一次性動作，之後只接受 v2。
+`migrate_editor_state_v1_to_v2()`。**交易順序＝先 void approvals、後寫 state**：
+1. 逐 gate 覆寫 manifest approval（`approved:false`＋migration note）→ 原子落盤。
+2. 升級 state（segments/variants/rights/migrated_from）→ 原子落盤。
+
+若步驟 2 失敗，留下的是「approvals 已 void＋state 仍為 v1」——下次載入會重跑 migration
+（重覆 void 是冪等的），不存在需要人工修復的半寫狀態。反向順序（先寫 state）會留下
+「v2 state＋存活的 v1 approvals」假核可組合且永不自癒，故禁止。
+
+其他 state 消費者（CLI `approve`、renderer 直跑、`/api/approval-revisions`）遇到 v1 state
+一律 fail closed（報錯要求先開 editor 頁觸發 migration；status 路由回 sentinel revision），
+不得自行升級或沿用。
 
 ## 新欄位與 default
 | 欄位 | default | 語意 |

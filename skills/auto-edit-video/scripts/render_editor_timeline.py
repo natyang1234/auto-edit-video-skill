@@ -552,6 +552,11 @@ def render_project(
     if snapshot_path is None:
         manifest = read_json(project_dir / "project.json", {}) or {}
         state = read_json(project_dir / "working/editor_state.json", {}) or {}
+        if state.get("schema_version") == 1:
+            raise SystemExit(
+                "editor_state schema_version 1 must be migrated first; open the "
+                "editor page once to run the v1→v2 migration"
+            )
         clip = None
         if quality == "final":
             approval = manifest.get("approvals", {}).get("timeline", {})

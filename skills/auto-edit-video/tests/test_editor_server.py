@@ -23,12 +23,15 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import editor_server  # noqa: E402
 from editor_server import (  # noqa: E402
     EditorServer,
     caption_effect_spans,
     editor_state_revision,
     extract_effect_keywords,
     gate_revision,
+    migrate_editor_state_v1_to_v2,
+    render_download_errors,
     validate_editor_state,
 )
 from render_editor_timeline import build_render_command, text_filter  # noqa: E402
@@ -1643,6 +1646,127 @@ class EditorServerTests(unittest.TestCase):
             status, 403, "state change must re-lock the final download gate"
         )
 
+    def test_tampered_final_output_is_blocked_even_with_approval(self) -> None:
+        self._install_synthetic_final_delivery()
+        status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
+        self.assertEqual(status, 200)
+        (self.project / "renders/final-ok.mp4").write_bytes(b"tampered-bytes")
+        status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
+        self.assertEqual(status, 403, "hash mismatch must block the download")
+
+    def test_final_receipt_wins_over_preview_receipt_for_same_path(self) -> None:
+        (self.project / "renders/collide.mp4").write_bytes(b"collide-bytes")
+        self.write_json(
+            "working/render_receipts/render-a.json",
+            {
+                "schema_version": 1,
+                "render_id": "render-a",
+                "quality": "preview",
+                "output": "renders/collide.mp4",
+            },
+        )
+        self.write_json(
+            "working/render_receipts/render-b.json",
+            {
+                "schema_version": 1,
+                "render_id": "render-b",
+                "quality": "final",
+                "output": "renders/collide.mp4",
+            },
+        )
+        status, _headers, _body = self.request("GET", "/renders/collide.mp4")
+        self.assertEqual(
+            status, 403, "a path with any final receipt must be gated as final"
+        )
+
+    def test_batch_archive_requires_final_approval(self) -> None:
+        self.write_json(
+            "working/latest_final_qa.json",
+            {
+                "schema_version": 2,
+                "status": "pass",
+                "archive": "renders/batch.zip",
+                "archive_sha256": "b" * 64,
+                "items": [],
+            },
+        )
+        errors = render_download_errors(self.project, "renders/batch.zip")
+        self.assertTrue(errors)
+        self.assertIn("final", errors[0])
+
+    def test_migration_state_write_failure_leaves_recoverable_v1(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        for key in ("segments", "variants", "rights", "migrated_from"):
+            state.pop(key, None)
+        state["schema_version"] = 1
+        self.write_json("working/editor_state.json", state)
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        manifest["approvals"] = {
+            gate: {"approved": True, "state_revision": "0" * 64}
+            for gate in ("destructive_edit", "highlight_selection", "timeline", "final")
+        }
+        self.write_json("project.json", manifest)
+
+        real_write = editor_server.atomic_write_json
+
+        def explode_on_state(path, payload):
+            if path.name == "editor_state.json":
+                raise OSError("disk full (simulated)")
+            real_write(path, payload)
+
+        with patch.object(editor_server, "atomic_write_json", explode_on_state):
+            with self.assertRaises(OSError):
+                migrate_editor_state_v1_to_v2(
+                    self.project,
+                    json.loads(
+                        (self.project / "project.json").read_text(encoding="utf-8")
+                    ),
+                    json.loads(
+                        (self.project / "working/editor_state.json").read_text(
+                            encoding="utf-8"
+                        )
+                    ),
+                )
+        on_disk_state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            on_disk_state["schema_version"], 1, "failed migration must keep v1 on disk"
+        )
+        manifest_after = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        for gate in ("destructive_edit", "highlight_selection", "timeline", "final"):
+            self.assertFalse(
+                manifest_after["approvals"][gate]["approved"],
+                "approvals must be voided before the state write can fail",
+            )
+        status, _headers, _body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        recovered = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            recovered["schema_version"], 2, "next load must complete the migration"
+        )
+
+    def test_v1_state_fails_closed_outside_the_editor_page(self) -> None:
+        with self.assertRaises(ValueError):
+            gate_revision(self.project, "timeline", {"schema_version": 1})
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["schema_version"] = 1
+        for key in ("segments", "variants", "rights", "migrated_from"):
+            state.pop(key, None)
+        self.write_json("working/editor_state.json", state)
+        status, _headers, body = self.request("GET", "/api/approval-revisions")
+        self.assertEqual(status, 200)
+        revisions = json.loads(body.decode("utf-8"))["revisions"]
+        self.assertEqual(revisions["timeline"], "unmigrated-editor-state-v1")
+
 
 
 class EditorRendererTests(unittest.TestCase):
@@ -1696,7 +1820,17 @@ class EditorRendererTests(unittest.TestCase):
         self.write_json(
             "working/editor_state.json",
             {
-                "schema_version": 1,
+                "schema_version": 2,
+                "segments": [
+                    {
+                        "id": "segment-abcdef012345",
+                        "source_start": 0.0,
+                        "source_end": 0.45,
+                        "origin": "default_full_source",
+                    }
+                ],
+                "variants": [],
+                "rights": {"asserted": False, "assertion_revision": None},
                 "canvas": {
                     "platform_id": "instagram-reels",
                     "width": 360,
