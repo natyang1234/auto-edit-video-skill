@@ -1466,6 +1466,38 @@ FOLDER_ROLE_BY_KIND = {
 FOLDER_IMPORT_MAX_FILES = 5000
 
 
+def cmd_analyze_video(args: argparse.Namespace) -> int:
+    """Whole-video technical analysis with stage-level checkpoint cache."""
+    try:
+        import video_analyzer
+    except ImportError as exc:
+        return die(f"cannot load video analyzer: {exc}")
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    if not (project_dir / "project.json").is_file():
+        return die(f"project manifest not found under {project_dir}")
+    try:
+        analysis, stats = video_analyzer.analyze(project_dir)
+    except ValueError as exc:
+        return die(str(exc))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "revision": analysis["revision"],
+                "duration_s": analysis["duration_s"],
+                "shots": len(analysis["shots"]),
+                "silences": len(analysis["silences"]),
+                "ocr_spans": len(analysis["ocr_spans"]),
+                "ocr_status": analysis["engines"]["ocr"]["status"],
+                "stages": stats,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_ingest_folder(args: argparse.Namespace) -> int:
     """Folder-first ingest: inventory, main-video pick, owned copy, assets."""
     try:
@@ -4022,6 +4054,13 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--main", help="Override the main-video pick (path inside the folder)")
     ingest.add_argument("--source-language", choices=SOURCE_LANGUAGES, default="auto")
     ingest.set_defaults(func=cmd_ingest_folder)
+
+    analyze_video = sub.add_parser(
+        "analyze-video",
+        help="Whole-video technical analysis (probe/loudness/silence/shots/OCR) with resume cache",
+    )
+    analyze_video.add_argument("--project-dir", required=True)
+    analyze_video.set_defaults(func=cmd_analyze_video)
 
     narrative = sub.add_parser(
         "apply-narrative-plan",
