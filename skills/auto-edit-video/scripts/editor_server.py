@@ -14,6 +14,7 @@ import math
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from local_http_security import (
+    csrf_token_matches,
     host_header_allowed,
     is_loopback_host,
     mutation_origin_allowed,
@@ -275,6 +277,7 @@ def editor_state_revision(state: dict[str, Any]) -> str:
     payload = {
         "schema_version": state.get("schema_version"),
         "project_id": state.get("project_id"),
+        "segments": state.get("segments"),
         "canvas": {
             key: canvas.get(key)
             for key in ("platform_id", "width", "height", "fps", "fit")
@@ -295,6 +298,73 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+EDITOR_STATE_SCHEMA_VERSION = 2
+MIGRATION_REASON = (
+    "editor_state v1→v2 migration: approvals must be re-confirmed under the "
+    "unified timeline contract"
+)
+
+
+def default_source_segments(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """v2 default: one full-length source segment (unified timeline contract)."""
+    source = manifest.get("source", {}) if isinstance(manifest.get("source"), dict) else {}
+    try:
+        duration = float(source.get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    seed = f"{source.get('sha256') or ''}:full"
+    segment_id = "segment-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+    return [
+        {
+            "id": segment_id,
+            "source_start": 0.0,
+            "source_end": max(duration, 0.001),
+            "origin": "default_full_source",
+        }
+    ]
+
+
+def migrate_editor_state_v1_to_v2(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """One-way v1→v2 upgrade; persists state and explicitly voids every gate.
+
+    Contract: contracts/policies/EDITOR_STATE_V2_MIGRATION.md. Approvals are
+    overwritten to approved:false with a migration note — never left to the
+    indirect effect of a revision drift.
+    """
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        return state, False
+    previous_revision = str(state.get("revision") or "")
+    state["schema_version"] = EDITOR_STATE_SCHEMA_VERSION
+    state["segments"] = default_source_segments(manifest)
+    state["variants"] = []
+    state["rights"] = {"asserted": False, "assertion_revision": None}
+    state["migrated_from"] = {
+        "schema_version": 1,
+        "at": now_utc(),
+        "reason": MIGRATION_REASON,
+        "previous_revision": previous_revision,
+    }
+    state["updated_at"] = now_utc()
+    state["revision"] = editor_state_revision(state)
+    atomic_write_json(project_dir / STATE_REL, state)
+    approvals = manifest.setdefault("approvals", {})
+    for gate in GATES:
+        approvals[gate] = {
+            "approved": False,
+            "confirmed_by": None,
+            "at": None,
+            "note": MIGRATION_REASON,
+            "invalidated_at": now_utc(),
+        }
+    manifest["updated_at"] = now_utc()
+    atomic_write_json(project_dir / "project.json", manifest)
+    return state, True
 
 
 def canonical_revision(payload: Any) -> str:
@@ -366,6 +436,97 @@ def approval_is_current(
             state if state is not None else read_json(project_dir / STATE_REL, {}) or {},
         )
     return current
+
+
+def _delivery_receipt_paths(receipt: Any, keys: tuple[str, ...]) -> set[str]:
+    paths: set[str] = set()
+    if not isinstance(receipt, dict):
+        return paths
+    for key in keys:
+        value = receipt.get(key)
+        if value:
+            paths.add(str(value))
+    items = receipt.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in keys:
+                value = item.get(key)
+                if value:
+                    paths.add(str(value))
+    return paths
+
+
+def render_receipt_index(project_dir: Path) -> tuple[set[str], set[str]]:
+    """Classify render outputs from receipts into (final_paths, preview_paths)."""
+    final_paths: set[str] = set()
+    preview_paths: set[str] = set()
+    receipts_dir = project_dir / "working/render_receipts"
+    if receipts_dir.is_dir():
+        for entry in sorted(receipts_dir.glob("*.json")):
+            receipt = read_json(entry, None)
+            if not isinstance(receipt, dict):
+                continue
+            output = str(receipt.get("output") or "")
+            if not output:
+                continue
+            if receipt.get("quality") == "final":
+                final_paths.add(output)
+            else:
+                preview_paths.add(output)
+    delivery_dir = project_dir / "working/delivery_qa"
+    if delivery_dir.is_dir():
+        for entry in sorted(delivery_dir.glob("*.json")):
+            final_paths |= _delivery_receipt_paths(
+                read_json(entry, None), ("output", "archive")
+            )
+    final_paths |= _delivery_receipt_paths(
+        read_json(project_dir / LATEST_DELIVERY_QA_REL, None), ("output", "archive")
+    )
+    return final_paths, preview_paths
+
+
+def render_download_errors(project_dir: Path, relative: str) -> list[str]:
+    """Server-side final download gate (contracts/policies/DOWNLOAD_GATE.md).
+
+    Preview outputs and the cover image stay reachable for review; every
+    final artifact requires a current final approval AND membership in the
+    current delivery receipt (whose digests approval_is_current re-verifies).
+    Files no receipt can vouch for fail closed.
+    """
+    if relative == "renders/cover.png":
+        return []
+    final_paths, preview_paths = render_receipt_index(project_dir)
+    if relative not in final_paths:
+        if relative in preview_paths:
+            return []
+        return ["download is not covered by any render receipt"]
+    manifest = read_json(project_dir / "project.json", {}) or {}
+    state = read_json(project_dir / STATE_REL, {}) or {}
+    if not approval_is_current(project_dir, manifest, "final", state):
+        return ["final output requires a current final approval before download"]
+    current = _delivery_receipt_paths(
+        read_json(project_dir / LATEST_DELIVERY_QA_REL, None), ("output", "archive")
+    )
+    if relative not in current:
+        return ["final output is not part of the current delivery receipt"]
+    return []
+
+
+def qa_download_errors(project_dir: Path, relative: str) -> list[str]:
+    """QA evidence gate: free to read until final approval, then receipt-bound."""
+    manifest = read_json(project_dir / "project.json", {}) or {}
+    state = read_json(project_dir / STATE_REL, {}) or {}
+    if not approval_is_current(project_dir, manifest, "final", state):
+        return []
+    allowed = _delivery_receipt_paths(
+        read_json(project_dir / LATEST_DELIVERY_QA_REL, None),
+        ("report", "contact_sheet"),
+    )
+    if relative in allowed:
+        return []
+    return ["only current delivery QA evidence can be read after final approval"]
 
 
 def approval_prerequisite_errors(
@@ -1307,10 +1468,13 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             )
         )
     state = {
-        "schema_version": 1,
+        "schema_version": 2,
         "updated_at": now_utc(),
         "project_id": manifest.get("project_id"),
         "source_sha256": manifest.get("source", {}).get("sha256"),
+        "segments": default_source_segments(manifest),
+        "variants": [],
+        "rights": {"asserted": False, "assertion_revision": None},
         "highlight_plan_revision": highlight_plan.get("plan_revision"),
         "active_highlight_id": highlights[0]["id"] if highlights else None,
         "highlights": highlights,
@@ -1355,8 +1519,48 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
 
 def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     errors: list[str] = []
-    if not isinstance(state, dict) or state.get("schema_version") != 1:
-        return ["editor state schema_version must be 1"]
+    if not isinstance(state, dict):
+        return ["editor state must be an object"]
+    if state.get("schema_version") == 1:
+        return [
+            "editor state schema_version 1 must be migrated by the server first; "
+            "reload the editor page"
+        ]
+    if state.get("schema_version") != EDITOR_STATE_SCHEMA_VERSION:
+        return [f"editor state schema_version must be {EDITOR_STATE_SCHEMA_VERSION}"]
+    segments = state.get("segments")
+    if not isinstance(segments, list) or not segments:
+        errors.append("segments must be a non-empty list (unified timeline contract)")
+    else:
+        for index, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                errors.append(f"segment {index} must be an object")
+                continue
+            start = segment.get("source_start")
+            end = segment.get("source_end")
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, (int, float))
+                or not isinstance(end, (int, float))
+                or not math.isfinite(float(start))
+                or not math.isfinite(float(end))
+                or float(start) < 0
+                or float(end) <= float(start)
+            ):
+                errors.append(f"segment {index} needs 0 <= source_start < source_end")
+            if segment.get("origin") not in {
+                "narrative",
+                "manual",
+                "legacy_import",
+                "default_full_source",
+            }:
+                errors.append(f"segment {index} origin is not supported")
+    if not isinstance(state.get("variants"), list):
+        errors.append("variants must be a list")
+    rights = state.get("rights")
+    if not isinstance(rights, dict) or not isinstance(rights.get("asserted"), bool):
+        errors.append("rights must be an object with a boolean asserted flag")
     canvas = state.get("canvas")
     if not isinstance(canvas, dict):
         errors.append("canvas must be an object")
@@ -1654,6 +1858,11 @@ class EditorServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], project_dir: Path):
         super().__init__(address, EditorHandler)
         self.project_dir = project_dir.resolve()
+        # Per-server CSRF token; browsers learn it from GET /api/project and
+        # must echo it on every mutation. This blocks cross-origin browser
+        # requests only — local processes reading loopback are outside this
+        # threat model (contracts/policies/DOWNLOAD_GATE.md).
+        self.csrf_token = secrets.token_urlsafe(32)
         self.voice_catalog = load_voice_catalog()
         self.project_lock = threading.RLock()
         self.render_lock = threading.Lock()
@@ -1712,6 +1921,10 @@ class EditorHandler(BaseHTTPRequestHandler):
         if mutation and not self.mutation_origin_allowed():
             self.close_connection = True
             self.send_json({"ok": False, "error": "cross-origin writes are not allowed"}, status=403)
+            return False
+        if mutation and not csrf_token_matches(self.headers, self.server.csrf_token):
+            self.close_connection = True
+            self.send_json({"ok": False, "error": "missing or invalid CSRF token"}, status=403)
             return False
         return True
 
@@ -1805,6 +2018,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             if state is None:
                 state = default_editor_state(project, manifest)
             else:
+                state, _migrated = migrate_editor_state_v1_to_v2(project, manifest, state)
                 upgraded = upgrade_editor_state_layout_effects(project, state)
                 upgraded = upgrade_video_template_state(state) or upgraded
                 state["asset_digests"] = referenced_asset_digests(project, state)
@@ -1814,6 +2028,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     atomic_write_json(project / STATE_REL, state)
             source_rel = str(manifest.get("source", {}).get("staged_path", ""))
             payload = {
+                "csrf_token": self.server.csrf_token,
                 "manifest": manifest,
                 "state": state,
                 "platform_presets": PLATFORM_PRESETS,
@@ -1983,6 +2198,10 @@ class EditorHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
+            gate_errors = render_download_errors(project, relative)
+            if gate_errors:
+                self.send_json({"ok": False, "error": gate_errors[0]}, status=403)
+                return
             self.serve_file(render, allow_range=render.suffix.lower() == ".mp4")
             return
         if path.startswith("/qa/"):
@@ -1994,6 +2213,10 @@ class EditorHandler(BaseHTTPRequestHandler):
                 return
             if artifact.suffix.lower() not in {".json", ".png", ".jpg", ".jpeg", ".webp"}:
                 self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            gate_errors = qa_download_errors(project, relative)
+            if gate_errors:
+                self.send_json({"ok": False, "error": gate_errors[0]}, status=403)
                 return
             self.serve_file(artifact)
             return

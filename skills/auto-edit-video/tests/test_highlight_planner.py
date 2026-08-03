@@ -244,8 +244,18 @@ class HighlightPlannerTests(unittest.TestCase):
 
     def test_editor_revision_and_validation_include_highlights_and_finite_values(self) -> None:
         state = {
-            "schema_version": 1,
+            "schema_version": 2,
             "project_id": "test",
+            "segments": [
+                {
+                    "id": "segment-abcdef012345",
+                    "source_start": 0.0,
+                    "source_end": 45.0,
+                    "origin": "default_full_source",
+                }
+            ],
+            "variants": [],
+            "rights": {"asserted": False, "assertion_revision": None},
             "canvas": {
                 "platform_id": "instagram-reels",
                 "width": 1080,

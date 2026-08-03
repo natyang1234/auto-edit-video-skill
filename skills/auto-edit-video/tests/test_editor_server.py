@@ -292,8 +292,11 @@ class EditorServerTests(unittest.TestCase):
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, http.client.HTTPMessage, bytes]:
+        request_headers = dict(headers or {})
+        if method.upper() not in {"GET", "HEAD"} and "X-Auto-Edit-CSRF" not in request_headers:
+            request_headers["X-Auto-Edit-CSRF"] = self.server.csrf_token
         connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
-        connection.request(method, path, body=body, headers=headers or {})
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read()
         status = response.status
@@ -309,6 +312,8 @@ class EditorServerTests(unittest.TestCase):
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, object]]:
         request_headers = {"Content-Type": "application/json"}
+        if method.upper() not in {"GET", "HEAD"}:
+            request_headers["X-Auto-Edit-CSRF"] = self.server.csrf_token
         request_headers.update(headers or {})
         status, _response_headers, body = self.request(
             method,
@@ -536,7 +541,17 @@ class EditorServerTests(unittest.TestCase):
 
     def test_state_validation_accepts_valid_effect_spans_and_rejects_stale_offsets(self) -> None:
         state = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "segments": [
+                {
+                    "id": "segment-abcdef012345",
+                    "source_start": 0.0,
+                    "source_end": 2.0,
+                    "origin": "default_full_source",
+                }
+            ],
+            "variants": [],
+            "rights": {"asserted": False, "assertion_revision": None},
             "director_style": "teacher-punch",
             "visual_quality_mode": "basic",
             "canvas": {
@@ -1423,6 +1438,211 @@ class EditorServerTests(unittest.TestCase):
             (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
         )
         self.assertEqual(persisted, previous)
+
+
+    @staticmethod
+    def _sha256_bytes(payload: bytes) -> str:
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _phase0_mutation_routes() -> list[tuple[str, str]]:
+        return [
+            ("PUT", "/api/editor-state"),
+            ("PUT", "/api/edit-decisions"),
+            ("PUT", "/api/voice-selection"),
+            ("POST", "/api/assets?filename=a.png"),
+            ("POST", "/api/copy-draft"),
+            ("POST", "/api/plan-highlights"),
+            ("POST", "/api/approve"),
+            ("POST", "/api/render"),
+            ("POST", "/api/render-batch"),
+            ("POST", "/api/cover"),
+        ]
+
+    def test_every_mutation_route_rejects_missing_or_wrong_csrf(self) -> None:
+        for method, path in self._phase0_mutation_routes():
+            for token in ("", "wrong-token"):
+                status, _headers, body = self.request(
+                    method,
+                    path,
+                    b"{}",
+                    {"Content-Type": "application/json", "X-Auto-Edit-CSRF": token},
+                )
+                self.assertEqual(
+                    status, 403, f"{method} {path} with token {token!r} returned {status}"
+                )
+                self.assertIn("CSRF", body.decode("utf-8"))
+
+    def test_project_get_exposes_csrf_token(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["csrf_token"], self.server.csrf_token)
+
+    def test_v1_state_migrates_on_project_get_and_voids_every_gate(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        for key in ("segments", "variants", "rights", "migrated_from"):
+            state.pop(key, None)
+        state["schema_version"] = 1
+        self.write_json("working/editor_state.json", state)
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        manifest["approvals"] = {
+            gate: {"approved": True, "state_revision": "0" * 64}
+            for gate in ("destructive_edit", "highlight_selection", "timeline", "final")
+        }
+        self.write_json("project.json", manifest)
+
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        migrated = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["segments"][0]["origin"], "default_full_source")
+        self.assertAlmostEqual(migrated["segments"][0]["source_end"], 2.0)
+        self.assertEqual(migrated["variants"], [])
+        self.assertFalse(migrated["rights"]["asserted"])
+        self.assertEqual(migrated["migrated_from"]["schema_version"], 1)
+        manifest_after = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        for gate in ("destructive_edit", "highlight_selection", "timeline", "final"):
+            approval = manifest_after["approvals"][gate]
+            self.assertFalse(
+                approval["approved"], f"gate {gate} must not survive migration"
+            )
+            self.assertIn("migration", str(approval.get("note", "")))
+
+    def test_put_of_v1_state_is_rejected(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["schema_version"] = 1
+        status, payload = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 422)
+        self.assertTrue(
+            any("migrated" in str(error) for error in payload.get("errors", [])),
+            payload,
+        )
+
+    def test_render_download_gate_blocks_unapproved_and_unknown_finals(self) -> None:
+        (self.project / "renders/preview-1.mp4").write_bytes(b"preview-bytes")
+        (self.project / "renders/final-1.mp4").write_bytes(b"final-bytes")
+        (self.project / "renders/mystery.mp4").write_bytes(b"mystery-bytes")
+        (self.project / "renders/cover.png").write_bytes(b"cover-bytes")
+        self.write_json(
+            "working/render_receipts/render-prev.json",
+            {
+                "schema_version": 1,
+                "render_id": "render-prev",
+                "quality": "preview",
+                "output": "renders/preview-1.mp4",
+            },
+        )
+        self.write_json(
+            "working/render_receipts/render-fin.json",
+            {
+                "schema_version": 1,
+                "render_id": "render-fin",
+                "quality": "final",
+                "output": "renders/final-1.mp4",
+            },
+        )
+        status, _headers, _body = self.request("GET", "/renders/preview-1.mp4")
+        self.assertEqual(status, 200)
+        status, _headers, _body = self.request("GET", "/renders/cover.png")
+        self.assertEqual(status, 200)
+        status, _headers, body = self.request("GET", "/renders/final-1.mp4")
+        self.assertEqual(status, 403)
+        self.assertIn("final", body.decode("utf-8"))
+        status, _headers, _body = self.request("GET", "/renders/mystery.mp4")
+        self.assertEqual(status, 403)
+
+    def _install_synthetic_final_delivery(self) -> dict[str, object]:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        state_revision = editor_state_revision(state)
+        output_bytes = b"approved-final-bytes"
+        (self.project / "renders/final-ok.mp4").write_bytes(output_bytes)
+        report_payload = {"status": "pass", "failures": [], "warnings": []}
+        report_text = json.dumps(report_payload, ensure_ascii=False, indent=2) + "\n"
+        (self.project / "qa/final-ok.json").write_text(report_text, encoding="utf-8")
+        contact_bytes = b"contact-sheet-bytes"
+        (self.project / "qa/final-ok-contact.png").write_bytes(contact_bytes)
+        render_receipt = {
+            "schema_version": 1,
+            "render_id": "render-ok",
+            "quality": "final",
+            "clip_id": "",
+            "state_revision": state_revision,
+            "output": "renders/final-ok.mp4",
+            "output_sha256": self._sha256_bytes(output_bytes),
+        }
+        self.write_json("working/render_receipts/render-ok.json", render_receipt)
+        receipt_bytes = (
+            self.project / "working/render_receipts/render-ok.json"
+        ).read_bytes()
+        delivery = {
+            "schema_version": 1,
+            "render_id": "render-ok",
+            "quality": "final",
+            "clip_id": "",
+            "state_revision": state_revision,
+            "status": "pass",
+            "output": "renders/final-ok.mp4",
+            "output_sha256": self._sha256_bytes(output_bytes),
+            "report": "qa/final-ok.json",
+            "report_sha256": self._sha256_bytes(report_text.encode("utf-8")),
+            "contact_sheet": "qa/final-ok-contact.png",
+            "contact_sheet_sha256": self._sha256_bytes(contact_bytes),
+            "render_receipt": "working/render_receipts/render-ok.json",
+            "render_receipt_sha256": self._sha256_bytes(receipt_bytes),
+            "warnings": [],
+            "failures": [],
+            "visual_quality": None,
+            "human_review_required": True,
+        }
+        self.write_json("working/latest_final_qa.json", delivery)
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        manifest.setdefault("approvals", {})["final"] = {
+            "approved": True,
+            "state_revision": gate_revision(self.project, "final"),
+        }
+        self.write_json("project.json", manifest)
+        return state
+
+    def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:
+        (self.project / "qa/stale-old.json").write_text(
+            json.dumps({"status": "pass"}), encoding="utf-8"
+        )
+        status, _headers, _body = self.request("GET", "/qa/stale-old.json")
+        self.assertEqual(status, 200, "QA evidence must stay readable before approval")
+
+        state = self._install_synthetic_final_delivery()
+        status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
+        self.assertEqual(status, 200, "current approved final must be downloadable")
+        status, _headers, _body = self.request("GET", "/qa/final-ok.json")
+        self.assertEqual(status, 200)
+        status, _headers, _body = self.request("GET", "/qa/stale-old.json")
+        self.assertEqual(
+            status, 403, "stale QA evidence must be blocked once final is approved"
+        )
+
+        tampered = json.loads(json.dumps(state))
+        tampered.setdefault("caption_defaults", {})["font_size"] = 55
+        status, _payload = self.json_request("PUT", "/api/editor-state", tampered)
+        self.assertEqual(status, 200)
+        status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
+        self.assertEqual(
+            status, 403, "state change must re-lock the final download gate"
+        )
+
 
 
 class EditorRendererTests(unittest.TestCase):

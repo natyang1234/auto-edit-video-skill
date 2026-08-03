@@ -81,7 +81,13 @@ function cacheElements() {
   ].forEach((id) => { elements[id] = byId(id); });
 }
 
+let csrfToken = "";
+
 async function request(url, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    options.headers = { ...(options.headers || {}), "X-Auto-Edit-CSRF": csrfToken };
+  }
   const response = await fetch(url, options);
   let payload = null;
   try {
@@ -92,6 +98,9 @@ async function request(url, options = {}) {
   if (!response.ok) {
     const message = payload.error || (payload.errors || []).join("；") || `請求失敗（${response.status}）`;
     throw new Error(message);
+  }
+  if (payload && typeof payload.csrf_token === "string") {
+    csrfToken = payload.csrf_token;
   }
   return payload;
 }
