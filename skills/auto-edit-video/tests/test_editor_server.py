@@ -2199,3 +2199,123 @@ class EditorRendererTests(unittest.TestCase):
                 {"id": "highlight-rich", "start": 0.0, "end": 0.4},
                 external,
             )
+
+    def test_multi_segment_reorder_concat_and_post_cut_captions(self) -> None:
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["segments"] = [
+            {
+                "id": "segment-aaaaaaaaaaaa",
+                "source_start": 0.30,
+                "source_end": 0.45,
+                "origin": "narrative",
+            },
+            {
+                "id": "segment-bbbbbbbbbbbb",
+                "source_start": 0.00,
+                "source_end": 0.15,
+                "origin": "narrative",
+            },
+        ]
+        state["overlays"] = [
+            {
+                "id": "caption-1",
+                "type": "caption",
+                "text": "哈囉",
+                "start": 0.02,
+                "end": 0.12,
+                "visible": True,
+                "style": {},
+                "layout": {},
+            }
+        ]
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        command = build_render_command(
+            self.project,
+            state,
+            manifest,
+            self.project / "renders/multi.mp4",
+            "preview",
+        )
+        joined = " ".join(command)
+        self.assertIn("concat=n=2:v=1", joined)
+        self.assertIn("concat=n=2:v=0:a=1", joined)
+        self.assertNotIn("-ss", command)
+        self.assertNotIn("-t", command)
+        self.assertIn("[aout]", joined)
+        self.assertIn("anull", joined, "silent source must skip loudnorm in the graph")
+        # caption source 0.02–0.12 lives in the SECOND post-cut segment
+        # (offset 0.15) → post-cut window 0.170–0.270
+        self.assertIn("between(t,0.170,0.270)", joined)
+
+        self.write_json("working/editor_state.json", state)
+        output = self.project / "renders/multi.mp4"
+        self.run_renderer("--quality", "preview", "--output", str(output))
+        duration = float(
+            subprocess.run(
+                [
+                    self.ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+        )
+        self.assertAlmostEqual(
+            duration, 0.30, delta=1.0 / 30.0 + 0.005,
+            msg="post-cut duration must equal the segment sum within one frame",
+        )
+
+    def test_overlay_crossing_removed_region_splits_into_two_windows(self) -> None:
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["segments"] = [
+            {
+                "id": "segment-aaaaaaaaaaaa",
+                "source_start": 0.00,
+                "source_end": 0.10,
+                "origin": "narrative",
+            },
+            {
+                "id": "segment-bbbbbbbbbbbb",
+                "source_start": 0.30,
+                "source_end": 0.40,
+                "origin": "narrative",
+            },
+        ]
+        state["overlays"] = [
+            {
+                "id": "caption-1",
+                "type": "caption",
+                "text": "跨切點",
+                "start": 0.05,
+                "end": 0.35,
+                "visible": True,
+                "style": {},
+                "layout": {},
+            }
+        ]
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        command = build_render_command(
+            self.project,
+            state,
+            manifest,
+            self.project / "renders/split.mp4",
+            "preview",
+        )
+        joined = " ".join(command)
+        self.assertIn("between(t,0.050,0.100)", joined)
+        self.assertIn("between(t,0.100,0.150)", joined)

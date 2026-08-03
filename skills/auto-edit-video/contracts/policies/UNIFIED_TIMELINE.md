@@ -20,8 +20,10 @@ overlays 且遇已核可 delete 拒繪 final。`source_cut.mp4` timeline rendere
    安全性由既有 fail-closed 檢查保證：只要存在 approved delete，editor 渲染路徑就拒絕
    final（`approved_destructive_deletes` 檢查原樣保留），因此刪除段不可能被靜默重新納入
    輸出。Phase 1a 落地 segments 轉換後，`edit_decisions.json` 才轉唯讀存查。
-5. **Invalidation**：segments 任何變更→editor_state revision 變更→timeline／final approvals
-   失效（沿用既有 revision-bound gate 機制）。
+5. **Invalidation 與 receipt 綁定**：`segments` 是 `editor_state_revision()` 的 hash 輸入之一
+   （Phase 0 起），因此 segments 任何變更→revision 變更→timeline／final approvals 失效；
+   render snapshot／receipt 透過 `state_revision` 已密碼學綁定 segments，**不另設冗餘的
+   `segments_hash` 欄位**（單一綁定來源，避免兩個 hash 漂移）。
 
 ## 驗收（Phase 1a 綁定）
 含一次 reorder 的 plan 由統一 renderer 輸出，MP4 duration＝Σ segments ±1 frame；

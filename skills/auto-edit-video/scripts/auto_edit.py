@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -1441,6 +1442,231 @@ def initialize_project(
     write_json(project_dir / "project.json", manifest)
     write_empty_artifacts(project_dir)
     return manifest
+
+
+FOLDER_KIND_BY_EXT = {
+    **{ext: "video" for ext in (".mp4", ".mov", ".m4v", ".webm", ".mkv")},
+    **{ext: "image" for ext in (".png", ".jpg", ".jpeg", ".webp")},
+    ".gif": "gif",
+    **{ext: "audio" for ext in (".mp3", ".wav", ".m4a", ".aac", ".flac")},
+    **{ext: "font" for ext in (".ttf", ".otf", ".woff2")},
+    **{ext: "subtitle" for ext in (".srt", ".vtt", ".ass")},
+    **{ext: "document" for ext in (".md", ".txt", ".pdf")},
+}
+FOLDER_ROLE_BY_KIND = {
+    "video": "broll",
+    "image": "asset",
+    "gif": "asset",
+    "audio": "asset",
+    "font": "font",
+    "subtitle": "transcript",
+    "document": "ignored",
+    "other": "ignored",
+}
+FOLDER_IMPORT_MAX_FILES = 5000
+
+
+def cmd_ingest_folder(args: argparse.Namespace) -> int:
+    """Folder-first ingest: inventory, main-video pick, owned copy, assets."""
+    try:
+        import contract_registry
+    except ImportError as exc:
+        return die(f"cannot load contract registry: {exc}")
+    folder = Path(args.folder).expanduser().resolve()
+    if not folder.is_dir():
+        return die(f"input folder not found: {folder}")
+    project_dir = Path(args.project_dir).expanduser()
+    files = sorted(
+        path
+        for path in folder.rglob("*")
+        if path.is_file() and not path.name.startswith(".") and not path.is_symlink()
+    )
+    if not files:
+        return die("the folder contains no importable files")
+    if len(files) > FOLDER_IMPORT_MAX_FILES:
+        return die(
+            f"folder has {len(files)} files; the import limit is "
+            f"{FOLDER_IMPORT_MAX_FILES}"
+        )
+    entries: list[dict[str, Any]] = []
+    videos: list[Path] = []
+    warnings: list[str] = []
+    for path in files:
+        kind = FOLDER_KIND_BY_EXT.get(path.suffix.lower(), "other")
+        if kind == "video":
+            videos.append(path)
+        entries.append(
+            {
+                "path": path.relative_to(folder).as_posix(),
+                "kind": kind,
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "mime": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                "role": FOLDER_ROLE_BY_KIND.get(kind, "ignored"),
+            }
+        )
+    if args.main:
+        main_video = Path(args.main).expanduser().resolve()
+        if folder not in main_video.parents or FOLDER_KIND_BY_EXT.get(
+            main_video.suffix.lower()
+        ) != "video":
+            return die("--main must point at a video inside the input folder")
+    else:
+        if not videos:
+            return die("no video file found in the folder; pass --main explicitly")
+        durations: list[tuple[float, Path]] = []
+        for candidate in videos:
+            try:
+                durations.append(
+                    (float(probe_media(candidate).get("duration_s") or 0.0), candidate)
+                )
+            except (ValueError, RuntimeError) as exc:
+                warnings.append(f"unreadable video skipped for main pick: {candidate.name}: {exc}")
+        if not durations:
+            return die("no probeable video found; pass --main explicitly")
+        durations.sort(key=lambda item: (-item[0], item[1].as_posix()))
+        main_video = durations[0][1]
+    main_rel = main_video.relative_to(folder).as_posix()
+    for entry in entries:
+        if entry["path"] == main_rel:
+            entry["role"] = "main_video"
+    try:
+        manifest = initialize_project(
+            main_video,
+            project_dir,
+            source_language=args.source_language,
+            source_mode="copy",
+            ingest_method="folder_import",
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    project_dir = project_dir.expanduser().absolute()
+    imported_dir = project_dir / "assets/imported"
+    copied = 0
+    for entry in entries:
+        if entry["role"] in {"main_video", "ignored"}:
+            continue
+        source_path = folder / entry["path"]
+        destination = imported_dir / f"{entry['sha256'][:8]}-{source_path.name}"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            shutil.copy2(source_path, destination)
+            copied += 1
+    inventory = {
+        "schema_version": 1,
+        "project_id": manifest["project_id"],
+        "scanned_at": now_utc(),
+        "root_display_name": folder.name,
+        "files": entries,
+        "main_video_path": main_rel,
+        "warnings": warnings,
+    }
+    errors = contract_registry.validate_artifact("folder_inventory", inventory)
+    if errors:
+        return die("folder inventory failed contract validation: " + "; ".join(errors))
+    write_json(project_dir / "working/folder_inventory.json", inventory)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "project_dir": str(project_dir),
+                "main_video": main_rel,
+                "files": len(entries),
+                "assets_copied": copied,
+                "warnings": warnings,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_apply_narrative_plan(args: argparse.Namespace) -> int:
+    """Apply a narrative_edit_plan to the editor state's unified segments."""
+    try:
+        import contract_registry
+        from editor_server import (
+            STATE_REL,
+            atomic_write_json,
+            default_editor_state,
+            editor_state_revision,
+            migrate_editor_state_v1_to_v2,
+            validate_editor_state,
+        )
+    except ImportError as exc:
+        return die(f"cannot load timeline contract: {exc}")
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    manifest_path = project_dir / "project.json"
+    if not manifest_path.is_file():
+        return die(f"project manifest not found: {manifest_path}")
+    manifest = read_json(manifest_path)
+    plan = read_json(Path(args.plan).expanduser())
+    if args.draft:
+        plan.setdefault("schema_version", 1)
+        plan.setdefault("source_sha256", str(manifest.get("source", {}).get("sha256") or ""))
+        plan.setdefault("warnings", [])
+        segments = plan.get("segments") or []
+        starts = [segment.get("source_start") for segment in segments]
+        reorder = starts != sorted(starts)
+        plan.setdefault("reorder", reorder)
+        plan.setdefault("risk", "high" if reorder else "low")
+        plan.setdefault(
+            "reanchor", {"status": "stale", "transcript_revision": "0" * 64}
+        )
+        plan["plan_hash"] = contract_registry.canonical_hash(
+            {key: value for key, value in plan.items() if key != "plan_hash"}
+        )
+    errors = contract_registry.validate_artifact("narrative_edit_plan", plan)
+    if errors:
+        return die("narrative plan failed contract validation: " + "; ".join(errors))
+    if plan.get("reorder") and not args.confirm_high_risk:
+        return die(
+            "this plan changes the source order (high-risk); re-run with "
+            "--confirm-high-risk after reviewing it"
+        )
+    state_path = project_dir / STATE_REL
+    if state_path.is_file():
+        state = read_json(state_path)
+    else:
+        state = default_editor_state(project_dir, manifest)
+    state, _migrated = migrate_editor_state_v1_to_v2(project_dir, manifest, state)
+    state["segments"] = [
+        {
+            "id": str(segment["id"]),
+            "source_start": float(segment["source_start"]),
+            "source_end": float(segment["source_end"]),
+            "origin": "narrative",
+        }
+        for segment in plan["segments"]
+    ]
+    duration = float(manifest.get("source", {}).get("duration_s") or 0.0)
+    state_errors = validate_editor_state(state, duration)
+    if state_errors:
+        return die("resulting editor state is invalid: " + "; ".join(state_errors))
+    state["updated_at"] = now_utc()
+    state["revision"] = editor_state_revision(state)
+    atomic_write_json(state_path, state)
+    write_json(project_dir / "working/narrative_edit_plan.json", plan)
+    post_cut = sum(
+        float(segment["source_end"]) - float(segment["source_start"])
+        for segment in plan["segments"]
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "segments": len(plan["segments"]),
+                "post_cut_duration_s": round(post_cut, 3),
+                "reorder": bool(plan.get("reorder")),
+                "state_revision": state["revision"],
+                "note": "existing approvals are stale until re-confirmed",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -3786,6 +4012,34 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--voice-speed", type=float, default=1.0)
     init.add_argument("--voice-mode", choices=("replace", "add"), default="replace")
     init.set_defaults(func=cmd_init)
+
+    ingest = sub.add_parser(
+        "ingest-folder",
+        help="Folder-first import: inventory, main-video pick and owned copy",
+    )
+    ingest.add_argument("--folder", required=True)
+    ingest.add_argument("--project-dir", required=True)
+    ingest.add_argument("--main", help="Override the main-video pick (path inside the folder)")
+    ingest.add_argument("--source-language", choices=SOURCE_LANGUAGES, default="auto")
+    ingest.set_defaults(func=cmd_ingest_folder)
+
+    narrative = sub.add_parser(
+        "apply-narrative-plan",
+        help="Apply a narrative_edit_plan.json to the unified segments timeline",
+    )
+    narrative.add_argument("--project-dir", required=True)
+    narrative.add_argument("--plan", required=True)
+    narrative.add_argument(
+        "--draft",
+        action="store_true",
+        help="Fill plan_hash/reorder/risk defaults for a hand-written plan",
+    )
+    narrative.add_argument(
+        "--confirm-high-risk",
+        action="store_true",
+        help="Required when the plan changes the source order",
+    )
+    narrative.set_defaults(func=cmd_apply_narrative_plan)
 
     target = sub.add_parser(
         "set-target",

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Render approved edit decisions into a deterministic source_cut.mp4."""
+"""Render approved edit decisions into a deterministic source_cut.mp4.
+
+LEGACY (unified timeline contract, contracts/policies/UNIFIED_TIMELINE.md):
+kept for pre-v2 compatibility only. New cut/reorder work goes through
+editor_state v2 ``segments`` and render_editor_timeline.py; do not extend
+this renderer or add new consumers of its intermediates.
+"""
 
 from __future__ import annotations
 

@@ -269,6 +269,65 @@ def image_filter(
     )
 
 
+def state_segments(state: dict[str, Any], source_duration: float) -> list[tuple[float, float]]:
+    """Ordered source segments from a v2 state; v1/absent means full source."""
+    raw = state.get("segments")
+    if not isinstance(raw, list) or not raw:
+        return [(0.0, max(source_duration, 0.001))]
+    segments: list[tuple[float, float]] = []
+    for entry in raw:
+        try:
+            start = float(entry.get("source_start"))
+            end = float(entry.get("source_end"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("segment timing must be numeric") from exc
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            raise ValueError("segment needs 0 <= source_start < source_end")
+        if end > source_duration + 0.05:
+            raise ValueError("segment extends past the source duration")
+        segments.append((start, end))
+    return segments
+
+
+def effective_segments(
+    segments: list[tuple[float, float]],
+    clip_start: float,
+    clip_end: float,
+) -> list[tuple[float, float]]:
+    """Intersect the timeline segments with a requested clip range, in order."""
+    out: list[tuple[float, float]] = []
+    for start, end in segments:
+        clipped_start = max(start, clip_start)
+        clipped_end = min(end, clip_end)
+        if clipped_end > clipped_start + 1e-6:
+            out.append((clipped_start, clipped_end))
+    if not out:
+        raise ValueError("the requested clip range does not intersect any timeline segment")
+    return out
+
+
+def map_source_range_to_post_cut(
+    segments: list[tuple[float, float]],
+    range_start: float,
+    range_end: float,
+) -> list[tuple[float, float]]:
+    """Project a source-time range onto the post-cut axis.
+
+    An overlay may intersect several segments (e.g. it spans a removed
+    silence); each intersection becomes its own post-cut window. Ranges that
+    fall entirely inside removed material yield no windows.
+    """
+    windows: list[tuple[float, float]] = []
+    offset = 0.0
+    for start, end in segments:
+        hit_start = max(range_start, start)
+        hit_end = min(range_end, end)
+        if hit_end > hit_start + 1e-6:
+            windows.append((offset + hit_start - start, offset + hit_end - start))
+        offset += end - start
+    return windows
+
+
 def build_render_command(
     project_dir: Path,
     state: dict[str, Any],
@@ -303,7 +362,19 @@ def build_render_command(
             or clip_end > source_duration + 0.05
         ):
             raise ValueError("render clip timing is outside the source")
-    duration = clip_end - clip_start
+    timeline_segments = state_segments(state, source_duration)
+    segments = effective_segments(timeline_segments, clip_start, clip_end)
+    multi_segment = len(segments) > 1
+    if multi_segment and visual_source is not None:
+        raise ValueError(
+            "designed graphic package rendering does not support multi-segment "
+            "timelines yet; flatten the timeline or use basic mode"
+        )
+    if multi_segment:
+        duration = sum(end - start for start, end in segments)
+    else:
+        clip_start, clip_end = segments[0]
+        duration = clip_end - clip_start
     source_rel = str(manifest.get("source", {}).get("staged_path", ""))
     source = project_dir / source_rel
     if not source.is_file():
@@ -330,7 +401,7 @@ def build_render_command(
         )
 
     command = [ffmpeg_path(), "-y"]
-    if clip_start > 0:
+    if not multi_segment and clip_start > 0:
         command.extend(["-ss", f"{clip_start:.3f}"])
     command.extend(["-i", str(source)])
     visual_input_index: int | None = None
@@ -352,13 +423,16 @@ def build_render_command(
             continue
         raw_start = float(source_overlay.get("start", 0.0))
         raw_end = float(source_overlay.get("end", 0.0))
-        if raw_end <= clip_start or raw_start >= clip_end:
-            continue
-        overlay = dict(source_overlay)
-        overlay["style"] = dict(source_overlay.get("style") or {})
-        overlay["start"] = max(raw_start, clip_start) - clip_start
-        overlay["end"] = min(raw_end, clip_end) - clip_start
-        if float(overlay["end"]) > float(overlay["start"]):
+        # Overlay times are stored on the source axis; project them onto the
+        # post-cut axis. Crossing a removed region yields one window per
+        # surviving intersection; fully removed overlays disappear.
+        for window_start, window_end in map_source_range_to_post_cut(
+            segments, raw_start, raw_end
+        ):
+            overlay = dict(source_overlay)
+            overlay["style"] = dict(source_overlay.get("style") or {})
+            overlay["start"] = window_start
+            overlay["end"] = window_end
             overlays.append(overlay)
     overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
     asset_inputs: dict[str, int] = {}
@@ -383,7 +457,30 @@ def build_render_command(
 
     render_text_dir = project_dir / "working/render_text"
     render_text_dir.mkdir(parents=True, exist_ok=True)
-    filters = [f"[{visual_input_index if visual_input_index is not None else 0}:v]{base_filter}[v0]"]
+    fps_value = int(canvas.get("fps", 30))
+    if multi_segment:
+        # Unified-timeline prelude (contracts/policies/UNIFIED_TIMELINE.md):
+        # normalise to CFR and a common timebase BEFORE trimming so concat
+        # cannot drift on VFR or odd-timebase sources, then cut and rejoin.
+        segment_count = len(segments)
+        prelude = [
+            f"[0:v]fps={fps_value},settb=AVTB,split={segment_count}"
+            + "".join(f"[vin{i}]" for i in range(segment_count))
+        ]
+        for i, (segment_start, segment_end) in enumerate(segments):
+            prelude.append(
+                f"[vin{i}]trim=start={segment_start:.6f}:end={segment_end:.6f},"
+                f"setpts=PTS-STARTPTS[vseg{i}]"
+            )
+        prelude.append(
+            "".join(f"[vseg{i}]" for i in range(segment_count))
+            + f"concat=n={segment_count}:v=1:a=0[vcat]"
+        )
+        filters = prelude + [f"[vcat]{base_filter}[v0]"]
+    else:
+        filters = [
+            f"[{visual_input_index if visual_input_index is not None else 0}:v]{base_filter}[v0]"
+        ]
     current = "v0"
     font = font_path()
     for index, overlay in enumerate(overlays, start=1):
@@ -416,28 +513,52 @@ def build_render_command(
         current = output_label
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    command.extend(
-        [
-            "-filter_complex",
-            ";".join(filters),
-            "-map",
-            f"[{current}]",
-            "-map",
-            "0:a?",
-        ]
+    has_audio_stream = manifest.get("source", {}).get("has_audio") is not False
+    normalize_audio = has_audio_stream and source_has_audible_signal(
+        source, segments[0][0], segments[-1][1] - segments[0][0]
     )
-    normalize_audio = (
-        manifest.get("source", {}).get("has_audio") is not False
-        and source_has_audible_signal(source, clip_start, duration)
-    )
-    if normalize_audio:
+    if multi_segment:
+        if has_audio_stream:
+            segment_count = len(segments)
+            filters.append(
+                "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"asplit={segment_count}"
+                + "".join(f"[ain{i}]" for i in range(segment_count))
+            )
+            for i, (segment_start, segment_end) in enumerate(segments):
+                filters.append(
+                    f"[ain{i}]atrim=start={segment_start:.6f}:end={segment_end:.6f},"
+                    f"asetpts=PTS-STARTPTS[aseg{i}]"
+                )
+            filters.append(
+                "".join(f"[aseg{i}]" for i in range(segment_count))
+                + f"concat=n={segment_count}:v=0:a=1[acat]"
+            )
+            if normalize_audio:
+                filters.append("[acat]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+            else:
+                filters.append("[acat]anull[aout]")
+        command.extend(["-filter_complex", ";".join(filters), "-map", f"[{current}]"])
+        if has_audio_stream:
+            command.extend(["-map", "[aout]"])
+    else:
         command.extend(
-            ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"]
+            [
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                f"[{current}]",
+                "-map",
+                "0:a?",
+            ]
         )
+        if normalize_audio:
+            command.extend(
+                ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"]
+            )
+        command.extend(["-t", f"{duration:.3f}"])
     command.extend(
         [
-            "-t",
-            f"{duration:.3f}",
             "-r",
             str(int(canvas.get("fps", 30))),
             "-c:v",
