@@ -1,0 +1,24 @@
+{
+ "schema_version": 1,
+ "items": [
+  {
+   "id": "structured-layer-abcdef01",
+   "visual_plan_item_id": "visual-beat-abcdef01",
+   "type": "chart",
+   "revision": 1,
+   "evidence_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "payload": {
+    "chart_kind": "pie",
+    "datums": [
+     {
+      "label": "Q1",
+      "value": 87.0,
+      "evidence_id": "evidence-abcdef01",
+      "source_literal": "Q1 是八十七"
+     }
+    ]
+   },
+   "review_status": "pending"
+  }
+ ]
+}

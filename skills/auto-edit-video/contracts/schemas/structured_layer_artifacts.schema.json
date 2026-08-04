@@ -43,13 +43,23 @@
      "artifact_hash": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+     },
+     "layer_id": {
+      "type": "string",
+      "pattern": "^structured-layer-[0-9a-f]{8,}$"
+     },
+     "canvas": {
+      "type": "string",
+      "minLength": 1
      }
     },
     "required": [
      "artifact_hash",
      "artifact_id",
+     "canvas",
      "compiler_version",
      "evidence_revision",
+     "layer_id",
      "mode_hash",
      "resolved_motion_plan_hash",
      "structured_layer_hash",

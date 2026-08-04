@@ -203,8 +203,8 @@ def semantic_structured_layer(layers) -> list[str]:
             if not _nonempty_str(payload.get("source_literal")):
                 errors.append(f"{path}.source_literal: stat must quote its source")
         elif layer_type == "chart":
-            if not _nonempty_str(payload.get("chart_kind")):
-                errors.append(f"{path}.chart_kind: required")
+            if payload.get("chart_kind") not in {"bar", "line"}:
+                errors.append(f"{path}.chart_kind: must be 'bar' or 'line' (Phase 1c)")
             datums = payload.get("datums")
             if not isinstance(datums, list) or not datums:
                 errors.append(f"{path}.datums: at least one datum required")
