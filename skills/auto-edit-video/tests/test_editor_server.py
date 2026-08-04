@@ -2819,3 +2819,118 @@ class EditorRendererTests(unittest.TestCase):
             "designed route must still overlay the compositor caption PNG",
         )
         self.assertIn("scale=eval=frame", joined, "pop must carry a timing scale")
+
+    def test_variant_baseline_two_orientations_and_per_variant_gates(self) -> None:
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["overlays"] = [
+            {
+                "id": "caption-var",
+                "type": "caption",
+                "text": "橫直式測試字幕",
+                "start": 0.05,
+                "end": 0.40,
+                "visible": True,
+                "style": {"font_size": 40},
+                "layout": {"x": 10, "y": 70, "width": 80, "height": 20},
+            }
+        ]
+        state["variants"] = [
+            {"variant_id": "portrait-main", "preset_id": "instagram-reels", "overrides": []},
+            {
+                "variant_id": "landscape-yt",
+                "preset_id": "youtube-landscape",
+                "overrides": [
+                    {"path": "caption.y", "kind": "caption_layout", "value": 84}
+                ],
+            },
+        ]
+        self.write_json("working/editor_state.json", state)
+
+        # preview both orientations through the CLI
+        # preview clamps the long side to 960: portrait 1080x1920→540x960,
+        # landscape 1920x1080→960x540
+        for variant_id, expected_width in (("portrait-main", 540), ("landscape-yt", 960)):
+            output = self.project / f"renders/{variant_id}.mp4"
+            result = subprocess.run(
+                [
+                    sys.executable, str(SCRIPTS_DIR / "render_editor_timeline.py"),
+                    "--project-dir", str(self.project),
+                    "--output", str(output),
+                    "--quality", "preview",
+                    "--variant", variant_id,
+                ],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            probe = subprocess.run(
+                [
+                    shutil.which("ffprobe") or "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=width",
+                    "-of", "csv=p=0", str(output),
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            width = int(probe.stdout.strip())
+            self.assertEqual(
+                width, expected_width, f"{variant_id}: unexpected width {width}"
+            )
+
+        # final without approval fails per-variant
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPTS_DIR / "render_editor_timeline.py"),
+                "--project-dir", str(self.project),
+                "--output", str(self.project / "renders/landscape-final.mp4"),
+                "--quality", "final",
+                "--variant", "landscape-yt",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+        # approve landscape timeline via the variant gate and render final
+        manifest = json.loads((self.project / "project.json").read_text("utf-8"))
+        revision = editor_server.variant_gate_revision(
+            self.project, "timeline", state, "landscape-yt"
+        )
+        manifest.setdefault("approvals", {})["timeline_by_variant"] = {
+            "landscape-yt": {"approved": True, "state_revision": revision}
+        }
+        self.write_json("project.json", manifest)
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPTS_DIR / "render_editor_timeline.py"),
+                "--project-dir", str(self.project),
+                "--output", str(self.project / "renders/landscape-final.mp4"),
+                "--quality", "final",
+                "--variant", "landscape-yt",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(
+            (self.project / "working/delivery_qa/landscape-yt.json").read_text("utf-8")
+        )
+        self.assertEqual(receipt["variant_id"], "landscape-yt")
+        self.assertEqual(receipt["output"], "renders/landscape-final.mp4")
+
+        # per-variant receipts must not clobber each other
+        self.assertFalse(
+            (self.project / "working/delivery_qa/portrait-main.json").exists()
+        )
+
+        # master edit → variant approval stale
+        state["overlays"][0]["style"]["font_size"] = 46
+        self.write_json("working/editor_state.json", state)
+        fresh = json.loads(
+            (self.project / "working/editor_state.json").read_text("utf-8")
+        )
+        self.assertFalse(
+            editor_server.variant_approval_is_current(
+                self.project, manifest, "timeline", fresh, "landscape-yt"
+            ),
+            "editing the master must invalidate variant approvals",
+        )

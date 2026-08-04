@@ -414,6 +414,27 @@ def render_download_errors(project_dir: Path, relative: str) -> list[str]:
         return ["download is not covered by any render receipt"]
     manifest = read_json(project_dir / "project.json", {}) or {}
     state = read_json(project_dir / STATE_REL, {}) or {}
+    # Variant outputs resolve to their OWN approval slot (plan v2 B4);
+    # legacy single-slot receipts keep the original path below.
+    delivery_dir = project_dir / VARIANT_DELIVERY_REL
+    if delivery_dir.is_dir():
+        for entry in sorted(delivery_dir.glob("*.json")):
+            receipt = read_json(entry, None)
+            if not isinstance(receipt, dict) or not receipt.get("variant_id"):
+                continue
+            if receipt.get("output") != relative:
+                continue
+            variant_id = str(receipt["variant_id"])
+            if not variant_approval_is_current(
+                project_dir, manifest, "final", state, variant_id
+            ):
+                return [
+                    f"variant {variant_id} needs a current final approval before download"
+                ]
+            target = project_dir / relative
+            if not target.is_file() or file_sha256(target) != receipt.get("output_sha256"):
+                return ["variant output does not match its delivery receipt"]
+            return []
     if not approval_is_current(project_dir, manifest, "final", state):
         return ["final output requires a current final approval before download"]
     current = _delivery_receipt_paths(
@@ -563,6 +584,148 @@ def load_layer_bundle(project_dir: Path) -> tuple[dict[str, Any], dict[str, Any]
         "revision": "0" * 64,
     }
     return layers, visual_plan
+
+
+VARIANT_SNAPSHOTS_REL = Path("working/variant_snapshots")
+VARIANT_DELIVERY_REL = Path("working/delivery_qa")
+
+
+def state_variants(state: dict[str, Any]) -> list[dict[str, Any]]:
+    variants = state.get("variants")
+    return variants if isinstance(variants, list) else []
+
+
+def find_variant(state: dict[str, Any], variant_id: str) -> dict[str, Any] | None:
+    for variant in state_variants(state):
+        if str(variant.get("variant_id")) == variant_id:
+            return variant
+    return None
+
+
+def variant_canvas(variant: dict[str, Any]) -> dict[str, Any]:
+    """Canvas for a variant: platform preset dims, contain+pad by default.
+
+    ``cover`` is only legal through an explicit frame override — that IS the
+    manual reframe confirmation (plan v2: no smart reframe in 1c).
+    """
+    preset_id = str(variant.get("preset_id") or "")
+    preset = PLATFORM_PRESETS.get(preset_id)
+    if preset is None:
+        raise ValueError(f"variant references an unknown platform preset: {preset_id}")
+    fit = "contain"
+    for override in variant.get("overrides") or []:
+        if override.get("kind") == "frame" and override.get("path") == "canvas.fit":
+            value = str(override.get("value"))
+            if value not in {"contain", "cover"}:
+                raise ValueError("canvas.fit override must be contain or cover")
+            fit = value
+    return {
+        "platform_id": preset_id,
+        "width": preset["width"],
+        "height": preset["height"],
+        "fps": preset["fps"],
+        "fit": fit,
+        "show_safe_zones": False,
+    }
+
+
+def variant_state_for(state: dict[str, Any], variant_id: str) -> dict[str, Any]:
+    """Render-facing state for one variant: swapped canvas + typed overrides."""
+    variant = find_variant(state, variant_id)
+    if variant is None:
+        raise ValueError(f"unknown variant: {variant_id}")
+    shaped = json.loads(json.dumps(state))
+    shaped["canvas"] = variant_canvas(variant)
+    for override in variant.get("overrides") or []:
+        kind = override.get("kind")
+        path = str(override.get("path") or "")
+        value = override.get("value")
+        if kind == "caption_layout" and path in {"caption.x", "caption.y"}:
+            key = path.split(".", 1)[1]
+            for overlay in shaped.get("overlays", []):
+                if overlay.get("type") in {"caption", "emphasis"} and not overlay.get("design_role"):
+                    overlay.setdefault("style", {})[key] = value
+        elif kind == "layout" and path in {"layer.x", "layer.y"}:
+            continue  # structured card position overrides land in P4+ UI work
+        elif kind == "frame" and path == "canvas.fit":
+            continue  # already applied by variant_canvas
+        else:
+            raise ValueError(f"unsupported variant override: {kind}:{path}")
+    return shaped
+
+
+def build_variant_snapshot(
+    project_dir: Path,
+    state: dict[str, Any],
+    variant_id: str,
+) -> dict[str, Any]:
+    """Frozen render identity for a variant (plan v2 B2) — gates hash THIS."""
+    shaped = variant_state_for(state, variant_id)
+    layers, visual_plan = load_layer_bundle(project_dir)
+    evidence = read_json(project_dir / "working/evidence_map.json", None)
+    snapshot = {
+        "schema_version": 1,
+        "variant_id": variant_id,
+        "editor_state_revision": editor_state_revision(shaped),
+        "structured_layers": canonical_revision(layers),
+        "visual_plan_v2": canonical_revision(visual_plan),
+        "evidence_map_revision": (evidence or {}).get("revision"),
+        "style_pack": shaped.get("style_pack"),
+        "canvas": shaped.get("canvas"),
+    }
+    snapshot["snapshot_hash"] = canonical_revision(snapshot)
+    snapshot_dir = project_dir / VARIANT_SNAPSHOTS_REL
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(snapshot_dir / f"{variant_id}.json", snapshot)
+    return snapshot
+
+
+def variant_gate_revision(
+    project_dir: Path,
+    gate: str,
+    state: dict[str, Any],
+    variant_id: str,
+) -> str:
+    snapshot = build_variant_snapshot(project_dir, state, variant_id)
+    if gate == "timeline":
+        return snapshot["snapshot_hash"]
+    if gate == "final":
+        receipt = read_json(
+            project_dir / VARIANT_DELIVERY_REL / f"{variant_id}.json", None
+        )
+        return canonical_revision(
+            {"snapshot": snapshot["snapshot_hash"], "delivery_qa": receipt}
+        )
+    raise ValueError(f"gate {gate} has no variant dimension")
+
+
+def variant_approval_entry(
+    manifest: dict[str, Any], gate: str, variant_id: str
+) -> dict[str, Any]:
+    approvals = manifest.get("approvals", {})
+    by_variant = approvals.get(f"{gate}_by_variant")
+    if isinstance(by_variant, dict):
+        entry = by_variant.get(variant_id)
+        if isinstance(entry, dict):
+            return entry
+    return {}
+
+
+def variant_approval_is_current(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    gate: str,
+    state: dict[str, Any],
+    variant_id: str,
+) -> bool:
+    entry = variant_approval_entry(manifest, gate, variant_id)
+    if not entry.get("approved"):
+        return False
+    try:
+        expected = variant_gate_revision(project_dir, gate, state, variant_id)
+    except ValueError:
+        return False
+    return entry.get("state_revision") == expected
 
 
 def effect_span_final_errors(
@@ -1644,8 +1807,30 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
                 "default_full_source",
             }:
                 errors.append(f"segment {index} origin is not supported")
-    if not isinstance(state.get("variants"), list):
+    variants = state.get("variants")
+    if not isinstance(variants, list):
         errors.append("variants must be a list")
+    else:
+        seen_variants: set[str] = set()
+        for index, variant in enumerate(variants):
+            if not isinstance(variant, dict):
+                errors.append(f"variant {index} must be an object")
+                continue
+            variant_key = str(variant.get("variant_id") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}", variant_key):
+                errors.append(f"variant {index} variant_id is invalid")
+            elif variant_key in seen_variants:
+                errors.append(f"variant id duplicated: {variant_key}")
+            seen_variants.add(variant_key)
+            if str(variant.get("preset_id") or "") not in PLATFORM_PRESETS:
+                errors.append(f"variant {variant_key} references an unknown preset")
+            for override in variant.get("overrides") or []:
+                if not isinstance(override, dict) or override.get("kind") not in {
+                    "layout",
+                    "caption_layout",
+                    "frame",
+                }:
+                    errors.append(f"variant {variant_key} has an unsupported override")
     rights = state.get("rights")
     if not isinstance(rights, dict) or not isinstance(rights.get("asserted"), bool):
         errors.append("rights must be an object with a boolean asserted flag")
@@ -2437,6 +2622,51 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "visual_plan": visual_plan,
                 "artifacts": artifacts,
                 "note": "timeline/final approvals are stale until re-confirmed",
+            }
+        )
+
+    def handle_variant_approval(
+        self, gate: str, variant_id: str, body: dict[str, Any]
+    ) -> None:
+        with self.server.project_lock:
+            manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+            if find_variant(state, variant_id) is None:
+                self.send_json({"ok": False, "error": "unknown variant"}, status=404)
+                return
+            try:
+                expected = variant_gate_revision(
+                    self.server.project_dir, gate, state, variant_id
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=422)
+                return
+            if str(body.get("expected_revision") or "") != expected:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "approval revision is stale",
+                        "current_revision": expected,
+                    },
+                    status=409,
+                )
+                return
+            approvals = manifest.setdefault("approvals", {})
+            slot = approvals.setdefault(f"{gate}_by_variant", {})
+            slot[variant_id] = {
+                "approved": True,
+                "state_revision": expected,
+                "confirmed_by": str(body.get("confirmed_by") or "editor"),
+                "at": now_utc(),
+            }
+            manifest["updated_at"] = now_utc()
+            atomic_write_json(self.server.project_dir / "project.json", manifest)
+        self.send_json(
+            {
+                "ok": True,
+                "gate": gate,
+                "variant_id": variant_id,
+                "approval": slot[variant_id],
             }
         )
 
@@ -3235,6 +3465,16 @@ class EditorHandler(BaseHTTPRequestHandler):
         gate = str(body.get("gate", ""))
         if gate not in GATES:
             self.send_json({"ok": False, "error": "unsupported approval gate"}, status=422)
+            return
+        variant_id = str(body.get("variant_id") or "") or None
+        if variant_id:
+            if gate not in {"timeline", "final"}:
+                self.send_json(
+                    {"ok": False, "error": "variant approvals only apply to timeline/final"},
+                    status=422,
+                )
+                return
+            self.handle_variant_approval(gate, variant_id, body)
             return
         expected_revision = str(body.get("expected_revision", ""))
         if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):

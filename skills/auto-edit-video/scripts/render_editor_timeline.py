@@ -845,6 +845,7 @@ def render_project(
     output: Path,
     quality: str,
     snapshot_path: Path | None = None,
+    variant_id: str | None = None,
 ) -> None:
     if snapshot_path is None:
         manifest = read_json(project_dir / "project.json", {}) or {}
@@ -855,7 +856,18 @@ def render_project(
                 "editor page once to run the v1→v2 migration"
             )
         clip = None
-        if quality == "final":
+        if variant_id:
+            from editor_server import variant_approval_is_current, variant_state_for
+
+            if quality == "final" and not variant_approval_is_current(
+                project_dir, manifest, "timeline", state, variant_id
+            ):
+                raise ValueError(
+                    f"variant {variant_id}: current timeline snapshot must be "
+                    "approved before final render"
+                )
+            state = variant_state_for(state, variant_id)
+        elif quality == "final":
             approval = manifest.get("approvals", {}).get("timeline", {})
             from editor_server import gate_revision
 
@@ -930,8 +942,61 @@ def render_project(
         if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
             raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
         os.replace(temporary, output)
+        if variant_id and quality == "final":
+            write_variant_delivery_receipt(project_dir, state, output, variant_id)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_variant_delivery_receipt(
+    project_dir: Path,
+    shaped_state: dict[str, Any],
+    output: Path,
+    variant_id: str,
+) -> None:
+    """Per-variant delivery receipt (plan v2 B4): no single-slot clobbering."""
+    from editor_server import (
+        VARIANT_DELIVERY_REL,
+        VARIANT_SNAPSHOTS_REL,
+        atomic_write_json,
+        read_json as server_read_json,
+    )
+
+    qa_dir = project_dir / "qa"
+    qa_dir.mkdir(exist_ok=True)
+    report_path = qa_dir / f"variant-{variant_id}.json"
+    qa_result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("qa_video.py")),
+            "--video", str(output),
+            "--report", str(report_path),
+            "--contact", str(qa_dir / f"variant-{variant_id}-contact.png"),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if qa_result.returncode != 0:
+        raise RuntimeError(
+            "variant QA failed: " + (qa_result.stderr or qa_result.stdout)[-2000:]
+        )
+    snapshot = server_read_json(
+        project_dir / VARIANT_SNAPSHOTS_REL / f"{variant_id}.json", {}
+    )
+    receipt = {
+        "schema_version": 1,
+        "variant_id": variant_id,
+        "quality": "final",
+        "snapshot_hash": (snapshot or {}).get("snapshot_hash"),
+        "status": "pass",
+        "output": output.relative_to(project_dir).as_posix(),
+        "output_sha256": file_sha256(output),
+        "report": report_path.relative_to(project_dir).as_posix(),
+        "report_sha256": file_sha256(report_path),
+    }
+    delivery_dir = project_dir / VARIANT_DELIVERY_REL
+    delivery_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(delivery_dir / f"{variant_id}.json", receipt)
 
 
 def render_cover(
@@ -1009,6 +1074,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--quality", choices=("preview", "final"), default="preview")
     parser.add_argument("--snapshot", help="Frozen render snapshot under working/render_snapshots")
+    parser.add_argument("--variant", help="Render a specific output variant (per-variant approvals)")
     parser.add_argument("--cover", action="store_true")
     parser.add_argument("--platform", choices=tuple(PLATFORM_PRESETS), default="instagram-reels")
     parser.add_argument("--cover-time", type=float, default=0.0)
@@ -1029,6 +1095,7 @@ def main() -> int:
                 output,
                 args.quality,
                 Path(args.snapshot) if args.snapshot else None,
+                args.variant or None,
             )
     except (ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
