@@ -31,7 +31,9 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 瀏覽器只把選定的本機 File 傳給 loopback Studio。Studio 會驗證影片、建立不可變的 owned copy、執行本機 Whisper，預設再用 loopback-only Ollama 逐句參照前後文校準整份字幕，完整覆蓋後才依平台短／中／長、剪輯重點與五種確定性導演策略產生最多十段有原文證據的精華。使用者可逐段保留／排除、改標題與起訖、校正字幕、加入字卡／動畫／授權素材、單段預覽，或一次批次輸出全部已保留精華。
 
-靜態圖片可在使用者勾選來源網路揭露後搜尋 Openverse 與 Wikimedia Commons。結果先以中繼資料列顯示，必須明確按下匯入才會下載；目前只允許內建的 CC0／CC BY 4.0 清單，並保存專案私有副本、來源／作者／授權／SHA-256 provenance，自動重建 `ATTRIBUTION.md`，在 final 權利閘再次核對。SVG、字型、GIF 與 B-roll 的來源搜尋尚未包含。
+靜態圖片可在使用者勾選來源網路揭露後搜尋 Openverse 與 Wikimedia Commons。結果先以中繼資料列顯示，必須明確按下匯入才會下載；目前只允許內建的 CC0／CC BY 4.0 清單，並保存專案私有副本、來源／作者／授權／SHA-256 provenance，自動重建 `ATTRIBUTION.md`，在 final 權利閘再次核對。Studio 的來源搜尋都必須取得該專案明確的網路揭露同意。字型搜尋只顯示中繼資料：Google Fonts 使用 pinned commit 的 `(ofl|apache|ufl)/family` 查詢文法，Fontsource 使用精確的 `id@x.y.z` semver。明確匯入時會嚴格驗證字型、保存 SPDX 授權證據，並將 TTF／OTF 與授權檔存為專案私有資產。選定的精確 `font_asset_id` 必須涵蓋實際輸出的字形；字型缺失、遭竄改或缺少字形時，preview 與 final 都會被阻擋。只有未選專案字型 ID 時，`AUTO_EDIT_FONT` 才可作為明示為未驗證的 legacy fallback。
+
+SVG 搜尋會顯示 Heroicons、Lucide、Tabler 與 Wikimedia 的中繼資料。原始 SVG 絕不進入 DOM 或 timeline，只能經嚴格清理後，以有界限制轉為 PNG 使用。若本機沒有 pinned 的 `resvg`，production Studio 會明確標示 SVG 匯入 unavailable 並 fail closed；不得據此暗示目前可實機匯入。Provider 測試使用 fake transport 與 rasterizer，不曾進行真實 provider 搜尋。任意 URL、GIF 與 B-roll provider 擷取仍不支援；本機授權上傳仍可使用。來源中繼資料與保存的證據不是法律意見，也不保證權利。
 
 字幕可直接選取句內字詞，套用可輸出的彈出、螢光或底線效果；字幕與設計圖卡可拖曳，並可調整位置、寬度／高度。GUI 會即時提示平台安全框與同時段圖層重疊。設計模式會把字幕、重點字與圖卡烘焙進同一份 HTML／GSAP graphic package，避免預覽能調、MP4 卻落回另一套字幕 renderer。
 
@@ -91,7 +93,7 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 - macOS、Linux，或 Windows WSL。
 - Python 3.10 以上。
 - `ffmpeg`、`ffprobe` 已在 `PATH`。
-- 可顯示中文的字型；自動偵測失敗時設定 `AUTO_EDIT_FONT=/字型/絕對路徑`。
+- 字幕需要中文時，準備涵蓋所需字形的專案字型。應選擇已匯入的專案 `font_asset_id`；只有未選專案字型時，`AUTO_EDIT_FONT=/字型/絕對路徑` 才是未驗證的 legacy fallback。
 - 本機 Whisper 相容轉錄引擎，可產生 word timestamps。Agent 負責從輸入影片建立轉錄，不會要求使用者先準備 JSON，也不會暗中上傳原始音訊。
 
 `edge-tts`、Node.js／HyperFrames 與其他視覺技能都是選配。3 種人物去背模板另需本機 `rembg` CPU 環境與已下載的 `isnet-general-use.onnx`；缺少任一項就會停用，不會下載模型或上傳影格。任何雲端配音都要先取得明確同意。

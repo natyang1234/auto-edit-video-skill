@@ -54,8 +54,24 @@ the user accepts the selected provider's network disclosure. Results stay as
 metadata rows until an explicit import; the Studio permits the bundled CC0/CC
 BY 4.0 allowlist, stores a project-private copy, records source/creator/license
 and SHA-256 provenance, regenerates `ATTRIBUTION.md`, and checks that evidence
-at the final rights gate. SVG, font, GIF, and B-roll provider search are not yet
-included.
+at the final rights gate. Studio provider search separately requires the
+project's explicit network-disclosure consent. Font search returns metadata
+only: Google Fonts accepts the pinned-commit grammar `(ofl|apache|ufl)/family`,
+and Fontsource accepts an exact `id@x.y.z` semver. An explicit import validates
+the font strictly, records SPDX license evidence, and stores a project-private
+TTF/OTF plus its license. A selected exact `font_asset_id` must cover the glyphs
+actually rendered; missing, tampered, or uncovered fonts block preview and
+final render. `AUTO_EDIT_FONT` is a legacy unverified fallback only when no
+project font ID is selected.
+
+SVG search displays Heroicons, Lucide, Tabler, and Wikimedia metadata. Raw SVG
+never enters the DOM or timeline: only strictly sanitized, bounded rasterized
+PNG is used. Production Studio fails closed and labels SVG import unavailable
+when no pinned local `resvg` is present. Provider tests use fake transport and
+rasterizer fixtures; they do not perform live provider searches. Arbitrary
+URLs, GIF, and B-roll provider retrieval remain unsupported; licensed local
+uploads remain supported. Provider metadata and stored evidence are not legal
+advice or a guarantee of rights.
 
 For mixed Chinese/English footage, select `Chinese + English` and optionally
 enter semicolon-separated terminology such as `It; to V; cigarette`. Auto and
@@ -158,7 +174,9 @@ This is designed for local coding agents with filesystem, Python, and FFmpeg acc
 - macOS, Linux, or Windows through WSL.
 - Python 3.10 or newer.
 - `ffmpeg` and `ffprobe` on `PATH`.
-- A CJK-capable font for Chinese subtitles. Set `AUTO_EDIT_FONT=/absolute/font/path` when auto-discovery is insufficient.
+- A CJK-capable project font for Chinese subtitles when captions need Chinese
+  glyphs. Select an imported project `font_asset_id`; `AUTO_EDIT_FONT=/absolute/font/path`
+  is only the unverified legacy fallback when no project font is selected.
 - A local Whisper-compatible transcription engine that can produce word timestamps. The agent creates the transcript from the input video rather than asking the user for JSON or silently uploading source audio.
 
 Optional: `edge-tts`, Node.js/HyperFrames, or separately installed visual/caption skills. The three subject-cutout templates additionally require a local `rembg` CPU environment and an already-downloaded `isnet-general-use.onnx` model; they disable themselves when either is missing and never upload frames. Cloud narration always requires explicit consent.

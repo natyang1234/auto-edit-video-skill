@@ -29,6 +29,18 @@ plans, source QA, and `working/editor_state.json`.
   render as local metadata rows with source links; approved CC0/CC BY 4.0
   imports become project-private files with SHA-256 provenance, deterministic
   `ATTRIBUTION.md`, and final-rights-gate checks.
+- Per-project explicit network-disclosure consent for Studio provider search.
+  Font search shows metadata only: Google Fonts uses pinned-commit
+  `(ofl|apache|ufl)/family` queries and Fontsource uses exact `id@x.y.z` semver.
+  Explicit import strictly validates and stores project-private TTF/OTF plus its
+  license and SPDX evidence. The exact `font_asset_id` must cover actual
+  rendered glyphs; missing, tampered, or uncovered fonts block preview/final.
+  `AUTO_EDIT_FONT` is an explicitly unverified legacy fallback only without a
+  selected project font ID.
+- SVG metadata search for Heroicons, Lucide, Tabler, and Wikimedia. Raw SVG
+  never reaches the DOM or timeline: strict sanitization and bounded PNG
+  rasterization are required. If pinned local `resvg` is absent, production UI
+  labels SVG import unavailable and fails closed.
 - Independent video-template catalog: three fixed-camera layouts with no source
   transform tween, two opt-in dynamic layouts, and three local subject-cutout
   layouts for solid, owned-image, or owned-looping-video backgrounds. Frame
@@ -36,7 +48,7 @@ plans, source QA, and `working/editor_state.json`.
 - Up to ten transcript-grounded semantic highlights with source timing,
   evidence, score, strategy, per-clip keep/reject, title/range editing, and a
   clip-scoped timeline.
-- Font family, size, fill/accent color, X/Y position, maximum width,
+- Verified project font, size, fill/accent color, X/Y position, maximum width,
   visibility, timing, and `none` / `fade` / `pop` / `slide-up` motion.
 - Character-range caption effects: select exact text and add editable
   `pop`, `highlight`, or `underline` spans with color and scale controls.
@@ -156,10 +168,12 @@ final approval even if the timeline did not change.
   silently ignoring them.
 - Local copy generation is a conservative draft, not a full brand-trained
   platform strategist.
-- The local planner does not autonomously retrieve assets. Openverse/Wikimedia
-  still-image search requires a provider disclosure checkbox and an explicit
-  import click. GIF, SVG, font, and B-roll provider retrieval remain outside
-  the bundled workflow; licensed local uploads are still supported.
+- Openverse/Wikimedia still-image search requires provider disclosure consent
+  and an explicit import click. Font and SVG provider search have the bounded
+  project-private workflows above; provider metadata/evidence is not legal
+  advice or a guarantee of rights. Tests use fake transport/rasterizer and do
+  not perform live provider search. Arbitrary URLs, GIF, and B-roll provider
+  retrieval remain unsupported; licensed local uploads are still supported.
 - A source that already contains burned captions will show duplicate captions
   if generated caption layers remain visible. Use clean source footage for a
   production edit.

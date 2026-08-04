@@ -337,13 +337,11 @@ must include transcript evidence, purpose, source/provenance, timing, and a
 fallback. Never choose a merely similar-looking asset when it contradicts the
 spoken content.
 
-The local Studio searches Openverse and Wikimedia Commons for still images only
-after provider disclosure consent. Results are metadata rows, never remote
-images. Explicitly importing an allowlisted `CC0-1.0` or `CC-BY-4.0` candidate
-stores a project-private copy plus source/creator/license/hash, regenerates
-`ATTRIBUTION.md`, and binds it into the final rights gate. Review provider
-metadata as evidence, not legal advice. Arbitrary URLs, GIFs, SVGs, and fonts
-are not retrieved by this workflow.
+The local Studio searches Openverse/Wikimedia still-image metadata after the project's explicit network-disclosure consent. Explicit import of allowlisted `CC0-1.0`/`CC-BY-4.0` stores a private copy, source/creator/license/hash, regenerates `ATTRIBUTION.md`, and binds it to the final rights gate; evidence is not legal advice.
+
+Font search is metadata-only: Google Fonts uses the pinned-commit grammar `(ofl|apache|ufl)/family`, Fontsource exact `id@x.y.z` semver. Explicit import strictly validates and stores private TTF/OTF, license, and SPDX evidence. Exact `font_asset_id` coverage of rendered glyphs is required: missing/tampered/uncovered fonts block preview/final; `AUTO_EDIT_FONT` is an explicitly unverified legacy fallback only without a project font ID.
+
+SVG search shows Heroicons/Lucide/Tabler/Wikimedia metadata; raw SVG never enters DOM or timeline, only strictly sanitized bounded rasterized PNG. Without pinned local `resvg`, production Studio labels SVG import unavailable and fails closed. Tests use fake transport/rasterizer, never live provider search. Arbitrary URLs, GIF, and B-roll provider retrieval remain unsupported; licensed local uploads work.
 
 Create transcript-grounded text cards in the bundled editor. When installed,
 route richer designed cards to `talking-head-recut`, finished narration footage
@@ -358,7 +356,8 @@ Generate the timeline preview and stop at the `timeline` gate before final rende
 Read [references/PAGE_EDITOR.md](references/PAGE_EDITOR.md), then launch `editor`.
 Use `studio` to import a new A-roll or `editor` to reopen an existing project.
 Both are loopback-only by default. The editor supports reviewed semantic
-highlights, clip-scoped video/timeline preview, font/color/size and position
+highlights, clip-scoped video/timeline preview, project-private verified font
+selection plus color/size and position
 controls, selectable inline caption effects, drag-to-position caption/card
 layers, card width/height, timed overlap warnings, text motions,
 PNG/JPG/WEBP/GIF/MP4/MOV layers, platform safe zones, local publishing-copy
