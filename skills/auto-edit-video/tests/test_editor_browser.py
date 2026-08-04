@@ -380,6 +380,51 @@ class EditorBrowserSmokeTests(unittest.TestCase):
 
         self.assertEqual(console_errors, [])
 
+    def test_production_desk_layer_variant_rights_flow(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True
+            )
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            page.locator("#layer-form:not([hidden])").wait_for()
+
+            # structured layer create (conceptual title card)
+            desk = page.locator("#desk-layers summary")
+            desk.scroll_into_view_if_needed()
+            page.locator("#desk-layer-type").select_option("title")
+            page.locator("#desk-layer-start").fill("0.1")
+            page.locator("#desk-layer-end").fill("0.5")
+            page.locator("#desk-layer-payload").fill(
+                '{"title_kind":"section","title":"桌面測試標題"}'
+            )
+            page.locator("#desk-layer-save").click()
+            page.locator("#desk-layer-list .batch-output-row").first.wait_for(timeout=8000)
+            self.assertIn("title", page.locator("#desk-layer-list").inner_text())
+
+            # variant add + status row
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variant-preset").select_option("youtube-landscape")
+            page.locator("#desk-variant-add").click()
+            page.wait_for_timeout(1600)
+            page.locator("#desk-variants summary").click()  # collapse
+            page.locator("#desk-variants summary").click()  # re-open → refresh
+            page.locator("#desk-variant-list .batch-output-row").first.wait_for(timeout=8000)
+            self.assertIn("youtube-landscape", page.locator("#desk-variant-list").inner_text())
+
+            # rights panel loads (empty message is fine on this fixture)
+            page.locator("#desk-rights summary").click()
+            page.wait_for_timeout(800)
+            self.assertTrue(page.locator("#desk-rights-list").inner_text() is not None)
+
+            self.assertEqual(errors, [], f"page errors: {errors}")
+            browser.close()
+
 
 if __name__ == "__main__":
     unittest.main()

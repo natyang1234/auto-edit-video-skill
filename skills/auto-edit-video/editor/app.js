@@ -2806,3 +2806,274 @@ byIdSafe("style-pack-select")?.addEventListener("change", (event) => {
   if (state.style_pack === null) delete state.style_pack;
   markDirty("視覺風格包已變更（結構卡與字幕預設將重新渲染）");
 });
+
+// ---------------------------------------------------------------------------
+// 產出工作台：結構卡 CRUD／素材指派／變體生命週期／授權核可（Phase 1c UI）
+// ---------------------------------------------------------------------------
+
+async function deskPost(body) {
+  return request("/api/structured-layers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function deskRefreshLayers() {
+  const host = byIdSafe("desk-layer-list");
+  if (!host) return;
+  try {
+    const bundle = await deskPost({ action: "list" });
+    host.replaceChildren();
+    for (const layer of bundle.layers?.items || []) {
+      const beat = (bundle.visual_plan?.items || []).find(
+        (item) => item.structured_layer_id === layer.id
+      );
+      const row = document.createElement("div");
+      row.className = "batch-output-row";
+      const label = document.createElement("span");
+      label.textContent =
+        `${layer.type}｜${layer.id.slice(-8)}` +
+        (beat ? `｜${beat.start}s–${beat.end}s` : "");
+      row.append(label);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "icon-button";
+      del.textContent = "刪";
+      del.addEventListener("click", async () => {
+        await deskPost({ action: "delete", id: layer.id });
+        showToast("結構卡已刪除；核可已失效", "success");
+        deskRefreshLayers();
+      });
+      row.append(del);
+      host.append(row);
+    }
+  } catch (_error) {
+    host.textContent = "";
+  }
+}
+
+async function deskSaveLayer() {
+  let payload;
+  try {
+    payload = JSON.parse(byIdSafe("desk-layer-payload").value || "{}");
+  } catch (error) {
+    showToast(`payload JSON 解析失敗：${error.message}`, "error");
+    return;
+  }
+  try {
+    await deskPost({
+      action: "upsert",
+      layer: { type: byIdSafe("desk-layer-type").value, payload },
+      timing: {
+        start: Number(byIdSafe("desk-layer-start").value || 0),
+        end: Number(byIdSafe("desk-layer-end").value || 0),
+      },
+    });
+    showToast("結構卡已儲存並重新編譯；timeline 核可已失效", "success");
+    deskRefreshLayers();
+  } catch (error) {
+    showToast(`結構卡儲存失敗：${error.message}`, "error");
+  }
+}
+
+async function deskRefreshAssets() {
+  const host = byIdSafe("desk-asset-library");
+  if (!host) return;
+  try {
+    const library = await request("/api/assets/library");
+    host.replaceChildren();
+    for (const asset of library.assets || []) {
+      const row = document.createElement("div");
+      row.className = "batch-output-row";
+      const label = document.createElement("span");
+      label.textContent =
+        `${asset.kind}｜${asset.path.split("/").pop()}` +
+        (asset.asserted ? "｜✓已授權" : "");
+      row.append(label);
+      const assign = document.createElement("button");
+      assign.type = "button";
+      assign.className = "icon-button";
+      assign.textContent = "＋beat";
+      assign.title = "以目前播放位置起 3 秒建立素材 beat";
+      assign.addEventListener("click", async () => {
+        const start = elements["preview-video"].currentTime || 0;
+        await deskPost({
+          action: "asset_beat",
+          asset: {
+            path: asset.path,
+            beat: asset.kind === "video" ? "broll" : "image",
+          },
+          timing: { start, end: start + 3 },
+        });
+        showToast("素材 beat 已建立", "success");
+      });
+      row.append(assign);
+      host.append(row);
+    }
+    if (!host.children.length) host.textContent = "（素材庫是空的）";
+  } catch (_error) {
+    host.textContent = "";
+  }
+}
+
+async function deskRefreshVariants() {
+  const host = byIdSafe("desk-variant-list");
+  const presetSelect = byIdSafe("desk-variant-preset");
+  if (!host || !presetSelect) return;
+  if (!presetSelect.options.length && projectPayload?.platform_presets) {
+    for (const [id, preset] of Object.entries(projectPayload.platform_presets)) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = preset.label;
+      presetSelect.append(option);
+    }
+  }
+  try {
+    const status = await request("/api/variants/status");
+    host.replaceChildren();
+    for (const variant of status.variants || []) {
+      const row = document.createElement("div");
+      row.className = "batch-output-row";
+      const summary = document.createElement("span");
+      summary.textContent =
+        `${variant.variant_id}｜${variant.preset_id}` +
+        `｜TL:${variant.timeline?.approved ? "✓" : "—"}` +
+        `｜FN:${variant.final?.approved ? "✓" : "—"}`;
+      row.append(summary);
+      const actions = [
+        ["預覽", () => deskRenderVariant(variant.variant_id, "preview")],
+        ["核TL", () => deskApproveVariant(variant.variant_id, "timeline", variant.timeline?.revision)],
+        ["出FN", () => deskRenderVariant(variant.variant_id, "final")],
+        ["核FN", () => deskApproveVariant(variant.variant_id, "final", variant.final?.revision)],
+      ];
+      for (const [text, handler] of actions) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "icon-button";
+        button.textContent = text;
+        button.addEventListener("click", handler);
+        row.append(button);
+      }
+      if (variant.delivery?.output && variant.final?.approved) {
+        const link = document.createElement("a");
+        link.href = `/${variant.delivery.output}`;
+        link.download = "";
+        link.textContent = "下載";
+        row.append(link);
+      }
+      host.append(row);
+    }
+    if (!host.children.length) host.textContent = "（尚未建立變體）";
+  } catch (_error) {
+    host.textContent = "";
+  }
+}
+
+function deskAddVariant() {
+  const preset = byIdSafe("desk-variant-preset").value;
+  if (!preset || !state) return;
+  pushHistory();
+  state.variants = state.variants || [];
+  const shortName = preset.replace(/[^a-z0-9-]/g, "").slice(0, 20);
+  state.variants.push({
+    variant_id: `${shortName}-${state.variants.length + 1}`,
+    preset_id: preset,
+    overrides: [],
+  });
+  markDirty("已新增輸出變體");
+  setTimeout(deskRefreshVariants, 1400);
+}
+
+async function deskRenderVariant(variantId, quality) {
+  try {
+    await request("/api/render-variant", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ variant_id: variantId, quality }),
+    });
+    showToast(`變體 ${variantId} ${quality} 輸出已排入`, "success");
+  } catch (error) {
+    showToast(`變體輸出失敗：${error.message}`, "error");
+  }
+}
+
+async function deskApproveVariant(variantId, gate, revision) {
+  if (!revision) {
+    showToast("尚無可核可的 revision；先儲存／輸出", "error");
+    return;
+  }
+  try {
+    await request("/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        gate,
+        variant_id: variantId,
+        expected_revision: revision,
+        confirmed_by: "editor",
+      }),
+    });
+    showToast(`變體 ${variantId} ${gate} 已核可`, "success");
+    deskRefreshVariants();
+  } catch (error) {
+    showToast(`核可失敗：${error.message}`, "error");
+  }
+}
+
+async function deskRefreshRights() {
+  const host = byIdSafe("desk-rights-list");
+  if (!host) return;
+  try {
+    const rights = await request("/api/rights");
+    host.replaceChildren();
+    for (const input of rights.inputs || []) {
+      if (!input.requires_assertion) continue;
+      const row = document.createElement("div");
+      row.className = "batch-output-row";
+      const label = document.createElement("span");
+      label.textContent =
+        `${input.path.split("/").pop()}｜${input.asserted ? "✓已授權" : "未授權"}`;
+      row.append(label);
+      if (!input.asserted) {
+        const assertButton = document.createElement("button");
+        assertButton.type = "button";
+        assertButton.className = "icon-button";
+        assertButton.textContent = "本人作品✓";
+        assertButton.addEventListener("click", async () => {
+          await request("/api/rights/assert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_path: input.path, basis: "own_work" }),
+          });
+          showToast("授權已記錄", "success");
+          deskRefreshRights();
+        });
+        row.append(assertButton);
+      }
+      host.append(row);
+    }
+    if (!host.children.length) host.textContent = "（目前沒有需要授權的素材）";
+  } catch (_error) {
+    host.textContent = "";
+  }
+}
+
+function bindProductionDesk() {
+  byIdSafe("desk-layer-save")?.addEventListener("click", deskSaveLayer);
+  byIdSafe("desk-variant-add")?.addEventListener("click", deskAddVariant);
+  const refreshers = [
+    ["desk-layers", deskRefreshLayers],
+    ["desk-assets", deskRefreshAssets],
+    ["desk-variants", deskRefreshVariants],
+    ["desk-rights", deskRefreshRights],
+  ];
+  for (const [id, refresh] of refreshers) {
+    byIdSafe(id)?.addEventListener("toggle", (event) => {
+      if (event.target.open) refresh();
+    });
+  }
+  deskRefreshLayers();
+}
+
+bindProductionDesk();

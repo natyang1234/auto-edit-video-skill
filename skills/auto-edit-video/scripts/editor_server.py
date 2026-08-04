@@ -2666,15 +2666,50 @@ class EditorHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
         action = str(body.get("action") or "upsert")
+        if action not in {"list", "upsert", "delete", "asset_beat"}:
+            self.send_json({"ok": False, "error": "unsupported action"}, status=422)
+            return
         with self.server.project_lock:
             layers, visual_plan = load_layer_bundle(self.server.project_dir)
+            if action == "list":
+                self.send_json(
+                    {"ok": True, "layers": layers, "visual_plan": visual_plan}
+                )
+                return
             items = {item["id"]: item for item in layers.get("items", [])}
             plan_items = {
                 item.get("structured_layer_id"): item
                 for item in visual_plan.get("items", [])
                 if item.get("structured_layer_id")
             }
-            if action == "delete":
+            if action == "asset_beat":
+                asset_rel = str((body.get("asset") or {}).get("path") or "")
+                timing = body.get("timing") or {}
+                try:
+                    scoped_project_path(self.server.project_dir, asset_rel, "assets")
+                except ValueError:
+                    self.send_json({"ok": False, "error": "asset path invalid"}, status=422)
+                    return
+                beat_kind = str((body.get("asset") or {}).get("beat") or "image")
+                if beat_kind not in {"image", "broll"}:
+                    self.send_json({"ok": False, "error": "beat must be image/broll"}, status=422)
+                    return
+                seed = canonical_revision({"asset-beat": asset_rel, "n": len(visual_plan.get("items", []))})
+                visual_plan.setdefault("items", []).append(
+                    {
+                        "id": f"visual-beat-{seed[:12]}",
+                        "highlight_id": str(timing.get("highlight_id") or "highlight-000000000000"),
+                        "start": float(timing.get("start", 0.0)),
+                        "end": float(timing.get("end", 0.0)),
+                        "beat": beat_kind,
+                        "structured_layer_id": None,
+                        "selected_asset": asset_rel,
+                        "conceptual_only": True,
+                        "evidence_ids": [],
+                        "review_status": "pending",
+                    }
+                )
+            elif action == "delete":
                 layer_id = str(body.get("id") or "")
                 if layer_id not in items:
                     self.send_json({"ok": False, "error": "layer not found"}, status=404)
@@ -2896,6 +2931,134 @@ class EditorHandler(BaseHTTPRequestHandler):
                 return
             atomic_write_json(self.server.project_dir / RIGHTS_REL, assertion)
         self.send_json({"ok": True, "asset_sha256": digest, "basis": basis})
+
+    def handle_variants_status(self, project: Path) -> None:
+        with self.server.project_lock:
+            manifest = read_json(project / "project.json", {}) or {}
+            state = read_json(project / STATE_REL, {}) or {}
+        variants = []
+        for variant in state_variants(state):
+            variant_id = str(variant.get("variant_id"))
+            entry: dict[str, Any] = {
+                "variant_id": variant_id,
+                "preset_id": variant.get("preset_id"),
+            }
+            for gate in ("timeline", "final"):
+                try:
+                    revision = variant_gate_revision(project, gate, state, variant_id)
+                except ValueError as exc:
+                    entry[gate] = {"error": str(exc)}
+                    continue
+                entry[gate] = {
+                    "revision": revision,
+                    "approved": variant_approval_is_current(
+                        project, manifest, gate, state, variant_id
+                    ),
+                }
+            receipt = read_json(
+                project / VARIANT_DELIVERY_REL / f"{variant_id}.json", None
+            )
+            entry["delivery"] = (
+                {"output": receipt.get("output")} if isinstance(receipt, dict) else None
+            )
+            variants.append(entry)
+        self.send_json({"ok": True, "variants": variants})
+
+    def handle_assets_library(self, project: Path) -> None:
+        assets_dir = project / "assets"
+        assertion = read_json(project / RIGHTS_REL, None)
+        asserted = {
+            str(item.get("asset_sha256"))
+            for item in (assertion or {}).get("items", [])
+            if item.get("asserted")
+        }
+        items = []
+        if assets_dir.is_dir():
+            for path in sorted(assets_dir.rglob("*")):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                if path.suffix.lower() not in {
+                    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".m4v",
+                }:
+                    continue
+                digest = file_sha256(path)
+                items.append(
+                    {
+                        "path": path.relative_to(project).as_posix(),
+                        "kind": "video" if path.suffix.lower() in {".mp4", ".mov", ".m4v"} else "image",
+                        "sha256": digest,
+                        "asserted": digest in asserted,
+                    }
+                )
+        self.send_json({"ok": True, "assets": items})
+
+    def handle_render_variant(self) -> None:
+        """Background variant render through the CLI (per-variant gates live
+        in the CLI path; the worker only reports status)."""
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        quality = str(body.get("quality", "preview"))
+        variant_id = str(body.get("variant_id") or "")
+        if quality not in {"preview", "final"}:
+            self.send_json({"ok": False, "error": "quality must be preview or final"}, status=422)
+            return
+        with self.server.project_lock:
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+        if find_variant(state, variant_id) is None:
+            self.send_json({"ok": False, "error": "unknown variant"}, status=404)
+            return
+        if not self.server.render_lock.acquire(blocking=False):
+            self.send_json({"ok": False, "error": "another render is already running"}, status=409)
+            return
+        output_rel = f"renders/variant-{variant_id}-{quality}.mp4"
+        with self.server.project_lock:
+            self.server.render_status = {
+                "state": "rendering",
+                "message": f"變體 {variant_id} 輸出中（{quality}）",
+                "output": None,
+            }
+
+        def worker() -> None:
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("render_editor_timeline.py")),
+                        "--project-dir", str(self.server.project_dir),
+                        "--output", str(self.server.project_dir / output_rel),
+                        "--quality", quality,
+                        "--variant", variant_id,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=2 * 60 * 60,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError((result.stderr or result.stdout).strip()[-800:])
+                status_payload = {
+                    "state": "done",
+                    "message": f"變體 {variant_id} 輸出完成",
+                    "output": output_rel,
+                    "variant_id": variant_id,
+                    "quality": quality,
+                }
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+                status_payload = {
+                    "state": "error",
+                    "message": str(exc)[:500],
+                    "output": None,
+                    "variant_id": variant_id,
+                }
+            finally:
+                self.server.render_lock.release()
+            with self.server.project_lock:
+                self.server.render_status = status_payload
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.send_json({"ok": True, "output": output_rel, "status_url": "/api/render-status"})
 
     def handle_caption_snap(self) -> None:
         """Server-authoritative cluster snapping for browser selections."""
@@ -3200,6 +3363,12 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/rights":
             self.handle_rights_status(project)
+            return
+        if path == "/api/variants/status":
+            self.handle_variants_status(project)
+            return
+        if path == "/api/assets/library":
+            self.handle_assets_library(project)
             return
         if path == "/api/captions/status":
             self.handle_caption_status(project)
@@ -3525,6 +3694,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/rights/assert":
             self.handle_rights_assert()
+            return
+        if path == "/api/render-variant":
+            self.handle_render_variant()
             return
         if path == "/api/approve":
             self.handle_approval()

@@ -463,6 +463,42 @@
             <div class="batch-output-list" id="batch-output-list"></div>
           </section>
         </section>
+
+        <section class="rail-section" id="production-desk" aria-label="產出工作台（結構卡／變體／授權）">
+          <h2>產出工作台</h2>
+          <details id="desk-layers" open>
+            <summary>結構卡（title／stat／chart／清單）</summary>
+            <div id="desk-layer-list" class="batch-output-list" aria-live="polite"></div>
+            <div class="caption-scope-row">
+              <select id="desk-layer-type">
+                <option value="title">標題卡</option>
+                <option value="stat">數據卡</option>
+                <option value="chart">圖表卡</option>
+                <option value="dynamic_list">清單卡</option>
+              </select>
+              <input id="desk-layer-start" type="number" step="0.1" min="0" placeholder="開始秒" aria-label="開始秒">
+              <input id="desk-layer-end" type="number" step="0.1" min="0" placeholder="結束秒" aria-label="結束秒">
+            </div>
+            <textarea id="desk-layer-payload" rows="4" placeholder='payload JSON，例：{"title_kind":"section","title":"重點"}'></textarea>
+            <button class="button button-secondary compact-button" id="desk-layer-save" type="button">新增結構卡</button>
+          </details>
+          <details id="desk-assets">
+            <summary>素材庫與指派</summary>
+            <div id="desk-asset-library" class="batch-output-list" aria-live="polite"></div>
+          </details>
+          <details id="desk-variants">
+            <summary>輸出變體（橫／直）</summary>
+            <div id="desk-variant-list" class="batch-output-list" aria-live="polite"></div>
+            <div class="caption-scope-row">
+              <select id="desk-variant-preset"></select>
+              <button class="button button-secondary compact-button" id="desk-variant-add" type="button">新增變體</button>
+            </div>
+          </details>
+          <details id="desk-rights">
+            <summary>素材授權（final 前必核）</summary>
+            <div id="desk-rights-list" class="batch-output-list" aria-live="polite"></div>
+          </details>
+        </section>
       </aside>
 
       <section class="timeline-panel" aria-label="影片時間軸">
