@@ -216,10 +216,25 @@ def picture_analysis(
     )
     for match in pattern.finditer(text):
         segments.append({key: float(value) for key, value in match.groupdict().items()})
+    if result.returncode != 0:
+        # A partial decode reports less picture than the file holds, which
+        # would understate every ratio measured against it.
+        raise ValueError(
+            (result.stderr or "").strip().splitlines()[-1]
+            if result.stderr
+            else "picture analysis failed"
+        )
     decoded = 0.0
-    for match in re.finditer(r"time=(\d+):(\d\d):(\d\d(?:\.\d+)?)", text):
-        hours, minutes, seconds = match.groups()
-        decoded = max(decoded, int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    # Only progress lines carry the decoded position. The rest of stderr
+    # echoes the input's filename and metadata tags, which are attacker
+    # controlled: the renderer copies source metadata into the delivery.
+    for line in re.split(r"[\r\n]", text):
+        if not line.startswith("frame=") and not line.startswith("size="):
+            continue
+        match = re.search(r"\stime=(\d+):(\d\d):(\d\d(?:\.\d+)?)", line)
+        if match:
+            hours, minutes, seconds = match.groups()
+            decoded = max(decoded, int(hours) * 3600 + int(minutes) * 60 + float(seconds))
     return segments, decoded
 
 
@@ -446,11 +461,13 @@ def inspect(
             failures.append("audio stream is missing")
 
     blacks, decoded = picture_analysis(video)
-    # Metadata can understate the timeline (a header claiming under a second
-    # would put the delivery below the length at which anything is judged)
-    # and no declared field is cross-checked by another. What decoded is what
-    # plays, so it wins whenever it runs longer.
-    if decoded > media["duration_s"]:
+    # The declared timeline is unreliable in both directions: a short claim
+    # puts the delivery below the length at which anything is judged, and a
+    # long one (a second video stream, an audio track outliving the picture)
+    # thins every ratio. What decoded is what plays, and it is the same pass
+    # the black segments came from, so ratios stay measured against their own
+    # source rather than against a number from somewhere else.
+    if decoded > 0:
         media["duration_s"] = round(decoded, 3)
     media["decoded_seconds"] = round(decoded, 3)
     longest_black = max((item["duration"] for item in blacks), default=0.0)

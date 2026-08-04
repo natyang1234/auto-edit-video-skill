@@ -812,6 +812,104 @@ class QaVideoGateTest(unittest.TestCase):
         self.assertFalse(ok, "a short second picture must not shorten the delivery")
         self.assertGreater(report["media"]["duration_s"], 10)
 
+    def make_half_black_video(self, name: str, extra: list[str] | None = None) -> Path:
+        video = self.dir / name
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=320x240:r=30:d=10,"
+                "geq=lum='if(lt(mod(T,1),0.5),16,235)':cb=128:cr=128",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=10",
+                *(extra or []),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return video
+
+    def test_metadata_cannot_stretch_the_measured_timeline(self) -> None:
+        # The decoded length is read from ffmpeg's progress output, and the
+        # same stream also echoes the input's filename and metadata tags.
+        # The renderer copies source metadata into deliveries, so a tag
+        # shaped like a progress reading is attacker supplied.
+        video = self.make_half_black_video(
+            "tagged.mp4", ["-metadata", "comment=time=00:00:25"]
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a metadata tag must not stretch the timeline")
+        self.assertLess(report["media"]["duration_s"], 15)
+
+    def test_filename_cannot_stretch_the_measured_timeline(self) -> None:
+        video = self.make_half_black_video("final time=00:00:25.mp4")
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a filename must not stretch the timeline")
+        self.assertLess(report["media"]["duration_s"], 15)
+
+    def test_a_longer_second_stream_cannot_dilute_black_coverage(self) -> None:
+        # Coverage is measured against the picture that decodes; a longer
+        # decorative stream must not become the denominator.
+        picture = self.make_half_black_video("mostly-black.mp4")
+        video = self.dir / "diluted.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(picture),
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x240:r=30:d=40",
+                "-map",
+                "0:v",
+                "-map",
+                "1:v",
+                "-map",
+                "0:a",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a longer second stream must not dilute coverage")
+        self.assertTrue(
+            any("black" in item for item in report["failures"]), report["failures"]
+        )
+
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal
         # delivery, not a dropout.
