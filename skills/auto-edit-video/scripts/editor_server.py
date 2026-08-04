@@ -8,6 +8,7 @@ and only reads/writes inside the selected project directory.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -54,6 +55,8 @@ from template_catalog import (
     validate_video_template_state,
 )
 
+
+import qa_video
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 EDITOR_DIR = SKILL_DIR / "editor"
@@ -2251,36 +2254,55 @@ def authorized_qa_profile(state: dict[str, Any] | None) -> str:
 def qa_profile_binding_errors(
     report: dict[str, Any], state: dict[str, Any] | None, label: str
 ) -> list[str]:
-    """The report must have run under the profile the state authorizes.
+    """The report must have run under the thresholds the state authorizes.
 
-    Comparing the report against the receipt alone only shows that two
-    mutable files agree; neither is the authority. The state is.
+    Comparing a report against a receipt only shows that two mutable files
+    agree; neither is the authority, and the profile a report names is just
+    another field it can carry. What is checked here is the effective policy
+    the run actually applied.
     """
+    declared = (state or {}).get("qa_policy")
+    declared = declared if isinstance(declared, dict) else {}
     authorized = authorized_qa_profile(state)
-    if report.get("schema_version", 1) < 2:
-        # Reports predating profiles could only have run strict.
-        used = "strict"
-    else:
-        used = report.get("profile")
-        if not isinstance(used, str):
-            return [f"{label} QA report does not record which profile it ran under"]
-    if used != authorized:
+    policy = report.get("policy")
+    if not isinstance(policy, dict):
+        return [f"{label} QA report does not record the thresholds it applied"]
+
+    if int(report.get("schema_version") or 1) < 2:
+        # Profiles did not exist when these were written, so the only policy
+        # they can legitimately carry is the strict one. Reject a report that
+        # claims to predate profiles while carrying a relaxation.
+        if authorized != "strict":
+            return [
+                f"{label} QA report predates delivery profiles but this project "
+                f"authorizes {authorized!r}; render again"
+            ]
+        if policy.get("allow_missing_audio") or policy.get("allow_silent_delivery"):
+            return [f"{label} QA report claims to predate profiles but relaxes audio checks"]
+        return []
+
+    expected = dataclasses.asdict(
+        qa_video.QaPolicy.for_profile(authorized, str(declared.get("intent", "")))
+    )
+    mismatched = sorted(
+        name
+        for name, value in expected.items()
+        if name not in {"profile", "intent"} and policy.get(name) != value
+    )
+    if mismatched:
         return [
-            f"{label} QA report ran under the {used!r} profile but this project "
-            f"authorizes {authorized!r}; render again"
+            f"{label} QA report applied thresholds this project does not authorize "
+            f"({', '.join(mismatched)}); render again"
+        ]
+    if report.get("profile") != authorized:
+        return [
+            f"{label} QA report is labelled {report.get('profile')!r} but ran under "
+            f"{authorized!r} thresholds"
         ]
     return []
 
 
-def qa_policy_args(state: dict[str, Any] | None) -> list[str]:
-    """QA flags for the declared delivery kind; empty means strict."""
-    declared = (state or {}).get("qa_policy")
-    if not isinstance(declared, dict):
-        return []
-    profile = declared.get("profile")
-    if profile not in QA_PROFILES or profile == "strict":
-        return []
-    return ["--qa-profile", str(profile), "--qa-intent", str(declared.get("intent", ""))]
+qa_policy_args = qa_video.qa_policy_args
 
 
 def validate_editor_state(state: Any, duration_s: float) -> list[str]:

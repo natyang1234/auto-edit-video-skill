@@ -14,6 +14,8 @@ import sys
 import textwrap
 import uuid
 from pathlib import Path
+
+import qa_video
 from typing import Any
 
 from editor_server import (
@@ -1035,17 +1037,6 @@ def render_project(
         temporary.unlink(missing_ok=True)
 
 
-def qa_policy_args(state: dict[str, Any] | None) -> list[str]:
-    """QA flags for the project's declared delivery kind; empty means strict."""
-    declared = (state or {}).get("qa_policy")
-    if not isinstance(declared, dict):
-        return []
-    profile = declared.get("profile")
-    if not isinstance(profile, str) or profile == "strict":
-        return []
-    return ["--qa-profile", profile, "--qa-intent", str(declared.get("intent", ""))]
-
-
 def qa_variant_output(
     project_dir: Path, candidate: Path, variant_id: str, state: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1061,7 +1052,7 @@ def qa_variant_output(
             "--video", str(candidate),
             "--report", str(report_path),
             "--contact", str(contact_path),
-            *qa_policy_args(state),
+            *qa_video.qa_policy_args(state),
         ],
         text=True,
         capture_output=True,

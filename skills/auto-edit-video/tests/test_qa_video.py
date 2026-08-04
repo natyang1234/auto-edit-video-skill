@@ -1127,6 +1127,19 @@ class QaVideoGateTest(unittest.TestCase):
                     _report, ok = self.inspect(video, policy=policy)
                     self.assertFalse(ok, f"{label} must fail under {profile}")
 
+    def test_silent_delivery_does_not_excuse_a_soundtrack_that_stops(self) -> None:
+        # Declaring a delivery silent must not turn a truncated soundtrack
+        # into an acceptable one: it carried sound, then lost it.
+        video = self.make_audio_shaped_video(
+            "sound-then-gone.mp4", "if(lt(t,4),0.3,0)", 20
+        )
+        policy = qa_video.QaPolicy.for_profile("silent_delivery", "declared silent")
+        report, ok = self.inspect(video, policy=policy)
+        self.assertFalse(ok, "a soundtrack that stops is damage, not intent")
+        self.assertTrue(
+            any("silent" in item for item in report["failures"]), report["failures"]
+        )
+
     def test_profile_requires_a_stated_intent(self) -> None:
         for profile in ("silent_delivery", "long_pause_delivery"):
             with self.assertRaises(ValueError):

@@ -2237,9 +2237,22 @@ class EditorServerTests(unittest.TestCase):
     def test_report_profile_must_match_what_the_project_authorizes(self) -> None:
         strict_state: dict[str, object] = {}
         relaxed_state = {"qa_policy": {"profile": "silent_delivery", "intent": "b-roll"}}
-        relaxed_report = {"schema_version": 2, "profile": "silent_delivery", "policy": {}}
-        strict_report = {"schema_version": 2, "profile": "strict", "policy": {}}
-        legacy_report = {"schema_version": 1, "policy": {}}
+        import dataclasses as _dc
+        import qa_video as _qa
+
+        def report_for(profile: str, intent: str = "b-roll") -> dict[str, object]:
+            policy = _dc.asdict(_qa.QaPolicy.for_profile(profile, intent))
+            return {"schema_version": 2, "profile": profile, "policy": policy}
+
+        relaxed_report = report_for("silent_delivery")
+        strict_report = report_for("strict", "")
+        legacy_report = {"schema_version": 1, "policy": {"allow_missing_audio": False}}
+        forged_legacy = {
+            "schema_version": 1,
+            "policy": {"allow_missing_audio": True, "allow_silent_delivery": True},
+        }
+        mislabelled = report_for("strict", "")
+        mislabelled["profile"] = "silent_delivery"
 
         # A relaxed report cannot be presented to a project that never
         # authorized relaxing anything.
@@ -2265,6 +2278,21 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertTrue(
             editor_server.qa_profile_binding_errors(legacy_report, relaxed_state, "delivery")
+        )
+        # A report claiming to predate profiles cannot carry a relaxation.
+        self.assertTrue(
+            editor_server.qa_profile_binding_errors(forged_legacy, strict_state, "delivery")
+        )
+        # Nor can the label disagree with the thresholds actually applied.
+        self.assertTrue(
+            editor_server.qa_profile_binding_errors(mislabelled, strict_state, "delivery")
+        )
+        # A v2 report whose thresholds were loosened after the fact is rejected
+        # even though it names the authorized profile.
+        tampered = report_for("strict", "")
+        tampered["policy"]["min_audible_ratio"] = 0.0
+        self.assertTrue(
+            editor_server.qa_profile_binding_errors(tampered, strict_state, "delivery")
         )
 
     def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:

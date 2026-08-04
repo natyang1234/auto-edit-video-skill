@@ -20,14 +20,9 @@ from typing import Any
 # individual thresholds: an open set of numbers is an open set of ways to turn
 # the gate off. Every profile here is reviewed and covered by tests.
 QA_PROFILES = ("strict", "silent_delivery", "long_pause_delivery")
-# Checks that describe how the file is damaged, rather than what the delivery
-# is meant to sound or look like. No profile relaxes these.
-UNRELAXABLE = (
-    "truncated or damaged picture",
-    "more than one picture or soundtrack",
-    "clipping",
-    "black frames",
-)
+# Above this share of audible content, a delivery declared silent is not
+# silent: it carried sound and then lost it, which is a truncated soundtrack.
+SILENT_DELIVERY_MAX_AUDIBLE_RATIO = 0.02
 
 
 @dataclass(frozen=True)
@@ -157,6 +152,17 @@ class QaPolicy:
             or self.min_audible_ratio < 0
         ):
             raise ValueError("QA policy coverage thresholds must be non-negative")
+
+
+def qa_policy_args(state: dict[str, Any] | None) -> list[str]:
+    """QA flags for a project's declared delivery kind; empty means strict."""
+    declared = (state or {}).get("qa_policy")
+    if not isinstance(declared, dict):
+        return []
+    profile = declared.get("profile")
+    if profile not in QA_PROFILES or profile == "strict":
+        return []
+    return ["--qa-profile", str(profile), "--qa-intent", str(declared.get("intent", ""))]
 
 
 def now_utc() -> str:
@@ -598,14 +604,19 @@ def inspect(
         if audio and not short_clip
         else None
     )
+    # A silent delivery is silent throughout. If sound was there and stopped,
+    # the ordinary dropout rules still apply — that is damage, not intent.
+    declared_silent = policy.allow_silent_delivery and (
+        silence is None or silence["audible_ratio"] <= SILENT_DELIVERY_MAX_AUDIBLE_RATIO
+    )
     if (
         audio
-        and not policy.allow_silent_delivery
+        and not declared_silent
         and media["duration_s"] >= SILENCE_MIN_MEASURABLE_SECONDS
         and silence is None
     ):
         failures.append("audio could not be measured for silence")
-    if audio and silence and not policy.allow_silent_delivery:
+    if audio and silence and not declared_silent:
         if silence["silent_ratio"] >= policy.max_silent_ratio:
             failures.append(
                 f"audio is silent for {silence['silent_ratio']:.1%} of the video, at or above "
@@ -629,7 +640,7 @@ def inspect(
     if audio:
         integrated = (levels or {}).get("integrated_lufs")
         true_peak = (levels or {}).get("true_peak_dbfs")
-        if policy.allow_silent_delivery:
+        if declared_silent:
             pass
         elif short_clip:
             # Too short for R128; judge level on the sample peak so brief
@@ -650,7 +661,7 @@ def inspect(
             )
         # Clipping applies at every duration: a short clip is still a delivery.
         if true_peak is None:
-            if not short_clip and not policy.allow_silent_delivery and integrated is not None:
+            if not short_clip and not declared_silent and integrated is not None:
                 failures.append("true peak could not be measured (silent or unreadable audio)")
         elif true_peak > policy.max_true_peak_dbfs:
             failures.append(
