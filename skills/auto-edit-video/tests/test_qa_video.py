@@ -436,6 +436,96 @@ class QaVideoGateTest(unittest.TestCase):
             any("clipping" in item for item in report["failures"]), report["failures"]
         )
 
+    def test_normalised_dead_air_with_room_tone_fails(self) -> None:
+        # The renderer normalises every final, which lifts the noise floor of
+        # a dead passage far above any absolute silence threshold. Real
+        # material always carries room tone, so this is the shape a truncated
+        # soundtrack actually takes by the time QA sees it.
+        raw = self.dir / "room-tone-raw.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25:duration=20",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=300:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=color=white:amplitude=0.001:duration=16",
+                "-filter_complex",
+                "[1:a][2:a]concat=n=2:v=0:a=1[a]",
+                "-map",
+                "0:v",
+                "-map",
+                "[a]",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-t",
+                "20",
+                str(raw),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        video = self.dir / "room-tone-normalised.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(raw),
+                "-map",
+                "0:v",
+                "-map",
+                "0:a",
+                "-c:v",
+                "copy",
+                "-af",
+                "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000",
+                "-c:a",
+                "aac",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(
+            ok, "normalisation must not disguise dead air as sound"
+        )
+        self.assertTrue(
+            any("silent" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_short_call_to_action_tail_is_not_flagged(self) -> None:
+        # A ten second clip closing on a four second silent card is a normal
+        # delivery, not a dropout.
+        video = self.make_audio_shaped_video(
+            "cta-tail.mp4", "if(lt(t,6),0.3,0)", 10
+        )
+        report, ok = self.inspect(video)
+        self.assertTrue(ok, f"a short silent outro must pass: {report['failures']}")
+
     def test_narration_with_pauses_is_not_flagged(self) -> None:
         # Repeated short gaps are normal pacing, not a dropout.
         video = self.dir / "narration-pauses.mp4"
