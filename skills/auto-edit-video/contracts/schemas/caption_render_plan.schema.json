@@ -109,9 +109,37 @@
     "shaping_engine_version": {
      "type": "string",
      "minLength": 1
+    },
+    "fonts": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+       "path",
+       "sha256"
+      ],
+      "properties": {
+       "path": {
+        "type": "string",
+        "minLength": 1
+       },
+       "sha256": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "disallowed_fallbacks": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
     }
    },
    "required": [
+    "disallowed_fallbacks",
+    "fonts",
     "shaping_engine",
     "shaping_engine_version"
    ],

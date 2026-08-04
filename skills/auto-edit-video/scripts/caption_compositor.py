@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""CoreText caption compositor — the single caption raster truth (Phase 1b).
+
+Renders each caption/emphasis overlay into a tight-bbox RGBA PNG with
+CTFramesetter shaping (real line breaking, per-run font fallback) and writes
+the ``caption_render_plan`` contract artifact. macOS is the single supported
+runtime; the engine version is part of every cache key and receipt.
+
+Font policy (plan v2 B2): text is laid out with the project's resolved font
+file plus a sanctioned emoji cascade (Apple Color Emoji). Any OTHER system
+fallback CoreText picks is recorded and flagged — final rendering fails
+closed on unsanctioned fallbacks.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import platform
+from pathlib import Path
+from typing import Any
+
+import caption_engine
+import contract_registry
+
+CAPTIONS_REL = Path("working/captions")
+RENDER_PLAN_REL = Path("working/caption_render_plan.json")
+SANCTIONED_FALLBACK_PS_NAMES = {"AppleColorEmoji"}
+PROJECT_FONT_ASSET_ID = "font-project-default"
+EMOJI_FONT_ASSET_ID = "font-system-emoji"
+
+_CORETEXT = None
+
+
+def _load_coretext():
+    global _CORETEXT
+    if _CORETEXT is not None:
+        return _CORETEXT
+    if os.environ.get("AUTO_EDIT_DISABLE_CORETEXT") == "1":
+        _CORETEXT = False
+        return _CORETEXT
+    try:
+        import CoreText  # type: ignore
+        import Foundation  # type: ignore
+        import Quartz  # type: ignore
+    except Exception:  # pragma: no cover - host-dependent
+        _CORETEXT = False
+        return _CORETEXT
+    _CORETEXT = (CoreText, Foundation, Quartz)
+    return _CORETEXT
+
+
+def compositor_available() -> bool:
+    return bool(_load_coretext()) and caption_engine.available()
+
+
+def engine_descriptor() -> dict[str, str]:
+    ok = compositor_available()
+    return {
+        "name": "macos-coretext",
+        "version": f"macos-{platform.mac_ver()[0] or 'unknown'}" if ok else "",
+        "status": "present" if ok else "not_configured",
+    }
+
+
+def _font_file(project_dir: Path) -> Path:
+    """Project font resolution — same chain the drawtext route uses."""
+    from render_editor_timeline import font_path  # lazy: avoids import cycle
+
+    return font_path()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _make_base_font(ct, size: float, font_file: Path):
+    descriptors = ct.CTFontManagerCreateFontDescriptorsFromURL(
+        __import__("Foundation").NSURL.fileURLWithPath_(str(font_file))
+    )
+    if not descriptors:
+        raise ValueError(f"font file yields no descriptors: {font_file}")
+    emoji_descriptor = ct.CTFontDescriptorCreateWithNameAndSize("Apple Color Emoji", size)
+    base_descriptor = ct.CTFontDescriptorCreateCopyWithAttributes(
+        descriptors[0], {ct.kCTFontCascadeListAttribute: [emoji_descriptor]}
+    )
+    return ct.CTFontCreateWithFontDescriptor(base_descriptor, size, None)
+
+
+def _cg_color(quartz, hex_color: str, alpha: float = 1.0):
+    value = hex_color.lstrip("#")
+    red, green, blue = (int(value[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return quartz.CGColorCreateGenericRGB(red, green, blue, alpha)
+
+
+def render_caption_png(
+    project_dir: Path,
+    overlay: dict[str, Any],
+    canvas: dict[str, Any],
+    render_scale: float,
+) -> dict[str, Any]:
+    """Shape + rasterise one caption overlay; returns the plan item dict."""
+    modules = _load_coretext()
+    if not modules:
+        raise RuntimeError("caption compositor is not available")
+    ct, foundation, quartz = modules
+    style = overlay.get("style") or {}
+    text = str(overlay.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise ValueError("caption text is empty")
+    canvas_width = int(canvas.get("width", 1080))
+    font_size = max(14.0, float(style.get("font_size", 52)) * render_scale)
+    max_width = max(20.0, min(96.0, float(style.get("max_width", 84))))
+    frame_width = canvas_width * render_scale * (max_width / 100.0)
+    font_file = _font_file(project_dir)
+    base_font = _make_base_font(ct, font_size, font_file)
+
+    attributed = foundation.NSMutableAttributedString.alloc().initWithString_(text)
+    full_range = foundation.NSMakeRange(0, attributed.length())
+    stroke_width = float(style.get("stroke_width", 3)) * render_scale
+    base_attrs = {
+        ct.kCTFontAttributeName: base_font,
+        ct.kCTForegroundColorAttributeName: _cg_color(
+            quartz, str(style.get("color") or "#F7F2E8")
+        ),
+    }
+    if stroke_width > 0:
+        # Negative stroke = fill + stroke; width is relative % of font size.
+        base_attrs[ct.kCTStrokeWidthAttributeName] = -(stroke_width / font_size * 100.0)
+        base_attrs[ct.kCTStrokeColorAttributeName] = _cg_color(
+            quartz, str(style.get("stroke_color") or "#17130F")
+        )
+    attributed.addAttributes_range_(base_attrs, full_range)
+
+    max_span_scale = 1.0
+    for span in overlay.get("effect_spans") or []:
+        span_style = span.get("style") or {}
+        start = int(span.get("start_char", 0))
+        end = int(span.get("end_char", 0))
+        if end <= start or end > attributed.length():
+            continue
+        span_range = foundation.NSMakeRange(start, end - start)
+        scale = max(0.5, min(3.0, float(span_style.get("font_scale", 1.0))))
+        max_span_scale = max(max_span_scale, scale)
+        span_attrs = {
+            ct.kCTForegroundColorAttributeName: _cg_color(
+                quartz, str(span_style.get("color") or "#FF5533")
+            )
+        }
+        if scale != 1.0:
+            span_attrs[ct.kCTFontAttributeName] = ct.CTFontCreateCopyWithAttributes(
+                base_font, font_size * scale, None, None
+            )
+        if span_style.get("effect") == "underline":
+            span_attrs[ct.kCTUnderlineStyleAttributeName] = ct.kCTUnderlineStyleSingle
+        attributed.addAttributes_range_(span_attrs, span_range)
+
+    framesetter = ct.CTFramesetterCreateWithAttributedString(attributed)
+    constraint = quartz.CGSizeMake(frame_width, 100000.0)
+    fitted, _ = ct.CTFramesetterSuggestFrameSizeWithConstraints(
+        framesetter, foundation.NSMakeRange(0, 0), None, constraint, None
+    )
+    padding = int(max(8.0, stroke_width * 2.0, font_size * (max_span_scale - 1.0) + 4.0))
+    width = int(fitted.width) + padding * 2
+    height = int(fitted.height) + padding * 2
+    width += width % 2
+    height += height % 2
+
+    color_space = quartz.CGColorSpaceCreateDeviceRGB()
+    context = quartz.CGBitmapContextCreate(
+        None, width, height, 8, width * 4, color_space,
+        quartz.kCGImageAlphaPremultipliedLast,
+    )
+    if context is None:
+        raise RuntimeError("could not create bitmap context")
+    if bool(style.get("box")):
+        quartz.CGContextSetFillColorWithColor(
+            context, _cg_color(quartz, str(style.get("box_color") or "#201B17"), 0.82)
+        )
+        quartz.CGContextFillRect(context, quartz.CGRectMake(0, 0, width, height))
+    path = quartz.CGPathCreateMutable()
+    quartz.CGPathAddRect(
+        path, None,
+        quartz.CGRectMake(padding, padding, fitted.width, fitted.height),
+    )
+    frame = ct.CTFramesetterCreateFrame(framesetter, foundation.NSMakeRange(0, 0), path, None)
+    ct.CTFrameDraw(frame, context)
+
+    # Glyph-run font accounting (plan v2 B2): map every run back to a
+    # declared asset or flag it.
+    project_ps_names = set()
+    ps_name = ct.CTFontCopyPostScriptName(base_font)
+    if ps_name:
+        project_ps_names.add(str(ps_name))
+    clusters = caption_engine.boundary_map(text)
+
+    def cluster_index_for(utf16_offset: int) -> int:
+        for index, (cluster_start, cluster_end) in enumerate(clusters):
+            if cluster_start <= utf16_offset < cluster_end:
+                return index
+        return max(0, len(clusters) - 1)
+
+    glyph_runs: list[dict[str, Any]] = []
+    disallowed_fallbacks: list[str] = []
+    lines = ct.CTFrameGetLines(frame)
+    for line in lines:
+        for run in ct.CTLineGetGlyphRuns(line):
+            attributes = ct.CTRunGetAttributes(run)
+            run_font = attributes.get(ct.kCTFontAttributeName)
+            run_ps = str(ct.CTFontCopyPostScriptName(run_font)) if run_font else "unknown"
+            run_range = ct.CTRunGetStringRange(run)
+            if run_ps in project_ps_names:
+                asset_id = PROJECT_FONT_ASSET_ID
+            elif run_ps in SANCTIONED_FALLBACK_PS_NAMES:
+                asset_id = EMOJI_FONT_ASSET_ID
+            else:
+                asset_id = f"font-unsanctioned-{run_ps}"
+                disallowed_fallbacks.append(run_ps)
+            glyph_runs.append(
+                {
+                    "font_asset_id": asset_id,
+                    "cluster_start": cluster_index_for(run_range.location),
+                    "cluster_end": cluster_index_for(
+                        max(run_range.location, run_range.location + run_range.length - 1)
+                    )
+                    + 1,
+                }
+            )
+
+    image = quartz.CGBitmapContextCreateImage(context)
+    captions_dir = project_dir / CAPTIONS_REL
+    captions_dir.mkdir(parents=True, exist_ok=True)
+    scratch = captions_dir / f".rendering-{overlay.get('id')}.png"
+    url = foundation.NSURL.fileURLWithPath_(str(scratch))
+    destination = quartz.CGImageDestinationCreateWithURL(url, "public.png", 1, None)
+    if destination is None:
+        raise RuntimeError("could not create PNG destination")
+    quartz.CGImageDestinationAddImage(destination, image, None)
+    if not quartz.CGImageDestinationFinalize(destination):
+        raise RuntimeError("PNG finalize failed")
+    artifact_hash = _file_sha256(scratch)
+    final_path = captions_dir / f"{overlay.get('id')}-{artifact_hash[:16]}.png"
+    scratch.replace(final_path)
+
+    return {
+        "caption_item_id": str(overlay.get("id")),
+        "clusters": clusters,
+        "glyph_runs": glyph_runs,
+        "artifact": {
+            "rgba_path": final_path.relative_to(project_dir).as_posix(),
+            "artifact_hash": artifact_hash,
+            "width": width,
+            "height": height,
+        },
+        "x_padding": padding,
+        "x_disallowed_fallbacks": sorted(set(disallowed_fallbacks)),
+    }
+
+
+def caption_overlays(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        overlay
+        for overlay in state.get("overlays", [])
+        if isinstance(overlay, dict)
+        and overlay.get("type") in {"caption", "emphasis"}
+        and overlay.get("visible", True)
+        and not overlay.get("design_role")
+        and str(overlay.get("text") or "").strip()
+    ]
+
+
+def caption_content_revision(state: dict[str, Any], canvas: dict[str, Any], render_scale: float) -> str:
+    payload = {
+        "engine": engine_descriptor(),
+        "canvas": {"width": canvas.get("width"), "height": canvas.get("height")},
+        "render_scale": round(float(render_scale), 4),
+        "items": [
+            {
+                "id": overlay.get("id"),
+                "text": overlay.get("text"),
+                "style": overlay.get("style"),
+                "effect_spans": overlay.get("effect_spans"),
+            }
+            for overlay in caption_overlays(state)
+        ],
+    }
+    return contract_registry.canonical_hash(payload)
+
+
+def build_render_plan(
+    project_dir: Path,
+    state: dict[str, Any],
+    render_scale: float = 1.0,
+) -> dict[str, Any]:
+    """Render every caption overlay (cache-aware) and write the plan artifact."""
+    if not compositor_available():
+        raise RuntimeError("caption compositor is not available on this host")
+    canvas = state.get("canvas") or {}
+    content_revision = caption_content_revision(state, canvas, render_scale)
+    plan_path = project_dir / RENDER_PLAN_REL
+    if plan_path.is_file():
+        try:
+            existing = contract_registry.load_artifact_text(plan_path.read_text("utf-8"))
+            if existing.get("caption_revision") == content_revision and all(
+                (project_dir / item["artifact"]["rgba_path"]).is_file()
+                for item in existing.get("items", [])
+            ):
+                return existing
+        except (ValueError, OSError, KeyError):
+            pass
+    items = [
+        render_caption_png(project_dir, overlay, canvas, render_scale)
+        for overlay in caption_overlays(state)
+    ]
+    disallowed = sorted({name for item in items for name in item.pop("x_disallowed_fallbacks")})
+    for item in items:
+        item.pop("x_padding", None)
+    font_file = _font_file(project_dir)
+    plan = {
+        "schema_version": 1,
+        "caption_revision": content_revision,
+        "grapheme_contract": "grapheme_cluster_v1",
+        "items": items,
+        "receipt": {
+            "shaping_engine": "macos-coretext",
+            "shaping_engine_version": engine_descriptor()["version"],
+            "fonts": {
+                PROJECT_FONT_ASSET_ID: {
+                    "path": str(font_file),
+                    "sha256": _file_sha256(font_file),
+                },
+                EMOJI_FONT_ASSET_ID: {"path": "system:Apple Color Emoji", "sha256": ""},
+            },
+            "disallowed_fallbacks": disallowed,
+        },
+    }
+    plan["revision"] = contract_registry.canonical_hash(plan)
+    errors = contract_registry.validate_artifact("caption_render_plan", plan)
+    if errors:
+        raise ValueError("caption render plan failed contract validation: " + "; ".join(errors))
+    scratch = plan_path.with_name(plan_path.name + ".tmp")
+    scratch.write_text(
+        __import__("json").dumps(plan, ensure_ascii=False, indent=2) + "\n", "utf-8"
+    )
+    scratch.replace(plan_path)
+    return plan

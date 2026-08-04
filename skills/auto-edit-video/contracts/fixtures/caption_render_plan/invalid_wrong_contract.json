@@ -32,7 +32,14 @@
  ],
  "receipt": {
   "shaping_engine": "pinned-shaper",
-  "shaping_engine_version": "1.0"
+  "shaping_engine_version": "1.0",
+  "fonts": {
+   "font-project-default": {
+    "path": "/tmp/f.ttc",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   }
+  },
+  "disallowed_fallbacks": []
  },
  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
