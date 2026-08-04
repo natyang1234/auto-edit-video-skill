@@ -124,6 +124,27 @@ class OpenverseParserTests(unittest.TestCase):
                 hostile = openverse_item(license_url=license_url)
                 self.assertEqual(parse_openverse({"results": [hostile]}), [])
 
+    def test_licences_that_forbid_commercial_use_or_derivatives_are_dropped(self) -> None:
+        # The delivery is a derivative work and may be used commercially, so
+        # only CC0 and CC BY qualify. Everything else is dropped by not being
+        # on the allowlist rather than by being named, which is why this is
+        # asserted directly.
+        for name, version in (
+            ("by-nc", "4.0"),
+            ("by-nd", "4.0"),
+            ("by-nc-nd", "4.0"),
+            ("by-nc-sa", "4.0"),
+            ("by-sa", "4.0"),
+            ("by", "3.0"),
+        ):
+            with self.subTest(licence=f"{name} {version}"):
+                item = openverse_item(
+                    license=name,
+                    license_version=version,
+                    license_url=f"https://creativecommons.org/licenses/{name}/{version}/",
+                )
+                self.assertEqual(parse_openverse({"results": [item]}), [])
+
     def test_cc0_and_by_candidates_use_fixed_download_url(self) -> None:
         cc0 = openverse_item(
             id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
