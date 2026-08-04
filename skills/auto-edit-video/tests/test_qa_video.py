@@ -257,6 +257,98 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertTrue(ok, f"pillarboxed content must not be flagged: {report['failures']}")
 
+    def test_dark_content_in_contain_padding_is_not_flagged(self) -> None:
+        # The renderer pads to canvas with a near-black tone, so the bars read
+        # as black pixels. A dark but real picture inside those bars must pass.
+        video = self.dir / "contain-dark.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=3,"
+            "eq=brightness=-0.32:contrast=0.6,"
+            "scale=360:640:force_original_aspect_ratio=decrease,"
+            "pad=360:640:(ow-iw)/2:(oh-ih)/2:color=0x171512",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertTrue(
+            ok, f"dark content inside contain padding must pass: {report['failures']}"
+        )
+        self.assertIsNotNone(
+            report["black_detection"]["measured_crop"],
+            "padding should have been excluded from the measurement",
+        )
+
+    def test_audio_that_stops_after_the_opening_fails(self) -> None:
+        # Integrated loudness is gated and ignores silence, so a final whose
+        # narration was truncated still measures a healthy level.
+        video = self.dir / "audio-drops-out.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=30:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=6",
+            "-af",
+            "volume=enable='gte(t,0.3)':volume=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "audio that stops after the opening must fail")
+        self.assertTrue(
+            any("silent for" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_very_short_audible_clip_is_not_failed_for_loudness(self) -> None:
+        # EBU R128 integrates over 400ms and reports -70 LUFS below that.
+        video = self.dir / "very-short.mp4"
+        make_video(
+            video,
+            video_source="testsrc",
+            audio_source="sine=frequency=440",
+            duration=0.3,
+        )
+        report, ok = self.inspect(video)
+        self.assertTrue(ok, f"a 0.3s audible clip must not fail: {report['failures']}")
+
     def test_short_fully_black_video_fails(self) -> None:
         video = self.dir / "short-black.mp4"
         make_video(
