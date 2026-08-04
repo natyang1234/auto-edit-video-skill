@@ -53,7 +53,7 @@ class EditorBrowserSmokeTests(unittest.TestCase):
                 "-f",
                 "lavfi",
                 "-i",
-                "anullsrc=r=48000:cl=stereo",
+                "sine=frequency=440:sample_rate=48000",
                 "-shortest",
                 "-c:v",
                 "libx264",

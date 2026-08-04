@@ -2822,6 +2822,11 @@ class EditorRendererTests(unittest.TestCase):
         self.project = Path(self._tmp.name) / "project"
         for name in ("source", "working", "assets", "renders"):
             (self.project / name).mkdir(parents=True, exist_ok=True)
+        self.rebuild_source(audio_source="sine=frequency=440:sample_rate=48000")
+        self._write_render_test_manifest()
+
+    def rebuild_source(self, audio_source: str) -> None:
+        """(Re)encode the shared 0.45s source clip with the given lavfi audio."""
         source = self.project / "source/source.mp4"
         result = subprocess.run(
             [
@@ -2834,7 +2839,7 @@ class EditorRendererTests(unittest.TestCase):
                 "-f",
                 "lavfi",
                 "-i",
-                "anullsrc=r=48000:cl=stereo",
+                audio_source,
                 "-shortest",
                 "-c:v",
                 "libx264",
@@ -2849,6 +2854,8 @@ class EditorRendererTests(unittest.TestCase):
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr)
+
+    def _write_render_test_manifest(self) -> None:
         self.write_json(
             "project.json",
             {
@@ -3180,6 +3187,7 @@ class EditorRendererTests(unittest.TestCase):
         self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000", command)
 
     def test_renderer_skips_loudnorm_for_silent_audio(self) -> None:
+        self.rebuild_source(audio_source="anullsrc=r=48000:cl=stereo")
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
         state = json.loads(
             (self.project / "working/editor_state.json").read_text(encoding="utf-8")
@@ -3241,6 +3249,7 @@ class EditorRendererTests(unittest.TestCase):
             )
 
     def test_multi_segment_reorder_concat_and_post_cut_captions(self) -> None:
+        self.rebuild_source(audio_source="anullsrc=r=48000:cl=stereo")
         state = json.loads(
             (self.project / "working/editor_state.json").read_text(encoding="utf-8")
         )

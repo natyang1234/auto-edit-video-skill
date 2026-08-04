@@ -278,6 +278,10 @@ python3 "$SKILL/scripts/qa_video.py" \
   --video /absolute/path/project/renders/final.mp4
 ```
 
+QA fails closed on black-frame coverage, missing or near-silent audio, and
+clipping; each threshold can be relaxed explicitly via
+`--max-black-segment-seconds`, `--max-black-ratio`, `--allow-missing-audio`,
+`--min-integrated-lufs`, and `--max-true-peak-dbfs`.
 Final approval is a separate human gate after QA and visual inspection.
 
 ## Optional integration discovery

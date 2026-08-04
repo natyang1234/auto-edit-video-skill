@@ -9,9 +9,25 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True)
+class QaPolicy:
+    """Configurable fail thresholds for delivery QA (contracts M7).
+
+    Defaults are fail-closed: a fully black or silent final must never pass.
+    Callers may relax individual thresholds explicitly per project.
+    """
+
+    max_black_segment_seconds: float = 2.0
+    max_black_ratio: float = 0.35
+    allow_missing_audio: bool = False
+    min_integrated_lufs: float = -45.0
+    max_true_peak_dbfs: float = 0.0
 
 
 def now_utc() -> str:
@@ -140,7 +156,13 @@ def contact_sheet(video: Path, output: Path, duration: float) -> None:
         raise ValueError(result.stderr.strip() or "contact-sheet render failed")
 
 
-def inspect(video: Path, report_path: Path, contact_path: Path) -> tuple[dict[str, Any], bool]:
+def inspect(
+    video: Path,
+    report_path: Path,
+    contact_path: Path,
+    policy: QaPolicy | None = None,
+) -> tuple[dict[str, Any], bool]:
+    policy = policy or QaPolicy()
     media = probe(video)
     failures: list[str] = []
     warnings: list[str] = []
@@ -157,12 +179,45 @@ def inspect(video: Path, report_path: Path, contact_path: Path) -> tuple[dict[st
     elif width % 2 or height % 2:
         warnings.append("video dimensions are not even")
     if not audio:
-        warnings.append("audio stream is missing")
+        if policy.allow_missing_audio:
+            warnings.append("audio stream is missing")
+        else:
+            failures.append("audio stream is missing")
 
     blacks = black_segments(video)
-    if any(item["duration"] >= 1.0 for item in blacks):
+    longest_black = max((item["duration"] for item in blacks), default=0.0)
+    if longest_black >= policy.max_black_segment_seconds:
+        failures.append(
+            f"black segment of {longest_black:.3f}s reaches the "
+            f"{policy.max_black_segment_seconds:.3f}s fail threshold"
+        )
+    elif longest_black >= 1.0:
         warnings.append("black segment of at least one second detected")
+    if media["duration_s"] > 0:
+        black_ratio = round(sum(item["duration"] for item in blacks) / media["duration_s"], 3)
+        if black_ratio >= policy.max_black_ratio:
+            failures.append(
+                f"black frames cover {black_ratio:.1%} of the video, at or above the "
+                f"{policy.max_black_ratio:.1%} fail threshold"
+            )
     levels = loudness(video) if audio else None
+    if audio:
+        integrated = (levels or {}).get("integrated_lufs")
+        if integrated is None:
+            failures.append(
+                "integrated loudness could not be measured (silent or unreadable audio)"
+            )
+        elif integrated < policy.min_integrated_lufs:
+            failures.append(
+                f"integrated loudness {integrated:.1f} LUFS is below the "
+                f"{policy.min_integrated_lufs:.1f} LUFS fail threshold (near-silent audio)"
+            )
+        true_peak = (levels or {}).get("true_peak_dbfs")
+        if true_peak is not None and true_peak > policy.max_true_peak_dbfs:
+            failures.append(
+                f"true peak {true_peak:.1f} dBFS is above the "
+                f"{policy.max_true_peak_dbfs:.1f} dBFS fail threshold (clipping)"
+            )
     contact_sheet(video, contact_path, media["duration_s"])
     report = {
         "schema_version": 1,
@@ -172,6 +227,7 @@ def inspect(video: Path, report_path: Path, contact_path: Path) -> tuple[dict[st
         "media": media,
         "black_segments": blacks,
         "loudness": levels,
+        "policy": asdict(policy),
         "contact_sheet": str(contact_path),
         "failures": failures,
         "warnings": warnings,
@@ -184,10 +240,50 @@ def inspect(video: Path, report_path: Path, contact_path: Path) -> tuple[dict[st
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    defaults = QaPolicy()
     parser.add_argument("--video", required=True)
     parser.add_argument("--report")
     parser.add_argument("--contact")
+    parser.add_argument(
+        "--max-black-segment-seconds",
+        type=float,
+        default=defaults.max_black_segment_seconds,
+        help="fail when any black segment lasts at least this many seconds",
+    )
+    parser.add_argument(
+        "--max-black-ratio",
+        type=float,
+        default=defaults.max_black_ratio,
+        help="fail when black frames cover at least this fraction of the duration",
+    )
+    parser.add_argument(
+        "--allow-missing-audio",
+        action="store_true",
+        help="downgrade a missing audio stream from failure to warning",
+    )
+    parser.add_argument(
+        "--min-integrated-lufs",
+        type=float,
+        default=defaults.min_integrated_lufs,
+        help="fail when integrated loudness is below this LUFS value",
+    )
+    parser.add_argument(
+        "--max-true-peak-dbfs",
+        type=float,
+        default=defaults.max_true_peak_dbfs,
+        help="fail when true peak is above this dBFS value",
+    )
     return parser
+
+
+def policy_from_args(args: argparse.Namespace) -> QaPolicy:
+    return QaPolicy(
+        max_black_segment_seconds=args.max_black_segment_seconds,
+        max_black_ratio=args.max_black_ratio,
+        allow_missing_audio=args.allow_missing_audio,
+        min_integrated_lufs=args.min_integrated_lufs,
+        max_true_peak_dbfs=args.max_true_peak_dbfs,
+    )
 
 
 def main() -> int:
@@ -199,7 +295,7 @@ def main() -> int:
     report = Path(args.report).expanduser().resolve() if args.report else video.parent.parent / "qa/qa-report.json"
     contact = Path(args.contact).expanduser().resolve() if args.contact else video.parent.parent / "qa/final-contact.png"
     try:
-        payload, ok = inspect(video, report, contact)
+        payload, ok = inspect(video, report, contact, policy=policy_from_args(args))
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(str(exc), file=sys.stderr)
         return 2

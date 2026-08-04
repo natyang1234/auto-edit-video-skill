@@ -186,6 +186,9 @@ python3 "$SKILL/scripts/qa_video.py" \
   --video /專案/絕對路徑/renders/final.mp4
 ```
 
+QA 對黑幕覆蓋、缺音軌／近無聲與爆音一律 fail closed；門檻可用
+`--max-black-segment-seconds`、`--max-black-ratio`、`--allow-missing-audio`、
+`--min-integrated-lufs`、`--max-true-peak-dbfs` 逐項明示放寬。
 通過 QA 與人工畫面檢查後，仍須另取得 final 核准。
 
 ## 選配整合探索
