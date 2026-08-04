@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -1776,7 +1777,7 @@ class EditorServerTests(unittest.TestCase):
         revisions = json.loads(body.decode("utf-8"))["revisions"]
         self.assertEqual(revisions["timeline"], "unmigrated-editor-state-v1")
 
-    def test_effect_span_final_gate_blocks_basic_route(self) -> None:
+    def test_effect_span_final_gate_follows_route_table(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         state = json.loads(body.decode("utf-8"))["state"]
         payload = json.loads(body.decode("utf-8"))
@@ -1786,12 +1787,21 @@ class EditorServerTests(unittest.TestCase):
             overlay.get("effect_spans") for overlay in state.get("overlays", [])
         )
         self.assertTrue(has_spans, "default state should carry effect spans")
-        errors = editor_server.effect_span_final_errors(state, None)
-        self.assertTrue(errors and "effect spans" in errors[0])
-        stripped = json.loads(json.dumps(state))
-        for overlay in stripped.get("overlays", []):
-            overlay.pop("effect_spans", None)
-        self.assertEqual(editor_server.effect_span_final_errors(stripped, None), [])
+
+        import caption_compositor
+
+        if caption_compositor.compositor_available():
+            # Route table: compositor renders spans on every route — no gate.
+            self.assertEqual(editor_server.effect_span_final_errors(state, None), [])
+        with unittest.mock.patch.object(
+            caption_compositor, "compositor_available", lambda: False
+        ):
+            errors = editor_server.effect_span_final_errors(state, None)
+            self.assertTrue(errors and "compositor" in errors[0])
+            stripped = json.loads(json.dumps(state))
+            for overlay in stripped.get("overlays", []):
+                overlay.pop("effect_spans", None)
+            self.assertEqual(editor_server.effect_span_final_errors(stripped, None), [])
 
     def test_platform_presets_come_from_validated_registry(self) -> None:
         registry = json.loads(
@@ -2470,3 +2480,112 @@ class EditorRendererTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("between(t,0.050,0.100)", joined)
         self.assertIn("between(t,0.100,0.150)", joined)
+
+    def test_caption_route_uses_compositor_pngs(self) -> None:
+        import caption_compositor
+
+        if not caption_compositor.compositor_available():
+            self.skipTest("needs macOS CoreText")
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["overlays"] = [
+            {
+                "id": "caption-route",
+                "type": "caption",
+                "text": "看到 It 想到 to V",
+                "start": 0.05,
+                "end": 0.40,
+                "visible": True,
+                "style": {"font_size": 40, "color": "#F7F2E8", "x": 50, "y": 78},
+                "layout": {"x": 10, "y": 70, "width": 80, "height": 20},
+                "effect_spans": [
+                    {
+                        "id": "fx1",
+                        "text": "It",
+                        "start_char": 3,
+                        "end_char": 5,
+                        "style": {"effect": "pop", "color": "#FF5533", "font_scale": 1.3},
+                    }
+                ],
+            },
+            {
+                "id": "title-1",
+                "type": "title",
+                "text": "標題保持 drawtext",
+                "start": 0.0,
+                "end": 0.3,
+                "visible": True,
+                "style": {"font_size": 44},
+                "layout": {"x": 10, "y": 10, "width": 80, "height": 20},
+            },
+        ]
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        command = build_render_command(
+            self.project, state, manifest,
+            self.project / "renders/caption-route.mp4", "preview",
+        )
+        joined = " ".join(command)
+        self.assertIn("working/captions/caption-route-", joined,
+                      "caption must ride its compositor PNG")
+        self.assertEqual(
+            joined.count("drawtext"), 1,
+            "only the title overlay may use drawtext on the compositor route",
+        )
+        plan = json.loads(
+            (self.project / "working/caption_render_plan.json").read_text("utf-8")
+        )
+        self.assertEqual(plan["items"][0]["caption_item_id"], "caption-route")
+
+        self.write_json("working/editor_state.json", state)
+        output = self.project / "renders/caption-route.mp4"
+        self.run_renderer("--quality", "preview", "--output", str(output))
+        self.assertTrue(output.is_file())
+
+    def test_unsanctioned_font_fallback_blocks_final(self) -> None:
+        import caption_compositor
+
+        if not caption_compositor.compositor_available():
+            self.skipTest("needs macOS CoreText")
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["overlays"] = [
+            {
+                "id": "caption-emoji",
+                "type": "caption",
+                "text": "測試👍字幕",
+                "start": 0.05,
+                "end": 0.40,
+                "visible": True,
+                "style": {"font_size": 40},
+                "layout": {"x": 10, "y": 70, "width": 80, "height": 20},
+            }
+        ]
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        with unittest.mock.patch.object(
+            caption_compositor, "SANCTIONED_FALLBACK_PS_NAMES", set()
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                build_render_command(
+                    self.project, state, manifest,
+                    self.project / "renders/blocked.mp4", "final",
+                )
+        self.assertIn("unsanctioned", str(ctx.exception))
+
+    def test_strip_caption_overlays_keeps_design_cards(self) -> None:
+        from render_editor_timeline import strip_caption_overlays
+
+        state = {
+            "overlays": [
+                {"id": "c1", "type": "caption", "text": "字幕"},
+                {"id": "d1", "type": "card", "design_role": "hook", "text": "卡"},
+                {"id": "e1", "type": "emphasis", "text": "強調"},
+            ]
+        }
+        stripped = strip_caption_overlays(state)
+        self.assertEqual([o["id"] for o in stripped["overlays"]], ["d1"])

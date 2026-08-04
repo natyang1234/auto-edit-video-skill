@@ -505,6 +505,12 @@ def effect_span_final_errors(
     )
     if not spans_present:
         return []
+    import caption_compositor
+
+    if caption_compositor.compositor_available():
+        # Route table (plan v2): with the compositor every caption route
+        # renders spans — nothing to gate here.
+        return []
     if clip is not None and state.get("visual_quality_mode") == "designed":
         # Same clip-scoped role resolution the renderer uses to pick the
         # designed route (visual_quality.overlays_for_clip) — global roles

@@ -269,6 +269,72 @@ def image_filter(
     )
 
 
+CAPTION_TYPES = {"caption", "emphasis"}
+
+
+def is_plain_caption(overlay: dict[str, Any]) -> bool:
+    return (
+        isinstance(overlay, dict)
+        and overlay.get("type") in CAPTION_TYPES
+        and not overlay.get("design_role")
+    )
+
+
+def strip_caption_overlays(state: dict[str, Any]) -> dict[str, Any]:
+    """Designed-route state without plain captions — the compositor is the
+    single caption truth, so the graphic package must not bake them again."""
+    return {
+        **state,
+        "overlays": [
+            overlay
+            for overlay in state.get("overlays", [])
+            if not is_plain_caption(overlay)
+        ],
+    }
+
+
+def captionized_overlays(
+    overlays: list[dict[str, Any]],
+    caption_plan: dict[str, Any],
+    width: int,
+) -> list[dict[str, Any]]:
+    """Swap plain caption overlays for their compositor PNG artifacts.
+
+    Runs after post-cut mapping, so windows/timing stay untouched; a caption
+    split across a removed region shares one PNG across both windows.
+    """
+    artifact_by_id = {
+        item["caption_item_id"]: item["artifact"] for item in caption_plan.get("items", [])
+    }
+    converted: list[dict[str, Any]] = []
+    for overlay in overlays:
+        if not is_plain_caption(overlay):
+            converted.append(overlay)
+            continue
+        artifact = artifact_by_id.get(str(overlay.get("id")))
+        if artifact is None:
+            continue  # empty/hidden captions have no raster
+        style = overlay.get("style") or {}
+        converted.append(
+            {
+                "id": overlay.get("id"),
+                "type": "image",
+                "source": artifact["rgba_path"],
+                "start": overlay.get("start"),
+                "end": overlay.get("end"),
+                "visible": True,
+                "z_index": overlay.get("z_index", 0),
+                "style": {
+                    "width": max(5.0, min(100.0, artifact["width"] / max(width, 1) * 100.0)),
+                    "x": float(style.get("x", 50)),
+                    "y": float(style.get("y", 78)),
+                    "animation": str(style.get("animation", "none")),
+                },
+            }
+        )
+    return converted
+
+
 def state_segments(state: dict[str, Any], source_duration: float) -> list[tuple[float, float]]:
     """Ordered source segments from a v2 state; v1/absent means full source."""
     raw = state.get("segments")
@@ -435,6 +501,22 @@ def build_render_command(
             overlay["end"] = window_end
             overlays.append(overlay)
     overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
+    if any(is_plain_caption(overlay) for overlay in overlays):
+        import caption_compositor
+
+        if caption_compositor.compositor_available():
+            caption_plan = caption_compositor.build_render_plan(
+                project_dir, state, render_scale
+            )
+            disallowed = caption_plan.get("receipt", {}).get("disallowed_fallbacks") or []
+            if disallowed and quality == "final":
+                raise ValueError(
+                    "captions use unsanctioned system font fallbacks "
+                    f"({', '.join(disallowed)}); add the glyph coverage to the "
+                    "project font or mark the caption for review"
+                )
+            overlays = captionized_overlays(overlays, caption_plan, width)
+
     asset_inputs: dict[str, int] = {}
     for overlay in overlays:
         if overlay.get("type") not in {"image", "gif", "video"}:
@@ -712,23 +794,34 @@ def render_project(
                 if item.get("design_role")
             }
             if set(DESIGN_ROLES).issubset(roles):
-                visual_source = ensure_graphic_package(project_dir, state, manifest, clip)
-        if quality == "final" and visual_source is None:
-            # Interim gate (PRD M6): the drawtext route drops per-character
-            # effect spans entirely. Never let an approved final silently lose
-            # styling the editor showed — fail closed until the caption
-            # compositor (Phase 1b) renders spans on this route.
-            spans_present = any(
-                overlay.get("effect_spans")
-                for overlay in state.get("overlays", [])
-                if isinstance(overlay, dict) and overlay.get("visible", True)
-            )
-            if spans_present:
-                raise ValueError(
-                    "per-character effect spans cannot be rendered by the current "
-                    "final route; switch to designed mode with a complete design-role "
-                    "set, or remove the effects (caption compositor lands in Phase 1b)"
+                import caption_compositor
+
+                package_state = (
+                    strip_caption_overlays(state)
+                    if caption_compositor.compositor_available()
+                    else state
                 )
+                visual_source = ensure_graphic_package(
+                    project_dir, package_state, manifest, clip
+                )
+        if quality == "final" and visual_source is None:
+            import caption_compositor
+
+            if not caption_compositor.compositor_available():
+                # Fail-closed gate (route table, plan v2): without the
+                # compositor the drawtext route would silently drop
+                # per-character styling.
+                spans_present = any(
+                    overlay.get("effect_spans")
+                    for overlay in state.get("overlays", [])
+                    if isinstance(overlay, dict) and overlay.get("visible", True)
+                )
+                if spans_present:
+                    raise ValueError(
+                        "per-character effect spans need the caption compositor, "
+                        "which is unavailable on this host; remove the effects or "
+                        "install the macOS CoreText stack"
+                    )
         command = build_render_command(
             project_dir,
             state,
