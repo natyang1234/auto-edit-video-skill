@@ -33,6 +33,9 @@ class QaPolicy:
     # whose narration was truncated still measures fine. Silent coverage
     # catches that; normal pacing leaves well under this share silent.
     max_silent_ratio: float = 0.8
+    # One unbroken silent stretch this large means the audio stopped rather
+    # than paused, which total coverage alone lets through.
+    max_silent_run_ratio: float = 0.5
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_missing_audio, bool):
@@ -47,6 +50,7 @@ class QaPolicy:
             "min_integrated_lufs",
             "max_true_peak_dbfs",
             "max_silent_ratio",
+            "max_silent_run_ratio",
         ):
             value = getattr(self, name)
             if (
@@ -59,6 +63,7 @@ class QaPolicy:
             self.max_black_segment_seconds < 0
             or self.max_black_ratio < 0
             or self.max_silent_ratio < 0
+            or self.max_silent_run_ratio < 0
         ):
             raise ValueError("QA policy coverage thresholds must be non-negative")
 
@@ -108,13 +113,6 @@ def probe(video: Path) -> dict[str, Any]:
 # coverage gate. Beyond 200fps detection degrades and the gate is unreliable.
 BLACK_DETECT_MIN_SECONDS = 0.005
 BLACK_DETECT_PIXEL_THRESHOLD = 0.10
-# A detected crop smaller than this share of the frame is treated as content
-# on a black frame rather than as letterbox padding.
-MIN_CONTENT_AREA_RATIO = 0.25
-# Luma at or below which cropdetect treats a pixel as padding. This is the
-# limited-range equivalent of the black pixel threshold below (16 + 0.10*219),
-# so padding drawn in the renderer's near-black tone is recognised.
-CROP_DETECT_LIMIT = 38
 # Share of a frame that must be dark before the frame counts as black.
 # ffmpeg defaults to 0.98, which misses a failed background render that still
 # carries a caption box or logo; 0.85 catches those while leaving room for
@@ -122,56 +120,8 @@ CROP_DETECT_LIMIT = 38
 BLACK_DETECT_PICTURE_RATIO = 0.85
 
 
-def content_crop(video: Path, width: int, height: int) -> dict[str, int] | None:
-    """Locate the picture area inside letterbox or pillarbox padding.
-
-    Padding is rendered in a near-black tone (contain fit), so the bars
-    themselves read as black pixels and would dominate the coverage
-    measurement — a tall canvas can be three-quarters bars before any
-    content is considered. Measuring the content area instead keeps the
-    gate about the picture. A crop that only covers a small part of the
-    frame is NOT padding (it is more likely a caption box on an otherwise
-    black frame), so it is ignored and the whole frame is measured.
-    """
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or width <= 0 or height <= 0:
-        return None
-    result = run(
-        [
-            ffmpeg,
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            str(video),
-            "-vf",
-            f"cropdetect=limit={CROP_DETECT_LIMIT}:round=2:reset=0",
-            "-an",
-            "-f",
-            "null",
-            "-",
-        ]
-    )
-    matches = re.findall(
-        r"crop=(?P<w>\d+):(?P<h>\d+):(?P<x>-?\d+):(?P<y>-?\d+)", result.stderr or ""
-    )
-    if not matches:
-        return None
-    crop_w, crop_h, crop_x, crop_y = (int(value) for value in matches[-1])
-    if crop_w <= 0 or crop_h <= 0 or crop_x < 0 or crop_y < 0:
-        return None
-    if crop_w > width or crop_h > height:
-        return None
-    if crop_w == width and crop_h == height:
-        return None
-    if (crop_w * crop_h) < (width * height * MIN_CONTENT_AREA_RATIO):
-        return None
-    return {"width": crop_w, "height": crop_h, "x": crop_x, "y": crop_y}
-
-
 def black_segments(
-    video: Path,
-    min_duration: float = BLACK_DETECT_MIN_SECONDS,
-    crop: dict[str, int] | None = None,
+    video: Path, min_duration: float = BLACK_DETECT_MIN_SECONDS
 ) -> list[dict[str, float]]:
     """Detect black segments down to roughly two frames.
 
@@ -182,9 +132,6 @@ def black_segments(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ValueError("ffmpeg is required")
-    prefix = (
-        f"crop={crop['width']}:{crop['height']}:{crop['x']}:{crop['y']}," if crop else ""
-    )
     result = run(
         [
             ffmpeg,
@@ -193,7 +140,7 @@ def black_segments(
             "-i",
             str(video),
             "-vf",
-            f"{prefix}blackdetect=d={min_duration}"
+            f"blackdetect=d={min_duration}"
             f":pic_th={BLACK_DETECT_PICTURE_RATIO}"
             f":pix_th={BLACK_DETECT_PIXEL_THRESHOLD}",
             "-an",
@@ -244,15 +191,20 @@ def silent_coverage(video: Path, duration: float) -> dict[str, float] | None:
         ]
     )
     text = result.stderr or ""
-    total = sum(
-        float(value) for value in re.findall(r"silence_duration:\s*([0-9.]+)", text)
-    )
+    runs = [float(value) for value in re.findall(r"silence_duration:\s*([0-9.]+)", text)]
     # An unterminated final silence is reported as a start with no duration.
     starts = [float(value) for value in re.findall(r"silence_start:\s*(-?[0-9.]+)", text)]
     ends = re.findall(r"silence_end:\s*[0-9.]+", text)
     if len(starts) > len(ends):
-        total += max(0.0, duration - starts[-1])
-    return {"silent_seconds": total, "silent_ratio": min(total / duration, 1.0)}
+        runs.append(max(0.0, duration - starts[-1]))
+    total = sum(runs)
+    longest = max(runs, default=0.0)
+    return {
+        "silent_seconds": total,
+        "silent_ratio": min(total / duration, 1.0),
+        "longest_silent_seconds": longest,
+        "longest_silent_ratio": min(longest / duration, 1.0),
+    }
 
 
 def peak_level_dbfs(video: Path) -> float | None:
@@ -353,8 +305,7 @@ def inspect(
         else:
             failures.append("audio stream is missing")
 
-    crop = content_crop(video, width, height)
-    blacks = black_segments(video, crop=crop)
+    blacks = black_segments(video)
     longest_black = max((item["duration"] for item in blacks), default=0.0)
     if longest_black >= policy.max_black_segment_seconds:
         failures.append(
@@ -373,11 +324,18 @@ def inspect(
     levels = loudness(video) if audio else None
     silence = silent_coverage(video, media["duration_s"]) if audio else None
     short_clip = 0 < media["duration_s"] < LOUDNESS_MIN_MEASURABLE_SECONDS
-    if audio and silence and silence["silent_ratio"] >= policy.max_silent_ratio:
-        failures.append(
-            f"audio is silent for {silence['silent_ratio']:.1%} of the video, at or above "
-            f"the {policy.max_silent_ratio:.1%} fail threshold (truncated or missing audio)"
-        )
+    if audio and silence:
+        if silence["silent_ratio"] >= policy.max_silent_ratio:
+            failures.append(
+                f"audio is silent for {silence['silent_ratio']:.1%} of the video, at or above "
+                f"the {policy.max_silent_ratio:.1%} fail threshold (truncated or missing audio)"
+            )
+        elif silence["longest_silent_ratio"] >= policy.max_silent_run_ratio:
+            failures.append(
+                f"audio is silent for an unbroken {silence['longest_silent_seconds']:.1f}s "
+                f"({silence['longest_silent_ratio']:.1%} of the video), at or above the "
+                f"{policy.max_silent_run_ratio:.1%} fail threshold (audio stopped)"
+            )
     if audio and short_clip:
         # Too short for R128; judge on peak level so brief clips are neither
         # falsely failed nor waved through.
@@ -418,7 +376,6 @@ def inspect(
             "min_segment_seconds": BLACK_DETECT_MIN_SECONDS,
             "pixel_threshold": BLACK_DETECT_PIXEL_THRESHOLD,
             "picture_ratio_threshold": BLACK_DETECT_PICTURE_RATIO,
-            "measured_crop": crop,
         },
         "loudness": levels,
         "silence": silence,
@@ -463,6 +420,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail when audio is silent for at least this fraction of the duration",
     )
     parser.add_argument(
+        "--max-silent-run-ratio",
+        type=float,
+        default=defaults.max_silent_run_ratio,
+        help="fail when one unbroken silence covers at least this fraction of the duration",
+    )
+    parser.add_argument(
         "--min-integrated-lufs",
         type=float,
         default=defaults.min_integrated_lufs,
@@ -483,6 +446,7 @@ def policy_from_args(args: argparse.Namespace) -> QaPolicy:
         max_black_ratio=args.max_black_ratio,
         allow_missing_audio=args.allow_missing_audio,
         max_silent_ratio=args.max_silent_ratio,
+        max_silent_run_ratio=args.max_silent_run_ratio,
         min_integrated_lufs=args.min_integrated_lufs,
         max_true_peak_dbfs=args.max_true_peak_dbfs,
     )

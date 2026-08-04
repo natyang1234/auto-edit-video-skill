@@ -257,9 +257,120 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertTrue(ok, f"pillarboxed content must not be flagged: {report['failures']}")
 
-    def test_dark_content_in_contain_padding_is_not_flagged(self) -> None:
-        # The renderer pads to canvas with a near-black tone, so the bars read
-        # as black pixels. A dark but real picture inside those bars must pass.
+    def test_black_frame_with_side_bars_still_fails(self) -> None:
+        # Decorative side bars cover only a small share of the frame but span
+        # most of its height. Measuring only the area they bound would hide
+        # the black between them.
+        video = self.dir / "black-side-bars.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=540x960:r=30:d=3,"
+            "drawbox=x=70:y=305:w=60:h=350:color=white:t=fill,"
+            "drawbox=x=410:y=305:w=60:h=350:color=white:t=fill",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a black frame framed by side bars must fail")
+        self.assertTrue(
+            any("black" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_audio_that_stops_partway_fails(self) -> None:
+        # Total silent coverage alone lets this through: the audio dies 30%
+        # in, leaving 70% silence, which is under the coverage threshold.
+        video = self.dir / "audio-stops-partway.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=30:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=6",
+            "-af",
+            "volume=enable='gte(t,1.8)':volume=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "audio that stops partway must fail")
+        self.assertTrue(
+            any("silent" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_narration_with_pauses_is_not_flagged(self) -> None:
+        # Repeated short gaps are normal pacing, not a dropout.
+        video = self.dir / "narration-pauses.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=30:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=6",
+            "-af",
+            "volume=enable='between(mod(t,2),1,2)':volume=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertTrue(ok, f"paced narration must not be flagged: {report['failures']}")
+
+    def test_moderately_dark_contain_delivery_passes(self) -> None:
+        # Contain fit pads to canvas in a near-black tone; a dark but real
+        # picture inside those bars must still pass.
         video = self.dir / "contain-dark.mp4"
         command = [
             FFMPEG,
@@ -293,10 +404,6 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertTrue(
             ok, f"dark content inside contain padding must pass: {report['failures']}"
-        )
-        self.assertIsNotNone(
-            report["black_detection"]["measured_crop"],
-            "padding should have been excluded from the measurement",
         )
 
     def test_audio_that_stops_after_the_opening_fails(self) -> None:
