@@ -738,6 +738,80 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertFalse(ok, "a silent delivery must fail whatever its header claims")
 
+    def test_a_second_video_stream_cannot_shorten_the_timeline(self) -> None:
+        # Reading the first video stream as "the picture" lets a brief
+        # decorative track stand in for a long delivery, shrinking every
+        # ratio to whatever that track covers.
+        source = self.dir / "dead-audio.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=20",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=20",
+                "-af",
+                "volume=enable='gte(t,2)':volume=0",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                str(source),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        video = self.dir / "two-video-streams.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x240:r=1:d=1",
+                "-i",
+                str(source),
+                "-map",
+                "0:v",
+                "-map",
+                "1:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a short second picture must not shorten the delivery")
+        self.assertGreater(report["media"]["duration_s"], 10)
+
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal
         # delivery, not a dropout.

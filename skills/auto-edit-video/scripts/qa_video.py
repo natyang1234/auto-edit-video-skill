@@ -103,17 +103,22 @@ def _positive_float(value: Any) -> float:
     return number if math.isfinite(number) and number > 0 else 0.0
 
 
-def picture_duration_candidates(visual: dict[str, Any] | None) -> list[float]:
-    """How long the picture runs, read from the video stream itself."""
-    if not visual:
-        return []
-    candidates = [_positive_float(visual.get("duration"))]
-    frames = _positive_float(visual.get("nb_frames"))
-    rate = str(visual.get("r_frame_rate") or "")
-    if frames and re.fullmatch(r"\d+/\d+", rate):
-        numerator, denominator = (float(part) for part in rate.split("/"))
-        if numerator > 0 and denominator > 0:
-            candidates.append(frames * denominator / numerator)
+def picture_duration_candidates(streams: list[dict[str, Any]]) -> list[float]:
+    """How long the picture runs, read from every video stream present.
+
+    Reading only the first stream lets a short decorative track stand in for
+    the delivery; a container carrying several pictures runs as long as its
+    longest one.
+    """
+    candidates: list[float] = []
+    for visual in streams:
+        candidates.append(_positive_float(visual.get("duration")))
+        frames = _positive_float(visual.get("nb_frames"))
+        rate = str(visual.get("r_frame_rate") or "")
+        if frames and re.fullmatch(r"\d+/\d+", rate):
+            numerator, denominator = (float(part) for part in rate.split("/"))
+            if numerator > 0 and denominator > 0:
+                candidates.append(frames * denominator / numerator)
     return [item for item in candidates if item > 0]
 
 
@@ -145,7 +150,8 @@ def probe(video: Path) -> dict[str, Any]:
     # the file still plays in full, and a long one (an audio track running
     # past the picture) dilutes dead air. Trust the picture instead, and take
     # the longest credible reading of it.
-    picture = max(picture_duration_candidates(visual), default=0.0)
+    visuals = [item for item in streams if item.get("codec_type") == "video"]
+    picture = max(picture_duration_candidates(visuals), default=0.0)
     if picture > 0:
         duration = picture
     return {
@@ -170,14 +176,19 @@ BLACK_DETECT_PIXEL_THRESHOLD = 0.10
 BLACK_DETECT_PICTURE_RATIO = 0.85
 
 
-def black_segments(
+def picture_analysis(
     video: Path, min_duration: float = BLACK_DETECT_MIN_SECONDS
-) -> list[dict[str, float]]:
-    """Detect black segments down to roughly two frames.
+) -> tuple[list[dict[str, float]], float]:
+    """Black segments, plus how much picture actually decoded.
 
-    The detection floor must stay well below the policy thresholds: coverage
-    is summed from detected segments, so segments shorter than the floor are
-    invisible and fragmented black frames would otherwise evade the gate.
+    The decoded length is the only reading of the timeline that does not
+    come from the file describing itself. Container headers, stream
+    durations and frame counts can all disagree with the picture that
+    plays, and every ratio here hangs off that number.
+
+    Detection floor: coverage is summed from detected segments, so
+    segments shorter than the floor are invisible and fragmented black
+    frames would otherwise evade the gate.
     """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -186,7 +197,6 @@ def black_segments(
         [
             ffmpeg,
             "-hide_banner",
-            "-nostats",
             "-i",
             str(video),
             "-vf",
@@ -206,7 +216,11 @@ def black_segments(
     )
     for match in pattern.finditer(text):
         segments.append({key: float(value) for key, value in match.groupdict().items()})
-    return segments
+    decoded = 0.0
+    for match in re.finditer(r"time=(\d+):(\d\d):(\d\d(?:\.\d+)?)", text):
+        hours, minutes, seconds = match.groups()
+        decoded = max(decoded, int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    return segments, decoded
 
 
 # Silence is judged relative to the delivery's own integrated loudness, not
@@ -431,7 +445,14 @@ def inspect(
         else:
             failures.append("audio stream is missing")
 
-    blacks = black_segments(video)
+    blacks, decoded = picture_analysis(video)
+    # Metadata can understate the timeline (a header claiming under a second
+    # would put the delivery below the length at which anything is judged)
+    # and no declared field is cross-checked by another. What decoded is what
+    # plays, so it wins whenever it runs longer.
+    if decoded > media["duration_s"]:
+        media["duration_s"] = round(decoded, 3)
+    media["decoded_seconds"] = round(decoded, 3)
     longest_black = max((item["duration"] for item in blacks), default=0.0)
     if longest_black >= policy.max_black_segment_seconds:
         failures.append(
