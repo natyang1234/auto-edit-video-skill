@@ -606,6 +606,61 @@ class QaVideoGateTest(unittest.TestCase):
         self.assertFalse(ok, "an audio track shorter than the video must fail")
         self.assertGreater(report["silence"]["unmeasured_seconds"], 10)
 
+    def test_barely_any_audio_track_fails(self) -> None:
+        # An audio track of a few hundred milliseconds against a long video
+        # yields too few windows to measure. Whether silence can be judged
+        # must follow the delivery's length, not how much the meter read.
+        video = self.dir / "tiny-audio-track.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x180:r=30:d=20",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc=exprs=0.3*sin(2*PI*220*t):s=48000:d=0.5",
+                "-af",
+                "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-t",
+                "20",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "half a second of audio in a 20s delivery must fail")
+        self.assertIsNotNone(report["silence"], "the silence gate must not be skipped")
+
+    def test_repeated_long_dropouts_fail(self) -> None:
+        # Each silence stays under the per-run limits and total coverage stays
+        # under the blanket limit, but the soundtrack keeps cutting out.
+        video = self.make_audio_shaped_video(
+            "repeated-dropouts.mp4", "if(lt(mod(t,10),4),0.3,0)", 30
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a soundtrack that keeps cutting out must fail")
+        self.assertTrue(
+            any("drops out" in item or "silent" in item for item in report["failures"]),
+            report["failures"],
+        )
+
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal
         # delivery, not a dropout.

@@ -28,7 +28,9 @@ class QaPolicy:
     max_black_ratio: float = 0.35
     allow_missing_audio: bool = False
     min_integrated_lufs: float = -45.0
-    max_true_peak_dbfs: float = 0.0
+    # Full scale itself is clipping: material limited to exactly 0.0 dBTP has
+    # been squashed against the ceiling. Delivery targets sit well below.
+    max_true_peak_dbfs: float = -0.1
     # Integrated loudness is gated: it ignores silent passages, so a final
     # whose narration was truncated still measures fine. Silent coverage
     # catches that; normal pacing leaves well under this share silent.
@@ -47,6 +49,10 @@ class QaPolicy:
     # silence chopped into runs that each stay under the limits adds up to a
     # near-silent delivery that no other threshold catches.
     min_audible_ratio: float = 0.3
+    # A quiet tail is one stretch. Several long silences mean the soundtrack
+    # is coming and going, which the per-run and coverage limits both miss
+    # when each stretch stays just under them.
+    max_long_silent_runs: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_missing_audio, bool):
@@ -63,6 +69,7 @@ class QaPolicy:
             "max_silent_ratio",
             "max_silent_run_ratio",
             "max_silent_run_seconds",
+            "max_long_silent_runs",
             "min_silent_run_seconds",
             "min_audible_ratio",
         ):
@@ -81,6 +88,7 @@ class QaPolicy:
             or self.max_silent_run_seconds < 0
             or self.min_silent_run_seconds < 0
             or self.min_audible_ratio < 0
+            or self.max_long_silent_runs < 0
         ):
             raise ValueError("QA policy coverage thresholds must be non-negative")
 
@@ -187,9 +195,15 @@ AUDIBLE_RELATIVE_LU = 25.0
 AUDIBLE_ABSOLUTE_LUFS = -50.0
 # ebur128 reports momentary loudness every 100ms.
 MOMENTARY_WINDOW_SECONDS = 0.1
+# A silence this long is a dropout rather than a pause; counting how many
+# there are separates a quiet ending from a soundtrack that keeps cutting out.
+LONG_SILENT_RUN_SECONDS = 3.5
 # EBU R128 integrates over 400ms, so shorter clips always measure -70 LUFS;
 # they are judged on peak level instead.
 LOUDNESS_MIN_MEASURABLE_SECONDS = 0.4
+# Silence needs windows either side of the ramp to mean anything, so it is
+# only judged from this length up. Shorter deliveries rely on the level gates.
+SILENCE_MIN_MEASURABLE_SECONDS = LOUDNESS_MIN_MEASURABLE_SECONDS * 2
 
 
 def momentary_loudness(video: Path) -> list[float]:
@@ -239,14 +253,18 @@ def silent_coverage(
     """
     if duration <= 0:
         return None
+    # Whether silence can be judged depends on how long the delivery is, not
+    # on how much of it the meter managed to read: an audio track that stops
+    # early yields few windows, and treating that as "unmeasurable" would
+    # skip the gate on exactly the deliveries it exists for.
+    if duration < SILENCE_MIN_MEASURABLE_SECONDS:
+        return None
     windows = momentary_loudness(video)
     # Momentary loudness integrates over 400ms, so the opening windows always
     # read near-silent while the measurement fills; counting them invents a
     # leading silent run and swamps a short delivery.
     ramp = int(LOUDNESS_MIN_MEASURABLE_SECONDS / MOMENTARY_WINDOW_SECONDS)
     windows = windows[ramp:]
-    if len(windows) < ramp:
-        return None
     threshold = (
         integrated - AUDIBLE_RELATIVE_LU
         if integrated is not None
@@ -281,6 +299,9 @@ def silent_coverage(
         "audible_threshold_lufs": threshold,
         "measured_seconds": measured,
         "unmeasured_seconds": uncovered,
+        "long_silent_runs": float(
+            sum(1 for item in runs if item >= LONG_SILENT_RUN_SECONDS)
+        ),
     }
 
 
@@ -405,6 +426,8 @@ def inspect(
         if audio and not short_clip
         else None
     )
+    if audio and media["duration_s"] >= SILENCE_MIN_MEASURABLE_SECONDS and silence is None:
+        failures.append("audio could not be measured for silence")
     if audio and silence:
         if silence["silent_ratio"] >= policy.max_silent_ratio:
             failures.append(
@@ -420,6 +443,12 @@ def inspect(
                 f"({silence['longest_silent_ratio']:.1%} of the video), at or above the "
                 f"{policy.max_silent_run_ratio:.1%} / {policy.max_silent_run_seconds:.1f}s "
                 f"fail thresholds (audio stopped)"
+            )
+        elif silence["long_silent_runs"] > policy.max_long_silent_runs:
+            failures.append(
+                f"audio drops out {int(silence['long_silent_runs'])} separate times for "
+                f"{policy.min_silent_run_seconds:.1f}s or more (a single quiet tail is "
+                f"expected; repeated dropouts are not)"
             )
         elif silence["audible_ratio"] < policy.min_audible_ratio:
             failures.append(
@@ -529,6 +558,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="shortest silence the proportional run limit applies to",
     )
     parser.add_argument(
+        "--max-long-silent-runs",
+        type=int,
+        default=defaults.max_long_silent_runs,
+        help="fail when more than this many separate long silences occur",
+    )
+    parser.add_argument(
         "--min-audible-ratio",
         type=float,
         default=defaults.min_audible_ratio,
@@ -558,6 +593,7 @@ def policy_from_args(args: argparse.Namespace) -> QaPolicy:
         max_silent_run_ratio=args.max_silent_run_ratio,
         max_silent_run_seconds=args.max_silent_run_seconds,
         min_silent_run_seconds=args.min_silent_run_seconds,
+        max_long_silent_runs=args.max_long_silent_runs,
         min_audible_ratio=args.min_audible_ratio,
         min_integrated_lufs=args.min_integrated_lufs,
         max_true_peak_dbfs=args.max_true_peak_dbfs,
