@@ -517,6 +517,95 @@ class QaVideoGateTest(unittest.TestCase):
             any("silent" in item for item in report["failures"]), report["failures"]
         )
 
+    def test_digital_silence_tail_after_normalisation_fails(self) -> None:
+        # Synthesised narration leaves exact digital zero between and after
+        # phrases, which the loudness meter reports as "nan" rather than a
+        # level. Those windows must count as dead air, not vanish from the
+        # measurement.
+        video = self.dir / "digital-silence-tail.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x180:r=30:d=20",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc='0.2*sin(2*PI*220*t)*lt(t,6)':d=20:s=48000",
+                "-shortest",
+                "-af",
+                "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-t",
+                "20",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a digital-silence tail must not vanish from the measurement")
+        self.assertTrue(
+            any("silent" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_audio_shorter_than_video_fails(self) -> None:
+        # The meter stops when the audio stream ends, so the remaining time
+        # is never measured. It is dead air, not absent time.
+        video = self.dir / "short-audio-track.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=20",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=4",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-t",
+                "20",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "an audio track shorter than the video must fail")
+        self.assertGreater(report["silence"]["unmeasured_seconds"], 10)
+
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal
         # delivery, not a dropout.

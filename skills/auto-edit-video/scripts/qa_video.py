@@ -213,9 +213,16 @@ def momentary_loudness(video: Path) -> list[float]:
         ]
     )
     values: list[float] = []
-    for match in re.finditer(r"M:\s*(-?[0-9.]+|-inf)", result.stderr or ""):
+    # Digital silence reports "nan", not "-inf". A window that cannot be
+    # parsed must count as silent: dropping it would erase that slice of the
+    # timeline from the measurement instead of marking it dead.
+    for match in re.finditer(r"M:\s*(nan|-?inf|-?[0-9.]+)", result.stderr or ""):
         raw = match.group(1)
-        values.append(float("-inf") if raw == "-inf" else float(raw))
+        try:
+            value = float(raw)
+        except ValueError:
+            value = float("-inf")
+        values.append(float("-inf") if math.isnan(value) else value)
     return values
 
 
@@ -253,20 +260,27 @@ def silent_coverage(
         elif current:
             runs.append(current)
             current = 0.0
+    measured = len(windows) * MOMENTARY_WINDOW_SECONDS
+    span = max(0.0, duration - LOUDNESS_MIN_MEASURABLE_SECONDS)
+    # Time the measurement never reached is dead air, not absent time: an
+    # audio stream shorter than the video stops the meter early, and judging
+    # ratios against what was measured would hide the gap entirely.
+    uncovered = max(0.0, span - measured)
+    current += uncovered
     if current:
         runs.append(current)
-    measured = len(windows) * MOMENTARY_WINDOW_SECONDS
     total = sum(runs)
     longest = max(runs, default=0.0)
-    silent_ratio = min(total / measured, 1.0) if measured > 0 else 0.0
+    silent_ratio = min(total / span, 1.0) if span > 0 else 0.0
     return {
         "silent_seconds": total,
         "silent_ratio": silent_ratio,
         "longest_silent_seconds": longest,
-        "longest_silent_ratio": min(longest / measured, 1.0) if measured > 0 else 0.0,
+        "longest_silent_ratio": min(longest / span, 1.0) if span > 0 else 0.0,
         "audible_ratio": max(0.0, 1.0 - silent_ratio),
         "audible_threshold_lufs": threshold,
         "measured_seconds": measured,
+        "unmeasured_seconds": uncovered,
     }
 
 
