@@ -40,7 +40,11 @@ class QaPolicy:
             "max_true_peak_dbfs",
         ):
             value = getattr(self, name)
-            if not isinstance(value, (int, float)) or not math.isfinite(value):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
                 raise ValueError(f"QA policy {name} must be a finite number, got {value!r}")
         if self.max_black_segment_seconds < 0 or self.max_black_ratio < 0:
             raise ValueError("QA policy black thresholds must be non-negative")
@@ -85,11 +89,17 @@ def probe(video: Path) -> dict[str, Any]:
     }
 
 
-# Must stay below one frame at any realistic delivery fps (200fps -> 5ms);
-# a floor above the frame duration makes single-frame black flicker
-# invisible to blackdetect and lets fragmented black evade the coverage gate.
+# Must stay below one frame at the delivery frame rates this tool produces
+# (up to 200fps -> 5ms); a floor above the frame duration makes single-frame
+# black flicker invisible to blackdetect and lets fragmented black evade the
+# coverage gate. Beyond 200fps detection degrades and the gate is unreliable.
 BLACK_DETECT_MIN_SECONDS = 0.005
 BLACK_DETECT_PIXEL_THRESHOLD = 0.10
+# Share of a frame that must be dark before the frame counts as black.
+# ffmpeg defaults to 0.98, which misses a failed background render that still
+# carries a caption box or logo; 0.85 catches those while leaving room for
+# legitimate letterboxing (a pillarboxed portrait delivery is ~68% black).
+BLACK_DETECT_PICTURE_RATIO = 0.85
 
 
 def black_segments(
@@ -112,7 +122,9 @@ def black_segments(
             "-i",
             str(video),
             "-vf",
-            f"blackdetect=d={min_duration}:pix_th={BLACK_DETECT_PIXEL_THRESHOLD}",
+            f"blackdetect=d={min_duration}"
+            f":pic_th={BLACK_DETECT_PICTURE_RATIO}"
+            f":pix_th={BLACK_DETECT_PIXEL_THRESHOLD}",
             "-an",
             "-f",
             "null",
@@ -263,6 +275,7 @@ def inspect(
         "black_detection": {
             "min_segment_seconds": BLACK_DETECT_MIN_SECONDS,
             "pixel_threshold": BLACK_DETECT_PIXEL_THRESHOLD,
+            "picture_ratio_threshold": BLACK_DETECT_PICTURE_RATIO,
         },
         "loudness": levels,
         "policy": asdict(policy),

@@ -2187,6 +2187,23 @@ class EditorServerTests(unittest.TestCase):
             any("missing or does not match" in item for item in errors), errors
         )
 
+        # A symlinked report inside qa/ must be rejected too, matching the
+        # single and batch paths.
+        inside_target = self.project / "qa/other-passing.json"
+        inside_text = json.dumps(
+            {"status": "pass", "policy": SYNTHETIC_QA_POLICY, "failures": [], "warnings": []}
+        )
+        inside_target.write_text(inside_text, encoding="utf-8")
+        linked = self.project / "qa/variant-linked.json"
+        linked.symlink_to(inside_target)
+        receipt["report"] = "qa/variant-linked.json"
+        receipt["report_sha256"] = self._sha256_bytes(inside_text.encode("utf-8"))
+        self.write_json("working/delivery_qa/variant-x.json", receipt)
+        errors = editor_server._variant_report_errors(self.project, receipt, "variant-x")
+        self.assertTrue(
+            any("missing or does not match" in item for item in errors), errors
+        )
+
     def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:
         (self.project / "qa/stale-old.json").write_text(
             json.dumps({"status": "pass"}), encoding="utf-8"

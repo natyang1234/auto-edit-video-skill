@@ -185,6 +185,78 @@ class QaVideoGateTest(unittest.TestCase):
             report["failures"],
         )
 
+    def test_black_frame_with_caption_box_still_counts_as_black(self) -> None:
+        # A failed background render that still draws the caption box leaves a
+        # frame that is ~94% black. Frame-level black detection must not need
+        # a near-perfectly black frame to notice.
+        video = self.dir / "black-with-caption-box.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=640x480:r=30:d=3,"
+            "drawbox=x=20:y=380:w=300:h=60:color=white:t=fill",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a black frame carrying a caption box must still fail")
+        self.assertTrue(
+            any("black" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_letterboxed_content_is_not_treated_as_black(self) -> None:
+        # Pillarboxed delivery (portrait content on a landscape canvas) has
+        # large black margins but real content; it must keep passing.
+        video = self.dir / "pillarboxed.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=180x480:rate=30:duration=3,"
+            "pad=width=640:height=480:x=230:y=0:color=black",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertTrue(ok, f"pillarboxed content must not be flagged: {report['failures']}")
+
     def test_short_fully_black_video_fails(self) -> None:
         video = self.dir / "short-black.mp4"
         make_video(
