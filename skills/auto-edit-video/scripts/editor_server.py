@@ -877,6 +877,89 @@ def rights_gate_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
     return errors
 
 
+def write_output_variant_set(
+    project_dir: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    variant_entries: list[dict[str, Any]],
+) -> None:
+    """Persist the output_variant_set contract instance (task 006 item 5)."""
+    import contract_registry
+
+    selection = state.get("style_pack") or {}
+    pack_id = str(selection.get("project_default") or "")
+    highlight_modes = []
+    for highlight in state.get("highlights", []) or []:
+        highlight_modes.append(
+            {
+                "highlight_id": str(highlight.get("id")),
+                "mode_id": str(state.get("director_style") or "teacher-punch"),
+                "mode_selection": "project-default",
+                "style_pack": {
+                    "id": pack_id or "dark-data-presenter",
+                    "selection": "user" if pack_id else "project-default",
+                },
+            }
+        )
+    variants = []
+    for entry in variant_entries:
+        if entry.get("timeline", {}).get("error"):
+            variant_state = "failed"
+        elif entry.get("final", {}).get("approved"):
+            variant_state = "approved"
+        elif entry.get("delivery"):
+            variant_state = "final_rendered"
+        elif entry.get("timeline", {}).get("approved"):
+            variant_state = "preview_rendered"
+        else:
+            variant_state = "planned"
+        source = find_variant(state, str(entry.get("variant_id"))) or {}
+        variants.append(
+            {
+                "variant_id": f"variant-{canonical_revision({'v': entry.get('variant_id')})[:8]}",
+                "highlight_id": "highlight-000000000000",
+                "preset_id": str(entry.get("preset_id")),
+                "state": variant_state,
+                "overrides": [
+                    {
+                        "path": str(override.get("path")),
+                        "kind": str(override.get("kind")),
+                        "value": override.get("value"),
+                    }
+                    for override in source.get("overrides") or []
+                ],
+            }
+        )
+    preset_ids = {str(entry.get("preset_id")) for entry in variant_entries}
+    artifact = {
+        "schema_version": 1,
+        "master_revision": editor_state_revision(state),
+        "highlight_modes": highlight_modes,
+        "outputs": [
+            {
+                "preset_id": preset_id,
+                "orientation": (
+                    "landscape"
+                    if PLATFORM_PRESETS.get(preset_id, {}).get("width", 0)
+                    > PLATFORM_PRESETS.get(preset_id, {}).get("height", 1)
+                    else "portrait"
+                ),
+                "enabled": True,
+            }
+            for preset_id in sorted(preset_ids)
+            if preset_id in PLATFORM_PRESETS
+        ],
+        "variants": variants,
+    }
+    artifact["revision"] = canonical_revision(
+        {k: v for k, v in artifact.items() if k != "revision"}
+    )
+    errors = contract_registry.validate_artifact("output_variant_set", artifact)
+    if errors:
+        return  # informational artifact must never break the status route
+    atomic_write_json(project_dir / "working/output_variant_set.json", artifact)
+
+
 def effect_span_final_errors(
     state: dict[str, Any],
     clip: dict[str, Any] | None,
@@ -2690,17 +2773,40 @@ class EditorHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self.send_json({"ok": False, "error": "asset path invalid"}, status=422)
                     return
+                if not (self.server.project_dir / asset_rel).is_file():
+                    self.send_json({"ok": False, "error": "asset not found"}, status=404)
+                    return
                 beat_kind = str((body.get("asset") or {}).get("beat") or "image")
                 if beat_kind not in {"image", "broll"}:
                     self.send_json({"ok": False, "error": "beat must be image/broll"}, status=422)
+                    return
+                manifest_now = read_json(self.server.project_dir / "project.json", {}) or {}
+                duration_now = float(manifest_now.get("source", {}).get("duration_s") or 0.0)
+                try:
+                    beat_start = float(timing.get("start"))
+                    beat_end = float(timing.get("end"))
+                except (TypeError, ValueError):
+                    self.send_json({"ok": False, "error": "timing must be numeric"}, status=422)
+                    return
+                if (
+                    not math.isfinite(beat_start)
+                    or not math.isfinite(beat_end)
+                    or beat_start < 0
+                    or beat_end <= beat_start
+                    or (duration_now and beat_end > duration_now + 0.05)
+                ):
+                    self.send_json(
+                        {"ok": False, "error": "timing must satisfy 0 <= start < end <= duration"},
+                        status=422,
+                    )
                     return
                 seed = canonical_revision({"asset-beat": asset_rel, "n": len(visual_plan.get("items", []))})
                 visual_plan.setdefault("items", []).append(
                     {
                         "id": f"visual-beat-{seed[:12]}",
                         "highlight_id": str(timing.get("highlight_id") or "highlight-000000000000"),
-                        "start": float(timing.get("start", 0.0)),
-                        "end": float(timing.get("end", 0.0)),
+                        "start": beat_start,
+                        "end": beat_end,
                         "beat": beat_kind,
                         "structured_layer_id": None,
                         "selected_asset": asset_rel,
@@ -2943,16 +3049,26 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "variant_id": variant_id,
                 "preset_id": variant.get("preset_id"),
             }
-            for gate in ("timeline", "final"):
-                try:
-                    revision = variant_gate_revision(project, gate, state, variant_id)
-                except ValueError as exc:
-                    entry[gate] = {"error": str(exc)}
-                    continue
+            try:
+                snapshot = compute_variant_snapshot(project, state, variant_id)
+            except ValueError as exc:
+                entry["timeline"] = entry["final"] = {"error": str(exc)}
+                variants.append(entry)
+                continue
+            timeline_revision = snapshot["snapshot_hash"]
+            receipt = read_json(
+                project / VARIANT_DELIVERY_REL / f"{variant_id}.json", None
+            )
+            final_revision = canonical_revision(
+                {"snapshot": timeline_revision, "delivery_qa": receipt}
+            )
+            for gate, revision in (("timeline", timeline_revision), ("final", final_revision)):
+                approval = variant_approval_entry(manifest, gate, variant_id)
                 entry[gate] = {
                     "revision": revision,
-                    "approved": variant_approval_is_current(
-                        project, manifest, gate, state, variant_id
+                    "approved": bool(
+                        approval.get("approved")
+                        and approval.get("state_revision") == revision
                     ),
                 }
             receipt = read_json(
@@ -2962,7 +3078,10 @@ class EditorHandler(BaseHTTPRequestHandler):
                 {"output": receipt.get("output")} if isinstance(receipt, dict) else None
             )
             variants.append(entry)
+        write_output_variant_set(project, state, manifest, variants)
         self.send_json({"ok": True, "variants": variants})
+
+    _ASSET_DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
 
     def handle_assets_library(self, project: Path) -> None:
         assets_dir = project / "assets"
@@ -2981,7 +3100,16 @@ class EditorHandler(BaseHTTPRequestHandler):
                     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".m4v",
                 }:
                     continue
-                digest = file_sha256(path)
+                stat = path.stat()
+                cache_key = (str(path), stat.st_size, stat.st_mtime_ns)
+                digest = self._ASSET_DIGEST_CACHE.get(cache_key)
+                if digest is None:
+                    digest = file_sha256(path)
+                    if len(self._ASSET_DIGEST_CACHE) > 2048:
+                        self._ASSET_DIGEST_CACHE.clear()
+                    self._ASSET_DIGEST_CACHE[cache_key] = digest
+                if len(items) >= 500:
+                    break
                 items.append(
                     {
                         "path": path.relative_to(project).as_posix(),
@@ -3014,11 +3142,13 @@ class EditorHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "another render is already running"}, status=409)
             return
         output_rel = f"renders/variant-{variant_id}-{quality}.mp4"
+        job_token = secrets.token_hex(8)
         with self.server.project_lock:
             self.server.render_status = {
                 "state": "rendering",
                 "message": f"變體 {variant_id} 輸出中（{quality}）",
                 "output": None,
+                "job": job_token,
             }
 
         def worker() -> None:
@@ -3053,11 +3183,27 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "variant_id": variant_id,
                 }
             finally:
-                self.server.render_lock.release()
-            with self.server.project_lock:
-                self.server.render_status = status_payload
+                with self.server.project_lock:
+                    # Only this job may write its terminal state, and the
+                    # lock is released inside the same critical section so a
+                    # successor cannot interleave (Codex review).
+                    if self.server.render_status.get("job") == job_token:
+                        status_payload["job"] = job_token
+                        self.server.render_status = status_payload
+                    self.server.render_lock.release()
 
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except RuntimeError:
+            with self.server.project_lock:
+                self.server.render_lock.release()
+                self.server.render_status = {
+                    "state": "error",
+                    "message": "無法啟動輸出執行緒",
+                    "output": None,
+                }
+            self.send_json({"ok": False, "error": "could not start render worker"}, status=500)
+            return
         self.send_json({"ok": True, "output": output_rel, "status_url": "/api/render-status"})
 
     def handle_caption_snap(self) -> None:

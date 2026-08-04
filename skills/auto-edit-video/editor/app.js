@@ -2836,6 +2836,12 @@ async function deskRefreshLayers() {
         `${layer.type}｜${layer.id.slice(-8)}` +
         (beat ? `｜${beat.start}s–${beat.end}s` : "");
       row.append(label);
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "icon-button";
+      edit.textContent = "編";
+      edit.addEventListener("click", () => deskEditLayer(layer, beat));
+      row.append(edit);
       const del = document.createElement("button");
       del.type = "button";
       del.className = "icon-button";
@@ -2853,6 +2859,8 @@ async function deskRefreshLayers() {
   }
 }
 
+let deskEditingLayerId = null;
+
 async function deskSaveLayer() {
   let payload;
   try {
@@ -2861,20 +2869,38 @@ async function deskSaveLayer() {
     showToast(`payload JSON 解析失敗：${error.message}`, "error");
     return;
   }
+  const body = {
+    action: "upsert",
+    layer: { type: byIdSafe("desk-layer-type").value, payload },
+    timing: {
+      start: Number(byIdSafe("desk-layer-start").value || 0),
+      end: Number(byIdSafe("desk-layer-end").value || 0),
+    },
+  };
+  if (deskEditingLayerId) body.id = deskEditingLayerId;
   try {
-    await deskPost({
-      action: "upsert",
-      layer: { type: byIdSafe("desk-layer-type").value, payload },
-      timing: {
-        start: Number(byIdSafe("desk-layer-start").value || 0),
-        end: Number(byIdSafe("desk-layer-end").value || 0),
-      },
-    });
-    showToast("結構卡已儲存並重新編譯；timeline 核可已失效", "success");
+    await deskPost(body);
+    showToast(
+      deskEditingLayerId
+        ? "結構卡已更新；timeline 核可已失效"
+        : "結構卡已建立；timeline 核可已失效",
+      "success"
+    );
+    deskEditingLayerId = null;
+    byIdSafe("desk-layer-save").textContent = "新增結構卡";
     deskRefreshLayers();
   } catch (error) {
     showToast(`結構卡儲存失敗：${error.message}`, "error");
   }
+}
+
+function deskEditLayer(layer, beat) {
+  deskEditingLayerId = layer.id;
+  byIdSafe("desk-layer-type").value = layer.type;
+  byIdSafe("desk-layer-payload").value = JSON.stringify(layer.payload || {}, null, 0);
+  byIdSafe("desk-layer-start").value = beat ? beat.start : 0;
+  byIdSafe("desk-layer-end").value = beat ? beat.end : 0;
+  byIdSafe("desk-layer-save").textContent = `更新 ${layer.id.slice(-8)}`;
 }
 
 async function deskRefreshAssets() {
@@ -2897,16 +2923,22 @@ async function deskRefreshAssets() {
       assign.textContent = "＋beat";
       assign.title = "以目前播放位置起 3 秒建立素材 beat";
       assign.addEventListener("click", async () => {
-        const start = elements["preview-video"].currentTime || 0;
-        await deskPost({
-          action: "asset_beat",
-          asset: {
-            path: asset.path,
-            beat: asset.kind === "video" ? "broll" : "image",
-          },
-          timing: { start, end: start + 3 },
-        });
-        showToast("素材 beat 已建立", "success");
+        const total = duration() || 3;
+        const start = Math.min(elements["preview-video"].currentTime || 0, Math.max(0, total - 0.2));
+        const end = Math.min(start + 3, total);
+        try {
+          await deskPost({
+            action: "asset_beat",
+            asset: {
+              path: asset.path,
+              beat: asset.kind === "video" ? "broll" : "image",
+            },
+            timing: { start, end },
+          });
+          showToast("素材 beat 已建立", "success");
+        } catch (error) {
+          showToast(`素材 beat 建立失敗：${error.message}`, "error");
+        }
       });
       row.append(assign);
       host.append(row);
@@ -2976,8 +3008,9 @@ function deskAddVariant() {
   pushHistory();
   state.variants = state.variants || [];
   const shortName = preset.replace(/[^a-z0-9-]/g, "").slice(0, 20);
+  const suffix = Math.random().toString(16).slice(2, 8);
   state.variants.push({
-    variant_id: `${shortName}-${state.variants.length + 1}`,
+    variant_id: `${shortName}-${suffix}`,
     preset_id: preset,
     overrides: [],
   });
@@ -2992,13 +3025,41 @@ async function deskRenderVariant(variantId, quality) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ variant_id: variantId, quality }),
     });
-    showToast(`變體 ${variantId} ${quality} 輸出已排入`, "success");
+    showToast(`變體 ${variantId} ${quality} 輸出中…`, "success");
+    deskWatchVariantRender(variantId, quality);
   } catch (error) {
     showToast(`變體輸出失敗：${error.message}`, "error");
   }
 }
 
-async function deskApproveVariant(variantId, gate, revision) {
+async function deskWatchVariantRender(variantId, quality, attempt = 0) {
+  try {
+    const status = await request("/api/render-status");
+    if (status.state === "rendering" && attempt < 240) {
+      setTimeout(() => deskWatchVariantRender(variantId, quality, attempt + 1), 1000);
+      return;
+    }
+    if (status.state === "done" && status.variant_id === variantId) {
+      showToast(`變體 ${variantId} 輸出完成`, "success");
+      if (quality === "preview" && status.output) {
+        // 直接切換播放器到 variant 預覽（輸出同源檢視）
+        elements["preview-video"].src = `/${status.output}`;
+        showingRenderedMedia = true;
+        elements["overlay-layer"].hidden = true;
+        elements["preview-video"].play?.();
+      }
+      deskRefreshVariants();
+      return;
+    }
+    if (status.state === "error") {
+      showToast(`變體輸出失敗：${status.message}`, "error");
+    }
+  } catch (_error) {
+    /* status endpoint hiccup — silent */
+  }
+}
+
+async function deskApproveVariant(variantId, gate, revision, isRetry = false) {
   if (!revision) {
     showToast("尚無可核可的 revision；先儲存／輸出", "error");
     return;
@@ -3017,7 +3078,24 @@ async function deskApproveVariant(variantId, gate, revision) {
     showToast(`變體 ${variantId} ${gate} 已核可`, "success");
     deskRefreshVariants();
   } catch (error) {
+    if (!isRetry) {
+      // 快照在點擊與請求間漂移（背景渲染等）：同一次點擊意圖內
+      // 取回 server 當下 revision 重試一次；再失敗才回報。
+      try {
+        const status = await request("/api/variants/status");
+        const fresh = (status.variants || []).find(
+          (variant) => variant.variant_id === variantId
+        );
+        const freshRevision = fresh?.[gate]?.revision;
+        if (freshRevision && freshRevision !== revision) {
+          return deskApproveVariant(variantId, gate, freshRevision, true);
+        }
+      } catch (_refreshError) {
+        /* fall through to the error toast */
+      }
+    }
     showToast(`核可失敗：${error.message}`, "error");
+    deskRefreshVariants();
   }
 }
 

@@ -417,10 +417,75 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             page.locator("#desk-variant-list .batch-output-row").first.wait_for(timeout=8000)
             self.assertIn("youtube-landscape", page.locator("#desk-variant-list").inner_text())
 
-            # rights panel loads (empty message is fine on this fixture)
+            # ---- full chain (task 006 acceptance) ----
+            # asset beat from the library
+            import subprocess as sp
+
+            asset_path = self.project / "assets/imported/pic.png"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            sp.run(
+                [
+                    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=orange:s=64x64:d=1",
+                    "-frames:v", "1", str(asset_path),
+                ],
+                check=True, capture_output=True,
+            )
+            page.locator("#desk-assets summary").click()
+            page.locator("#desk-asset-library .batch-output-row").first.wait_for(timeout=8000)
+            page.locator("#desk-asset-library .batch-output-row button").first.click()
+            page.wait_for_timeout(600)
+
+            # rights: the referenced asset appears and gets asserted
             page.locator("#desk-rights summary").click()
+            page.locator("#desk-rights-list .batch-output-row").first.wait_for(timeout=8000)
+            page.locator("#desk-rights-list .batch-output-row button").first.click()
+            page.wait_for_timeout(600)
+            page.locator("#desk-rights summary").click()
+            page.locator("#desk-rights summary").click()
+            page.wait_for_timeout(600)
+            self.assertIn("✓已授權", page.locator("#desk-rights-list").inner_text())
+
+            # variant lifecycle: approve TL → final render → approve FN → download link
+            # refresh first: the asset beat changed the snapshot revision
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variant-list .batch-output-row").first.wait_for(timeout=8000)
+            variant_row = page.locator("#desk-variant-list .batch-output-row").first
+            variant_row.get_by_role("button", name="核TL").click()
             page.wait_for_timeout(800)
-            self.assertTrue(page.locator("#desk-rights-list").inner_text() is not None)
+            variant_row = page.locator("#desk-variant-list .batch-output-row").first
+            self.assertIn("TL:✓", variant_row.inner_text())
+            variant_row.get_by_role("button", name="出FN").click()
+            render_state = {}
+            for _ in range(240):
+                render_state = page.evaluate(
+                    "() => fetch('/api/render-status').then(r => r.json())"
+                )
+                if render_state.get("state") != "rendering":
+                    break
+                page.wait_for_timeout(1000)
+            self.assertEqual(
+                render_state.get("state"), "done",
+                f"variant final render failed: {render_state}",
+            )
+            page.wait_for_timeout(500)
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variant-list .batch-output-row").first.wait_for(timeout=8000)
+            variant_row = page.locator("#desk-variant-list .batch-output-row").first
+            variant_row.get_by_role("button", name="核FN").click()
+            page.wait_for_timeout(800)
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variants summary").click()
+            page.locator("#desk-variant-list .batch-output-row").first.wait_for(timeout=8000)
+            variant_row = page.locator("#desk-variant-list .batch-output-row").first
+            self.assertIn("FN:✓", variant_row.inner_text())
+            download = variant_row.get_by_role("link", name="下載")
+            download.wait_for(timeout=8000)
+            href = download.get_attribute("href")
+            response = page.request.get(f"http://{host}:{port}{href}")
+            self.assertEqual(response.status, 200, "approved variant final must download")
 
             self.assertEqual(errors, [], f"page errors: {errors}")
             browser.close()
