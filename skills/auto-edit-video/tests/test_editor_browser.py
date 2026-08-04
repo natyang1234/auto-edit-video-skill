@@ -141,6 +141,11 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             page.locator("#effect-style").select_option("highlight")
             page.locator("#effect-color").fill("#00cc88")
             page.locator("#add-effect-span").click()
+            # addEffectSpan now awaits the server snap endpoint; wait for the
+            # new row instead of counting synchronously.
+            page.locator("#effect-span-list .effect-span-row").nth(
+                initial_effect_count
+            ).wait_for(timeout=5000)
             self.assertEqual(
                 page.locator("#effect-span-list .effect-span-row").count(),
                 initial_effect_count + 1,
