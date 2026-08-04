@@ -1,46 +1,138 @@
 {
- "x_schema_version": 1,
- "note": "文字樣本，供 sanitizer 測試；不得直接開啟",
+ "x_schema_version": 2,
+ "note": "文字樣本，供 sanitizer 測試；不得直接開啟或注入 DOM",
  "cases": [
   {
    "id": "script-tag",
    "svg": "<svg><script>alert(1)</script></svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "disallowed-element:script"
   },
   {
    "id": "event-handler",
    "svg": "<svg onload=\"alert(1)\"><rect/></svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "event-handler-attribute:onload"
   },
   {
    "id": "foreign-object",
    "svg": "<svg><foreignObject><body/></foreignObject></svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "disallowed-element:foreignObject"
   },
   {
    "id": "external-href",
    "svg": "<svg><image href=\"https://evil/x.png\"/></svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "disallowed-element:image"
   },
   {
    "id": "external-use",
    "svg": "<svg><use href=\"https://evil/x.svg#a\"/></svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "external-reference:href"
   },
   {
-   "id": "data-uri-script",
-   "svg": "<svg><a href=\"data:text/html,<script>1</script>\"><rect/></a></svg>",
-   "expect": "reject"
+   "id": "xlink-external-image",
+   "svg": "<svg xmlns:xlink=\"http://www.w3.org/1999/xlink\"><image xlink:href=\"https://evil/x.png\"/></svg>",
+   "expect": "reject",
+   "reason": "disallowed-element:image"
+  },
+  {
+   "id": "data-uri-image",
+   "svg": "<svg><image href=\"data:image/png;base64,AAAA\"/></svg>",
+   "expect": "reject",
+   "reason": "disallowed-element:image"
+  },
+  {
+   "id": "data-uri-anchor",
+   "svg": "<svg><a href=\"data:text/plain,hello\"><rect/></a></svg>",
+   "expect": "reject",
+   "reason": "disallowed-element:a"
   },
   {
    "id": "entity-expansion",
    "svg": "<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY a \"aaaa\"><!ENTITY b \"&a;&a;&a;\">]><svg>&b;</svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "doctype-forbidden"
+  },
+  {
+   "id": "doctype-external-dtd",
+   "svg": "<!DOCTYPE svg SYSTEM \"https://evil/x.dtd\"><svg><rect/></svg>",
+   "expect": "reject",
+   "reason": "doctype-forbidden"
   },
   {
    "id": "css-import",
    "svg": "<svg><style>@import url(https://evil/a.css);</style><rect/></svg>",
-   "expect": "reject"
+   "expect": "reject",
+   "reason": "css-import"
+  },
+  {
+   "id": "style-external-url",
+   "svg": "<svg><style>rect{fill:url(https://evil/a.svg#p)}</style><rect/></svg>",
+   "expect": "reject",
+   "reason": "external-url"
+  },
+  {
+   "id": "presentation-url-external",
+   "svg": "<svg><rect fill=\"url(https://evil/a.svg#p)\"/></svg>",
+   "expect": "reject",
+   "reason": "external-url"
+  },
+  {
+   "id": "animate-element",
+   "svg": "<svg><rect><animate attributeName=\"x\" to=\"9\"/></rect></svg>",
+   "expect": "reject",
+   "reason": "disallowed-element:animate"
+  },
+  {
+   "id": "iframe-element",
+   "svg": "<svg><iframe src=\"https://evil\"/></svg>",
+   "expect": "reject",
+   "reason": "disallowed-element:iframe"
+  },
+  {
+   "id": "processing-instruction",
+   "svg": "<svg><?xml-stylesheet href=\"x.css\"?><rect/></svg>",
+   "expect": "reject",
+   "reason": "processing-instruction-forbidden"
+  },
+  {
+   "id": "oversized-viewbox",
+   "svg": "<svg viewBox=\"0 0 9999999 9999999\"><rect/></svg>",
+   "expect": "reject",
+   "reason": "oversized-viewbox"
+  },
+  {
+   "id": "duplicate-id",
+   "svg": "<svg><rect id=\"a\"/><rect id=\"a\"/></svg>",
+   "expect": "reject",
+   "reason": "duplicate-id"
+  },
+  {
+   "id": "unresolved-reference",
+   "svg": "<svg><use href=\"#missing\"/></svg>",
+   "expect": "reject",
+   "reason": "unresolved-reference"
+  },
+  {
+   "id": "cyclic-reference",
+   "svg": "<svg><defs><g id=\"a\"><use href=\"#b\"/></g><g id=\"b\"><use href=\"#a\"/></g></defs></svg>",
+   "expect": "reject",
+   "reason": "cyclic-reference"
+  },
+  {
+   "id": "not-svg-root",
+   "svg": "<html><rect/></html>",
+   "expect": "reject",
+   "reason": "root-not-svg"
+  },
+  {
+   "id": "malformed-xml",
+   "svg": "<svg><rect></svg>",
+   "expect": "reject",
+   "reason": "parse-error"
   },
   {
    "id": "plain-icon",
@@ -50,6 +142,26 @@
   {
    "id": "local-gradient",
    "svg": "<svg><defs><linearGradient id=\"g\"/></defs><rect fill=\"url(#g)\"/></svg>",
+   "expect": "accept"
+  },
+  {
+   "id": "text-icon",
+   "svg": "<svg viewBox=\"0 0 24 24\"><text x=\"2\" y=\"18\"><tspan>Ab</tspan></text></svg>",
+   "expect": "accept"
+  },
+  {
+   "id": "polygon-icon",
+   "svg": "<svg viewBox=\"0 0 10 10\"><polygon points=\"0,0 10,0 5,10\"/></svg>",
+   "expect": "accept"
+  },
+  {
+   "id": "clip-use-local",
+   "svg": "<svg viewBox=\"0 0 24 24\"><defs><clipPath id=\"c\"><rect width=\"24\" height=\"24\"/></clipPath></defs><g clip-path=\"url(#c)\"><path d=\"M0 0h24v24H0z\"/></g></svg>",
+   "expect": "accept"
+  },
+  {
+   "id": "namespaced-svg",
+   "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"10\"/></svg>",
    "expect": "accept"
   }
  ]
