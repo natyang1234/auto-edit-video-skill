@@ -66,9 +66,13 @@ project font ID is selected.
 
 SVG search displays Heroicons, Lucide, Tabler, and Wikimedia metadata. Raw SVG
 never enters the DOM or timeline: only strictly sanitized, bounded rasterized
-PNG is used. Production Studio fails closed and labels SVG import unavailable
-when no pinned local `resvg` is present. Provider tests use fake transport and
-rasterizer fixtures; they do not perform live provider searches. Arbitrary
+PNG is used. Production Studio uses only an explicitly configured machine
+manifest; it never trusts `PATH`. After installing `resvg`, run
+`python3 skills/auto-edit-video/scripts/configure_resvg.py --resvg <canonical-absolute-path>`
+to write the owner-only manifest and reviewed deny-network sandbox profile.
+Missing, drifted, or unsafe configuration keeps SVG import unavailable and
+fails closed. Provider tests use fake transport and rasterizer fixtures; they
+do not perform live provider searches. Arbitrary
 URLs, GIF, and B-roll provider retrieval remain unsupported; licensed local
 uploads remain supported. Provider metadata and stored evidence are not legal
 advice or a guarantee of rights.

@@ -33,7 +33,7 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 靜態圖片可在使用者勾選來源網路揭露後搜尋 Openverse 與 Wikimedia Commons。結果先以中繼資料列顯示，必須明確按下匯入才會下載；目前只允許內建的 CC0／CC BY 4.0 清單，並保存專案私有副本、來源／作者／授權／SHA-256 provenance，自動重建 `ATTRIBUTION.md`，在 final 權利閘再次核對。Studio 的來源搜尋都必須取得該專案明確的網路揭露同意。字型搜尋只顯示中繼資料：Google Fonts 使用 pinned commit 的 `(ofl|apache|ufl)/family` 查詢文法，Fontsource 使用精確的 `id@x.y.z` semver。明確匯入時會嚴格驗證字型、保存 SPDX 授權證據，並將 TTF／OTF 與授權檔存為專案私有資產。選定的精確 `font_asset_id` 必須涵蓋實際輸出的字形；字型缺失、遭竄改或缺少字形時，preview 與 final 都會被阻擋。只有未選專案字型 ID 時，`AUTO_EDIT_FONT` 才可作為明示為未驗證的 legacy fallback。
 
-SVG 搜尋會顯示 Heroicons、Lucide、Tabler 與 Wikimedia 的中繼資料。原始 SVG 絕不進入 DOM 或 timeline，只能經嚴格清理後，以有界限制轉為 PNG 使用。若本機沒有 pinned 的 `resvg`，production Studio 會明確標示 SVG 匯入 unavailable 並 fail closed；不得據此暗示目前可實機匯入。Provider 測試使用 fake transport 與 rasterizer，不曾進行真實 provider 搜尋。任意 URL、GIF 與 B-roll provider 擷取仍不支援；本機授權上傳仍可使用。來源中繼資料與保存的證據不是法律意見，也不保證權利。
+SVG 搜尋會顯示 Heroicons、Lucide、Tabler 與 Wikimedia 的中繼資料。原始 SVG 絕不進入 DOM 或 timeline，只能經嚴格清理後，以有界限制轉為 PNG 使用。Production Studio 不信任 `PATH`，只接受明確設定的 machine manifest；安裝 `resvg` 後執行 `python3 skills/auto-edit-video/scripts/configure_resvg.py --resvg <canonical-absolute-path>`，才會寫入僅 owner 可讀寫的 manifest 與經審查、禁止網路的 sandbox profile。設定缺失、漂移或不安全時仍明確標示 SVG 匯入 unavailable 並 fail closed。Provider 測試使用 fake transport 與 rasterizer，不曾進行真實 provider 搜尋。任意 URL、GIF 與 B-roll provider 擷取仍不支援；本機授權上傳仍可使用。來源中繼資料與保存的證據不是法律意見，也不保證權利。
 
 字幕可直接選取句內字詞，套用可輸出的彈出、螢光或底線效果；字幕與設計圖卡可拖曳，並可調整位置、寬度／高度。GUI 會即時提示平台安全框與同時段圖層重疊。設計模式會把字幕、重點字與圖卡烘焙進同一份 HTML／GSAP graphic package，避免預覽能調、MP4 卻落回另一套字幕 renderer。
 

@@ -83,6 +83,18 @@ _SVG_RASTERIZER_IDENTITY_FIELDS = frozenset(
         "sandbox_profile_sha256",
     }
 )
+_SVG_RUNTIME_METADATA_FIELDS = _SVG_RASTERIZER_IDENTITY_FIELDS | frozenset(
+    {
+        "sandboxed",
+        "timeout_seconds",
+        "memory_limit_enforced",
+        "output_limit_bytes",
+        "log_limit_bytes",
+    }
+)
+_SVG_TIMEOUT_SECONDS = 5.0
+_SVG_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
+_SVG_LOG_LIMIT_BYTES = 64 * 1024
 _SVG_RASTER_RESULT_FIELDS = frozenset(
     {"png_bytes", "png_sha256", "width", "height", "metadata"}
 )
@@ -446,7 +458,7 @@ class AssetProviderService:
             try:
                 from svg_security import ResvgRasterizer  # type: ignore[import-not-found]
 
-                svg_pipeline = ResvgRasterizer(None)
+                svg_pipeline = ResvgRasterizer.from_machine_manifest()
             except ImportError:
                 svg_pipeline = None
         self._svg_pipeline = svg_pipeline
@@ -724,7 +736,9 @@ class AssetProviderService:
             or width * height > MAX_PIXELS
         ):
             return None
-        identity = AssetProviderService._validate_svg_rasterizer_identity(fields["metadata"])
+        identity = AssetProviderService._validate_svg_runtime_metadata(
+            fields["metadata"]
+        )
         if identity is None:
             return None
         return _ValidatedSvgRasterResult(
@@ -734,6 +748,38 @@ class AssetProviderService:
             height=height,
             identity=identity,
         )
+
+    @staticmethod
+    def _validate_svg_runtime_metadata(metadata: Any) -> dict[str, str] | None:
+        """Validate the exact production evidence contract, then extract identity."""
+        if type(metadata) is not dict:
+            return None
+        try:
+            snapshot = dict(metadata)
+        except Exception:
+            return None
+        if set(snapshot) != _SVG_RUNTIME_METADATA_FIELDS:
+            return None
+        if snapshot["sandboxed"] is not True:
+            return None
+        if (
+            type(snapshot["timeout_seconds"]) is not float
+            or snapshot["timeout_seconds"] != _SVG_TIMEOUT_SECONDS
+        ):
+            return None
+        if snapshot["memory_limit_enforced"] is not False:
+            return None
+        if (
+            type(snapshot["output_limit_bytes"]) is not int
+            or snapshot["output_limit_bytes"] != _SVG_OUTPUT_LIMIT_BYTES
+            or type(snapshot["log_limit_bytes"]) is not int
+            or snapshot["log_limit_bytes"] != _SVG_LOG_LIMIT_BYTES
+        ):
+            return None
+        identity = {
+            field: snapshot[field] for field in _SVG_RASTERIZER_IDENTITY_FIELDS
+        }
+        return AssetProviderService._validate_svg_rasterizer_identity(identity)
 
     def _svg_available(self) -> tuple[bool, str]:
         if self._svg_preflight_identity is not None:

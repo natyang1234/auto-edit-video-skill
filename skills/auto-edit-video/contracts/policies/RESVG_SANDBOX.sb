@@ -1,0 +1,16 @@
+(version 1)
+(deny default)
+(deny network*)
+(allow process-exec
+  (literal (param "RESVG_EXECUTABLE")))
+(allow file-read*
+  (literal "/")
+  (literal (param "RESVG_EXECUTABLE"))
+  (subpath (param "WORK_DIR"))
+  (subpath "/usr/lib")
+  (subpath "/System")
+  (literal "/dev/null")
+  (literal "/dev/urandom"))
+(allow file-write*
+  (subpath (param "WORK_DIR")))
+(allow sysctl-read)

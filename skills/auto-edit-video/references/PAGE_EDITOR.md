@@ -39,8 +39,12 @@ plans, source QA, and `working/editor_state.json`.
   selected project font ID.
 - SVG metadata search for Heroicons, Lucide, Tabler, and Wikimedia. Raw SVG
   never reaches the DOM or timeline: strict sanitization and bounded PNG
-  rasterization are required. If pinned local `resvg` is absent, production UI
-  labels SVG import unavailable and fails closed.
+  rasterization are required. Production never discovers `resvg` through
+  `PATH`; after installation, run `python3 scripts/configure_resvg.py --resvg
+  <canonical-absolute-path>` from the skill directory. This writes an
+  owner-only manifest and reviewed deny-network sandbox profile. Missing,
+  drifted, or unsafe configuration leaves SVG import unavailable and fails
+  closed.
 - Independent video-template catalog: three fixed-camera layouts with no source
   transform tween, two opt-in dynamic layouts, and three local subject-cutout
   layouts for solid, owned-image, or owned-looping-video backgrounds. Frame

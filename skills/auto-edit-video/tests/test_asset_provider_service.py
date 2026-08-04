@@ -244,6 +244,17 @@ def fontsource_font_payload(*, license_spdx: str = "OFL-1.1") -> bytes:
 _DEFAULT_RASTER_METADATA = object()
 
 
+def production_raster_metadata(identity: dict[str, str]) -> dict[str, Any]:
+    return {
+        **identity,
+        "sandboxed": True,
+        "timeout_seconds": 5.0,
+        "memory_limit_enforced": False,
+        "output_limit_bytes": 64 * 1024 * 1024,
+        "log_limit_bytes": 64 * 1024,
+    }
+
+
 class FakeSvgPipeline:
     """Available test pipeline that never impersonates ResvgRasterizer."""
 
@@ -279,7 +290,7 @@ class FakeSvgPipeline:
             width=width,
             height=height,
             metadata=(
-                dict(self.identity)
+                production_raster_metadata(self.identity)
                 if self.raster_metadata is _DEFAULT_RASTER_METADATA
                 else self.raster_metadata
             ),
@@ -291,6 +302,15 @@ class AssetProviderServiceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary.name) / "project"
         self.project.mkdir()
+        self.resvg_manifest_environment = patch.dict(
+            os.environ,
+            {
+                "AUTO_EDIT_VIDEO_RESVG_MANIFEST": str(
+                    Path(self.temporary.name).resolve() / "missing-resvg-manifest.json"
+                )
+            },
+        )
+        self.resvg_manifest_environment.start()
         self.clock = FakeClock()
         self.service = AssetProviderService(
             self.project,
@@ -300,6 +320,7 @@ class AssetProviderServiceTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.resvg_manifest_environment.stop()
         self.temporary.cleanup()
 
     def test_catalog_and_consent_are_project_scoped_persisted_and_secret_free(self) -> None:
@@ -903,6 +924,64 @@ class AssetProviderServiceTests(unittest.TestCase):
         self.assertEqual(replayed.exception.status_code, 404)
         self.assertEqual(replayed.exception.code, "import_token_not_found")
 
+    def test_exact_production_runtime_metadata_is_accepted(self) -> None:
+        pipeline = FakeSvgPipeline()
+        pipeline.raster_metadata = production_raster_metadata(pipeline.identity)
+        service, _downloader, _pipeline = self._svg_service(
+            [BENIGN_SVG], pipeline=pipeline
+        )
+        imported = self._import_repo_svg(service, "heroicons", "arrow-right")
+        self.assertTrue((self.project / imported["source"]).is_file())
+
+    def test_production_runtime_metadata_limit_mutations_fail_closed(self) -> None:
+        identity = {
+            "version": "resvg-test-1",
+            "executable_sha256": "a" * 64,
+            "sandbox_executable_sha256": "b" * 64,
+            "sandbox_profile_sha256": "c" * 64,
+        }
+        valid = production_raster_metadata(identity)
+
+        class MetadataMapping(dict[str, Any]):
+            pass
+
+        mutations = {
+            "mapping_subclass": MetadataMapping(valid),
+            "extra": {**valid, "unexpected": True},
+            "missing": {key: value for key, value in valid.items() if key != "log_limit_bytes"},
+            "sandboxed_false": {**valid, "sandboxed": False},
+            "sandboxed_one": {**valid, "sandboxed": 1},
+            "timeout_bool": {**valid, "timeout_seconds": True},
+            "timeout_changed": {**valid, "timeout_seconds": 4.9},
+            "memory_true": {**valid, "memory_limit_enforced": True},
+            "memory_zero": {**valid, "memory_limit_enforced": 0},
+            "output_bool": {**valid, "output_limit_bytes": True},
+            "output_changed": {**valid, "output_limit_bytes": 64 * 1024 * 1024 - 1},
+            "log_bool": {**valid, "log_limit_bytes": True},
+            "log_changed": {**valid, "log_limit_bytes": 64 * 1024 - 1},
+        }
+        for label, metadata in mutations.items():
+            with self.subTest(label=label):
+                project = self.project / f"runtime-{label}"
+                project.mkdir()
+                pipeline = FakeSvgPipeline(raster_metadata=metadata)
+                downloader = FakeDownloader([BENIGN_SVG])
+                service = AssetProviderService(
+                    project,
+                    downloader=downloader,
+                    resolver=lambda host, port: ["93.184.216.34"],
+                    clock=self.clock,
+                    svg_pipeline=pipeline,
+                )
+                service.grant_consent("heroicons", "nat")
+                token = service.search("heroicons", "arrow-right")["items"][0][
+                    "import_token"
+                ]
+                with self.assertRaises(AssetProviderError) as rejected:
+                    service.import_candidate(token, lambda _path: True)
+                self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+                self._assert_no_svg_publication(project)
+
     def test_raster_metadata_requires_exact_plain_cached_identity(self) -> None:
         identity = {
             "version": "resvg-test-1",
@@ -915,12 +994,22 @@ class AssetProviderServiceTests(unittest.TestCase):
             pass
 
         malformed = {
-            "missing": {key: value for key, value in identity.items() if key != "version"},
-            "extra": {**identity, "unexpected": "value"},
-            "mapping_subclass": IdentityMapping(identity),
-            "changed_version": {**identity, "version": "resvg-test-2"},
-            "changed_hash": {**identity, "executable_sha256": "d" * 64},
-            "uppercase_hash": {**identity, "executable_sha256": "A" * 64},
+            "missing": {
+                key: value
+                for key, value in production_raster_metadata(identity).items()
+                if key != "version"
+            },
+            "extra": {**production_raster_metadata(identity), "unexpected": "value"},
+            "mapping_subclass": IdentityMapping(production_raster_metadata(identity)),
+            "changed_version": production_raster_metadata(
+                {**identity, "version": "resvg-test-2"}
+            ),
+            "changed_hash": production_raster_metadata(
+                {**identity, "executable_sha256": "d" * 64}
+            ),
+            "uppercase_hash": production_raster_metadata(
+                {**identity, "executable_sha256": "A" * 64}
+            ),
         }
         for label, metadata in malformed.items():
             with self.subTest(label=label):
@@ -980,7 +1069,9 @@ class AssetProviderServiceTests(unittest.TestCase):
                         "png_sha256": hashlib.sha256(payload).hexdigest(),
                         "width": width,
                         "height": height,
-                        "metadata": dict(selected_pipeline.identity),
+                        "metadata": production_raster_metadata(
+                            selected_pipeline.identity
+                        ),
                     }
                     return selected(valid)
 

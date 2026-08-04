@@ -3,12 +3,14 @@ from __future__ import annotations
 import binascii
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
 
@@ -16,11 +18,17 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 from svg_security import (  # noqa: E402
+    BUNDLED_SANDBOX_PROFILE,
+    BUNDLED_SANDBOX_PROFILE_BYTES,
+    BUNDLED_SANDBOX_PROFILE_SHA256,
+    DEFAULT_RESVG_MANIFEST_PATH,
+    RESVG_MANIFEST_ENV,
     POLICY_VERSION,
     SANITIZER_VERSION,
     PNGValidationResult,
     ResvgRasterizer,
     SvgSecurityError,
+    load_resvg_manifest,
     sanitize_and_rasterize,
     sanitize_svg_bytes,
     validate_png_bytes,
@@ -213,6 +221,13 @@ class RasterizerTests(unittest.TestCase):
         self.sandbox.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         self.profile = self.root / "svg.sb"
         self.profile.write_text("(version 1)\n(deny default)\n", encoding="utf-8")
+        self.reviewed_profile = self.root / "resvg-sandbox.sb"
+        # Use the same immutable import-time reviewed bytes as the loader. This
+        # keeps the fixture coherent even if a developer edits the source
+        # profile concurrently with a long discovery run; production still
+        # fails closed against any machine-profile drift.
+        self.reviewed_profile.write_bytes(BUNDLED_SANDBOX_PROFILE_BYTES)
+        self.reviewed_profile.chmod(0o600)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -261,6 +276,150 @@ class RasterizerTests(unittest.TestCase):
         self.assertTrue(checked.checks_ok)
         self.assertFalse(checked.available)
         self.assertEqual(checked.code, "RASTERIZER_TEST_BACKEND")
+
+    def test_machine_manifest_loader_is_strict_and_permission_gated(self) -> None:
+        path = self.root / "manifest.json"
+        manifest = self.manifest(
+            executable_path=str(self.executable.resolve()),
+            sandbox_executable_path="/usr/bin/sandbox-exec",
+            sandbox_executable_sha256=hashlib.sha256(
+                Path("/usr/bin/sandbox-exec").read_bytes()
+            ).hexdigest(),
+            sandbox_profile_path=str(self.reviewed_profile.resolve()),
+            sandbox_profile_sha256=BUNDLED_SANDBOX_PROFILE_SHA256,
+        )
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        path.chmod(0o600)
+        loaded, code = load_resvg_manifest(path)
+        self.assertEqual(code, "OK")
+        self.assertEqual(loaded, manifest)
+
+        self.reviewed_profile.chmod(0o644)
+        self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_UNSAFE")
+        self.reviewed_profile.chmod(0o600)
+
+        path.chmod(0o644)
+        self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_UNSAFE")
+        path.chmod(0o600)
+        path.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
+        self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_INVALID")
+        path.write_text(json.dumps({**manifest, "extra": True}), encoding="utf-8")
+        self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_INVALID")
+
+        link = self.root / "manifest-link.json"
+        link.symlink_to(path)
+        self.assertEqual(load_resvg_manifest(link)[1], "RASTERIZER_MANIFEST_UNSAFE")
+
+    def test_manifest_schema_version_requires_exact_plain_integer_one(self) -> None:
+        path = self.root / "manifest.json"
+        manifest = self.manifest(
+            executable_path=str(self.executable.resolve()),
+            sandbox_executable_path="/usr/bin/sandbox-exec",
+            sandbox_executable_sha256=hashlib.sha256(
+                Path("/usr/bin/sandbox-exec").read_bytes()
+            ).hexdigest(),
+            sandbox_profile_path=str(self.reviewed_profile.resolve()),
+            sandbox_profile_sha256=BUNDLED_SANDBOX_PROFILE_SHA256,
+        )
+        for hostile_version in (True, 1.0):
+            with self.subTest(schema_version=hostile_version):
+                hostile = {**manifest, "schema_version": hostile_version}
+                path.write_text(json.dumps(hostile), encoding="utf-8")
+                path.chmod(0o600)
+                self.assertEqual(
+                    load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_INVALID"
+                )
+                self.assertEqual(
+                    ResvgRasterizer(hostile, probe=self.probe).preflight().code,
+                    "RASTERIZER_MANIFEST_INVALID",
+                )
+
+    def test_manifest_environment_override_must_be_explicit_absolute_path(self) -> None:
+        self.assertTrue(DEFAULT_RESVG_MANIFEST_PATH.is_absolute())
+        with patch.dict(os.environ, {RESVG_MANIFEST_ENV: "relative.json"}, clear=False):
+            self.assertEqual(
+                ResvgRasterizer.from_machine_manifest().preflight().code,
+                "RASTERIZER_MANIFEST_INVALID",
+            )
+
+    def test_reviewed_profile_cannot_be_replaced_by_self_signed_profile(self) -> None:
+        path = self.root / "manifest.json"
+        manifest = self.manifest()
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        path.chmod(0o600)
+        self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_INVALID")
+
+        reviewed_manifest = self.manifest(
+            executable_path=str(self.executable.resolve()),
+            sandbox_executable_path="/usr/bin/sandbox-exec",
+            sandbox_executable_sha256=hashlib.sha256(
+                Path("/usr/bin/sandbox-exec").read_bytes()
+            ).hexdigest(),
+            sandbox_profile_path=str(self.reviewed_profile.resolve()),
+            sandbox_profile_sha256=BUNDLED_SANDBOX_PROFILE_SHA256,
+        )
+        path.write_text(json.dumps(reviewed_manifest), encoding="utf-8")
+        path.chmod(0o600)
+        self.assertEqual(load_resvg_manifest(path)[1], "OK")
+        self.reviewed_profile.write_bytes(BUNDLED_SANDBOX_PROFILE_BYTES + b"\n; drift")
+        self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_UNSAFE")
+
+    def test_manifest_is_independent_of_runtime_bundle_copy_path(self) -> None:
+        path = self.root / "manifest.json"
+        manifest = self.manifest(
+            executable_path=str(self.executable.resolve()),
+            sandbox_executable_path="/usr/bin/sandbox-exec",
+            sandbox_executable_sha256=hashlib.sha256(
+                Path("/usr/bin/sandbox-exec").read_bytes()
+            ).hexdigest(),
+            sandbox_profile_path=str(self.reviewed_profile.resolve()),
+            sandbox_profile_sha256=BUNDLED_SANDBOX_PROFILE_SHA256,
+        )
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        path.chmod(0o600)
+        other_copy = self.root / "other-copy.sb"
+        other_copy.write_bytes(BUNDLED_SANDBOX_PROFILE_BYTES + b"\n; concurrent edit")
+        with patch("svg_security.BUNDLED_SANDBOX_PROFILE", other_copy):
+            self.assertEqual(load_resvg_manifest(path)[1], "OK")
+
+    def test_reviewed_profile_denies_network_and_has_no_home_read_scope(self) -> None:
+        profile = BUNDLED_SANDBOX_PROFILE.read_text(encoding="utf-8")
+        self.assertIn("(deny default)", profile)
+        self.assertIn("(deny network*)", profile)
+        self.assertIn('(literal (param "RESVG_EXECUTABLE"))', profile)
+        self.assertNotIn("/Users", profile)
+        self.assertNotIn("(allow network", profile)
+        self.assertNotIn("mach-", profile)
+
+    def test_production_runner_contract_has_no_shell_and_no_memory_cap_claim(self) -> None:
+        manifest = self.manifest(
+            executable_path=str(self.executable.resolve()),
+            sandbox_executable_path="/usr/bin/sandbox-exec",
+            sandbox_executable_sha256=hashlib.sha256(
+                Path("/usr/bin/sandbox-exec").read_bytes()
+            ).hexdigest(),
+            sandbox_profile_path=str(self.reviewed_profile.resolve()),
+            sandbox_profile_sha256=BUNDLED_SANDBOX_PROFILE_SHA256,
+        )
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_process(argv: list[str], **kwargs: object) -> dict[str, object]:
+            calls.append((argv, kwargs))
+            if argv[-1] == "--version":
+                return {"returncode": 0, "stdout": b"resvg 0.test\n", "stderr": b""}
+            Path(argv[-1]).write_bytes(png_bytes(1, 1))
+            return {"returncode": 0, "stdout": b"", "stderr": b""}
+
+        rasterizer = ResvgRasterizer._production_for_configure(manifest)
+        with patch("svg_security._run_bounded_process", side_effect=fake_process):
+            checked = rasterizer.preflight()
+        self.assertTrue(checked.available)
+        raster_argv, raster_kwargs = calls[-1]
+        self.assertIn("--quiet", raster_argv)
+        self.assertIn("--skip-system-fonts", raster_argv)
+        self.assertIn("--resources-dir", raster_argv)
+        self.assertNotIn("shell", raster_kwargs)
+        self.assertNotIn("memory_bytes", raster_kwargs)
 
     def test_hostile_svg_never_calls_rasterizer(self) -> None:
         calls = []

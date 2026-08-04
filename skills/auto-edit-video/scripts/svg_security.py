@@ -18,9 +18,13 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import stat
 import struct
+import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Mapping
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -43,6 +47,29 @@ MAX_RASTER_SIDE = 4096
 MAX_RASTER_PIXELS = 16 * 1024 * 1024
 MAX_PNG_BYTES = 64 * 1024 * 1024
 MAX_REFERENCE_DEPTH = 8
+
+RESVG_MANIFEST_ENV = "AUTO_EDIT_VIDEO_RESVG_MANIFEST"
+DEFAULT_RESVG_MANIFEST_PATH = Path(
+    os.path.expanduser("~/.config/auto-edit-video/resvg-manifest.json")
+).absolute()
+BUNDLED_SANDBOX_PROFILE = (
+    Path(__file__).resolve().parents[1] / "contracts/policies/RESVG_SANDBOX.sb"
+).resolve()
+BUNDLED_SANDBOX_PROFILE_SHA256 = (
+    "fdeafff37a24abd03bc8f4069c88c8366e6cebbfd693874da9fd18b3cbae1420"
+)
+try:
+    BUNDLED_SANDBOX_PROFILE_BYTES = BUNDLED_SANDBOX_PROFILE.read_bytes()
+except OSError:
+    BUNDLED_SANDBOX_PROFILE_BYTES = b""
+
+SANDBOX_EXECUTABLE = Path("/usr/bin/sandbox-exec")
+RASTER_TIMEOUT_SECONDS = 5.0
+MAX_RASTER_LOG_BYTES = 64 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+# Python cannot safely install per-child RLIMIT_AS from a threaded macOS
+# service without preexec_fn.  The adapter therefore makes no memory-cap claim.
+RASTER_MEMORY_LIMIT_ENFORCED = False
 
 _LIMITS = {
     "raw_bytes": MAX_RAW_BYTES,
@@ -896,6 +923,231 @@ def validate_png_bytes(payload: bytes, *, expected_width: int, expected_height: 
 Probe = Callable[[Mapping[str, Any]], tuple[str, bytes]]
 Runner = Callable[..., Any]
 
+_MANIFEST_REQUIRED = frozenset(
+    {
+        "schema_version", "executable_path", "executable_sha256", "version",
+        "sandbox_executable_path", "sandbox_executable_sha256",
+        "sandbox_profile_path", "sandbox_profile_sha256",
+    }
+)
+
+
+class _BoundedProcessError(RuntimeError):
+    pass
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
+def _run_bounded_process(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: Mapping[str, str],
+    timeout: float,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    """Run fixed argv while bounding time, logs, and any expected PNG file.
+
+    No ``preexec_fn`` is used: it is unsafe in the threaded Studio process on
+    macOS.  Output and log caps are actively supervised and always rechecked
+    before bytes cross back into the caller.
+    """
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    selected = selectors.DefaultSelector()
+    selected.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selected.register(process.stderr, selectors.EVENT_READ, "stderr")
+    logs = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        while selected.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process_group(process)
+                raise TimeoutError
+            if output_path is not None:
+                try:
+                    if output_path.stat().st_size > MAX_PNG_BYTES:
+                        _kill_process_group(process)
+                        raise _BoundedProcessError("output limit")
+                except FileNotFoundError:
+                    pass
+            for key, _event in selected.select(min(0.05, remaining)):
+                chunk = os.read(key.fileobj.fileno(), 8192)
+                if not chunk:
+                    selected.unregister(key.fileobj)
+                    continue
+                buffer = logs[key.data]
+                if len(buffer) + len(chunk) > MAX_RASTER_LOG_BYTES:
+                    _kill_process_group(process)
+                    raise _BoundedProcessError("log limit")
+                buffer.extend(chunk)
+        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_group(process)
+        raise TimeoutError from exc
+    finally:
+        selected.close()
+        if process.poll() is None:
+            _kill_process_group(process)
+        process.wait()
+        process.stdout.close()
+        process.stderr.close()
+    if output_path is not None:
+        try:
+            if output_path.stat().st_size > MAX_PNG_BYTES:
+                raise _BoundedProcessError("output limit")
+        except FileNotFoundError:
+            pass
+    return {
+        "returncode": returncode,
+        "stdout": bytes(logs["stdout"]),
+        "stderr": bytes(logs["stderr"]),
+    }
+
+
+def _manifest_path(path: str | os.PathLike[str] | None) -> Path | None:
+    if path is None:
+        override = os.environ.get(RESVG_MANIFEST_ENV)
+        path = override if override is not None else DEFAULT_RESVG_MANIFEST_PATH
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return None
+    return candidate
+
+
+def load_resvg_manifest(
+    path: str | os.PathLike[str] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Load a strict, owner-only machine manifest without following symlinks."""
+    candidate = _manifest_path(path)
+    if candidate is None:
+        return None, "RASTERIZER_MANIFEST_INVALID"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except FileNotFoundError:
+        return None, "RASTERIZER_MANIFEST_MISSING"
+    except OSError:
+        return None, "RASTERIZER_MANIFEST_UNSAFE"
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size <= 0
+            or info.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None, "RASTERIZER_MANIFEST_UNSAFE"
+        chunks = bytearray()
+        while len(chunks) <= MAX_MANIFEST_BYTES:
+            chunk = os.read(descriptor, min(8192, MAX_MANIFEST_BYTES + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > MAX_MANIFEST_BYTES:
+            return None, "RASTERIZER_MANIFEST_UNSAFE"
+    finally:
+        os.close(descriptor)
+    try:
+        manifest = json.loads(
+            bytes(chunks).decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, "RASTERIZER_MANIFEST_INVALID"
+    if type(manifest) is not dict or set(manifest) != _MANIFEST_REQUIRED:
+        return None, "RASTERIZER_MANIFEST_INVALID"
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest["schema_version"] != 1
+        or type(manifest.get("version")) is not str
+    ):
+        return None, "RASTERIZER_MANIFEST_INVALID"
+    profile_path = manifest.get("sandbox_profile_path")
+    if (
+        not isinstance(profile_path, str)
+        or not os.path.isabs(profile_path)
+        or manifest.get("sandbox_profile_sha256") != BUNDLED_SANDBOX_PROFILE_SHA256
+        or hashlib.sha256(BUNDLED_SANDBOX_PROFILE_BYTES).hexdigest()
+        != BUNDLED_SANDBOX_PROFILE_SHA256
+    ):
+        return None, "RASTERIZER_MANIFEST_INVALID"
+    try:
+        configured_profile = Path(profile_path)
+        profile_info = configured_profile.lstat()
+        if (
+            stat.S_ISLNK(profile_info.st_mode)
+            or not stat.S_ISREG(profile_info.st_mode)
+            or profile_info.st_uid != os.geteuid()
+            or stat.S_IMODE(profile_info.st_mode) != 0o600
+            or str(configured_profile.resolve(strict=True)) != profile_path
+        ):
+            return None, "RASTERIZER_MANIFEST_UNSAFE"
+        profile_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        profile_fd = os.open(configured_profile, profile_flags)
+        try:
+            opened_profile_info = os.fstat(profile_fd)
+            if (
+                not stat.S_ISREG(opened_profile_info.st_mode)
+                or opened_profile_info.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_profile_info.st_mode) != 0o600
+                or opened_profile_info.st_size != len(BUNDLED_SANDBOX_PROFILE_BYTES)
+            ):
+                return None, "RASTERIZER_MANIFEST_UNSAFE"
+            profile_bytes = bytearray()
+            while len(profile_bytes) <= len(BUNDLED_SANDBOX_PROFILE_BYTES):
+                chunk = os.read(profile_fd, 8192)
+                if not chunk:
+                    break
+                profile_bytes.extend(chunk)
+        finally:
+            os.close(profile_fd)
+        if bytes(profile_bytes) != BUNDLED_SANDBOX_PROFILE_BYTES:
+            return None, "RASTERIZER_MANIFEST_INVALID"
+    except OSError:
+        return None, "RASTERIZER_MANIFEST_UNSAFE"
+    if manifest.get("sandbox_executable_path") != str(SANDBOX_EXECUTABLE):
+        return None, "RASTERIZER_MANIFEST_INVALID"
+    return manifest, "OK"
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> None:
+    del value
+    raise ValueError("invalid JSON constant")
+
 
 class ResvgRasterizer:
     """Manifest-gated rasterizer seam.
@@ -904,18 +1156,38 @@ class ResvgRasterizer:
     test-only and can pass checks, but never report production availability.
     """
 
-    _REQUIRED = frozenset(
-        {
-            "schema_version", "executable_path", "executable_sha256", "version",
-            "sandbox_executable_path", "sandbox_executable_sha256",
-            "sandbox_profile_path", "sandbox_profile_sha256",
-        }
-    )
+    _PRODUCTION_TOKEN = object()
 
-    def __init__(self, manifest: Mapping[str, Any] | None, *, probe: Probe | None = None, runner: Runner | None = None) -> None:
+    def __init__(
+        self,
+        manifest: Mapping[str, Any] | None,
+        *,
+        probe: Probe | None = None,
+        runner: Runner | None = None,
+        _production_token: object | None = None,
+        _load_error: str | None = None,
+    ) -> None:
         self._manifest = dict(manifest) if manifest is not None else None
         self._probe = probe
         self._runner = runner
+        self._production = _production_token is self._PRODUCTION_TOKEN
+        self._load_error = _load_error
+
+    @classmethod
+    def from_machine_manifest(
+        cls, path: str | os.PathLike[str] | None = None
+    ) -> "ResvgRasterizer":
+        manifest, code = load_resvg_manifest(path)
+        return cls(
+            manifest,
+            _production_token=cls._PRODUCTION_TOKEN,
+            _load_error=None if code == "OK" else code,
+        )
+
+    @classmethod
+    def _production_for_configure(cls, manifest: Mapping[str, Any]) -> "ResvgRasterizer":
+        """Private configure-time verifier; never selected by service injection."""
+        return cls(manifest, _production_token=cls._PRODUCTION_TOKEN)
 
     @staticmethod
     def _safe_file(path_value: Any, expected_hash: Any, *, executable: bool) -> tuple[Path, str] | RasterizerPreflight:
@@ -926,7 +1198,12 @@ class ResvgRasterizer:
             info = path.lstat()
         except OSError:
             return RasterizerPreflight(False, False, "RASTERIZER_EXECUTABLE_MISSING" if executable else "RASTERIZER_SANDBOX_FAILED")
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or (executable and not os.access(path, os.X_OK)):
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o022
+            or (executable and not os.access(path, os.X_OK))
+        ):
             return RasterizerPreflight(False, False, "RASTERIZER_EXECUTABLE_UNSAFE" if executable else "RASTERIZER_SANDBOX_FAILED")
         if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
             return RasterizerPreflight(False, False, "RASTERIZER_MANIFEST_INVALID")
@@ -941,8 +1218,18 @@ class ResvgRasterizer:
     def preflight(self) -> RasterizerPreflight:
         manifest = self._manifest
         if manifest is None:
-            return RasterizerPreflight(False, False, "RASTERIZER_MANIFEST_MISSING")
-        if set(manifest) != self._REQUIRED or manifest.get("schema_version") != 1 or not isinstance(manifest.get("version"), str):
+            return RasterizerPreflight(
+                False, False, self._load_error or "RASTERIZER_MANIFEST_MISSING"
+            )
+        if (
+            set(manifest) != _MANIFEST_REQUIRED
+            or type(manifest.get("schema_version")) is not int
+            or manifest["schema_version"] != 1
+            or type(manifest.get("version")) is not str
+            or not manifest["version"]
+            or len(manifest["version"]) > 200
+            or any(ord(char) < 32 or ord(char) == 127 for char in manifest["version"])
+        ):
             return RasterizerPreflight(False, False, "RASTERIZER_MANIFEST_INVALID")
         executable = self._safe_file(manifest["executable_path"], manifest["executable_sha256"], executable=True)
         if isinstance(executable, RasterizerPreflight):
@@ -959,12 +1246,34 @@ class ResvgRasterizer:
             return RasterizerPreflight(False, False, "RASTERIZER_SANDBOX_FAILED")
         if b"(deny default)" not in profile_bytes or b"(allow network" in profile_bytes:
             return RasterizerPreflight(False, False, "RASTERIZER_SANDBOX_FAILED")
-        if self._probe is None:
-            # Production execution is deliberately unavailable until a pinned
-            # real resvg probe/runner is implemented and reviewed.
+        if self._production:
+            if (
+                manifest["sandbox_executable_path"] != str(SANDBOX_EXECUTABLE)
+                or manifest["sandbox_profile_sha256"] != BUNDLED_SANDBOX_PROFILE_SHA256
+                or profile_bytes != BUNDLED_SANDBOX_PROFILE_BYTES
+                or hashlib.sha256(profile_bytes).hexdigest()
+                != BUNDLED_SANDBOX_PROFILE_SHA256
+                or b"(deny network*)" not in profile_bytes
+                or str(Path(manifest["executable_path"]).resolve(strict=True))
+                != manifest["executable_path"]
+            ):
+                return RasterizerPreflight(False, False, "RASTERIZER_SANDBOX_FAILED")
+            try:
+                profile_info = Path(manifest["sandbox_profile_path"]).lstat()
+            except OSError:
+                return RasterizerPreflight(False, False, "RASTERIZER_SANDBOX_FAILED")
+            if (
+                profile_info.st_uid != os.geteuid()
+                or stat.S_IMODE(profile_info.st_mode) != 0o600
+            ):
+                return RasterizerPreflight(False, False, "RASTERIZER_SANDBOX_FAILED")
+            probe = self._production_probe
+        elif self._probe is None:
             return RasterizerPreflight(False, False, "RASTERIZER_PROBE_UNAVAILABLE")
+        else:
+            probe = self._probe
         try:
-            version, smoke_png = self._probe(manifest)
+            version, smoke_png = probe(manifest)
             if version != manifest["version"]:
                 return RasterizerPreflight(False, False, "RASTERIZER_VERSION_MISMATCH")
             validate_png_bytes(smoke_png, expected_width=1, expected_height=1)
@@ -978,39 +1287,134 @@ class ResvgRasterizer:
             "sandbox_executable_sha256": sandbox[1],
             "sandbox_profile_sha256": profile[1],
         }
-        if self._probe is not None or self._runner is not None:
+        if not self._production:
             return RasterizerPreflight(False, True, "RASTERIZER_TEST_BACKEND", identity)
         return RasterizerPreflight(True, True, "OK", identity)
+
+    @staticmethod
+    def _sandbox_argv(manifest: Mapping[str, Any], workdir: Path) -> list[str]:
+        return [
+            str(manifest["sandbox_executable_path"]),
+            "-D", f"WORK_DIR={workdir}",
+            "-D", f"RESVG_EXECUTABLE={manifest['executable_path']}",
+            "-f", str(manifest["sandbox_profile_path"]),
+            str(manifest["executable_path"]),
+        ]
+
+    @staticmethod
+    def _fixed_env(workdir: Path) -> dict[str, str]:
+        return {
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TMPDIR": str(workdir),
+            "HOME": str(workdir),
+        }
+
+    @classmethod
+    def _production_probe(cls, manifest: Mapping[str, Any]) -> tuple[str, bytes]:
+        with tempfile.TemporaryDirectory(prefix="auto-edit-svg-probe-") as directory:
+            root = Path(directory).resolve(strict=True)
+            os.chmod(root, 0o700)
+            version_result = _run_bounded_process(
+                cls._sandbox_argv(manifest, root) + ["--version"],
+                cwd=str(root),
+                env=cls._fixed_env(root),
+                timeout=RASTER_TIMEOUT_SECONDS,
+            )
+            if version_result.get("returncode") != 0:
+                raise _BoundedProcessError("version probe failed")
+            stderr = version_result.get("stderr", b"")
+            stdout = version_result.get("stdout", b"")
+            if stderr or not isinstance(stdout, bytes):
+                raise _BoundedProcessError("version probe output")
+            try:
+                version = stdout.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise _BoundedProcessError("version encoding") from exc
+            input_path = root / "input.svg"
+            output_path = root / "output.png"
+            input_path.write_bytes(
+                b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1" width="1" height="1"><rect width="1" height="1" fill="#000000"/></svg>'
+            )
+            os.chmod(input_path, 0o600)
+            result = _run_bounded_process(
+                cls._raster_argv(manifest, root, input_path, output_path, 1, 1),
+                cwd=str(root),
+                env=cls._fixed_env(root),
+                timeout=RASTER_TIMEOUT_SECONDS,
+                output_path=output_path,
+            )
+            if result.get("returncode") != 0 or result.get("stdout") or result.get("stderr"):
+                raise _BoundedProcessError("smoke raster failed")
+            return version, output_path.read_bytes()
+
+    @classmethod
+    def _raster_argv(
+        cls,
+        manifest: Mapping[str, Any],
+        root: Path,
+        input_path: Path,
+        output_path: Path,
+        width: int,
+        height: int,
+    ) -> list[str]:
+        return cls._sandbox_argv(manifest, root) + [
+            "--quiet",
+            "--skip-system-fonts",
+            "--resources-dir", str(root),
+            "--width", str(width),
+            "--height", str(height),
+            str(input_path),
+            str(output_path),
+        ]
 
     def rasterize(self, sanitized: SanitizeResult) -> RasterizedPNG:
         if not isinstance(sanitized, SanitizeResult):
             _reject("RASTERIZER_INPUT_INVALID")
         checked = self.preflight()
-        if not checked.checks_ok or self._runner is None:
+        if not checked.checks_ok or (not self._production and self._runner is None):
             _reject("RASTERIZER_UNAVAILABLE")
         width = sanitized.metadata["requested_width"]
         height = sanitized.metadata["requested_height"]
         with tempfile.TemporaryDirectory(prefix="auto-edit-svg-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve(strict=True)
             os.chmod(root, 0o700)
             input_path = root / "input.svg"
             output_path = root / "output.png"
             input_path.write_bytes(sanitized.canonical_svg)
             os.chmod(input_path, 0o600)
             manifest = self._manifest or {}
-            argv = [
-                str(manifest["sandbox_executable_path"]), "-f", str(manifest["sandbox_profile_path"]),
-                str(manifest["executable_path"]), "--width", str(width), "--height", str(height),
-                str(input_path), str(output_path),
-            ]
-            env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TMPDIR": str(root)}
+            argv = self._raster_argv(
+                manifest, root, input_path, output_path, width, height
+            )
+            env = self._fixed_env(root)
             try:
-                completed = self._runner(
-                    argv, cwd=str(root), env=env, timeout=5.0,
-                    limits={"memory_bytes": 256 * 1024 * 1024, "file_bytes": MAX_PNG_BYTES, "log_bytes": 64 * 1024},
-                )
+                if self._production:
+                    completed = _run_bounded_process(
+                        argv,
+                        cwd=str(root),
+                        env=env,
+                        timeout=RASTER_TIMEOUT_SECONDS,
+                        output_path=output_path,
+                    )
+                elif self._runner is not None:
+                    completed = self._runner(
+                        argv,
+                        cwd=str(root),
+                        env=env,
+                        timeout=RASTER_TIMEOUT_SECONDS,
+                        limits={
+                            "file_bytes": MAX_PNG_BYTES,
+                            "log_bytes": MAX_RASTER_LOG_BYTES,
+                        },
+                    )
+                else:
+                    _reject("RASTERIZER_UNAVAILABLE")
             except TimeoutError:
                 _reject("RASTERIZER_TIMEOUT")
+            except _BoundedProcessError:
+                _reject("RASTERIZER_RESOURCE_LIMIT")
             except Exception:
                 _reject("RASTERIZER_FAILED")
             if not isinstance(completed, Mapping) or completed.get("returncode") != 0:
@@ -1029,7 +1433,14 @@ class ResvgRasterizer:
             except OSError:
                 _reject("RASTERIZER_OUTPUT_MISSING")
             png = validate_png_bytes(payload, expected_width=width, expected_height=height)
-            metadata = {**checked.identity, "sandboxed": True, "timeout_seconds": 5}
+            metadata = {
+                **checked.identity,
+                "sandboxed": True,
+                "timeout_seconds": RASTER_TIMEOUT_SECONDS,
+                "memory_limit_enforced": RASTER_MEMORY_LIMIT_ENFORCED,
+                "output_limit_bytes": MAX_PNG_BYTES,
+                "log_limit_bytes": MAX_RASTER_LOG_BYTES,
+            }
             return RasterizedPNG(payload, png.png_sha256, width, height, metadata)
 
 

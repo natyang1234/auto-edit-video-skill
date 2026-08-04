@@ -68,7 +68,9 @@ version、sandbox profile、requested dimensions與 PNG hash；任一 identity�
 Production只接受 manifest指定的 absolute、non-symlink regular executable，且 binary/version、
 sandbox executable/profile hashes全匹配。無可靠 local rasterizer或preflight失敗時 provider必須
 顯示 unavailable，search/import不得觸網；禁止回退瀏覽器、QuickLook、ImageMagick或未釘版
-FFmpeg。本機目前沒有可見 SVG/librsvg FFmpeg decoder，也沒有 resvg，因此預期 fail closed。
+FFmpeg。Production不得從`PATH`探索 binary；必須由明確 configure command寫入 owner-only machine
+manifest與逐 byte符合 reviewed contract的 deny-network sandbox profile。設定缺失、權限不安全、
+version/hash/profile漂移時一律 fail closed。
 
 PNG validator必須驗 signature、chunk framing/order、CRC、IHDR exact dimensions、8-bit RGB/RGBA、
 non-interlaced、bounded zlib exact scanlines、filter bytes、critical chunks與 trailing bytes。
