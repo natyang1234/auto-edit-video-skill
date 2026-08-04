@@ -330,3 +330,23 @@ def build_structured_artifacts(
     scratch.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", "utf-8")
     scratch.replace(index_path)
     return index
+
+_PACK_CACHE: dict[str, Any] | None = None
+
+
+def load_default_pack() -> dict[str, Any]:
+    """Style pack registry — fail closed like the platform/director loaders."""
+    global _PACK_CACHE
+    if _PACK_CACHE is not None:
+        return _PACK_CACHE
+    pack_path = (
+        Path(__file__).resolve().parent.parent
+        / "contracts/instances/style_pack__dark_data_presenter.json"
+    )
+    pack = contract_registry.load_artifact_text(pack_path.read_text("utf-8"))
+    errors = contract_registry.validate_artifact("style_pack", pack)
+    if errors:
+        raise RuntimeError("style pack registry invalid: " + "; ".join(errors))
+    _PACK_CACHE = pack
+    return pack
+

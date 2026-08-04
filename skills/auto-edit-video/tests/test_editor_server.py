@@ -2022,6 +2022,104 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, _body = self.request("GET", item["url"])
         self.assertEqual(status, 404, "tampered artifact bytes must never be served")
 
+    def test_structured_layer_crud_transaction_and_gate_staleness(self) -> None:
+        import structured_card_compositor
+
+        if not structured_card_compositor.compositor_available():
+            self.skipTest("needs macOS CoreText")
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        before_timeline = gate_revision(self.project, "timeline", state)
+
+        status, created = self.json_request(
+            "POST",
+            "/api/structured-layers",
+            {
+                "action": "upsert",
+                "layer": {
+                    "type": "stat",
+                    "payload": {
+                        "value": "87%",
+                        "label": "留存率",
+                        "evidence_id": "evidence-abcdef01",
+                        "source_literal": "留存是87%",
+                    },
+                },
+                "timing": {"start": 0.1, "end": 0.4},
+            },
+        )
+        self.assertEqual(status, 200, created)
+        self.assertEqual(created["capability"]["status"], "static_fallback")
+        layer_id = created["layers"]["items"][0]["id"]
+        plan_item = created["visual_plan"]["items"][0]
+        self.assertEqual(plan_item["structured_layer_id"], layer_id)
+        self.assertEqual(plan_item["start"], 0.1)
+        self.assertNotIn("start", created["layers"]["items"][0], "timing SSOT: envelope has no timing")
+        artifact = created["artifacts"]["items"][0]
+        self.assertTrue((self.project / artifact["artifact_id"]).is_file())
+
+        after_timeline = gate_revision(self.project, "timeline", state)
+        self.assertNotEqual(
+            before_timeline, after_timeline,
+            "layer edits must invalidate the timeline gate revision",
+        )
+
+        # factual layer without evidence must be rejected by the bundle gate
+        status, rejected = self.json_request(
+            "POST",
+            "/api/structured-layers",
+            {
+                "action": "upsert",
+                "layer": {"type": "stat", "payload": {"value": "1", "label": "x"}},
+                "timing": {"start": 0.1, "end": 0.2},
+            },
+        )
+        self.assertEqual(status, 422, rejected)
+
+        # renderer picks the card PNG as an overlay
+        manifest = json.loads((self.project / "project.json").read_text("utf-8"))
+        command = build_render_command(
+            self.project, state, manifest,
+            self.project / "renders/layer-route.mp4", "preview",
+        )
+        self.assertIn("working/structured_cards/", " ".join(command))
+
+        # delete removes both sides transactionally
+        status, deleted = self.json_request(
+            "POST", "/api/structured-layers", {"action": "delete", "id": layer_id}
+        )
+        self.assertEqual(status, 200, deleted)
+        self.assertEqual(deleted["layers"]["items"], [])
+        self.assertEqual(deleted["visual_plan"]["items"], [])
+
+    def test_layer_transaction_journal_rolls_forward(self) -> None:
+        layers = {"schema_version": 1, "items": []}
+        plan = {
+            "schema_version": 1,
+            "highlight_plan_revision": "0" * 64,
+            "items": [],
+            "revision": "1" * 64,
+        }
+        editor_server.atomic_write_json(
+            self.project / editor_server.LAYER_TXN_JOURNAL_REL,
+            {
+                "generation": "t",
+                "files": {
+                    editor_server.LAYERS_REL.as_posix(): layers,
+                    editor_server.VISUAL_PLAN_REL.as_posix(): plan,
+                },
+            },
+        )
+        # simulate the crash: journal exists, target files half-written
+        (self.project / editor_server.LAYERS_REL).unlink(missing_ok=True)
+        loaded_layers, loaded_plan = editor_server.load_layer_bundle(self.project)
+        self.assertEqual(loaded_layers, layers)
+        self.assertEqual(loaded_plan["revision"], "1" * 64)
+        self.assertFalse(
+            (self.project / editor_server.LAYER_TXN_JOURNAL_REL).is_file(),
+            "journal must clear after roll-forward",
+        )
+
 
 class EditorRendererTests(unittest.TestCase):
     @classmethod

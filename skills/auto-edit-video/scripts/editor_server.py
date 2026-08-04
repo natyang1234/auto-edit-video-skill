@@ -304,7 +304,14 @@ def gate_revision(
             }
         )
     if gate == "timeline":
-        return editor_state_revision(current_state)
+        layers, visual_plan = load_layer_bundle(project_dir)
+        return canonical_revision(
+            {
+                "editor_state": editor_state_revision(current_state),
+                "structured_layers": layers,
+                "visual_plan_v2": visual_plan,
+            }
+        )
     if gate == "final":
         receipt = read_json(project_dir / LATEST_DELIVERY_QA_REL, None)
         return canonical_revision(
@@ -486,6 +493,76 @@ def migrate_caption_spans(state: dict[str, Any]) -> list[str]:
             kept.append(span)
         overlay["effect_spans"] = kept
     return warnings
+
+
+LAYERS_REL = Path("working/structured_layers.json")
+VISUAL_PLAN_REL = Path("working/visual_plan_v2.json")
+LAYER_TXN_JOURNAL_REL = Path("working/.layer-txn-journal.json")
+
+
+def recover_layer_transaction(project_dir: Path) -> None:
+    """Roll an interrupted layer transaction FORWARD from its journal.
+
+    The journal stores the full new contents of every file in the
+    transaction, so recovery is always deterministic: rewrite, then clear.
+    """
+    journal_path = project_dir / LAYER_TXN_JOURNAL_REL
+    if not journal_path.is_file():
+        return
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        for rel, content in (journal.get("files") or {}).items():
+            atomic_write_json(project_dir / rel, content)
+    except (ValueError, OSError):
+        pass
+    journal_path.unlink(missing_ok=True)
+
+
+def publish_layer_bundle(
+    project_dir: Path,
+    layers: dict[str, Any],
+    visual_plan: dict[str, Any],
+) -> None:
+    """Cross-file transactional publish (plan v2 B1): validate everything in
+    memory, journal the full target contents, then replace file by file."""
+    import contract_registry
+
+    bundle: dict[str, Any] = {
+        "structured_layer": layers,
+        "visual_plan": visual_plan,
+    }
+    evidence = read_json(project_dir / "working/evidence_map.json", None)
+    if isinstance(evidence, dict):
+        bundle["evidence_map"] = evidence
+    errors = contract_registry.validate_bundle(bundle)
+    if errors:
+        raise ValueError("layer bundle rejected: " + "; ".join(errors))
+    journal = {
+        "generation": now_utc(),
+        "files": {
+            LAYERS_REL.as_posix(): layers,
+            VISUAL_PLAN_REL.as_posix(): visual_plan,
+        },
+    }
+    atomic_write_json(project_dir / LAYER_TXN_JOURNAL_REL, journal)
+    atomic_write_json(project_dir / LAYERS_REL, layers)
+    atomic_write_json(project_dir / VISUAL_PLAN_REL, visual_plan)
+    (project_dir / LAYER_TXN_JOURNAL_REL).unlink(missing_ok=True)
+
+
+def load_layer_bundle(project_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    recover_layer_transaction(project_dir)
+    layers = read_json(project_dir / LAYERS_REL, None) or {
+        "schema_version": 1,
+        "items": [],
+    }
+    visual_plan = read_json(project_dir / VISUAL_PLAN_REL, None) or {
+        "schema_version": 1,
+        "highlight_plan_revision": "0" * 64,
+        "items": [],
+        "revision": "0" * 64,
+    }
+    return layers, visual_plan
 
 
 def effect_span_final_errors(
@@ -2221,6 +2298,130 @@ class EditorHandler(BaseHTTPRequestHandler):
         response["applied_to"] = [str(o.get("id")) for o in recipients]
         self.send_json(response)
 
+    def handle_structured_layers(self) -> None:
+        """Transactional CRUD for structured layers + their visual-plan items.
+
+        Timing lives ONLY on the visual_plan item (§7.4.10 SSOT); the server
+        creates/updates both sides in one journaled transaction and rebuilds
+        the artifact receipts, so a half-written bundle can never be seen.
+        """
+        import structured_card_compositor
+
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        action = str(body.get("action") or "upsert")
+        with self.server.project_lock:
+            layers, visual_plan = load_layer_bundle(self.server.project_dir)
+            items = {item["id"]: item for item in layers.get("items", [])}
+            plan_items = {
+                item.get("structured_layer_id"): item
+                for item in visual_plan.get("items", [])
+                if item.get("structured_layer_id")
+            }
+            if action == "delete":
+                layer_id = str(body.get("id") or "")
+                if layer_id not in items:
+                    self.send_json({"ok": False, "error": "layer not found"}, status=404)
+                    return
+                items.pop(layer_id)
+                plan_items.pop(layer_id, None)
+                visual_plan["items"] = [
+                    item
+                    for item in visual_plan.get("items", [])
+                    if item.get("structured_layer_id") != layer_id
+                ]
+            else:
+                payload = body.get("layer") or {}
+                timing = body.get("timing") or {}
+                layer_id = str(body.get("id") or "")
+                if not layer_id:
+                    seed = canonical_revision({"new-layer": now_utc(), "n": len(items)})
+                    layer_id = f"structured-layer-{seed[:12]}"
+                beat_id = f"visual-beat-{layer_id.rsplit('-', 1)[-1]}"
+                existing = items.get(layer_id)
+                layer_type = str(payload.get("type") or (existing or {}).get("type") or "")
+                envelope = {
+                    "id": layer_id,
+                    "visual_plan_item_id": beat_id,
+                    "type": layer_type,
+                    "revision": int((existing or {}).get("revision", 0)) + 1,
+                    "evidence_revision": str(
+                        body.get("evidence_revision")
+                        or (existing or {}).get("evidence_revision")
+                        or "0" * 64
+                    ),
+                    "payload": payload.get("payload") or {},
+                    "review_status": str(payload.get("review_status") or "pending"),
+                }
+                items[layer_id] = envelope
+                evidence_ids: list[str] = []
+                if layer_type == "stat":
+                    evidence_ids = [str(envelope["payload"].get("evidence_id") or "")]
+                elif layer_type == "chart":
+                    evidence_ids = [
+                        str(datum.get("evidence_id") or "")
+                        for datum in envelope["payload"].get("datums", [])
+                    ]
+                evidence_ids = [e for e in evidence_ids if e]
+                plan_item = plan_items.get(layer_id) or {
+                    "id": beat_id,
+                    "highlight_id": str(timing.get("highlight_id") or "highlight-000000000000"),
+                    "beat": layer_type,
+                    "structured_layer_id": layer_id,
+                    "selected_asset": None,
+                    "review_status": "pending",
+                }
+                plan_item.update(
+                    {
+                        "start": float(timing.get("start", plan_item.get("start", 0.0))),
+                        "end": float(timing.get("end", plan_item.get("end", 0.0))),
+                        "beat": layer_type,
+                        "conceptual_only": not evidence_ids,
+                        "evidence_ids": evidence_ids,
+                    }
+                )
+                if plan_item.get("id") not in {
+                    item.get("id") for item in visual_plan.get("items", [])
+                }:
+                    visual_plan.setdefault("items", []).append(plan_item)
+            layers["items"] = list(items.values())
+            visual_plan["revision"] = canonical_revision(
+                {k: v for k, v in visual_plan.items() if k != "revision"}
+            )
+            try:
+                publish_layer_bundle(self.server.project_dir, layers, visual_plan)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=422)
+                return
+            artifacts = None
+            capability = structured_card_compositor.capability_status()
+            if capability["status"] == "static_fallback" and layers["items"]:
+                state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                try:
+                    artifacts = structured_card_compositor.build_structured_artifacts(
+                        self.server.project_dir,
+                        state,
+                        layers,
+                        structured_card_compositor.load_default_pack(),
+                        1.0,
+                    )
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, status=422)
+                    return
+        self.send_json(
+            {
+                "ok": True,
+                "capability": capability,
+                "layers": layers,
+                "visual_plan": visual_plan,
+                "artifacts": artifacts,
+                "note": "timeline/final approvals are stale until re-confirmed",
+            }
+        )
+
     def handle_caption_snap(self) -> None:
         """Server-authoritative cluster snapping for browser selections."""
         try:
@@ -2840,6 +3041,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/captions/apply-style":
             self.handle_caption_apply_style()
+            return
+        if path == "/api/structured-layers":
+            self.handle_structured_layers()
             return
         if path == "/api/approve":
             self.handle_approval()

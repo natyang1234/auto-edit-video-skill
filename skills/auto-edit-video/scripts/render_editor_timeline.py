@@ -519,6 +519,72 @@ def build_render_command(
             overlay["end"] = window_end
             overlays.append(overlay)
     overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
+    from editor_server import load_layer_bundle
+
+    layers_bundle, visual_plan_v2 = load_layer_bundle(project_dir)
+    if layers_bundle.get("items"):
+        import structured_card_compositor
+
+        if not structured_card_compositor.compositor_available():
+            if quality == "final":
+                raise ValueError(
+                    "structured layers need the static card compositor, which is "
+                    "unavailable on this host; final would silently lose content"
+                )
+        else:
+            artifacts_index = structured_card_compositor.build_structured_artifacts(
+                project_dir, state, layers_bundle,
+                structured_card_compositor.load_default_pack(), render_scale,
+            )
+            key = structured_card_compositor.canvas_key(canvas, render_scale)
+            artifact_by_layer = {
+                item["layer_id"]: item
+                for item in artifacts_index.get("items", [])
+                if item.get("canvas") == key
+            }
+            for plan_item in visual_plan_v2.get("items", []):
+                layer_ref = plan_item.get("structured_layer_id")
+                asset_ref = plan_item.get("selected_asset")
+                windows = map_source_range_to_post_cut(
+                    segments,
+                    float(plan_item.get("start", 0.0)),
+                    float(plan_item.get("end", 0.0)),
+                )
+                for window_start, window_end in windows:
+                    if layer_ref and layer_ref in artifact_by_layer:
+                        artifact = artifact_by_layer[layer_ref]
+                        overlays.append(
+                            {
+                                "id": plan_item.get("id"),
+                                "type": "image",
+                                "source": artifact["artifact_id"],
+                                "start": window_start,
+                                "end": window_end,
+                                "visible": True,
+                                "z_index": 5,
+                                "style": {
+                                    "width": 84.0,
+                                    "x": 50,
+                                    "y": 46,
+                                    "animation": "fade",
+                                },
+                            }
+                        )
+                    elif asset_ref:
+                        overlays.append(
+                            {
+                                "id": plan_item.get("id"),
+                                "type": "image",
+                                "source": str(asset_ref),
+                                "start": window_start,
+                                "end": window_end,
+                                "visible": True,
+                                "z_index": 4,
+                                "style": {"width": 60.0, "x": 50, "y": 42,
+                                          "animation": "fade"},
+                            }
+                        )
+
     if any(is_plain_caption(overlay) for overlay in overlays):
         import caption_compositor
 
