@@ -19,9 +19,11 @@ from contract_registry import (  # noqa: E402
     run_bundle_suite,
     run_fixture_suite,
     run_instance_suite,
+    semantic_asset_provenance,
     semantic_approval_receipt,
     semantic_evidence_references,
     semantic_master_timeline,
+    semantic_provider_interface,
     semantic_structured_layer,
     semantic_video_analysis,
     semantic_visual_plan,
@@ -198,6 +200,159 @@ class DiscriminatedPayloadTests(unittest.TestCase):
         item["beat"] = "broll"
         errors = semantic_visual_plan({"items": [item]})
         self.assertTrue(any("structured layer" in e for e in errors))
+
+
+class ProviderInterfaceSemanticTests(unittest.TestCase):
+    def _provider(self, **overrides) -> dict:
+        provider = {
+            "id": "openverse",
+            "kind": "image",
+            "consent_required": True,
+            "cost_class": "free",
+            "idempotency_key_fields": ["query", "page"],
+            "license_class": "open",
+            "offline_fallback": "skip",
+            "preflight": {
+                "required": True,
+                "checks": ["reachability", "license-metadata"],
+            },
+        }
+        provider.update(overrides)
+        return provider
+
+    def test_provider_ids_and_preflight_requirements(self) -> None:
+        duplicate = self._provider()
+        duplicate["preflight"] = {"required": False, "checks": ["reachability"]}
+        errors = semantic_provider_interface(
+            {"providers": [self._provider(), duplicate]}
+        )
+        self.assertTrue(any("duplicate provider id" in error for error in errors))
+        self.assertTrue(any("license-metadata" in error for error in errors))
+        self.assertTrue(any("cannot disable preflight" in error for error in errors))
+
+    def test_provider_lists_are_trimmed_nonempty_and_unique(self) -> None:
+        provider = self._provider(
+            id="generation",
+            kind="generation",
+            license_class="generated",
+            idempotency_key_fields=[" query ", "query", "  "],
+            preflight={
+                "required": False,
+                "checks": [" reachability ", "reachability", ""],
+            },
+        )
+        errors = semantic_provider_interface({"providers": [provider]})
+        self.assertTrue(any("idempotency_key_fields" in error for error in errors))
+        self.assertTrue(any("preflight.checks" in error for error in errors))
+
+    def test_open_provider_accepts_trimmed_license_check(self) -> None:
+        provider = self._provider()
+        provider["preflight"]["checks"] = [" reachability ", " license-metadata "]
+        self.assertEqual(semantic_provider_interface({"providers": [provider]}), [])
+
+
+class AssetProvenanceSemanticTests(unittest.TestCase):
+    def _asset(self, **overrides) -> dict:
+        asset = {
+            "asset_id": "asset-1",
+            "path": "assets/a.png",
+            "sha256": "a" * 64,
+            "origin": "folder-import",
+            "provider_id": None,
+            "source_url": None,
+            "license": {
+                "spdx": "CC0-1.0",
+                "attribution_required": False,
+                "attribution_text": "",
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+            "review_status": "approved",
+        }
+        asset.update(overrides)
+        return asset
+
+    def test_asset_ids_paths_and_normalized_path_safety(self) -> None:
+        first = self._asset()
+        second = self._asset()
+        unsafe = self._asset(
+            asset_id="asset-3", path="assets/../outside.png"
+        )
+        errors = semantic_asset_provenance({"items": [first, second, unsafe]})
+        self.assertTrue(any("duplicate asset_id" in error for error in errors))
+        self.assertTrue(any("duplicate path" in error for error in errors))
+        self.assertTrue(any("normalized POSIX" in error for error in errors))
+
+    def test_asset_origin_relationships_and_secure_provider_url(self) -> None:
+        provider = self._asset(
+            asset_id="asset-provider",
+            path="assets/provider.png",
+            origin="provider",
+            provider_id=" ",
+            source_url="https://user:secret@example.com/provider.png",
+        )
+        upload = self._asset(
+            asset_id="asset-upload",
+            path="assets/upload.png",
+            origin="user-upload",
+            provider_id="provider",
+            source_url="https://example.com/upload.png",
+        )
+        generated = self._asset(
+            asset_id="asset-generated",
+            path="assets/generated.png",
+            origin="generated",
+            provider_id="",
+        )
+        errors = semantic_asset_provenance({"items": [provider, upload, generated]})
+        self.assertTrue(any("non-empty provider_id" in error for error in errors))
+        self.assertTrue(any("without credentials" in error for error in errors))
+        self.assertTrue(any("requires null provider_id" in error for error in errors))
+        self.assertTrue(any("requires null source_url" in error for error in errors))
+
+    def test_license_review_and_attribution_rules(self) -> None:
+        naive = self._asset(
+            asset_id="asset-naive",
+            path="assets/naive.png",
+            license={
+                "spdx": "UNKNOWN",
+                "attribution_required": False,
+                "attribution_text": "",
+                "verified_at": "2026-08-04T03:00:00",
+            },
+        )
+        cc_by = self._asset(
+            asset_id="asset-cc-by",
+            path="assets/cc-by.png",
+            license={
+                "spdx": "CC-BY-4.0",
+                "attribution_required": True,
+                "attribution_text": "",
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+        )
+        errors = semantic_asset_provenance({"items": [naive, cc_by]})
+        self.assertTrue(any("timezone-aware ISO-8601" in error for error in errors))
+        self.assertTrue(any("attribution_text" in error for error in errors))
+        self.assertTrue(any("final-allowlist" in error for error in errors))
+        self.assertTrue(any("UNKNOWN cannot be approved" in error for error in errors))
+
+    def test_provider_license_evidence_requires_exact_canonical_path(self) -> None:
+        provider = self._asset(
+            origin="provider",
+            provider_id="openverse",
+            source_url="https://openverse.org/image",
+            license={
+                "spdx": "CC-BY-4.0",
+                "evidence_url": "https://creativecommons.org/licenses/by/4.0////",
+                "attribution_required": True,
+                "attribution_text": "Jane Example",
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+        )
+
+        errors = semantic_asset_provenance({"items": [provider]})
+
+        self.assertTrue(any("canonical SPDX license URL" in error for error in errors))
 
 
 class BundleSuiteTests(unittest.TestCase):

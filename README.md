@@ -49,6 +49,14 @@ approved highlights in one queue. In
 designed mode, captions and effect spans are baked into the same HTML/GSAP
 graphic package used by the rendered MP4.
 
+For still images, the Studio can search Openverse and Wikimedia Commons after
+the user accepts the selected provider's network disclosure. Results stay as
+metadata rows until an explicit import; the Studio permits the bundled CC0/CC
+BY 4.0 allowlist, stores a project-private copy, records source/creator/license
+and SHA-256 provenance, regenerates `ATTRIBUTION.md`, and checks that evidence
+at the final rights gate. SVG, font, GIF, and B-roll provider search are not yet
+included.
+
 For mixed Chinese/English footage, select `Chinese + English` and optionally
 enter semicolon-separated terminology such as `It; to V; cigarette`. Auto and
 Chinese modes also tell local Whisper to preserve incidental English spelling.
@@ -267,6 +275,9 @@ Specific overrides include `VIDEO_AUTOPILOT_SKILL_DIR`, `CUT_NARRATION_SKILL_DIR
 - Studio imports use a project-owned copy, CSRF/Host/Origin checks, media limits,
   container probing, and atomic project creation.
 - Uploaded assets are project-scoped, type/size checked, and provenance-recorded.
+- Provider search requires explicit disclosure consent. Provider JSON and every
+  HTTPS redirect are revalidated; imported images are size/type checked and
+  never rendered from a remote URL.
 - No package manager or system dependency is invoked by the installer.
 - No cloud TTS runs without an explicit `--allow-cloud` decision.
 - AI cut, subtitle, translation, and visual suggestions remain proposals until reviewed.

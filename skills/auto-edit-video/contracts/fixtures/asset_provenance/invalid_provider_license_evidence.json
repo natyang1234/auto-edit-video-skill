@@ -1,0 +1,21 @@
+{
+ "schema_version": 1,
+ "items": [
+  {
+   "asset_id": "provider-openverse-mismatch",
+   "path": "assets/providers/openverse/mismatch.jpg",
+   "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "origin": "provider",
+   "provider_id": "openverse",
+   "source_url": "https://example.org/mismatch",
+   "license": {
+    "spdx": "CC-BY-4.0",
+    "evidence_url": "https://attacker.invalid/not-cc-by",
+    "attribution_required": true,
+    "attribution_text": "Example",
+    "verified_at": "2026-08-04T03:00:00Z"
+   },
+   "review_status": "approved"
+  }
+ ]
+}

@@ -15,8 +15,7 @@
    "preflight": {
     "required": true,
     "checks": [
-     "reachability",
-     "license-metadata"
+     "reachability"
     ]
    }
   }

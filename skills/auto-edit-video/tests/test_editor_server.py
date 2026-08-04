@@ -38,6 +38,58 @@ from editor_server import (  # noqa: E402
 from render_editor_timeline import build_render_command, text_filter  # noqa: E402
 
 
+class FakeAssetProviderService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.search_error = None
+
+    def status(self) -> dict[str, object]:
+        self.calls.append(("status",))
+        return {
+            "providers": [
+                {
+                    "id": "openverse",
+                    "label": "Openverse",
+                    "kind": "image",
+                    "consent_required": True,
+                    "cost_class": "free",
+                    "network_disclosure": "會送出短搜尋詞。",
+                    "consented": False,
+                    "consented_at": None,
+                    "confirmed_by": None,
+                }
+            ]
+        }
+
+    def set_consent(self, provider_id: str, consented: bool, confirmed_by: str) -> dict[str, object]:
+        self.calls.append(("consent", provider_id, consented, confirmed_by))
+        return {
+            "provider_id": provider_id,
+            "kind": "image",
+            "consented": consented,
+            "consented_at": "2026-08-04T00:00:00Z",
+            "confirmed_by": confirmed_by,
+        }
+
+    def search(self, provider_id: str, query: str, page: int) -> dict[str, object]:
+        self.calls.append(("search", provider_id, query, page))
+        if self.search_error is not None:
+            raise self.search_error
+        return {
+            "provider_id": provider_id,
+            "page": page,
+            "items": [{"candidate_id": "candidate", "import_token": "opaque-token"}],
+        }
+
+    def import_candidate(self, token: str, visual_validator) -> dict[str, object]:
+        self.calls.append(("import", token, callable(visual_validator)))
+        return {
+            "source": "assets/providers/openverse/candidate.jpg",
+            "url": "/assets/providers/openverse/candidate.jpg",
+            "idempotent": False,
+        }
+
+
 class CaptionEffectModelTests(unittest.TestCase):
     def test_semantic_review_metadata_does_not_change_render_revision(self) -> None:
         state = {
@@ -698,6 +750,177 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    def test_provider_routes_share_csrf_validation_and_safe_error_mapping(self) -> None:
+        fake = FakeAssetProviderService()
+        self.server.asset_provider_service = fake
+
+        status, _headers, body = self.request("GET", "/api/providers/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["providers"][0]["id"], "openverse")
+
+        status, payload = self.json_request(
+            "POST",
+            "/api/providers/consent",
+            {"provider_id": "openverse", "consented": True, "confirmed_by": "nat"},
+            headers={"X-Auto-Edit-CSRF": "wrong"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("CSRF", str(payload["error"]))
+
+        status, payload = self.json_request("POST", "/api/providers/consent", [])
+        self.assertEqual(status, 400)
+        status, payload = self.json_request(
+            "POST",
+            "/api/providers/consent",
+            {"provider_id": "openverse", "consented": True, "confirmed_by": "nat"},
+        )
+        self.assertEqual(status, 200, payload)
+
+        status, payload = self.json_request(
+            "POST",
+            "/api/assets/search",
+            {"provider_id": "openverse", "query": "cat", "page": 2},
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["items"][0]["import_token"], "opaque-token")
+
+        status, payload = self.json_request(
+            "POST", "/api/assets/import-provider", {"import_token": "opaque-token"}
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["source"], "assets/providers/openverse/candidate.jpg")
+
+        fake.search_error = editor_server.AssetProviderError(
+            "provider request failed", status_code=502, code="provider_failure"
+        )
+        status, payload = self.json_request(
+            "POST",
+            "/api/assets/search",
+            {"provider_id": "openverse", "query": "secret query"},
+        )
+        self.assertEqual(status, 502)
+        self.assertNotIn("secret query", str(payload))
+
+    def test_asset_library_exposes_current_license_and_fails_closed_on_bad_registry(self) -> None:
+        path = self.project / "assets/providers/openverse/candidate.jpg"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"registered-provider-image")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        editor_server.asset_registry.upsert_item(
+            self.project,
+            {
+                "asset_id": "provider-openverse-candidate",
+                "path": "assets/providers/openverse/candidate.jpg",
+                "sha256": digest,
+                "origin": "provider",
+                "provider_id": "openverse",
+                "source_url": "https://example.org/candidate",
+                "license": {
+                    "spdx": "CC-BY-4.0",
+                    "evidence_url": "https://creativecommons.org/licenses/by/4.0/",
+                    "attribution_required": True,
+                    "attribution_text": "Jane Example",
+                    "verified_at": "2026-08-04T00:00:00Z",
+                },
+                "review_status": "approved",
+            },
+        )
+
+        status, _headers, body = self.request("GET", "/api/assets/library")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        item = next(asset for asset in payload["assets"] if asset["path"].endswith("candidate.jpg"))
+        self.assertEqual(item["provider_id"], "openverse")
+        self.assertEqual(item["license_spdx"], "CC-BY-4.0")
+        self.assertEqual(item["review_status"], "approved")
+        self.assertTrue(item["attribution_required"])
+        self.assertIsNone(payload["registry_error"])
+
+        (self.project / "assets/provenance.json").write_text(
+            '{"items": []}', encoding="utf-8"
+        )
+        status, _headers, body = self.request("GET", "/api/assets/library")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        item = next(asset for asset in payload["assets"] if asset["path"].endswith("candidate.jpg"))
+        self.assertTrue(payload["registry_error"])
+        self.assertIsNone(item["provider_id"])
+        self.assertNotEqual(item["review_status"], "approved")
+
+    def test_cross_origin_gets_cannot_trigger_legacy_registry_migration(self) -> None:
+        asset = self.project / "assets/legacy.png"
+        asset.write_bytes(b"legacy-upload")
+        registry = self.project / editor_server.asset_registry.PROVENANCE_REL
+        legacy = json.dumps(
+            {
+                "items": [
+                    {
+                        "file": "assets/legacy.png",
+                        "original_name": "legacy.png",
+                        "source": "user-uploaded-through-local-editor",
+                        "bytes": len(asset.read_bytes()),
+                        "sha256": hashlib.sha256(asset.read_bytes()).hexdigest(),
+                        "uploaded_at": "2026-08-04T03:00:00+00:00",
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        registry.write_bytes(legacy)
+        mtime_before = registry.stat().st_mtime_ns
+
+        for endpoint in ("/api/assets/library", "/api/rights"):
+            status, _headers, _body = self.request(
+                "GET", endpoint, headers={"Origin": "https://attacker.invalid"}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(registry.read_bytes(), legacy)
+            self.assertEqual(registry.stat().st_mtime_ns, mtime_before)
+            self.assertFalse(
+                (self.project / editor_server.asset_registry.ATTRIBUTION_REL).exists()
+            )
+
+    def test_server_initialization_migrates_legacy_before_get_requests(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+        asset = self.project / "assets/legacy-init.png"
+        asset.write_bytes(b"legacy-init-upload")
+        registry = self.project / editor_server.asset_registry.PROVENANCE_REL
+        registry.write_text(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "file": "assets/legacy-init.png",
+                            "original_name": "legacy-init.png",
+                            "source": "user-uploaded-through-local-editor",
+                            "bytes": len(asset.read_bytes()),
+                            "sha256": hashlib.sha256(asset.read_bytes()).hexdigest(),
+                            "uploaded_at": "2026-08-04T03:00:00+00:00",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.server = EditorServer(("127.0.0.1", 0), self.project)
+        migrated_before_get = registry.read_bytes()
+        mtime_before_get = registry.stat().st_mtime_ns
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.host, self.port = self.server.server_address
+
+        migrated = json.loads(migrated_before_get)
+        self.assertEqual(migrated["schema_version"], 1)
+        self.assertEqual(migrated["items"][0]["origin"], "user-upload")
+        for endpoint in ("/api/assets/library", "/api/rights"):
+            status, _headers, _body = self.request("GET", endpoint)
+            self.assertEqual(status, 200)
+            self.assertEqual(registry.read_bytes(), migrated_before_get)
+            self.assertEqual(registry.stat().st_mtime_ns, mtime_before_get)
+
     def test_state_save_asset_scope_upload_and_final_gate(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
@@ -738,7 +961,14 @@ class EditorServerTests(unittest.TestCase):
         provenance = json.loads(
             (self.project / "assets/provenance.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(provenance["items"][0]["source"], "user-uploaded-through-local-editor")
+        self.assertEqual(provenance["schema_version"], 1)
+        self.assertEqual(provenance["items"][0]["origin"], "user-upload")
+        self.assertEqual(provenance["items"][0]["path"], upload["source"])
+        self.assertIsNone(provenance["items"][0]["provider_id"])
+        self.assertIsNone(provenance["items"][0]["source_url"])
+        self.assertEqual(provenance["items"][0]["license"]["spdx"], "UNKNOWN")
+        self.assertFalse(provenance["items"][0]["license"]["attribution_required"])
+        self.assertEqual(provenance["items"][0]["review_status"], "pending")
         expected_digest = hashlib.sha256(upload_body).hexdigest()
         self.assertEqual(upload["sha256"], expected_digest)
         self.assertEqual(provenance["items"][0]["sha256"], expected_digest)
@@ -799,6 +1029,37 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 415)
         self.assertFalse(any(item.name.startswith("payload-") for item in (self.project / "assets").iterdir()))
+
+    def test_manual_upload_rolls_back_asset_and_registry_on_attribution_failure(self) -> None:
+        upload_body = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        real_write = editor_server.asset_registry._atomic_write_bytes
+        failed = False
+
+        def fail_attribution_once(path: Path, payload: bytes, label: str) -> None:
+            nonlocal failed
+            if label == "ATTRIBUTION.md" and not failed:
+                failed = True
+                raise editor_server.asset_registry.AssetRegistryError("simulated failure")
+            real_write(path, payload, label)
+
+        with patch.object(
+            editor_server.asset_registry,
+            "_atomic_write_bytes",
+            fail_attribution_once,
+        ):
+            status, _headers, _body = self.request(
+                "POST",
+                "/api/assets?filename=rollback.png",
+                upload_body,
+                {"Content-Type": "image/png"},
+            )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(list((self.project / "assets").glob("rollback-*.png")), [])
+        self.assertFalse((self.project / "assets/provenance.json").exists())
+        self.assertFalse((self.project / "ATTRIBUTION.md").exists())
 
     def test_cutout_asset_template_fails_closed_before_render(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
@@ -2174,6 +2435,73 @@ class EditorServerTests(unittest.TestCase):
         asset.write_bytes(b"\x89PNG\r\n\x1a\n" + b"different-bytes")
         errors = editor_server.rights_gate_errors(self.project, state)
         self.assertTrue(errors, "hash change must invalidate the assertion")
+
+    def test_current_provider_license_bypasses_assertion_but_tamper_blocks_final(self) -> None:
+        asset = self.project / "assets/providers/openverse/licensed.png"
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(b"\x89PNG\r\n\x1a\nlicensed")
+        digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+        editor_server.asset_registry.upsert_item(
+            self.project,
+            {
+                "asset_id": "provider-openverse-licensed",
+                "path": "assets/providers/openverse/licensed.png",
+                "sha256": digest,
+                "origin": "provider",
+                "provider_id": "openverse",
+                "source_url": "https://example.org/licensed",
+                "license": {
+                    "spdx": "CC-BY-4.0",
+                    "evidence_url": "https://creativecommons.org/licenses/by/4.0/",
+                    "attribution_required": True,
+                    "attribution_text": "Jane Example",
+                    "verified_at": "2026-08-04T00:00:00Z",
+                },
+                "review_status": "approved",
+            },
+        )
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body)["state"]
+        state["overlays"] = [
+            {
+                "id": "provider-image",
+                "type": "image",
+                "source": "assets/providers/openverse/licensed.png",
+                "start": 0.1,
+                "end": 0.5,
+                "visible": True,
+                "style": {"width": 40, "x": 50, "y": 50},
+                "layout": {"x": 10, "y": 10, "width": 40, "height": 40},
+            }
+        ]
+
+        self.assertTrue(
+            editor_server.rights_gate_errors(self.project, state),
+            "registry metadata alone must not auto-approve a provider asset",
+        )
+        registered = editor_server.asset_registry.load_registry(self.project)["items"][0]
+        editor_server.asset_registry.save_provider_receipt(
+            self.project,
+            registered,
+            candidate_id="licensed",
+            download_url="https://api.openverse.org/v1/images/licensed/thumb/",
+        )
+
+        referenced = editor_server.referenced_render_inputs(self.project, state)
+        provider_input = next(item for item in referenced if item["path"].endswith("licensed.png"))
+        self.assertFalse(provider_input["requires_assertion"])
+        self.assertEqual(provider_input["license_status"], "provider-approved")
+        self.assertEqual(editor_server.rights_gate_errors(self.project, state), [])
+
+        (self.project / "ATTRIBUTION.md").write_text("tampered\n", encoding="utf-8")
+        errors = editor_server.rights_gate_errors(self.project, state)
+        self.assertTrue(any("ATTRIBUTION" in error for error in errors))
+
+        editor_server.asset_registry.refresh_attribution(self.project)
+        asset.write_bytes(b"\x89PNG\r\n\x1a\ntampered")
+        errors = editor_server.rights_gate_errors(self.project, state)
+        self.assertTrue(any("provenance" in error for error in errors))
 
 
 class EditorRendererTests(unittest.TestCase):

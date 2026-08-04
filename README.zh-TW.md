@@ -31,6 +31,8 @@ python3 "$SKILL/scripts/auto_edit.py" studio \
 
 瀏覽器只把選定的本機 File 傳給 loopback Studio。Studio 會驗證影片、建立不可變的 owned copy、執行本機 Whisper，預設再用 loopback-only Ollama 逐句參照前後文校準整份字幕，完整覆蓋後才依平台短／中／長、剪輯重點與五種確定性導演策略產生最多十段有原文證據的精華。使用者可逐段保留／排除、改標題與起訖、校正字幕、加入字卡／動畫／授權素材、單段預覽，或一次批次輸出全部已保留精華。
 
+靜態圖片可在使用者勾選來源網路揭露後搜尋 Openverse 與 Wikimedia Commons。結果先以中繼資料列顯示，必須明確按下匯入才會下載；目前只允許內建的 CC0／CC BY 4.0 清單，並保存專案私有副本、來源／作者／授權／SHA-256 provenance，自動重建 `ATTRIBUTION.md`，在 final 權利閘再次核對。SVG、字型、GIF 與 B-roll 的來源搜尋尚未包含。
+
 字幕可直接選取句內字詞，套用可輸出的彈出、螢光或底線效果；字幕與設計圖卡可拖曳，並可調整位置、寬度／高度。GUI 會即時提示平台安全框與同時段圖層重疊。設計模式會把字幕、重點字與圖卡烘焙進同一份 HTML／GSAP graphic package，避免預覽能調、MP4 卻落回另一套字幕 renderer。
 
 中英混合影片可選「中英混合」並用分號填入術語，例如 `It; to V; cigarette`。即使維持自動或中文模式，本機 Whisper 也會收到「英文保留原文、不做中文音譯」提示；提示會限制長度並排除過長例句，避免英文偏置反而降低相鄰中文準確度。另可填入經確認的正字規則，例如 `複數=富數;It is=意思;例句=音譽句`；正字與誤字可不同長度，系統會保留完整來源時間範圍並盡量沿用 word boundaries，必要時可在 manifest 加 `start`／`end` 限定歧義詞的時間範圍。專案會分開儲存機械檢查與語義校準報告；機械警示為 0 不代表語義已審核，套用規則後仍是 `applied_needs_review`，並把過長 Whisper 段落切成 GUI 可讀的定時字幕。
@@ -200,6 +202,7 @@ export AUTO_EDIT_SKILLS_ROOTS="/opt/agent-skills:$HOME/my-skills"
 - 頁面編輯器預設只綁 loopback；遠端開放需明示。
 - Studio 匯入含 CSRF／Host／Origin、防 traversal、大小／格式／container／ffprobe 檢查與原子建案。
 - 上傳素材限制在專案內，檢查類型／大小並記錄來源。
+- 來源搜尋須先明確同意網路揭露；來源 JSON 與每次 HTTPS redirect 都會重新驗證，匯入圖片會檢查大小／格式，頁面不直接嵌入遠端圖片。
 - 安裝器不會自行呼叫系統套件管理器。
 - 未明確同意前不執行任何雲端 TTS。
 - AI 產生的刪剪、字幕、翻譯與視覺配置都只是待審提案。

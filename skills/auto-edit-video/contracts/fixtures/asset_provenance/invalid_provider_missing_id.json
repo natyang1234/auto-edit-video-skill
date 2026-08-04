@@ -2,12 +2,12 @@
  "schema_version": 1,
  "items": [
   {
-   "asset_id": "asset-1",
-   "path": "assets/a.png",
+   "asset_id": "asset-provider-1",
+   "path": "assets/provider.png",
    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-   "origin": "folder-import",
+   "origin": "provider",
    "provider_id": null,
-   "source_url": null,
+   "source_url": "https://example.com/provider.png",
    "license": {
     "spdx": "CC0-1.0",
     "attribution_required": false,

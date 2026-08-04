@@ -490,6 +490,156 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             self.assertEqual(errors, [], f"page errors: {errors}")
             browser.close()
 
+    def test_production_desk_provider_search_consent_and_import(self) -> None:
+        """Provider discovery stays local to the editor and never hotlinks media."""
+        host, port = self.server.server_address
+        events: list[tuple[str, dict[str, object]]] = []
+        provider_payload = {
+            "ok": True,
+            "providers": [
+                {
+                    "id": "openverse",
+                    "label": "Openverse",
+                    "kind": "image",
+                    "consent_required": True,
+                    "cost_class": "free",
+                    "network_disclosure": "搜尋會連線至 Openverse；不會直接載入遠端圖片。",
+                    "consented": False,
+                },
+                {
+                    "id": "wikimedia",
+                    "label": "Wikimedia Commons",
+                    "kind": "image",
+                    "consent_required": True,
+                    "cost_class": "free",
+                    "network_disclosure": "搜尋會連線至 Wikimedia Commons；匯入後保存本機副本。",
+                    "consented": True,
+                },
+            ],
+        }
+        result_payload = {
+            "import_token": "token-secret",
+            "provider_id": "openverse",
+            "candidate_id": "candidate-1",
+            "title": "River <script>alert(1)</script>",
+            "landing_url": "https://openverse.org/image/river-1",
+            "creator": "Ada Creator",
+            "license_spdx": "CC-BY-4.0",
+            "license_url": "https://creativecommons.org/licenses/by/4.0/",
+            "attribution_text": "Ada Creator / Openverse",
+            "mime_type": "image/jpeg",
+            "width": 640,
+            "height": 480,
+            "attribution_required": True,
+        }
+
+        def fulfill(route: object, payload: object, status: int = 200) -> None:
+            route.fulfill(
+                status=status,
+                content_type="application/json",
+                body=json.dumps(payload, ensure_ascii=False),
+            )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True
+            )
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            console_errors: list[str] = []
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+
+            def provider_status(route: object) -> None:
+                events.append(("status", {}))
+                fulfill(route, provider_payload)
+
+            def provider_consent(route: object) -> None:
+                body = route.request.post_data_json
+                events.append(("consent", body))
+                fulfill(route, {"ok": True, "provider_id": body["provider_id"], "consented": True})
+
+            def asset_search(route: object) -> None:
+                body = route.request.post_data_json
+                events.append(("search", body))
+                fulfill(route, {"ok": True, "provider_id": "openverse", "items": [result_payload]})
+
+            def asset_import(route: object) -> None:
+                body = route.request.post_data_json
+                events.append(("import", body))
+                fulfill(
+                    route,
+                    {
+                        "ok": True,
+                        "source": "assets/imported/river.jpg",
+                        "url": "/assets/imported/river.jpg",
+                        "sha256": "a" * 64,
+                        "provider_id": "openverse",
+                        "license_spdx": "CC-BY-4.0",
+                    },
+                )
+
+            page.route("**/api/providers/status", provider_status)
+            page.route("**/api/providers/consent", provider_consent)
+            page.route("**/api/assets/search", asset_search)
+            page.route("**/api/assets/import-provider", asset_import)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            page.locator("#desk-assets summary").click()
+            page.wait_for_function(
+                "() => document.querySelectorAll('#desk-provider-select option').length === 2",
+                timeout=8000,
+            )
+            self.assertEqual(page.locator("#desk-provider-select option").count(), 2)
+            self.assertIn("尚未同意", page.locator("#desk-provider-disclosure").inner_text())
+            self.assertFalse(page.locator("#desk-provider-consent").is_checked())
+
+            page.locator("#desk-provider-query").fill("  river stone  ")
+            page.locator("#desk-provider-search").click()
+            page.wait_for_timeout(300)
+            self.assertFalse(
+                any(kind == "search" for kind, _body in events),
+                "search must not be sent without consent",
+            )
+            self.assertIn("勾選", page.locator("#desk-provider-status").inner_text())
+
+            page.locator("#desk-provider-consent").check()
+            page.locator("#desk-provider-search").click()
+            page.locator("#desk-provider-results .provider-result-row").first.wait_for(timeout=8000)
+            mutation_events = [(kind, body) for kind, body in events if kind in {"consent", "search"}]
+            self.assertEqual([kind for kind, _body in mutation_events], ["consent", "search"])
+            self.assertEqual(
+                mutation_events[0][1],
+                {"provider_id": "openverse", "consented": True, "confirmed_by": "editor"},
+            )
+            self.assertEqual(
+                mutation_events[1][1],
+                {"provider_id": "openverse", "query": "river stone", "page": 1},
+            )
+            result_row = page.locator("#desk-provider-results .provider-result-row").first
+            result_text = result_row.inner_text()
+            self.assertIn("CC-BY-4.0", result_text)
+            self.assertIn("Ada Creator", result_text)
+            self.assertIn("需列名", result_text)
+            self.assertIn("<script>", result_text)
+            self.assertEqual(result_row.locator("script").count(), 0)
+            source_link = result_row.get_by_role("link", name="來源頁")
+            self.assertEqual(source_link.get_attribute("href"), "https://openverse.org/image/river-1")
+            self.assertEqual(source_link.get_attribute("target"), "_blank")
+            self.assertIn("noopener", source_link.get_attribute("rel") or "")
+            self.assertEqual(page.locator("#desk-provider-results img").count(), 0)
+
+            result_row.get_by_role("button", name="匯入").click()
+            page.get_by_role("button", name="已匯入").wait_for(timeout=8000)
+            import_events = [body for kind, body in events if kind == "import"]
+            self.assertEqual(import_events, [{"import_token": "token-secret"}])
+            self.assertIn("已匯入", result_row.inner_text())
+            self.assertEqual(console_errors, [])
+            browser.close()
+
 
 if __name__ == "__main__":
     unittest.main()

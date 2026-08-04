@@ -484,6 +484,37 @@
           </details>
           <details id="desk-assets">
             <summary>素材庫與指派</summary>
+            <section class="provider-panel" aria-labelledby="desk-provider-heading">
+              <div class="provider-panel-heading">
+                <div>
+                  <p class="eyebrow">OPEN MEDIA SOURCES</p>
+                  <h3 id="desk-provider-heading">搜尋開放素材</h3>
+                </div>
+                <span class="local-chip">不直接載入遠端圖片</span>
+              </div>
+              <label class="field" for="desk-provider-select">
+                <span>來源平台</span>
+                <select id="desk-provider-select" aria-describedby="desk-provider-disclosure" disabled></select>
+              </label>
+              <label class="field" for="desk-provider-query">
+                <span>搜尋關鍵詞</span>
+                <input
+                  id="desk-provider-query"
+                  type="text"
+                  maxlength="120"
+                  placeholder="最多 6 個短關鍵詞"
+                  autocomplete="off"
+                >
+              </label>
+              <label class="provider-consent" for="desk-provider-consent">
+                <input id="desk-provider-consent" type="checkbox" disabled>
+                <span>我已閱讀網路揭露，並同意向所選來源搜尋</span>
+              </label>
+              <p id="desk-provider-disclosure" class="provider-disclosure" aria-live="polite">尚未載入來源揭露。</p>
+              <button class="button button-secondary full-width compact-button" id="desk-provider-search" type="button" disabled>搜尋開放素材</button>
+              <p id="desk-provider-status" class="provider-status" role="status" aria-live="polite">打開素材庫後載入來源。</p>
+              <div id="desk-provider-results" class="provider-results" aria-live="polite"></div>
+            </section>
             <div id="desk-asset-library" class="batch-output-list" aria-live="polite"></div>
           </details>
           <details id="desk-variants">

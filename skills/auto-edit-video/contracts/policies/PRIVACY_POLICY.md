@@ -9,3 +9,5 @@
    agent 時的既有信任邊界；loopback Ollama 模式 transcript 不出本機。
 5. **Telemetry：無**。本工具不回傳任何使用資料。
 6. 憑證／token 永不寫入任何 artifact、receipt、log。
+7. Provider 原始 JSON 只作傳輸期解析，成功或失敗後都刪除；磁碟僅保留不含明文 query、
+   provider echo 或 import token 的 canonical search metadata（query 只留 SHA-256）。

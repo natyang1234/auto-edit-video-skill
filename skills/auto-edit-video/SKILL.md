@@ -337,6 +337,14 @@ must include transcript evidence, purpose, source/provenance, timing, and a
 fallback. Never choose a merely similar-looking asset when it contradicts the
 spoken content.
 
+The local Studio searches Openverse and Wikimedia Commons for still images only
+after provider disclosure consent. Results are metadata rows, never remote
+images. Explicitly importing an allowlisted `CC0-1.0` or `CC-BY-4.0` candidate
+stores a project-private copy plus source/creator/license/hash, regenerates
+`ATTRIBUTION.md`, and binds it into the final rights gate. Review provider
+metadata as evidence, not legal advice. Arbitrary URLs, GIFs, SVGs, and fonts
+are not retrieved by this workflow.
+
 Create transcript-grounded text cards in the bundled editor. When installed,
 route richer designed cards to `talking-head-recut`, finished narration footage
 with screenshots/HTML explanations to `chengfeng-narration-to-video`, and

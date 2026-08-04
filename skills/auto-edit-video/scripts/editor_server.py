@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 import caption_engine
+import asset_registry
+from asset_provider_service import AssetProviderError, AssetProviderService
 from local_http_security import (
     csrf_token_matches,
     host_header_allowed,
@@ -124,6 +126,10 @@ DIRECTOR_PRESETS: dict[str, dict[str, Any]] = _load_director_presets()
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def now_utc_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def read_json(path: Path, fallback: Any = None) -> Any:
@@ -807,6 +813,17 @@ def referenced_render_inputs(
     their declared license.
     """
     inputs: dict[str, dict[str, Any]] = {}
+    registry_problem = False
+    try:
+        provenance = asset_registry.load_registry(project_dir)
+    except asset_registry.AssetRegistryError:
+        provenance = {"schema_version": 1, "items": []}
+        registry_problem = True
+    provenance_by_path: dict[str, list[dict[str, Any]]] = {}
+    for provenance_item in provenance["items"]:
+        provenance_by_path.setdefault(str(provenance_item.get("path")), []).append(
+            provenance_item
+        )
 
     def add(path_text: str, kind: str) -> None:
         if not path_text:
@@ -820,12 +837,39 @@ def referenced_render_inputs(
             return
         rel = candidate.relative_to(project_dir.resolve()).as_posix()
         requires = rel.startswith("assets/")
+        digest = file_sha256(candidate)
+        license_status = "exempt"
+        if requires:
+            license_status = "manual-assertion-required"
+            path_items = provenance_by_path.get(rel, [])
+            current = next(
+                (item for item in path_items if item.get("sha256") == digest),
+                None,
+            )
+            provider_items = [
+                item for item in path_items if item.get("origin") == "provider"
+            ]
+            if current is not None and current.get("origin") == "provider":
+                if asset_registry.provider_consistency_errors(project_dir, current):
+                    license_status = "provider-license-invalid"
+                else:
+                    license_status = "provider-approved"
+                    requires = False
+            elif provider_items:
+                license_status = "provider-provenance-stale"
+            elif rel.startswith("assets/providers/"):
+                license_status = (
+                    "provider-provenance-invalid"
+                    if registry_problem
+                    else "provider-provenance-missing"
+                )
         if rel not in inputs:
             inputs[rel] = {
                 "path": rel,
                 "kind": kind,
-                "sha256": file_sha256(candidate),
+                "sha256": digest,
                 "requires_assertion": requires,
+                "license_status": license_status,
             }
 
     for overlay in state.get("overlays", []):
@@ -853,20 +897,44 @@ def referenced_render_inputs(
 def rights_gate_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
     """Final gate: every render input that needs a rights assertion has a
     CURRENT one (sha-bound; a changed file voids its assertion)."""
+    inputs = referenced_render_inputs(project_dir, state)
+    errors: list[str] = []
+    provider_current = [
+        item for item in inputs if item.get("license_status") == "provider-approved"
+    ]
+    for item in inputs:
+        status = item.get("license_status")
+        if status in {
+            "provider-license-invalid",
+            "provider-provenance-stale",
+            "provider-provenance-invalid",
+            "provider-provenance-missing",
+        }:
+            errors.append(
+                f"asset {item['path']} provider provenance or license is not current"
+            )
+    if provider_current:
+        try:
+            provenance = asset_registry.load_registry(project_dir)
+        except asset_registry.AssetRegistryError:
+            errors.append("asset provider provenance registry is invalid")
+        else:
+            errors.extend(asset_registry.attribution_errors(project_dir, provenance))
+
     required = [
         item
-        for item in referenced_render_inputs(project_dir, state)
+        for item in inputs
         if item["requires_assertion"]
+        and item.get("license_status") == "manual-assertion-required"
     ]
     if not required:
-        return []
+        return errors
     assertion = read_json(project_dir / RIGHTS_REL, None)
     by_sha: dict[str, dict[str, Any]] = {}
     if isinstance(assertion, dict):
         for item in assertion.get("items", []):
             if item.get("asserted"):
                 by_sha[str(item.get("asset_sha256"))] = item
-    errors = []
     for item in required:
         matched = by_sha.get(item["sha256"])
         if matched is None:
@@ -1570,6 +1638,52 @@ def ffprobe_has_visual_stream(path: Path) -> bool:
     except json.JSONDecodeError:
         return False
     return bool(streams and streams[0].get("codec_type") == "video")
+
+
+def ffprobe_visual_dimensions(path: Path) -> tuple[int, int] | None:
+    """Decode-probe the first visual stream and return positive dimensions."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type,width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (AttributeError, json.JSONDecodeError):
+        return None
+    if not streams or streams[0].get("codec_type") != "video":
+        return None
+    width, height = streams[0].get("width"), streams[0].get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        return None
+    return width, height
 
 
 def artifact_plan_overlays(
@@ -2397,13 +2511,19 @@ class EditorServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address: tuple[str, int], project_dir: Path):
+        resolved_project = project_dir.resolve()
+        # Controlled initialization is an explicit local mutation boundary.
+        # Complete exact legacy provenance migration before binding the HTTP
+        # server so no GET/HEAD request can become a migration trigger.
+        asset_registry.migrate_legacy_registry(resolved_project)
         super().__init__(address, EditorHandler)
-        self.project_dir = project_dir.resolve()
+        self.project_dir = resolved_project
         # Per-server CSRF token; browsers learn it from GET /api/project and
         # must echo it on every mutation. This blocks cross-origin browser
         # requests only — local processes reading loopback are outside this
         # threat model (contracts/policies/DOWNLOAD_GATE.md).
         self.csrf_token = secrets.token_urlsafe(32)
+        self.asset_provider_service = AssetProviderService(self.project_dir)
         self.caption_job_lock = threading.Lock()
         self.caption_render_serial = threading.Lock()
         self.caption_job: dict[str, Any] = {
@@ -3085,6 +3205,17 @@ class EditorHandler(BaseHTTPRequestHandler):
 
     def handle_assets_library(self, project: Path) -> None:
         assets_dir = project / "assets"
+        registry_error: str | None = None
+        try:
+            registry = asset_registry.load_registry(project)
+        except asset_registry.AssetRegistryError:
+            registry = {"schema_version": 1, "items": []}
+            registry_error = "asset provenance registry is invalid"
+        registry_by_path: dict[str, list[dict[str, Any]]] = {}
+        for registry_item in registry["items"]:
+            registry_by_path.setdefault(str(registry_item.get("path")), []).append(
+                registry_item
+            )
         assertion = read_json(project / RIGHTS_REL, None)
         asserted = {
             str(item.get("asset_sha256"))
@@ -3094,7 +3225,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         items = []
         if assets_dir.is_dir():
             for path in sorted(assets_dir.rglob("*")):
-                if not path.is_file() or path.name.startswith("."):
+                if not path.is_file() or path.is_symlink() or path.name.startswith("."):
                     continue
                 if path.suffix.lower() not in {
                     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".m4v",
@@ -3110,15 +3241,141 @@ class EditorHandler(BaseHTTPRequestHandler):
                     self._ASSET_DIGEST_CACHE[cache_key] = digest
                 if len(items) >= 500:
                     break
+                relative = path.relative_to(project).as_posix()
+                current_registry = next(
+                    (
+                        registry_item
+                        for registry_item in registry_by_path.get(relative, [])
+                        if registry_item.get("sha256") == digest
+                    ),
+                    None,
+                )
+                item_registry_error = registry_error
+                if current_registry is None and registry_by_path.get(relative):
+                    item_registry_error = "asset provenance hash is stale"
+                license_info = (
+                    current_registry.get("license", {}) if current_registry else {}
+                )
                 items.append(
                     {
-                        "path": path.relative_to(project).as_posix(),
+                        "path": relative,
                         "kind": "video" if path.suffix.lower() in {".mp4", ".mov", ".m4v"} else "image",
                         "sha256": digest,
                         "asserted": digest in asserted,
+                        "provider_id": (
+                            current_registry.get("provider_id") if current_registry else None
+                        ),
+                        "license_spdx": license_info.get("spdx"),
+                        "review_status": (
+                            current_registry.get("review_status")
+                            if current_registry
+                            else "unregistered"
+                        ),
+                        "attribution_required": bool(
+                            license_info.get("attribution_required")
+                        ),
+                        "registry_error": item_registry_error,
                     }
                 )
-        self.send_json({"ok": True, "assets": items})
+        self.send_json(
+            {"ok": True, "assets": items, "registry_error": registry_error}
+        )
+
+    def _provider_error(self, exc: AssetProviderError) -> None:
+        self.send_json(
+            {"ok": False, "error": str(exc), "code": exc.code},
+            status=exc.status_code,
+        )
+
+    def handle_provider_status(self) -> None:
+        try:
+            payload = self.server.asset_provider_service.status()
+        except AssetProviderError as exc:
+            self._provider_error(exc)
+            return
+        self.send_json({"ok": True, **payload})
+
+    def handle_provider_consent(self) -> None:
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if not isinstance(body, dict) or set(body) != {
+            "provider_id",
+            "consented",
+            "confirmed_by",
+        }:
+            self.send_json({"ok": False, "error": "consent body is malformed"}, status=400)
+            return
+        if (
+            not isinstance(body.get("provider_id"), str)
+            or not isinstance(body.get("consented"), bool)
+            or not isinstance(body.get("confirmed_by"), str)
+        ):
+            self.send_json({"ok": False, "error": "consent body is malformed"}, status=400)
+            return
+        try:
+            consent = self.server.asset_provider_service.set_consent(
+                body["provider_id"], body["consented"], body["confirmed_by"]
+            )
+        except AssetProviderError as exc:
+            self._provider_error(exc)
+            return
+        self.send_json({"ok": True, "consent": consent})
+
+    def handle_provider_search(self) -> None:
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if not isinstance(body, dict) or not set(body).issubset(
+            {"provider_id", "query", "page"}
+        ) or not {"provider_id", "query"}.issubset(body):
+            self.send_json({"ok": False, "error": "search body is malformed"}, status=400)
+            return
+        page = body.get("page", 1)
+        if (
+            not isinstance(body.get("provider_id"), str)
+            or not isinstance(body.get("query"), str)
+            or isinstance(page, bool)
+            or not isinstance(page, int)
+        ):
+            self.send_json({"ok": False, "error": "search body is malformed"}, status=400)
+            return
+        try:
+            result = self.server.asset_provider_service.search(
+                body["provider_id"], body["query"], page
+            )
+        except AssetProviderError as exc:
+            self._provider_error(exc)
+            return
+        self.send_json({"ok": True, **result})
+
+    def handle_provider_import(self) -> None:
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"import_token"}
+            or not isinstance(body.get("import_token"), str)
+            or not body["import_token"]
+        ):
+            self.send_json({"ok": False, "error": "import body is malformed"}, status=400)
+            return
+        try:
+            result = self.server.asset_provider_service.import_candidate(
+                body["import_token"],
+                lambda path: ffprobe_visual_dimensions(path) is not None,
+            )
+        except AssetProviderError as exc:
+            self._provider_error(exc)
+            return
+        self.send_json({"ok": True, **result})
 
     def handle_render_variant(self) -> None:
         """Background variant render through the CLI (per-variant gates live
@@ -3516,6 +3773,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/assets/library":
             self.handle_assets_library(project)
             return
+        if path == "/api/providers/status":
+            self.handle_provider_status()
+            return
         if path == "/api/captions/status":
             self.handle_caption_status(project)
             return
@@ -3823,6 +4083,15 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/assets":
             self.handle_asset_upload(query)
             return
+        if path == "/api/providers/consent":
+            self.handle_provider_consent()
+            return
+        if path == "/api/assets/search":
+            self.handle_provider_search()
+            return
+        if path == "/api/assets/import-provider":
+            self.handle_provider_import()
+            return
         if path == "/api/copy-draft":
             self.handle_copy_draft()
             return
@@ -3896,25 +4165,37 @@ class EditorHandler(BaseHTTPRequestHandler):
             os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
-        provenance_path = self.server.project_dir / "assets/provenance.json"
-        provenance = read_json(provenance_path, {"items": []}) or {"items": []}
-        provenance.setdefault("items", []).append(
-            {
-                "file": f"assets/{stored_name}",
-                "original_name": Path(filename).name,
-                "source": "user-uploaded-through-local-editor",
-                "bytes": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "uploaded_at": now_utc(),
-            }
-        )
-        atomic_write_json(provenance_path, provenance)
+        relative = f"assets/{stored_name}"
+        digest = hashlib.sha256(data).hexdigest()
+        item = {
+            "asset_id": "asset-upload-" + hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20],
+            "path": relative,
+            "sha256": digest,
+            "origin": "user-upload",
+            "provider_id": None,
+            "source_url": None,
+            "license": {
+                "spdx": "UNKNOWN",
+                "attribution_required": False,
+                "attribution_text": "",
+                "verified_at": now_utc_z(),
+            },
+            "review_status": "pending",
+        }
+        try:
+            asset_registry.upsert_item(self.server.project_dir, item)
+        except asset_registry.AssetRegistryError:
+            output.unlink(missing_ok=True)
+            self.send_json(
+                {"ok": False, "error": "asset registry update failed"}, status=409
+            )
+            return
         self.send_json(
             {
                 "ok": True,
-                "source": f"assets/{stored_name}",
+                "source": relative,
                 "url": f"/assets/{urllib.parse.quote(stored_name)}",
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "sha256": digest,
             }
         )
 

@@ -25,6 +25,10 @@ plans, source QA, and `working/editor_state.json`.
   multitrack timeline, with vermilion actions and amber emphasis.
 - Project-scoped editing brief, selectable director cards, and quick actions for
   subtitles, emphasis text, title cards, animations, images, GIFs, and video.
+- Explicit-consent Openverse and Wikimedia Commons still-image search. Results
+  render as local metadata rows with source links; approved CC0/CC BY 4.0
+  imports become project-private files with SHA-256 provenance, deterministic
+  `ATTRIBUTION.md`, and final-rights-gate checks.
 - Independent video-template catalog: three fixed-camera layouts with no source
   transform tween, two opt-in dynamic layouts, and three local subject-cutout
   layouts for solid, owned-image, or owned-looping-video backgrounds. Frame
@@ -152,8 +156,10 @@ final approval even if the timeline did not change.
   silently ignoring them.
 - Local copy generation is a conservative draft, not a full brand-trained
   platform strategist.
-- Content-related stock/GIF retrieval is not automatic; the local planner makes
-  transcript-grounded text-card proposals and accepts licensed uploads.
+- The local planner does not autonomously retrieve assets. Openverse/Wikimedia
+  still-image search requires a provider disclosure checkbox and an explicit
+  import click. GIF, SVG, font, and B-roll provider retrieval remain outside
+  the bundled workflow; licensed local uploads are still supported.
 - A source that already contains burned captions will show duplicate captions
   if generated caption layers remain visible. Use clean source footage for a
   production edit.

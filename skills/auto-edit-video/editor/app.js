@@ -22,6 +22,9 @@ let effectCreationMode = false;
 let activeTemplateGroup = "fixed";
 let batchRenderActive = false;
 let renderBusy = false;
+let deskProviderRecords = [];
+let deskProviderStatusLoaded = false;
+let deskProviderSearchBusy = false;
 
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
@@ -2708,6 +2711,10 @@ async function initialize() {
     renderAll();
     updateScrubberBounds();
     renderVoicePanel();
+    // Load the production desk only after /api/project has established the
+    // CSRF token; firing its POST list request during script startup races
+    // initialization and produces a harmless but noisy 403 in the console.
+    deskRefreshLayers();
     if (projectPayload.render_status?.state === "running") {
       const isBatch = projectPayload.render_status.mode === "batch";
       if (isBatch) {
@@ -2906,6 +2913,9 @@ function deskEditLayer(layer, beat) {
 async function deskRefreshAssets() {
   const host = byIdSafe("desk-asset-library");
   if (!host) return;
+  // The provider catalog is fetched the first time this details panel opens;
+  // subsequent library refreshes (including after import) reuse it.
+  void deskLoadProviders();
   try {
     const library = await request("/api/assets/library");
     host.replaceChildren();
@@ -2913,9 +2923,16 @@ async function deskRefreshAssets() {
       const row = document.createElement("div");
       row.className = "batch-output-row";
       const label = document.createElement("span");
-      label.textContent =
-        `${asset.kind}｜${asset.path.split("/").pop()}` +
-        (asset.asserted ? "｜✓已授權" : "");
+      const pathName = String(asset.path || "").split("/").pop();
+      let labelText = `${asset.kind}｜${pathName}`;
+      if (["provider_id", "license_spdx", "review_status"].some((key) => key in asset)) {
+        const providerId = String(asset.provider_id || "未知來源");
+        const license = String(asset.license_spdx || "UNKNOWN");
+        const review = asset.review_status === "approved" ? "已驗證" : "待審";
+        labelText += `｜${providerId}｜${license}｜${review}`;
+      }
+      if (asset.asserted) labelText += "｜✓已授權";
+      label.textContent = labelText;
       row.append(label);
       const assign = document.createElement("button");
       assign.type = "button";
@@ -2946,6 +2963,254 @@ async function deskRefreshAssets() {
     if (!host.children.length) host.textContent = "（素材庫是空的）";
   } catch (_error) {
     host.textContent = "";
+  }
+}
+
+function deskProviderElements() {
+  return {
+    select: byIdSafe("desk-provider-select"),
+    query: byIdSafe("desk-provider-query"),
+    consent: byIdSafe("desk-provider-consent"),
+    disclosure: byIdSafe("desk-provider-disclosure"),
+    search: byIdSafe("desk-provider-search"),
+    status: byIdSafe("desk-provider-status"),
+    results: byIdSafe("desk-provider-results"),
+  };
+}
+
+function deskSelectedProvider() {
+  const { select } = deskProviderElements();
+  const providerId = select?.value || "";
+  return deskProviderRecords.find((provider) => String(provider.id) === providerId) || null;
+}
+
+function deskRenderProviderDisclosure() {
+  const { select, consent, disclosure, search, status, results } = deskProviderElements();
+  const provider = deskSelectedProvider();
+  if (!provider) {
+    if (consent) {
+      consent.checked = false;
+      consent.disabled = true;
+    }
+    if (disclosure) disclosure.textContent = "尚未載入來源揭露。";
+    if (search) search.disabled = true;
+    if (status) status.textContent = "目前沒有可用的開放素材來源。";
+    if (results) results.replaceChildren();
+    return;
+  }
+  const consentRequired = provider.consent_required !== false;
+  const consented = Boolean(provider.consented);
+  if (consent) {
+    consent.checked = consented;
+    consent.disabled = false;
+  }
+  if (disclosure) {
+    const networkDisclosure = String(
+      provider.network_disclosure || "搜尋會向所選來源送出關鍵詞；匯入後只保存本機檔案。",
+    );
+    disclosure.textContent = `${networkDisclosure}｜${consentRequired ? (consented ? "已同意" : "尚未同意") : "不需額外同意"}`;
+  }
+  if (search) search.disabled = deskProviderSearchBusy;
+  if (status) {
+    status.textContent = consentRequired && !consented
+      ? "請閱讀揭露並勾選同意後搜尋。"
+      : `已選擇 ${String(provider.label || provider.id)}，可開始搜尋。`;
+  }
+}
+
+async function deskLoadProviders() {
+  const { select, status } = deskProviderElements();
+  if (!select || deskProviderStatusLoaded) {
+    deskRenderProviderDisclosure();
+    return;
+  }
+  if (status) status.textContent = "正在載入開放素材來源…";
+  try {
+    const payload = await request("/api/providers/status");
+    if (payload && payload.ok === false) throw new Error(payload.error || "來源狀態無法取得");
+    deskProviderRecords = Array.isArray(payload?.providers) ? payload.providers : [];
+    select.replaceChildren();
+    for (const provider of deskProviderRecords) {
+      if (!provider || !provider.id) continue;
+      const option = document.createElement("option");
+      option.value = String(provider.id);
+      option.textContent = String(provider.label || provider.id);
+      select.append(option);
+    }
+    deskProviderStatusLoaded = true;
+    select.disabled = deskProviderRecords.length === 0;
+    deskRenderProviderDisclosure();
+  } catch (error) {
+    select.disabled = true;
+    if (status) status.textContent = `來源狀態載入失敗：${error.message}`;
+    showToast(`開放素材來源載入失敗：${error.message}`, "error");
+  }
+}
+
+function deskClearProviderResults(message = "") {
+  const { results } = deskProviderElements();
+  if (!results) return;
+  results.replaceChildren();
+  if (message) results.textContent = message;
+}
+
+function deskSafeLandingLink(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.protocol !== "https:") return null;
+    return url;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function deskProviderResultText(value, fallback = "—") {
+  if (value === null || value === undefined || value === "") return fallback;
+  return String(value);
+}
+
+async function deskImportProviderAsset(result, row, button, importStatus) {
+  const importToken = typeof result?.import_token === "string" ? result.import_token : "";
+  if (!importToken || !button || button.disabled) return;
+  button.disabled = true;
+  if (importStatus) importStatus.textContent = "匯入中…";
+  try {
+    const payload = await request("/api/assets/import-provider", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ import_token: importToken }),
+    });
+    if (payload && payload.ok === false) throw new Error(payload.error || "匯入失敗");
+    row?.classList.add("is-imported");
+    button.textContent = "已匯入";
+    if (importStatus) importStatus.textContent = "已匯入；來源與授權資訊已保存。";
+    showToast("素材已匯入本機素材庫", "success");
+    await Promise.all([deskRefreshAssets(), deskRefreshRights()]);
+  } catch (error) {
+    button.disabled = false;
+    if (importStatus) importStatus.textContent = `匯入失敗：${error.message}`;
+    showToast(`素材匯入失敗：${error.message}`, "error");
+  }
+}
+
+function deskRenderProviderResults(results) {
+  const { results: host, status } = deskProviderElements();
+  if (!host) return;
+  host.replaceChildren();
+  if (!Array.isArray(results) || results.length === 0) {
+    host.textContent = "找不到符合條件的素材。";
+    if (status) status.textContent = "搜尋完成：0 筆結果。";
+    return;
+  }
+  if (status) status.textContent = `搜尋完成：${results.length} 筆結果。`;
+  for (const result of results) {
+    const row = document.createElement("article");
+    row.className = "provider-result-row";
+
+    const title = document.createElement("strong");
+    title.textContent = deskProviderResultText(result?.title, "（未命名素材）");
+    row.append(title);
+
+    const creator = document.createElement("span");
+    creator.className = "provider-result-creator";
+    creator.textContent = `作者：${deskProviderResultText(result?.creator)}`;
+    row.append(creator);
+
+    const dimensions = result?.width && result?.height
+      ? `${deskProviderResultText(result.width)}×${deskProviderResultText(result.height)}`
+      : "尺寸未知";
+    const details = document.createElement("span");
+    details.className = "provider-result-details";
+    details.textContent = `授權：${deskProviderResultText(result?.license_spdx, "UNKNOWN")}｜尺寸：${dimensions}｜${result?.attribution_required ? "需列名" : "可免列名"}`;
+    row.append(details);
+
+    const actions = document.createElement("div");
+    actions.className = "provider-result-actions";
+    const landingUrl = deskSafeLandingLink(result?.landing_url);
+    if (landingUrl) {
+      const sourceLink = document.createElement("a");
+      sourceLink.href = landingUrl.toString();
+      sourceLink.target = "_blank";
+      sourceLink.rel = "noopener noreferrer";
+      sourceLink.textContent = "來源頁";
+      actions.append(sourceLink);
+    }
+    const importButton = document.createElement("button");
+    importButton.type = "button";
+    importButton.className = "icon-button provider-import-button";
+    importButton.textContent = "匯入";
+    if (typeof result?.import_token !== "string" || !result.import_token) {
+      importButton.disabled = true;
+    }
+    const importStatus = document.createElement("span");
+    importStatus.className = "provider-import-status";
+    importStatus.setAttribute("role", "status");
+    importStatus.setAttribute("aria-live", "polite");
+    importButton.addEventListener("click", () => deskImportProviderAsset(result, row, importButton, importStatus));
+    actions.append(importButton, importStatus);
+    row.append(actions);
+    host.append(row);
+  }
+}
+
+function deskProviderChanged() {
+  deskClearProviderResults();
+  deskRenderProviderDisclosure();
+}
+
+async function deskSearchProviders() {
+  const { select, query, consent, search, status } = deskProviderElements();
+  const provider = deskSelectedProvider();
+  const trimmedQuery = String(query?.value || "").trim();
+  if (!provider || !select?.value) {
+    if (status) status.textContent = "請先選擇素材來源。";
+    return;
+  }
+  if (!trimmedQuery) {
+    if (status) status.textContent = "請輸入搜尋關鍵詞。";
+    showToast("請輸入搜尋關鍵詞", "error");
+    return;
+  }
+  if (!consent?.checked) {
+    if (status) status.textContent = "搜尋前必須勾選網路揭露同意。";
+    showToast("請先勾選網路揭露同意", "error");
+    return;
+  }
+  if (!search || search.disabled) return;
+  deskProviderSearchBusy = true;
+  search.disabled = true;
+  deskClearProviderResults();
+  try {
+    if (provider.consent_required !== false && !provider.consented) {
+      if (status) status.textContent = "正在記錄來源同意…";
+      const consentPayload = await request("/api/providers/consent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider_id: String(provider.id), consented: true, confirmed_by: "editor" }),
+      });
+      if (consentPayload && consentPayload.ok === false) {
+        throw new Error(consentPayload.error || "來源同意記錄失敗");
+      }
+      provider.consented = true;
+      deskRenderProviderDisclosure();
+    }
+    if (status) status.textContent = "搜尋中…";
+    const payload = await request("/api/assets/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider_id: String(provider.id), query: trimmedQuery, page: 1 }),
+    });
+    if (payload && payload.ok === false) throw new Error(payload.error || "素材搜尋失敗");
+    // The provider service exposes candidates as `items`. Keep `results` as a
+    // temporary compatibility fallback for older mocked integrations.
+    deskRenderProviderResults(payload?.items || payload?.results || []);
+  } catch (error) {
+    deskClearProviderResults(`搜尋失敗：${error.message}`);
+    if (status) status.textContent = `搜尋失敗：${error.message}`;
+    showToast(`開放素材搜尋失敗：${error.message}`, "error");
+  } finally {
+    deskProviderSearchBusy = false;
+    search.disabled = false;
   }
 }
 
@@ -3140,6 +3405,8 @@ async function deskRefreshRights() {
 function bindProductionDesk() {
   byIdSafe("desk-layer-save")?.addEventListener("click", deskSaveLayer);
   byIdSafe("desk-variant-add")?.addEventListener("click", deskAddVariant);
+  byIdSafe("desk-provider-select")?.addEventListener("change", deskProviderChanged);
+  byIdSafe("desk-provider-search")?.addEventListener("click", deskSearchProviders);
   const refreshers = [
     ["desk-layers", deskRefreshLayers],
     ["desk-assets", deskRefreshAssets],
@@ -3151,7 +3418,6 @@ function bindProductionDesk() {
       if (event.target.open) refresh();
     });
   }
-  deskRefreshLayers();
 }
 
 bindProductionDesk();

@@ -19,7 +19,9 @@ import json
 import math
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = SKILL_DIR / "contracts" / "schemas"
@@ -175,6 +177,234 @@ TITLE_KINDS = {"full-screen-hook", "section", "lower-third", "quote", "hero-stat
 
 def _nonempty_str(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def semantic_provider_interface(interface) -> list[str]:
+    """Validate provider relationships that the schema cannot express.
+
+    Provider IDs are the bundle-wide identity for an integration.  The
+    idempotency and preflight lists are compared after trimming so that
+    whitespace-only entries and aliases that differ only by surrounding
+    whitespace cannot silently bypass uniqueness checks.
+    """
+    errors = []
+    provider_ids = set()
+    for index, provider in enumerate(interface.get("providers", [])):
+        path = f"$.providers[{index}]"
+        provider_id = provider.get("id")
+        if provider_id in provider_ids:
+            errors.append(f"{path}.id: duplicate provider id {provider_id!r}")
+        else:
+            provider_ids.add(provider_id)
+
+        key_fields = provider.get("idempotency_key_fields", [])
+        seen_fields = set()
+        for field_index, field in enumerate(key_fields):
+            field_path = f"{path}.idempotency_key_fields[{field_index}]"
+            if not _nonempty_str(field):
+                errors.append(f"{field_path}: must be non-empty after trim")
+                continue
+            normalized = field.strip()
+            if normalized in seen_fields:
+                errors.append(f"{field_path}: duplicate field {normalized!r} after trim")
+            else:
+                seen_fields.add(normalized)
+
+        preflight = provider.get("preflight") or {}
+        checks = preflight.get("checks", [])
+        seen_checks = set()
+        normalized_checks = set()
+        for check_index, check in enumerate(checks):
+            check_path = f"{path}.preflight.checks[{check_index}]"
+            if not _nonempty_str(check):
+                errors.append(f"{check_path}: must be non-empty after trim")
+                continue
+            normalized = check.strip()
+            normalized_checks.add(normalized)
+            if normalized in seen_checks:
+                errors.append(f"{check_path}: duplicate check {normalized!r} after trim")
+            else:
+                seen_checks.add(normalized)
+
+        if provider.get("license_class") == "open":
+            if preflight.get("required") is not True:
+                errors.append(f"{path}.preflight.required: open provider must require preflight")
+            if "license-metadata" not in normalized_checks:
+                errors.append(
+                    f"{path}.preflight.checks: open provider requires 'license-metadata'"
+                )
+        if provider.get("kind") in {"image", "svg", "font"} and preflight.get(
+            "required"
+        ) is False:
+            errors.append(
+                f"{path}.preflight.required: {provider.get('kind')} provider cannot disable preflight"
+            )
+    return errors
+
+
+# Final licenses copied from contracts/policies/LICENSE_POLICY.md's allowlist.
+LICENSE_FINAL_ALLOWLIST = frozenset(
+    {
+        "CC0-1.0",
+        "CC-BY-4.0",
+        "CC-BY-SA-4.0",
+        "OFL-1.1",
+        "Apache-2.0",
+        "MIT",
+        "Unlicense",
+        "internal-original",
+        "user-owned",
+    }
+)
+
+
+def _safe_asset_path(value) -> bool:
+    """Return whether *value* is a normalized POSIX path under ``assets/``."""
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        return False
+    if "\\" in value:
+        return False
+    parts = value.split("/")
+    if len(parts) < 2 or parts[0] != "assets":
+        return False
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    return True
+
+
+def _https_url_without_credentials(value) -> bool:
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        # Accessing ``port`` makes malformed numeric ports fail closed too.
+        _ = parsed.port
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and bool(parsed.netloc)
+        and hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def _timezone_aware_iso8601(value) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    candidate = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except (TypeError, ValueError):
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _canonical_provider_license_evidence(value, spdx) -> bool:
+    expected_paths = {
+        "CC0-1.0": "/publicdomain/zero/1.0",
+        "CC-BY-4.0": "/licenses/by/4.0",
+        "CC-BY-SA-4.0": "/licenses/by-sa/4.0",
+    }
+    expected_path = expected_paths.get(spdx)
+    if expected_path is None or not _https_url_without_credentials(value):
+        return False
+    parsed = urlsplit(value)
+    return bool(
+        parsed.hostname
+        and parsed.hostname.casefold() == "creativecommons.org"
+        and parsed.port in {None, 443}
+        and parsed.path in {expected_path, f"{expected_path}/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def semantic_asset_provenance(provenance) -> list[str]:
+    """Validate asset identity, provenance, path, license, and review rules."""
+    errors = []
+    asset_ids = set()
+    paths = set()
+    for index, item in enumerate(provenance.get("items", [])):
+        path = f"$.items[{index}]"
+        asset_id = item.get("asset_id")
+        if asset_id in asset_ids:
+            errors.append(f"{path}.asset_id: duplicate asset_id {asset_id!r}")
+        else:
+            asset_ids.add(asset_id)
+        asset_path = item.get("path")
+        if asset_path in paths:
+            errors.append(f"{path}.path: duplicate path {asset_path!r}")
+        else:
+            paths.add(asset_path)
+        if not _safe_asset_path(asset_path):
+            errors.append(
+                f"{path}.path: must be a normalized POSIX project-relative path under assets/"
+            )
+
+        origin = item.get("origin")
+        provider_id = item.get("provider_id")
+        source_url = item.get("source_url")
+        license_info = item.get("license") or {}
+        if origin == "provider":
+            if not _nonempty_str(provider_id):
+                errors.append(f"{path}.provider_id: provider origin requires a non-empty provider_id")
+            if not _https_url_without_credentials(source_url):
+                errors.append(
+                    f"{path}.source_url: provider origin requires an HTTPS URL without credentials"
+                )
+            if not _https_url_without_credentials(license_info.get("evidence_url")):
+                errors.append(
+                    f"{path}.license.evidence_url: provider origin requires HTTPS license evidence"
+                )
+            elif not _canonical_provider_license_evidence(
+                license_info.get("evidence_url"), license_info.get("spdx")
+            ):
+                errors.append(
+                    f"{path}.license.evidence_url: must match the canonical SPDX license URL"
+                )
+        elif origin in {"user-upload", "folder-import"}:
+            if provider_id is not None:
+                errors.append(f"{path}.provider_id: {origin} origin requires null provider_id")
+            if source_url is not None:
+                errors.append(f"{path}.source_url: {origin} origin requires null source_url")
+            if license_info.get("evidence_url") is not None:
+                errors.append(
+                    f"{path}.license.evidence_url: {origin} origin requires null evidence"
+                )
+        elif origin == "generated":
+            if not _nonempty_str(provider_id):
+                errors.append(f"{path}.provider_id: generated origin requires a non-empty provider_id")
+
+        spdx = license_info.get("spdx")
+        if not _timezone_aware_iso8601(license_info.get("verified_at")):
+            errors.append(f"{path}.license.verified_at: must be timezone-aware ISO-8601")
+        if license_info.get("attribution_required") is True and not _nonempty_str(
+            license_info.get("attribution_text")
+        ):
+            errors.append(
+                f"{path}.license.attribution_text: required when attribution_required is true"
+            )
+        if spdx in {"CC-BY-4.0", "CC-BY-SA-4.0"} and license_info.get(
+            "attribution_required"
+        ) is not True:
+            errors.append(
+                f"{path}.license.attribution_required: {spdx} requires attribution_required true"
+            )
+        if item.get("review_status") == "approved":
+            if spdx not in LICENSE_FINAL_ALLOWLIST:
+                errors.append(
+                    f"{path}.license.spdx: approved asset requires a final-allowlist license"
+                )
+            if spdx == "UNKNOWN":
+                errors.append(f"{path}.license.spdx: UNKNOWN cannot be approved")
+        # UNKNOWN is intentionally permitted only while a review is pending or
+        # rejected; schema validation handles all other review-status values.
+        elif spdx == "UNKNOWN" and item.get("review_status") not in {"pending", "rejected"}:
+            errors.append(f"{path}.license.spdx: UNKNOWN is only allowed for pending/rejected")
+    return errors
 
 
 def semantic_structured_layer(layers) -> list[str]:
@@ -361,6 +591,8 @@ SEMANTIC_VALIDATORS = {
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
     "master_timeline": semantic_master_timeline,
     "approval_receipt": semantic_approval_receipt,
+    "asset_provenance": semantic_asset_provenance,
+    "provider_interface": semantic_provider_interface,
     "structured_layer": semantic_structured_layer,
     "video_analysis": semantic_video_analysis,
     "rights_assertion": semantic_rights_assertion,
