@@ -2795,3 +2795,14 @@ async function renderFontPanel() {
 
 byIdSafe("apply-caption-scope")?.addEventListener("click", applyCaptionScopeStyle);
 renderFontPanel();
+
+byIdSafe("style-pack-select")?.addEventListener("change", (event) => {
+  if (!state) return;
+  pushHistory();
+  const packId = event.target.value || null;
+  state.style_pack = packId
+    ? { project_default: packId, per_highlight: state.style_pack?.per_highlight || {} }
+    : null;
+  if (state.style_pack === null) delete state.style_pack;
+  markDirty("視覺風格包已變更（結構卡與字幕預設將重新渲染）");
+});

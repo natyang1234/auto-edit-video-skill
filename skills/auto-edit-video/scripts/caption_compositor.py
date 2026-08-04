@@ -116,13 +116,15 @@ def render_caption_png(
     overlay: dict[str, Any],
     canvas: dict[str, Any],
     render_scale: float,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Shape + rasterise one caption overlay; returns the plan item dict."""
     modules = _load_coretext()
     if not modules:
         raise RuntimeError("caption compositor is not available")
     ct, foundation, quartz = modules
-    style = overlay.get("style") or {}
+    pack, pack_source = selected_pack(state or {}, overlay)
+    style, style_sources = resolve_caption_style(overlay, pack, pack_source)
     text = str(overlay.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         raise ValueError("caption text is empty")
@@ -311,6 +313,7 @@ def render_caption_png(
 
     return {
         "caption_item_id": str(overlay.get("id")),
+        "style_sources": style_sources,
         "clusters": clusters,
         "glyph_runs": glyph_runs,
         "artifact": {
@@ -341,9 +344,20 @@ def caption_content_revision(state: dict[str, Any], canvas: dict[str, Any], rend
         font_identity = font_digest(_font_file(None))
     except (OSError, ValueError):
         font_identity = "unresolved"
+    pack_identity: dict[str, Any] = {}
+    for overlay in caption_overlays(state):
+        try:
+            pack, pack_source = selected_pack(state, overlay)
+        except ValueError:
+            pack, pack_source = None, "invalid"
+        pack_identity[str(overlay.get("id"))] = {
+            "source": pack_source,
+            "defaults": pack_caption_defaults(pack) if pack else {},
+        }
     payload = {
         "engine": engine_descriptor(),
         "font_sha256": font_identity,
+        "style_packs": pack_identity,
         "canvas": {"width": canvas.get("width"), "height": canvas.get("height")},
         "render_scale": round(float(render_scale), 4),
         "items": [
@@ -383,7 +397,7 @@ def build_render_plan(
         except (ValueError, OSError, KeyError):
             pass
     items = [
-        render_caption_png(project_dir, overlay, canvas, render_scale)
+        render_caption_png(project_dir, overlay, canvas, render_scale, state)
         for overlay in caption_overlays(state)
     ]
     disallowed = sorted({name for item in items for name in item.pop("x_disallowed_fallbacks")})
@@ -418,3 +432,62 @@ def build_render_plan(
     )
     scratch.replace(plan_path)
     return plan
+
+SYSTEM_CAPTION_DEFAULTS = {"color": "#F7F2E8", "stroke_color": "#17130F"}
+PACK_CAPTION_KEYS = ("color", "stroke_color")
+
+
+def pack_caption_defaults(pack: dict[str, Any]) -> dict[str, str]:
+    palette = pack.get("tokens", {}).get("palette", {})
+    defaults: dict[str, str] = {}
+    if palette.get("ink"):
+        defaults["color"] = str(palette["ink"])
+    if palette.get("bg"):
+        defaults["stroke_color"] = str(palette["bg"])
+    return defaults
+
+
+def resolve_caption_style(
+    overlay: dict[str, Any],
+    pack: dict[str, Any] | None,
+    pack_source: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Precedence (plan v2): manual key > pack default > system default.
+
+    Variant overrides slot in above manual at render time (P3). Returns the
+    resolved style plus a per-key source map for the render receipt.
+    """
+    manual = overlay.get("style") or {}
+    resolved = dict(manual)
+    sources = {key: "manual" for key in manual}
+    pack_defaults = pack_caption_defaults(pack) if pack else {}
+    for key in PACK_CAPTION_KEYS:
+        if key in manual and manual.get(key):
+            continue
+        if key in pack_defaults:
+            resolved[key] = pack_defaults[key]
+            sources[key] = pack_source
+        elif key in SYSTEM_CAPTION_DEFAULTS:
+            resolved[key] = SYSTEM_CAPTION_DEFAULTS[key]
+            sources[key] = "system"
+    return resolved, sources
+
+
+def selected_pack(state: dict[str, Any], overlay: dict[str, Any]):
+    """Per-highlight pack beats the project default; None when unset."""
+    import structured_card_compositor
+
+    selection = state.get("style_pack") or {}
+    highlight = str(overlay.get("highlight_id") or "")
+    pack_id = (
+        (selection.get("per_highlight") or {}).get(highlight)
+        or selection.get("project_default")
+    )
+    if not pack_id:
+        return None, "system"
+    pack = structured_card_compositor.load_default_pack()
+    if pack.get("id") != pack_id:
+        raise ValueError(f"unknown style pack: {pack_id}")
+    scope = "pack-highlight" if (selection.get("per_highlight") or {}).get(highlight) else "pack-project"
+    return pack, f"{scope}:{pack_id}"
+

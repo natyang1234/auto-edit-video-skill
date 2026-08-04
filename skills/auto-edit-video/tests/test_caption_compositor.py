@@ -223,3 +223,72 @@ class CompositorRegressionTests(unittest.TestCase):
             again["items"][0]["artifact"]["artifact_hash"],
             "tampered bytes must be replaced by an honest re-render",
         )
+
+
+@unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+class PackPrecedenceTests(unittest.TestCase):
+    """Plan v2 P2: manual > pack default > system, with receipt sources."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="pack-precedence-")
+        self.project = Path(self._tmp.name)
+        (self.project / "working").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def state_with(self, manual_color: str | None, pack: bool) -> dict:
+        style = {"font_size": 40, "stroke_width": 0}
+        if manual_color:
+            style["color"] = manual_color
+        state = {
+            "canvas": {"width": 1080, "height": 1920},
+            "overlays": [
+                {
+                    "id": "caption-p2", "type": "caption", "text": "風格包測試",
+                    "start": 0, "end": 1, "visible": True,
+                    "style": style, "effect_spans": [],
+                }
+            ],
+        }
+        if pack:
+            state["style_pack"] = {"project_default": "dark-data-presenter"}
+        return state
+
+    def test_manual_key_survives_pack_switch(self) -> None:
+        manual = cc.build_render_plan(self.project, self.state_with("#123456", pack=False))
+        with_pack = cc.build_render_plan(self.project, self.state_with("#123456", pack=True))
+        self.assertEqual(
+            manual["items"][0]["style_sources"]["color"], "manual"
+        )
+        self.assertEqual(
+            with_pack["items"][0]["style_sources"]["color"], "manual",
+            "a manually set key must never be overridden by the pack",
+        )
+        self.assertEqual(
+            manual["items"][0]["artifact"]["artifact_hash"],
+            with_pack["items"][0]["artifact"]["artifact_hash"],
+            "manual colour pixels must be byte-stable across pack switch",
+        )
+
+    def test_unset_key_takes_pack_default_and_goes_stale(self) -> None:
+        without = cc.build_render_plan(self.project, self.state_with(None, pack=False))
+        self.assertEqual(without["items"][0]["style_sources"]["color"], "system")
+        with_pack = cc.build_render_plan(self.project, self.state_with(None, pack=True))
+        self.assertEqual(
+            with_pack["items"][0]["style_sources"]["color"],
+            "pack-project:dark-data-presenter",
+        )
+        self.assertNotEqual(
+            without["caption_revision"], with_pack["caption_revision"],
+            "pack switch must invalidate the caption plan",
+        )
+        self.assertNotEqual(
+            without["items"][0]["artifact"]["artifact_hash"],
+            with_pack["items"][0]["artifact"]["artifact_hash"],
+            "unset colour must actually change pixels",
+        )
+
+    def test_unknown_pack_fails_closed(self) -> None:
+        state = self.state_with(None, pack=True)
+        state["style_pack"]["project_default"] = "vaporwave-9000"
+        with self.assertRaises(ValueError):
+            cc.build_render_plan(self.project, state)

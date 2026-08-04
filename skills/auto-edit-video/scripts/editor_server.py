@@ -1649,6 +1649,24 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     rights = state.get("rights")
     if not isinstance(rights, dict) or not isinstance(rights.get("asserted"), bool):
         errors.append("rights must be an object with a boolean asserted flag")
+    style_pack = state.get("style_pack")
+    if style_pack is not None:
+        import structured_card_compositor
+
+        known_packs = {structured_card_compositor.load_default_pack().get("id")}
+        if not isinstance(style_pack, dict):
+            errors.append("style_pack must be an object")
+        else:
+            project_default = style_pack.get("project_default")
+            if project_default is not None and project_default not in known_packs:
+                errors.append(f"unknown style pack: {project_default}")
+            per_highlight = style_pack.get("per_highlight") or {}
+            if not isinstance(per_highlight, dict):
+                errors.append("style_pack.per_highlight must be an object")
+            else:
+                for pack_id in per_highlight.values():
+                    if pack_id not in known_packs:
+                        errors.append(f"unknown style pack: {pack_id}")
     canvas = state.get("canvas")
     if not isinstance(canvas, dict):
         errors.append("canvas must be an object")
