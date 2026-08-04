@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import http.client
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,7 @@ import unittest
 import unittest.mock
 import urllib.parse
 import zipfile
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -723,6 +726,25 @@ class EditorServerTests(unittest.TestCase):
             "GET", "/renders/%2e%2e/working/editor_state.json"
         )
         self.assertEqual(status, 403)
+
+    def test_assets_route_rejects_svg_xml_variants_but_serves_png(self) -> None:
+        blocked = {
+            "unsafe.svg": b"<svg>must not be served</svg>",
+            "unsafe.SVGZ": b"compressed SVG must not be served",
+            "unsafe.XML": b"<?xml version='1.0'?>",
+        }
+        for name, payload in blocked.items():
+            (self.project / "assets" / name).write_bytes(payload)
+            encoded_name = urllib.parse.quote(name, safe="")
+            status, _headers, body = self.request("GET", f"/assets/{encoded_name}")
+            self.assertEqual(status, 403, name)
+            self.assertNotIn(payload, body, name)
+
+        png = self.project / "assets" / "safe.PNG"
+        png.write_bytes(b"PNG bytes are still served")
+        status, _headers, body = self.request("GET", "/assets/safe.%50%4E%47")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, png.read_bytes())
 
     def test_source_symlink_outside_project_is_rejected(self) -> None:
         outside = Path(self._tmp.name) / "outside.mp4"
@@ -2502,6 +2524,123 @@ class EditorServerTests(unittest.TestCase):
         asset.write_bytes(b"\x89PNG\r\n\x1a\ntampered")
         errors = editor_server.rights_gate_errors(self.project, state)
         self.assertTrue(any("provenance" in error for error in errors))
+
+    def test_generated_svg_png_requires_provider_receipt_even_with_manual_assertion(self) -> None:
+        def png_chunk(kind: bytes, payload: bytes) -> bytes:
+            checksum = binascii.crc32(kind)
+            checksum = binascii.crc32(payload, checksum) & 0xFFFFFFFF
+            return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + png_chunk(
+            b"IHDR", struct.pack(">IIBBBBB", 24, 24, 8, 6, 0, 0, 0)
+        ) + png_chunk(
+            b"IDAT", zlib.compress(b"".join(b"\0" + b"\x33" * (24 * 4) for _ in range(24)))
+        ) + png_chunk(b"IEND", b"")
+        png_digest = hashlib.sha256(png_bytes).hexdigest()
+        png = self.project / f"assets/generated/svg/{png_digest}.png"
+        png.parent.mkdir(parents=True)
+        png.write_bytes(png_bytes)
+        png_relative = png.relative_to(self.project).as_posix()
+        state = {
+            "overlays": [
+                {
+                    "id": "generated-svg",
+                    "type": "image",
+                    "source": png_relative,
+                }
+            ]
+        }
+
+        # A manual rights assertion must not turn an unregistered generated
+        # SVG derivative into a final-eligible input.
+        status, payload = self.json_request(
+            "POST",
+            "/api/rights/assert",
+            {"asset_path": png_relative, "basis": "own_work"},
+        )
+        self.assertEqual(status, 200, payload)
+        inputs = editor_server.referenced_render_inputs(self.project, state)
+        self.assertEqual(inputs[0]["license_status"], "provider-provenance-missing")
+        self.assertTrue(inputs[0]["requires_assertion"])
+        errors = editor_server.rights_gate_errors(self.project, state)
+        self.assertTrue(any("provider provenance" in error for error in errors), errors)
+        self.assertFalse(any("rights assertion" in error for error in errors), errors)
+
+        digest = hashlib.sha256(png.read_bytes()).hexdigest()
+        item = {
+            "asset_id": f"provider-heroicons-arrow-right-{digest[:16]}",
+            "path": png_relative,
+            "sha256": digest,
+            "origin": "provider",
+            "provider_id": "heroicons",
+            "source_url": "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/optimized/24/outline/arrow-right.svg",
+            "license": {
+                "spdx": "MIT",
+                "evidence_url": "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/LICENSE",
+                "attribution_required": True,
+                "attribution_text": "Tailwind Labs",
+                "verified_at": "2026-08-04T00:00:00Z",
+            },
+            "review_status": "approved",
+        }
+        editor_server.asset_registry.upsert_item(self.project, item)
+        errors = editor_server.rights_gate_errors(self.project, state)
+        self.assertTrue(any("provider provenance" in error for error in errors), errors)
+
+        raw_bytes = b"<svg/>"
+        sanitized_bytes = b"<svg xmlns='http://www.w3.org/2000/svg'/>"
+        raw_digest = hashlib.sha256(raw_bytes).hexdigest()
+        sanitized_digest = hashlib.sha256(sanitized_bytes).hexdigest()
+        raw = self.project / f"working/source_artifacts/svg/{raw_digest}.svg.untrusted"
+        sanitized = self.project / f"working/sanitized_svg/{sanitized_digest}.svg"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        sanitized.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(raw_bytes)
+        sanitized.write_bytes(sanitized_bytes)
+        from svg_security import LIMITS_SHA256, POLICY_VERSION, SANITIZER_VERSION
+
+        query_hash = hashlib.sha256(b"arrow-right").hexdigest()
+        cache_key = editor_server.asset_registry.contract_registry.canonical_hash(
+            {
+                "raw_sha256": raw_digest,
+                "policy_version": POLICY_VERSION,
+                "sanitizer_version": SANITIZER_VERSION,
+                "limits_sha256": LIMITS_SHA256,
+            }
+        )
+        editor_server.asset_registry.save_svg_provider_receipt(
+            self.project,
+            item,
+            candidate_id="arrow-right",
+            query_hash=query_hash,
+            download_url="https://raw.githubusercontent.com/tailwindlabs/heroicons/0435d4ca364a608cc75e2f8683d374e55abbae26/optimized/24/outline/arrow-right.svg",
+            raw_sha256=hashlib.sha256(raw.read_bytes()).hexdigest(),
+            raw_path=raw.relative_to(self.project).as_posix(),
+            raw_size=raw.stat().st_size,
+            sanitized_sha256=sanitized_digest,
+            sanitized_path=sanitized.relative_to(self.project).as_posix(),
+            sanitized_size=sanitized.stat().st_size,
+            png_size=png.stat().st_size,
+            png_width=24,
+            png_height=24,
+            sanitizer_identity={
+                "policy_version": POLICY_VERSION,
+                "sanitizer_version": SANITIZER_VERSION,
+                "limits_sha256": LIMITS_SHA256,
+                "sanitize_cache_key_sha256": cache_key,
+            },
+            rasterizer_identity={
+                "version": "resvg-test-1",
+                "executable_sha256": "c" * 64,
+                "sandbox_executable_sha256": "d" * 64,
+                "sandbox_profile_sha256": "e" * 64,
+            },
+        )
+        self.assertEqual(
+            editor_server.referenced_render_inputs(self.project, state)[0]["license_status"],
+            "provider-approved",
+        )
+        self.assertEqual(editor_server.rights_gate_errors(self.project, state), [])
 
 
 class EditorRendererTests(unittest.TestCase):

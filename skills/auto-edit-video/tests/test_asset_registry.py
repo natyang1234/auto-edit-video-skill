@@ -2,18 +2,37 @@
 
 from __future__ import annotations
 
+import binascii
 import hashlib
 import json
+import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import zlib
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 import asset_registry  # noqa: E402
+from svg_security import (  # noqa: E402
+    LIMITS_SHA256,
+    POLICY_VERSION,
+    SANITIZER_VERSION,
+)
+
+
+def strict_png(width: int = 24, height: int = 24) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        checksum = binascii.crc32(kind)
+        checksum = binascii.crc32(payload, checksum) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    rows = b"".join(b"\0" + b"\x33" * (width * 4) for _ in range(height))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
 class AssetRegistryTests(unittest.TestCase):
@@ -72,6 +91,102 @@ class AssetRegistryTests(unittest.TestCase):
         artifact = {"schema_version": 1, "items": list(items)}
         asset_registry.save_registry(self.project, artifact)
         return artifact
+
+    def svg_item(
+        self, *, provider_id: str = "heroicons", review_status: str = "approved"
+    ) -> tuple[dict, dict[str, bytes]]:
+        raw = b'<svg viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg>'
+        sanitized = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"/>'
+        png = strict_png()
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        sanitized_hash = hashlib.sha256(sanitized).hexdigest()
+        png_hash = hashlib.sha256(png).hexdigest()
+        if provider_id == "wikimedia-svg":
+            spdx = "CC-BY-4.0"
+            license_url = "https://creativecommons.org/licenses/by/4.0/"
+            source_url = "https://commons.wikimedia.org/wiki/File:Example.svg"
+            attribution = "Example Author"
+        else:
+            spdx = "MIT"
+            license_url = "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/LICENSE"
+            source_url = "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/optimized/24/outline/arrow-right.svg"
+            attribution = "Tailwind Labs"
+        candidate_id = "123" if provider_id == "wikimedia-svg" else "arrow-right"
+        item = {
+            "asset_id": f"provider-{provider_id}-{candidate_id}-{png_hash[:16]}",
+            "path": f"assets/generated/svg/{png_hash}.png",
+            "sha256": png_hash,
+            "origin": "provider",
+            "provider_id": provider_id,
+            "source_url": source_url,
+            "license": {
+                "spdx": spdx,
+                "evidence_url": license_url,
+                "attribution_required": True,
+                "attribution_text": attribution,
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+            "review_status": review_status,
+        }
+        files = {
+            f"working/source_artifacts/svg/{raw_hash}.svg.untrusted": raw,
+            f"working/sanitized_svg/{sanitized_hash}.svg": sanitized,
+            item["path"]: png,
+        }
+        return item, files
+
+    def publish_svg_receipt(self, item: dict, files: dict[str, bytes]) -> dict:
+        for relative, payload in files.items():
+            path = self.project / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        raw_path, sanitized_path, _png_path = files
+        raw = files[raw_path]
+        sanitized = files[sanitized_path]
+        cache_key = asset_registry.contract_registry.canonical_hash(
+            {
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                "policy_version": POLICY_VERSION,
+                "sanitizer_version": SANITIZER_VERSION,
+                "limits_sha256": LIMITS_SHA256,
+            }
+        )
+        return asset_registry.save_svg_provider_receipt(
+            self.project,
+            item,
+            candidate_id="123" if item["provider_id"] == "wikimedia-svg" else "arrow-right",
+            query_hash=(
+                "1" * 64
+                if item["provider_id"] == "wikimedia-svg"
+                else hashlib.sha256(b"arrow-right").hexdigest()
+            ),
+            download_url=(
+                "https://upload.wikimedia.org/wikipedia/commons/a/a1/Example.svg"
+                if item["provider_id"] == "wikimedia-svg"
+                else "https://raw.githubusercontent.com/tailwindlabs/heroicons/0435d4ca364a608cc75e2f8683d374e55abbae26/optimized/24/outline/arrow-right.svg"
+            ),
+            raw_sha256=hashlib.sha256(raw).hexdigest(),
+            raw_path=raw_path,
+            raw_size=len(raw),
+            sanitized_sha256=hashlib.sha256(sanitized).hexdigest(),
+            sanitized_path=sanitized_path,
+            sanitized_size=len(sanitized),
+            png_size=len(files[item["path"]]),
+            png_width=24,
+            png_height=24,
+            sanitizer_identity={
+                "policy_version": POLICY_VERSION,
+                "sanitizer_version": SANITIZER_VERSION,
+                "limits_sha256": LIMITS_SHA256,
+                "sanitize_cache_key_sha256": cache_key,
+            },
+            rasterizer_identity={
+                "version": "resvg-test-1",
+                "executable_sha256": "4" * 64,
+                "sandbox_executable_sha256": "5" * 64,
+                "sandbox_profile_sha256": "6" * 64,
+            },
+        )
 
     def test_missing_registry_returns_empty_v1_artifact(self) -> None:
         self.assertEqual(
@@ -320,6 +435,76 @@ class AssetRegistryTests(unittest.TestCase):
         self.assertNotIn("download_url", receipt)
         tampered = dict(item, sha256="0" * 64)
         self.assertTrue(asset_registry.provider_consistency_errors(self.project, tampered))
+
+    def test_svg_v2_receipt_is_strict_hash_bound_and_recomputes_all_files(self) -> None:
+        item, files = self.svg_item()
+        receipt = self.publish_svg_receipt(item, files)
+        self.assertEqual(set(receipt), {
+            "schema_version", "evidence_id", "asset_id", "provider_id",
+            "candidate_id", "query_hash", "download_url_sha256",
+            "registry_item_sha256", "license_spdx", "license_url", "decision",
+            "issued_at", "raw", "sanitized", "png", "sanitizer", "rasterizer",
+        })
+        self.assertEqual(asset_registry.provider_consistency_errors(self.project, item), [])
+
+        for section in ("raw", "sanitized", "png"):
+            with self.subTest(section=section):
+                path = self.project / receipt[section]["path"]
+                original = path.read_bytes()
+                path.write_bytes(original + b"tampered")
+                self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+                path.write_bytes(original)
+        self.assertEqual(asset_registry.provider_consistency_errors(self.project, item), [])
+
+    def test_svg_v2_receipt_rejects_extra_keys_bad_paths_sizes_and_identities(self) -> None:
+        item, files = self.svg_item()
+        receipt = self.publish_svg_receipt(item, files)
+        receipt_path = (
+            self.project / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        cases = []
+        extra = json.loads(json.dumps(receipt))
+        extra["extra"] = True
+        cases.append(extra)
+        traversal = json.loads(json.dumps(receipt))
+        traversal["raw"]["path"] = "../outside"
+        cases.append(traversal)
+        backslash = json.loads(json.dumps(receipt))
+        backslash["sanitized"]["path"] = "working\\sanitized_svg\\x.svg"
+        cases.append(backslash)
+        zero_size = json.loads(json.dumps(receipt))
+        zero_size["png"]["size"] = 0
+        cases.append(zero_size)
+        missing_identity = json.loads(json.dumps(receipt))
+        del missing_identity["rasterizer"]["sandbox_profile_sha256"]
+        cases.append(missing_identity)
+        bad_hash = json.loads(json.dumps(receipt))
+        bad_hash["sanitizer"]["limits_sha256"] = "not-a-hash"
+        cases.append(bad_hash)
+        for malformed in cases:
+            with self.subTest(malformed=malformed):
+                receipt_path.write_text(json.dumps(malformed), encoding="utf-8")
+                self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+
+    def test_svg_v2_receipt_rejects_symlinked_artifact_without_following_it(self) -> None:
+        item, files = self.svg_item()
+        receipt = self.publish_svg_receipt(item, files)
+        raw = self.project / receipt["raw"]["path"]
+        outside = self.project / "outside"
+        outside.write_bytes(raw.read_bytes())
+        raw.unlink()
+        raw.symlink_to(outside)
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+
+    def test_wikimedia_svg_pending_is_never_final_eligible(self) -> None:
+        item, files = self.svg_item(
+            provider_id="wikimedia-svg", review_status="pending"
+        )
+        self.publish_svg_receipt(item, files)
+        errors = asset_registry.provider_consistency_errors(self.project, item)
+        self.assertTrue(errors)
+        self.assertTrue(any("review_status" in error for error in errors))
 
     def test_attribution_is_sorted_and_control_text_is_one_line(self) -> None:
         first = self.item(

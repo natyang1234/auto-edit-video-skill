@@ -20,6 +20,13 @@ from typing import Any
 
 import contract_registry
 from open_asset_providers import canonical_license_url
+from svg_security import (
+    LIMITS_SHA256 as SVG_LIMITS_SHA256,
+    POLICY_VERSION as SVG_POLICY_VERSION,
+    SANITIZER_VERSION as SVG_SANITIZER_VERSION,
+    SvgSecurityError,
+    validate_png_bytes,
+)
 
 
 PROVENANCE_REL = Path("assets/provenance.json")
@@ -34,6 +41,7 @@ _AUTO_LICENSE_ALLOWLIST = frozenset(
         "CC-BY-SA-4.0",
         "Apache-2.0",
         "MIT",
+        "ISC",
         "Unlicense",
         "OFL-1.1",
         "internal-original",
@@ -42,7 +50,30 @@ _AUTO_LICENSE_ALLOWLIST = frozenset(
 _BUILTIN_PROVIDER_PREFIXES = {
     "openverse": "assets/providers/openverse/",
     "wikimedia": "assets/providers/wikimedia/",
+    "heroicons": "assets/generated/svg/",
+    "lucide": "assets/generated/svg/",
+    "tabler": "assets/generated/svg/",
+    "wikimedia-svg": "assets/generated/svg/",
 }
+_SVG_PROVIDER_IDS = frozenset({"heroicons", "lucide", "tabler", "wikimedia-svg"})
+_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
+_EVIDENCE_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+_SVG_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version", "evidence_id", "asset_id", "provider_id",
+        "candidate_id", "query_hash", "download_url_sha256",
+        "registry_item_sha256", "license_spdx", "license_url", "decision",
+        "issued_at", "raw", "sanitized", "png", "sanitizer", "rasterizer",
+    }
+)
+_SVG_FILE_KEYS = frozenset({"path", "sha256", "size"})
+_SVG_PNG_KEYS = frozenset({"path", "sha256", "size", "width", "height", "mime"})
+_SVG_SANITIZER_KEYS = frozenset(
+    {"policy_version", "sanitizer_version", "limits_sha256", "sanitize_cache_key_sha256"}
+)
+_SVG_RASTERIZER_KEYS = frozenset(
+    {"version", "executable_sha256", "sandbox_executable_sha256", "sandbox_profile_sha256"}
+)
 _MISSING = object()
 
 # The first two lines are intentionally fixed.  Keep this string private so
@@ -252,6 +283,37 @@ def _restore_snapshot(path: Path, payload: bytes | None, label: str) -> None:
             raise AssetRegistryError(f"cannot remove rolled-back {label}: {path}") from exc
         return
     _atomic_write_bytes(path, payload, label)
+
+
+def snapshot_publication(project_dir: Path) -> dict[str, bytes | None]:
+    """Capture exact registry/attribution bytes for a larger asset transaction."""
+    project = Path(project_dir)
+    return {
+        "registry": _file_snapshot(_registry_path(project), "provenance registry"),
+        "attribution": _file_snapshot(_attribution_path(project), "ATTRIBUTION.md"),
+    }
+
+
+def restore_publication(
+    project_dir: Path, snapshot: dict[str, bytes | None]
+) -> None:
+    """Restore a snapshot exactly, including original file absence."""
+    if not isinstance(snapshot, dict) or set(snapshot) != {"registry", "attribution"}:
+        raise AssetRegistryError("registry publication snapshot is invalid")
+    project = Path(project_dir)
+    errors: list[str] = []
+    for path, key, label in (
+        (_registry_path(project), "registry", "provenance registry"),
+        (_attribution_path(project), "attribution", "ATTRIBUTION.md"),
+    ):
+        try:
+            _restore_snapshot(path, snapshot[key], label)
+        except AssetRegistryError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise AssetRegistryError(
+            "registry transaction rollback failed: " + "; ".join(errors)
+        )
 
 
 def _publish_registry_and_attribution(project_dir: Path, artifact: dict) -> None:
@@ -504,8 +566,8 @@ def _provider_receipt_path(project_dir: Path, asset_id: str) -> Path:
     return Path(project_dir) / PROVIDER_RECEIPTS_REL / name
 
 
-def _provider_static_errors(item: dict) -> list[str]:
-    errors = auto_license_errors(item)
+def _provider_identity_errors(item: dict) -> list[str]:
+    errors: list[str] = []
     provider_id = item.get("provider_id")
     prefix = _BUILTIN_PROVIDER_PREFIXES.get(provider_id)
     if prefix is None:
@@ -513,11 +575,21 @@ def _provider_static_errors(item: dict) -> list[str]:
     elif not isinstance(item.get("path"), str) or not item["path"].startswith(prefix):
         errors.append("provider asset path does not match provider_id")
     license_info = item.get("license") or {}
-    if canonical_license_url(
+    canonical = canonical_license_url(
         license_info.get("evidence_url"), str(license_info.get("spdx") or "")
-    ) is None:
+    )
+    repo_license = {
+        ("heroicons", "MIT"): "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/LICENSE",
+        ("lucide", "ISC"): "https://github.com/lucide-icons/lucide/blob/f12b0de177fbc2a6795e99be065887e72b237123/LICENSE",
+        ("tabler", "MIT"): "https://github.com/tabler/tabler-icons/blob/8ac7d81b72ece11072ef25ea9fd92e80c6f3c9fc/LICENSE",
+    }.get((provider_id, license_info.get("spdx")))
+    if canonical is None and license_info.get("evidence_url") != repo_license:
         errors.append("provider license evidence is not canonical")
     return errors
+
+
+def _provider_static_errors(item: dict) -> list[str]:
+    return auto_license_errors(item) + _provider_identity_errors(item)
 
 
 def save_provider_receipt(
@@ -560,12 +632,255 @@ def save_provider_receipt(
     return receipt
 
 
+def save_svg_provider_receipt(
+    project_dir: Path, item: dict, *, candidate_id: str, query_hash: str, download_url: str,
+    raw_sha256: str, raw_path: str, raw_size: int, sanitized_sha256: str,
+    sanitized_path: str, sanitized_size: int, png_size: int, png_width: int, png_height: int,
+    sanitizer_identity: dict, rasterizer_identity: dict,
+) -> dict:
+    """Write SVG v2 consistency evidence with every transformed artifact bound."""
+    if item.get("provider_id") not in _SVG_PROVIDER_IDS:
+        raise AssetRegistryError("SVG provider item is not eligible for consistency evidence")
+    if (
+        item.get("origin") != "provider"
+        or not isinstance(item.get("license"), dict)
+        or _validation_errors({"schema_version": 1, "items": [item]})
+        or _provider_identity_errors(item)
+    ):
+        raise AssetRegistryError("SVG provider item is not eligible for consistency evidence")
+    if (
+        not isinstance(candidate_id, str)
+        or not candidate_id
+        or len(candidate_id) > 200
+        or _CONTROL_RE.search(candidate_id)
+        or not isinstance(download_url, str)
+        or not download_url.startswith("https://")
+        or len(download_url) > 2048
+        or _CONTROL_RE.search(download_url)
+    ):
+        raise AssetRegistryError("SVG receipt inputs are invalid")
+    if not isinstance(sanitizer_identity, dict) or not isinstance(rasterizer_identity, dict):
+        raise AssetRegistryError("SVG security identities are invalid")
+    try:
+        sanitizer = {key: sanitizer_identity[key] for key in _SVG_SANITIZER_KEYS}
+        rasterizer = {key: rasterizer_identity[key] for key in _SVG_RASTERIZER_KEYS}
+    except KeyError as exc:
+        raise AssetRegistryError("SVG security identities are incomplete") from exc
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (raw_size, sanitized_size, png_size, png_width, png_height)
+    ):
+        raise AssetRegistryError("SVG security identities are incomplete")
+    receipt = {
+        "schema_version": 2,
+        "evidence_id": uuid.uuid4().hex,
+        "asset_id": item["asset_id"],
+        "provider_id": item["provider_id"],
+        "candidate_id": candidate_id,
+        "query_hash": query_hash,
+        "download_url_sha256": hashlib.sha256(download_url.encode("utf-8")).hexdigest(),
+        "registry_item_sha256": contract_registry.canonical_hash(item),
+        "license_spdx": item["license"]["spdx"],
+        "license_url": item["license"]["evidence_url"],
+        "decision": item["review_status"],
+        "issued_at": item["license"]["verified_at"],
+        "raw": {"path": raw_path, "sha256": raw_sha256, "size": raw_size},
+        "sanitized": {"path": sanitized_path, "sha256": sanitized_sha256, "size": sanitized_size},
+        "png": {
+            "path": item["path"], "sha256": item["sha256"], "size": png_size,
+            "width": png_width, "height": png_height, "mime": "image/png",
+        },
+        "sanitizer": sanitizer,
+        "rasterizer": rasterizer,
+    }
+    if _svg_receipt_shape_errors(receipt):
+        raise AssetRegistryError("SVG provider consistency evidence is invalid")
+    path = _provider_receipt_path(Path(project_dir), item["asset_id"])
+    if path.exists() or path.is_symlink():
+        raise AssetRegistryError("provider consistency evidence already exists")
+    _secure_prepare_relative_parent(
+        Path(project_dir), path.relative_to(Path(project_dir)).as_posix(),
+        "provider consistency evidence",
+    )
+    _atomic_write_bytes(path, _json_bytes(receipt), "provider consistency evidence")
+    return receipt
+
+
+def _secure_prepare_relative_parent(
+    project_dir: Path, relative: str, label: str
+) -> Path:
+    """Create/check every parent segment without traversing symlinks."""
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or relative.startswith("/")
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        raise AssetRegistryError(f"{label} path is invalid")
+    current = Path(project_dir)
+    for part in relative.split("/")[:-1]:
+        current = current / part
+        try:
+            if current.is_symlink():
+                raise AssetRegistryError(f"{label} parent must not be a symlink")
+            current.mkdir(exist_ok=True)
+        except AssetRegistryError:
+            raise
+        except OSError as exc:
+            raise AssetRegistryError(f"cannot create {label} parent") from exc
+        if not current.is_dir() or current.is_symlink():
+            raise AssetRegistryError(f"{label} parent is unsafe")
+    return Path(project_dir) / relative
+
+
+def _safe_existing_project_file(
+    project_dir: Path, relative: str, label: str
+) -> Path:
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or relative.startswith("/")
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        raise AssetRegistryError(f"{label} path is invalid")
+    current = Path(project_dir)
+    for part in relative.split("/")[:-1]:
+        current = current / part
+        try:
+            if current.is_symlink() or not current.is_dir():
+                raise AssetRegistryError(f"{label} parent is missing or unsafe")
+        except OSError as exc:
+            raise AssetRegistryError(f"cannot inspect {label} parent") from exc
+    target = Path(project_dir) / relative
+    try:
+        if target.is_symlink() or not target.is_file():
+            raise AssetRegistryError(f"{label} is missing or unsafe")
+    except OSError as exc:
+        raise AssetRegistryError(f"cannot inspect {label}") from exc
+    return target
+
+
+def _positive_int(value: Any, *, maximum: int | None = None) -> bool:
+    return bool(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        and (maximum is None or value <= maximum)
+    )
+
+
+def _bounded_identity(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and len(value) <= 200
+        and not _CONTROL_RE.search(value)
+    )
+
+
+def _svg_receipt_shape_errors(receipt: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(receipt, dict) or set(receipt) != _SVG_RECEIPT_KEYS:
+        return ["receipt keys are invalid"]
+    if receipt.get("schema_version") != 2:
+        errors.append("schema_version is invalid")
+    for key in (
+        "asset_id", "provider_id", "candidate_id", "license_spdx", "license_url",
+        "decision", "issued_at",
+    ):
+        if not _bounded_identity(receipt.get(key)):
+            errors.append(f"{key} is invalid")
+    for key in (
+        "query_hash", "download_url_sha256", "registry_item_sha256",
+    ):
+        if not isinstance(receipt.get(key), str) or _HASH_RE.fullmatch(receipt[key]) is None:
+            errors.append(f"{key} is invalid")
+    if not isinstance(receipt.get("evidence_id"), str) or _EVIDENCE_ID_RE.fullmatch(receipt["evidence_id"]) is None:
+        errors.append("evidence_id is invalid")
+    if receipt.get("provider_id") not in _SVG_PROVIDER_IDS:
+        errors.append("provider_id is invalid")
+    if receipt.get("decision") not in {"approved", "pending"}:
+        errors.append("decision is invalid")
+    if not contract_registry._timezone_aware_iso8601(receipt.get("issued_at")):
+        errors.append("issued_at is invalid")
+
+    for section, expected_keys, maximum in (
+        ("raw", _SVG_FILE_KEYS, 2 * 1024 * 1024),
+        ("sanitized", _SVG_FILE_KEYS, 2 * 1024 * 1024),
+        ("png", _SVG_PNG_KEYS, 64 * 1024 * 1024),
+    ):
+        value = receipt.get(section)
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            errors.append(f"{section} is invalid")
+            continue
+        if not isinstance(value.get("sha256"), str) or _HASH_RE.fullmatch(value["sha256"]) is None:
+            errors.append(f"{section}.sha256 is invalid")
+        if not _positive_int(value.get("size"), maximum=maximum):
+            errors.append(f"{section}.size is invalid")
+        digest = value.get("sha256")
+        expected_path = None
+        if isinstance(digest, str) and _HASH_RE.fullmatch(digest):
+            if section == "raw":
+                expected_path = f"working/source_artifacts/svg/{digest}.svg.untrusted"
+            elif section == "sanitized":
+                expected_path = f"working/sanitized_svg/{digest}.svg"
+            else:
+                expected_path = f"assets/generated/svg/{digest}.png"
+        if value.get("path") != expected_path or "\\" in str(value.get("path")):
+            errors.append(f"{section}.path is invalid")
+    png = receipt.get("png")
+    if isinstance(png, dict):
+        if png.get("mime") != "image/png":
+            errors.append("png.mime is invalid")
+        if not _positive_int(png.get("width"), maximum=4096) or not _positive_int(png.get("height"), maximum=4096):
+            errors.append("png dimensions are invalid")
+        elif png["width"] * png["height"] > 16 * 1024 * 1024:
+            errors.append("png pixel count is invalid")
+
+    sanitizer = receipt.get("sanitizer")
+    if not isinstance(sanitizer, dict) or set(sanitizer) != _SVG_SANITIZER_KEYS:
+        errors.append("sanitizer identity is invalid")
+    else:
+        if sanitizer.get("policy_version") != SVG_POLICY_VERSION:
+            errors.append("policy_version is stale")
+        if sanitizer.get("sanitizer_version") != SVG_SANITIZER_VERSION:
+            errors.append("sanitizer_version is stale")
+        if sanitizer.get("limits_sha256") != SVG_LIMITS_SHA256:
+            errors.append("limits_sha256 is stale")
+        if not isinstance(sanitizer.get("sanitize_cache_key_sha256"), str) or _HASH_RE.fullmatch(sanitizer["sanitize_cache_key_sha256"]) is None:
+            errors.append("sanitize cache identity is invalid")
+    rasterizer = receipt.get("rasterizer")
+    if not isinstance(rasterizer, dict) or set(rasterizer) != _SVG_RASTERIZER_KEYS:
+        errors.append("rasterizer identity is invalid")
+    else:
+        if not _bounded_identity(rasterizer.get("version")):
+            errors.append("rasterizer version is invalid")
+        for key in _SVG_RASTERIZER_KEYS - {"version"}:
+            if not isinstance(rasterizer.get(key), str) or _HASH_RE.fullmatch(rasterizer[key]) is None:
+                errors.append(f"rasterizer {key} is invalid")
+    if not errors and isinstance(sanitizer, dict):
+        raw = receipt["raw"]
+        expected_cache = contract_registry.canonical_hash(
+            {
+                "raw_sha256": raw["sha256"],
+                "policy_version": sanitizer["policy_version"],
+                "sanitizer_version": sanitizer["sanitizer_version"],
+                "limits_sha256": sanitizer["limits_sha256"],
+            }
+        )
+        if sanitizer["sanitize_cache_key_sha256"] != expected_cache:
+            errors.append("sanitize cache identity does not match raw input")
+    return errors
+
+
 def _load_provider_receipt(project_dir: Path, asset_id: str) -> dict:
-    path = _provider_receipt_path(Path(project_dir), asset_id)
-    _reject_parent_symlink(path, "provider consistency evidence")
-    _reject_symlink(path, "provider consistency evidence")
-    if not path.is_file():
-        raise AssetRegistryError("provider consistency evidence is missing")
+    name = hashlib.sha256(asset_id.encode("utf-8")).hexdigest() + ".json"
+    relative = (PROVIDER_RECEIPTS_REL / name).as_posix()
+    path = _safe_existing_project_file(
+        Path(project_dir), relative, "provider consistency evidence"
+    )
     try:
         receipt = contract_registry.load_artifact_text(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -600,8 +915,156 @@ def _load_provider_receipt(project_dir: Path, asset_id: str) -> dict:
     return receipt
 
 
+def _load_svg_provider_receipt(project_dir: Path, asset_id: str) -> dict:
+    name = hashlib.sha256(asset_id.encode("utf-8")).hexdigest() + ".json"
+    path = _safe_existing_project_file(
+        Path(project_dir),
+        (PROVIDER_RECEIPTS_REL / name).as_posix(),
+        "SVG provider consistency evidence",
+    )
+    try:
+        receipt = contract_registry.load_artifact_text(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AssetRegistryError("SVG provider consistency evidence is invalid") from exc
+    if _svg_receipt_shape_errors(receipt):
+        raise AssetRegistryError("SVG provider consistency evidence is invalid")
+    return receipt
+
+
+def _svg_receipt_consistency_errors(
+    project_dir: Path, item: dict, receipt: dict
+) -> list[str]:
+    license_info = item.get("license") if isinstance(item, dict) else None
+    if not isinstance(license_info, dict):
+        return ["SVG provider license metadata is invalid"]
+    expected = {
+        "asset_id": item.get("asset_id"),
+        "provider_id": item.get("provider_id"),
+        "registry_item_sha256": contract_registry.canonical_hash(item),
+        "license_spdx": license_info.get("spdx"),
+        "license_url": license_info.get("evidence_url"),
+        "decision": item.get("review_status"),
+        "issued_at": license_info.get("verified_at"),
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        return ["SVG provider consistency evidence does not match registry item"]
+    if (
+        receipt["png"]["path"] != item.get("path")
+        or receipt["png"]["sha256"] != item.get("sha256")
+    ):
+        return ["SVG PNG does not match registry item"]
+
+    provider_id = item.get("provider_id")
+    candidate_id = receipt["candidate_id"]
+    safe_candidate = re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", candidate_id)
+    if provider_id == "wikimedia-svg":
+        safe_candidate = re.fullmatch(r"[1-9][0-9]{0,19}", candidate_id)
+    if safe_candidate is None:
+        return ["SVG candidate identity is invalid"]
+    expected_asset_id = (
+        f"provider-{provider_id}-{candidate_id}-{receipt['png']['sha256'][:16]}"
+    )
+    if item.get("asset_id") != expected_asset_id:
+        return ["SVG candidate identity does not match registry item"]
+
+    if provider_id in {"heroicons", "lucide", "tabler"}:
+        try:
+            from open_svg_providers import (
+                heroicons_candidate,
+                lucide_candidate,
+                tabler_candidate,
+            )
+
+            builder = {
+                "heroicons": heroicons_candidate,
+                "lucide": lucide_candidate,
+                "tabler": tabler_candidate,
+            }[provider_id]
+            candidate = builder(candidate_id)
+        except Exception:
+            return ["SVG repository candidate identity is invalid"]
+        expected_download_hash = hashlib.sha256(
+            candidate.download_url.encode("utf-8")
+        ).hexdigest()
+        expected_query_hash = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()
+        if (
+            receipt["download_url_sha256"] != expected_download_hash
+            or receipt["query_hash"] != expected_query_hash
+            or item.get("source_url") != candidate.landing_url
+            or license_info.get("spdx") != candidate.license_spdx
+            or license_info.get("evidence_url") != candidate.license_url
+        ):
+            return ["SVG repository candidate evidence does not match pinned provider"]
+
+    for section in ("raw", "sanitized", "png"):
+        data = receipt[section]
+        try:
+            artifact = _safe_existing_project_file(
+                Path(project_dir), data["path"], f"SVG {section} artifact"
+            )
+            size = artifact.stat().st_size
+            digest = _hash_file(artifact)
+        except (OSError, AssetRegistryError):
+            return [f"SVG {section} artifact is missing or unsafe"]
+        if size != data["size"] or digest != data["sha256"]:
+            return [f"SVG {section} artifact hash or size does not match consistency evidence"]
+    try:
+        png_bytes = _safe_existing_project_file(
+            Path(project_dir), receipt["png"]["path"], "SVG PNG artifact"
+        ).read_bytes()
+        validate_png_bytes(
+            png_bytes,
+            expected_width=receipt["png"]["width"],
+            expected_height=receipt["png"]["height"],
+        )
+    except (OSError, AssetRegistryError, SvgSecurityError):
+        return ["SVG PNG artifact is invalid"]
+    return []
+
+
+def current_svg_provider_item(
+    project_dir: Path,
+    *,
+    provider_id: str,
+    candidate_id: str,
+    query_hash: str,
+    download_url: str,
+) -> dict | None:
+    """Return a physically current v2 SVG import without mutating the project."""
+    if provider_id not in _SVG_PROVIDER_IDS:
+        return None
+    expected_download_hash = hashlib.sha256(download_url.encode("utf-8")).hexdigest()
+    artifact = load_registry(Path(project_dir))
+    for item in artifact["items"]:
+        if item.get("provider_id") != provider_id:
+            continue
+        try:
+            receipt = _load_svg_provider_receipt(Path(project_dir), item["asset_id"])
+        except (KeyError, AssetRegistryError):
+            continue
+        if (
+            receipt.get("candidate_id") == candidate_id
+            and receipt.get("query_hash") == query_hash
+            and receipt.get("download_url_sha256") == expected_download_hash
+            and not _provider_identity_errors(item)
+            and not _svg_receipt_consistency_errors(Path(project_dir), item, receipt)
+        ):
+            return item
+    return None
+
+
 def provider_consistency_errors(project_dir: Path, item: dict) -> list[str]:
     """Check built-in identity, path, license, and server-issued evidence."""
+    # SVG receipts use v2 because three separate files are security-relevant.
+    if item.get("provider_id") in _SVG_PROVIDER_IDS:
+        errors = _provider_static_errors(item)
+        if errors:
+            return errors
+        try:
+            receipt = _load_svg_provider_receipt(Path(project_dir), item["asset_id"])
+            return _svg_receipt_consistency_errors(Path(project_dir), item, receipt)
+        except (KeyError, OSError, ValueError, contract_registry.ContractError, AssetRegistryError):
+            return ["SVG provider consistency evidence is invalid"]
     errors = _provider_static_errors(item)
     if errors:
         return errors
@@ -714,12 +1177,16 @@ __all__ = [
     "attribution_errors",
     "attribution_markdown",
     "auto_license_errors",
+    "current_svg_provider_item",
     "current_item",
     "load_registry",
     "migrate_legacy_registry",
     "provider_consistency_errors",
     "refresh_attribution",
+    "restore_publication",
     "save_registry",
     "save_provider_receipt",
+    "save_svg_provider_receipt",
+    "snapshot_publication",
     "upsert_item",
 ]

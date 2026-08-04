@@ -1,6 +1,7 @@
 """Phase 0 contract registry tests: dialect strictness, fixtures, hashing."""
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -353,6 +354,43 @@ class AssetProvenanceSemanticTests(unittest.TestCase):
         errors = semantic_asset_provenance({"items": [provider]})
 
         self.assertTrue(any("canonical SPDX license URL" in error for error in errors))
+
+    def test_svg_repo_mit_and_isc_require_exact_provider_pinned_license(self) -> None:
+        cases = (
+            (
+                "heroicons",
+                "MIT",
+                "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/LICENSE",
+            ),
+            (
+                "lucide",
+                "ISC",
+                "https://github.com/lucide-icons/lucide/blob/f12b0de177fbc2a6795e99be065887e72b237123/LICENSE",
+            ),
+        )
+        for provider_id, spdx, evidence_url in cases:
+            with self.subTest(provider_id=provider_id):
+                provider = self._asset(
+                    origin="provider",
+                    provider_id=provider_id,
+                    source_url="https://github.com/example/repo/blob/pin/icon.svg",
+                    license={
+                        "spdx": spdx,
+                        "evidence_url": evidence_url,
+                        "attribution_required": True,
+                        "attribution_text": "Upstream contributors",
+                        "verified_at": "2026-08-04T03:00:00Z",
+                    },
+                )
+                self.assertEqual(semantic_asset_provenance({"items": [provider]}), [])
+                hostile = json.loads(json.dumps(provider))
+                hostile["license"]["evidence_url"] = "https://attacker.invalid/LICENSE"
+                self.assertTrue(
+                    any(
+                        "canonical SPDX license URL" in error
+                        for error in semantic_asset_provenance({"items": [hostile]})
+                    )
+                )
 
 
 class BundleSuiteTests(unittest.TestCase):

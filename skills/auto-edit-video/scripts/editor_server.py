@@ -837,6 +837,10 @@ def referenced_render_inputs(
             return
         rel = candidate.relative_to(project_dir.resolve()).as_posix()
         requires = rel.startswith("assets/")
+        generated_svg_png = (
+            rel.startswith("assets/generated/svg/")
+            and candidate.suffix.lower() == ".png"
+        )
         digest = file_sha256(candidate)
         license_status = "exempt"
         if requires:
@@ -861,6 +865,17 @@ def referenced_render_inputs(
                 license_status = (
                     "provider-provenance-invalid"
                     if registry_problem
+                    else "provider-provenance-missing"
+                )
+            elif generated_svg_png:
+                # Generated SVG PNGs are only publishable as the output of the
+                # provider sanitizer/rasterizer pipeline.  Never let an
+                # unregistered or non-provider item fall through to a manual
+                # rights assertion: that would bypass the transformed-artifact
+                # receipt gate.
+                license_status = (
+                    "provider-provenance-invalid"
+                    if registry_problem or current is not None
                     else "provider-provenance-missing"
                 )
         if rel not in inputs:
@@ -3760,6 +3775,11 @@ class EditorHandler(BaseHTTPRequestHandler):
             try:
                 asset = scoped_project_path(project, relative, "assets")
             except ValueError:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            if asset.suffix.lower() in {".svg", ".svgz", ".xml"}:
+                # SVG/XML bytes are never browser-served.  Provider SVG
+                # imports publish only the receipt-bound PNG derivative.
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self.serve_file(asset, allow_range=asset.suffix.lower() in {".mp4", ".mov"})

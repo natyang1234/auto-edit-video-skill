@@ -251,11 +251,18 @@ LICENSE_FINAL_ALLOWLIST = frozenset(
         "OFL-1.1",
         "Apache-2.0",
         "MIT",
+        "ISC",
         "Unlicense",
         "internal-original",
         "user-owned",
     }
 )
+
+_SVG_REPO_LICENSE_EVIDENCE = {
+    ("heroicons", "MIT"): "https://github.com/tailwindlabs/heroicons/blob/0435d4ca364a608cc75e2f8683d374e55abbae26/LICENSE",
+    ("lucide", "ISC"): "https://github.com/lucide-icons/lucide/blob/f12b0de177fbc2a6795e99be065887e72b237123/LICENSE",
+    ("tabler", "MIT"): "https://github.com/tabler/tabler-icons/blob/8ac7d81b72ece11072ef25ea9fd92e80c6f3c9fc/LICENSE",
+}
 
 
 def _safe_asset_path(value) -> bool:
@@ -361,6 +368,8 @@ def semantic_asset_provenance(provenance) -> list[str]:
                 )
             elif not _canonical_provider_license_evidence(
                 license_info.get("evidence_url"), license_info.get("spdx")
+            ) and license_info.get("evidence_url") != _SVG_REPO_LICENSE_EVIDENCE.get(
+                (provider_id, license_info.get("spdx"))
             ):
                 errors.append(
                     f"{path}.license.evidence_url: must match the canonical SPDX license URL"

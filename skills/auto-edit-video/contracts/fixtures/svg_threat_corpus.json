@@ -1,168 +1,54 @@
 {
- "x_schema_version": 2,
- "note": "文字樣本，供 sanitizer 測試；不得直接開啟或注入 DOM",
+ "x_schema_version": 3,
+ "note": "Hostile SVG文字樣本；不得直接開啟、渲染或注入DOM。大型bomb由測試生成。",
  "cases": [
-  {
-   "id": "script-tag",
-   "svg": "<svg><script>alert(1)</script></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:script"
-  },
-  {
-   "id": "event-handler",
-   "svg": "<svg onload=\"alert(1)\"><rect/></svg>",
-   "expect": "reject",
-   "reason": "event-handler-attribute:onload"
-  },
-  {
-   "id": "foreign-object",
-   "svg": "<svg><foreignObject><body/></foreignObject></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:foreignObject"
-  },
-  {
-   "id": "external-href",
-   "svg": "<svg><image href=\"https://evil/x.png\"/></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:image"
-  },
-  {
-   "id": "external-use",
-   "svg": "<svg><use href=\"https://evil/x.svg#a\"/></svg>",
-   "expect": "reject",
-   "reason": "external-reference:href"
-  },
-  {
-   "id": "xlink-external-image",
-   "svg": "<svg xmlns:xlink=\"http://www.w3.org/1999/xlink\"><image xlink:href=\"https://evil/x.png\"/></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:image"
-  },
-  {
-   "id": "data-uri-image",
-   "svg": "<svg><image href=\"data:image/png;base64,AAAA\"/></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:image"
-  },
-  {
-   "id": "data-uri-anchor",
-   "svg": "<svg><a href=\"data:text/plain,hello\"><rect/></a></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:a"
-  },
-  {
-   "id": "entity-expansion",
-   "svg": "<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY a \"aaaa\"><!ENTITY b \"&a;&a;&a;\">]><svg>&b;</svg>",
-   "expect": "reject",
-   "reason": "doctype-forbidden"
-  },
-  {
-   "id": "doctype-external-dtd",
-   "svg": "<!DOCTYPE svg SYSTEM \"https://evil/x.dtd\"><svg><rect/></svg>",
-   "expect": "reject",
-   "reason": "doctype-forbidden"
-  },
-  {
-   "id": "css-import",
-   "svg": "<svg><style>@import url(https://evil/a.css);</style><rect/></svg>",
-   "expect": "reject",
-   "reason": "css-import"
-  },
-  {
-   "id": "style-external-url",
-   "svg": "<svg><style>rect{fill:url(https://evil/a.svg#p)}</style><rect/></svg>",
-   "expect": "reject",
-   "reason": "external-url"
-  },
-  {
-   "id": "presentation-url-external",
-   "svg": "<svg><rect fill=\"url(https://evil/a.svg#p)\"/></svg>",
-   "expect": "reject",
-   "reason": "external-url"
-  },
-  {
-   "id": "animate-element",
-   "svg": "<svg><rect><animate attributeName=\"x\" to=\"9\"/></rect></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:animate"
-  },
-  {
-   "id": "iframe-element",
-   "svg": "<svg><iframe src=\"https://evil\"/></svg>",
-   "expect": "reject",
-   "reason": "disallowed-element:iframe"
-  },
-  {
-   "id": "processing-instruction",
-   "svg": "<svg><?xml-stylesheet href=\"x.css\"?><rect/></svg>",
-   "expect": "reject",
-   "reason": "processing-instruction-forbidden"
-  },
-  {
-   "id": "oversized-viewbox",
-   "svg": "<svg viewBox=\"0 0 9999999 9999999\"><rect/></svg>",
-   "expect": "reject",
-   "reason": "oversized-viewbox"
-  },
-  {
-   "id": "duplicate-id",
-   "svg": "<svg><rect id=\"a\"/><rect id=\"a\"/></svg>",
-   "expect": "reject",
-   "reason": "duplicate-id"
-  },
-  {
-   "id": "unresolved-reference",
-   "svg": "<svg><use href=\"#missing\"/></svg>",
-   "expect": "reject",
-   "reason": "unresolved-reference"
-  },
-  {
-   "id": "cyclic-reference",
-   "svg": "<svg><defs><g id=\"a\"><use href=\"#b\"/></g><g id=\"b\"><use href=\"#a\"/></g></defs></svg>",
-   "expect": "reject",
-   "reason": "cyclic-reference"
-  },
-  {
-   "id": "not-svg-root",
-   "svg": "<html><rect/></html>",
-   "expect": "reject",
-   "reason": "root-not-svg"
-  },
-  {
-   "id": "malformed-xml",
-   "svg": "<svg><rect></svg>",
-   "expect": "reject",
-   "reason": "parse-error"
-  },
-  {
-   "id": "plain-icon",
-   "svg": "<svg viewBox=\"0 0 24 24\"><path d=\"M4 4h16v16H4z\"/></svg>",
-   "expect": "accept"
-  },
-  {
-   "id": "local-gradient",
-   "svg": "<svg><defs><linearGradient id=\"g\"/></defs><rect fill=\"url(#g)\"/></svg>",
-   "expect": "accept"
-  },
-  {
-   "id": "text-icon",
-   "svg": "<svg viewBox=\"0 0 24 24\"><text x=\"2\" y=\"18\"><tspan>Ab</tspan></text></svg>",
-   "expect": "accept"
-  },
-  {
-   "id": "polygon-icon",
-   "svg": "<svg viewBox=\"0 0 10 10\"><polygon points=\"0,0 10,0 5,10\"/></svg>",
-   "expect": "accept"
-  },
-  {
-   "id": "clip-use-local",
-   "svg": "<svg viewBox=\"0 0 24 24\"><defs><clipPath id=\"c\"><rect width=\"24\" height=\"24\"/></clipPath></defs><g clip-path=\"url(#c)\"><path d=\"M0 0h24v24H0z\"/></g></svg>",
-   "expect": "accept"
-  },
-  {
-   "id": "namespaced-svg",
-   "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"10\"/></svg>",
-   "expect": "accept"
-  }
+  {"id":"script-tag","svg":"<svg><script>alert(1)</script></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"event-handler","svg":"<svg onload=\"evil()\"><rect/></svg>","expect":"reject","code":"SVG_EVENT_HANDLER"},
+  {"id":"foreign-object","svg":"<svg><foreignObject><body/></foreignObject></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"iframe","svg":"<svg><iframe/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"object","svg":"<svg><object/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"embed","svg":"<svg><embed/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"image-external","svg":"<svg><image href=\"https://evil/x.png\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"anchor-data","svg":"<svg><a href=\"data:text/plain,x\"><rect/></a></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"use-external","svg":"<svg><use href=\"https://evil/x.svg#a\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"use-local","svg":"<svg><defs><path id=\"p\" d=\"M0 0\"/></defs><use href=\"#p\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"href-local-on-shape","svg":"<svg><rect href=\"#x\"/></svg>","expect":"reject","code":"SVG_URL_FORBIDDEN"},
+  {"id":"style-element","svg":"<svg><style>rect{fill:red}</style><rect/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"style-attribute","svg":"<svg><rect style=\"fill:red\"/></svg>","expect":"reject","code":"SVG_CSS_FORBIDDEN"},
+  {"id":"class-attribute","svg":"<svg><rect class=\"x\"/></svg>","expect":"reject","code":"SVG_CSS_FORBIDDEN"},
+  {"id":"css-import","svg":"<svg><style>@import url(https://evil/a.css)</style></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"text","svg":"<svg><text x=\"1\" y=\"2\">x</text></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"tspan","svg":"<svg><tspan>x</tspan></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"mask","svg":"<svg><mask id=\"m\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"symbol","svg":"<svg><symbol id=\"s\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"animate","svg":"<svg><rect><animate attributeName=\"x\"/></rect></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"filter","svg":"<svg><filter id=\"f\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"pattern","svg":"<svg><pattern id=\"p\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"marker","svg":"<svg><marker id=\"m\"/></svg>","expect":"reject","code":"SVG_ELEMENT_FORBIDDEN"},
+  {"id":"external-paint-url","svg":"<svg><rect fill=\"url(https://evil/x.svg#g)\"/></svg>","expect":"reject","code":"SVG_URL_FORBIDDEN"},
+  {"id":"data-paint-url","svg":"<svg><rect fill=\"url(data:image/svg+xml,x)\"/></svg>","expect":"reject","code":"SVG_URL_FORBIDDEN"},
+  {"id":"doctype-entity","svg":"<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY x \"xxxx\">]><svg>&x;</svg>","expect":"reject","code":"SVG_DTD_FORBIDDEN"},
+  {"id":"doctype-external","svg":"<!DOCTYPE svg SYSTEM \"https://evil/x.dtd\"><svg/>","expect":"reject","code":"SVG_DTD_FORBIDDEN"},
+  {"id":"processing-instruction","svg":"<svg><?xml-stylesheet href=\"x.css\"?></svg>","expect":"reject","code":"SVG_PROCESSING_INSTRUCTION"},
+  {"id":"comment","svg":"<svg><!-- hidden --><rect/></svg>","expect":"reject","code":"SVG_XML_DECLARATION_FORBIDDEN"},
+  {"id":"cdata","svg":"<svg><title><![CDATA[x]]></title></svg>","expect":"reject","code":"SVG_XML_DECLARATION_FORBIDDEN"},
+  {"id":"xinclude","svg":"<svg xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"file:///etc/passwd\"/></svg>","expect":"reject","code":"SVG_NAMESPACE_FORBIDDEN"},
+  {"id":"xslt-root","svg":"<xsl:stylesheet xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\" version=\"1.0\"/>","expect":"reject","code":"SVG_ROOT_INVALID"},
+  {"id":"not-svg-root","svg":"<html><rect/></html>","expect":"reject","code":"SVG_ROOT_INVALID"},
+  {"id":"malformed-xml","svg":"<svg><rect></svg>","expect":"reject","code":"SVG_XML_PARSE"},
+  {"id":"duplicate-id","svg":"<svg><rect id=\"a\"/><rect id=\"a\"/></svg>","expect":"reject","code":"SVG_ID_DUPLICATE"},
+  {"id":"unresolved-reference","svg":"<svg><rect fill=\"url(#missing)\"/></svg>","expect":"reject","code":"SVG_REFERENCE_UNRESOLVED"},
+  {"id":"wrong-reference-target","svg":"<svg><defs><linearGradient id=\"g\"/></defs><rect clip-path=\"url(#g)\"/></svg>","expect":"reject","code":"SVG_REFERENCE_TARGET"},
+  {"id":"reference-cycle","svg":"<svg><defs><clipPath id=\"a\" clip-path=\"url(#b)\"/><clipPath id=\"b\" clip-path=\"url(#a)\"/></defs></svg>","expect":"reject","code":"SVG_REFERENCE_CYCLE"},
+  {"id":"reference-chain-nine","svg":"<svg><defs><clipPath id=\"c1\" clip-path=\"url(#c2)\"/><clipPath id=\"c2\" clip-path=\"url(#c3)\"/><clipPath id=\"c3\" clip-path=\"url(#c4)\"/><clipPath id=\"c4\" clip-path=\"url(#c5)\"/><clipPath id=\"c5\" clip-path=\"url(#c6)\"/><clipPath id=\"c6\" clip-path=\"url(#c7)\"/><clipPath id=\"c7\" clip-path=\"url(#c8)\"/><clipPath id=\"c8\" clip-path=\"url(#c9)\"/><clipPath id=\"c9\" clip-path=\"url(#c10)\"/><clipPath id=\"c10\"/></defs></svg>","expect":"reject","code":"SVG_REFERENCE_DEPTH"},
+  {"id":"oversized-viewbox","svg":"<svg viewBox=\"0 0 9999999 24\"/>","expect":"reject","code":"SVG_GEOMETRY_LIMIT"},
+  {"id":"oversized-width","svg":"<svg width=\"4097\" height=\"1\"/>","expect":"reject","code":"SVG_GEOMETRY_LIMIT"},
+  {"id":"bad-path-command","svg":"<svg><path d=\"M0 0R1 1\"/></svg>","expect":"reject","code":"SVG_PATH_INVALID"},
+  {"id":"bad-arc-flag","svg":"<svg><path d=\"M0 0A1 1 0 2 0 3 3\"/></svg>","expect":"reject","code":"SVG_PATH_INVALID"},
+  {"id":"plain-icon","svg":"<svg viewBox=\"0 0 24 24\"><path d=\"M4 4h16v16H4z\"/></svg>","expect":"accept"},
+  {"id":"local-gradient","svg":"<svg><defs><linearGradient id=\"g\"/></defs><rect fill=\"url(#g)\"/></svg>","expect":"accept"},
+  {"id":"polygon-icon","svg":"<svg viewBox=\"0 0 10 10\"><polygon points=\"0,0 10,0 5,10\"/></svg>","expect":"accept"},
+  {"id":"clip-local","svg":"<svg viewBox=\"0 0 24 24\"><defs><clipPath id=\"c\"><rect width=\"24\" height=\"24\"/></clipPath></defs><g clip-path=\"url(#c)\"><path d=\"M0 0h24v24H0z\"/></g></svg>","expect":"accept"},
+  {"id":"namespaced-svg","svg":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"10\"/></svg>","expect":"accept"}
  ]
 }

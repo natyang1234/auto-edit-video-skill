@@ -25,6 +25,11 @@ let renderBusy = false;
 let deskProviderRecords = [];
 let deskProviderStatusLoaded = false;
 let deskProviderSearchBusy = false;
+const PROVIDER_AVAILABILITY_MESSAGES = Object.freeze({
+  svg_rasterizer_unavailable: "SVG 匯入目前不可用：本機安全轉檔引擎未就緒。",
+  provider_disabled: "此素材來源目前已停用。",
+  provider_unavailable: "此素材來源目前無法使用。",
+});
 
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
@@ -2978,6 +2983,22 @@ function deskProviderElements() {
   };
 }
 
+function deskProviderIsAvailable(provider) {
+  // Older image-provider payloads did not expose availability.  Keep those
+  // providers usable while treating an explicit false as unavailable.
+  return provider?.available !== false;
+}
+
+function deskProviderAvailabilityMessage(provider) {
+  if (deskProviderIsAvailable(provider)) return "";
+  const code = String(provider?.availability_code || "");
+  return PROVIDER_AVAILABILITY_MESSAGES[code] || "此素材來源目前不可用。";
+}
+
+function deskProviderSearchDisabled(provider, busy = deskProviderSearchBusy) {
+  return !deskProviderIsAvailable(provider) || Boolean(busy);
+}
+
 function deskSelectedProvider() {
   const { select } = deskProviderElements();
   const providerId = select?.value || "";
@@ -2998,6 +3019,18 @@ function deskRenderProviderDisclosure() {
     if (results) results.replaceChildren();
     return;
   }
+  if (!deskProviderIsAvailable(provider)) {
+    const reason = deskProviderAvailabilityMessage(provider);
+    if (consent) {
+      consent.checked = false;
+      consent.disabled = true;
+    }
+    if (disclosure) disclosure.textContent = reason;
+    if (search) search.disabled = true;
+    if (status) status.textContent = reason;
+    if (results) results.replaceChildren();
+    return;
+  }
   const consentRequired = provider.consent_required !== false;
   const consented = Boolean(provider.consented);
   if (consent) {
@@ -3010,7 +3043,7 @@ function deskRenderProviderDisclosure() {
     );
     disclosure.textContent = `${networkDisclosure}｜${consentRequired ? (consented ? "已同意" : "尚未同意") : "不需額外同意"}`;
   }
-  if (search) search.disabled = deskProviderSearchBusy;
+  if (search) search.disabled = deskProviderSearchDisabled(provider);
   if (status) {
     status.textContent = consentRequired && !consented
       ? "請閱讀揭露並勾選同意後搜尋。"
@@ -3034,11 +3067,15 @@ async function deskLoadProviders() {
       if (!provider || !provider.id) continue;
       const option = document.createElement("option");
       option.value = String(provider.id);
-      option.textContent = String(provider.label || provider.id);
+      const label = String(provider.label || provider.id);
+      option.textContent = deskProviderIsAvailable(provider) ? label : `${label}（不可用）`;
+      if (!deskProviderIsAvailable(provider)) option.title = deskProviderAvailabilityMessage(provider);
       select.append(option);
     }
     deskProviderStatusLoaded = true;
     select.disabled = deskProviderRecords.length === 0;
+    const firstAvailable = deskProviderRecords.find((provider) => deskProviderIsAvailable(provider));
+    if (firstAvailable) select.value = String(firstAvailable.id);
     deskRenderProviderDisclosure();
   } catch (error) {
     select.disabled = true;
@@ -3069,9 +3106,16 @@ function deskProviderResultText(value, fallback = "—") {
   return String(value);
 }
 
+function deskProviderResultIsSvg(result, provider = deskSelectedProvider()) {
+  return provider?.kind === "svg"
+    || result?.kind === "svg"
+    || String(result?.mime_type || "").toLowerCase() === "image/svg+xml";
+}
+
 async function deskImportProviderAsset(result, row, button, importStatus) {
   const importToken = typeof result?.import_token === "string" ? result.import_token : "";
   if (!importToken || !button || button.disabled) return;
+  const providerAtImport = deskSelectedProvider();
   button.disabled = true;
   if (importStatus) importStatus.textContent = "匯入中…";
   try {
@@ -3085,7 +3129,14 @@ async function deskImportProviderAsset(result, row, button, importStatus) {
     button.textContent = "已匯入";
     if (importStatus) importStatus.textContent = "已匯入；來源與授權資訊已保存。";
     showToast("素材已匯入本機素材庫", "success");
-    await Promise.all([deskRefreshAssets(), deskRefreshRights()]);
+    // SVG imports publish only a receipt-bound PNG derivative.  Refresh the
+    // asset library; rights UI is intentionally not used as an SVG import
+    // side-channel.  Preserve the existing image-provider refresh behavior.
+    if (deskProviderResultIsSvg(result, providerAtImport)) {
+      await deskRefreshAssets();
+    } else {
+      await Promise.all([deskRefreshAssets(), deskRefreshRights()]);
+    }
   } catch (error) {
     button.disabled = false;
     if (importStatus) importStatus.textContent = `匯入失敗：${error.message}`;
@@ -3096,6 +3147,7 @@ async function deskImportProviderAsset(result, row, button, importStatus) {
 function deskRenderProviderResults(results) {
   const { results: host, status } = deskProviderElements();
   if (!host) return;
+  const provider = deskSelectedProvider();
   host.replaceChildren();
   if (!Array.isArray(results) || results.length === 0) {
     host.textContent = "找不到符合條件的素材。";
@@ -3106,6 +3158,8 @@ function deskRenderProviderResults(results) {
   for (const result of results) {
     const row = document.createElement("article");
     row.className = "provider-result-row";
+    const isSvgResult = deskProviderResultIsSvg(result, provider);
+    row.dataset.kind = isSvgResult ? "svg" : "image";
 
     const title = document.createElement("strong");
     title.textContent = deskProviderResultText(result?.title, "（未命名素材）");
@@ -3121,7 +3175,7 @@ function deskRenderProviderResults(results) {
       : "尺寸未知";
     const details = document.createElement("span");
     details.className = "provider-result-details";
-    details.textContent = `授權：${deskProviderResultText(result?.license_spdx, "UNKNOWN")}｜尺寸：${dimensions}｜${result?.attribution_required ? "需列名" : "可免列名"}`;
+    details.textContent = `${isSvgResult ? "格式：SVG｜" : ""}授權：${deskProviderResultText(result?.license_spdx, "UNKNOWN")}｜尺寸：${dimensions}｜${result?.attribution_required ? "需列名" : "可免列名"}`;
     row.append(details);
 
     const actions = document.createElement("div");
@@ -3164,6 +3218,12 @@ async function deskSearchProviders() {
   const trimmedQuery = String(query?.value || "").trim();
   if (!provider || !select?.value) {
     if (status) status.textContent = "請先選擇素材來源。";
+    return;
+  }
+  if (!deskProviderIsAvailable(provider)) {
+    const reason = deskProviderAvailabilityMessage(provider);
+    if (status) status.textContent = reason;
+    if (search) search.disabled = true;
     return;
   }
   if (!trimmedQuery) {
@@ -3210,7 +3270,7 @@ async function deskSearchProviders() {
     showToast(`開放素材搜尋失敗：${error.message}`, "error");
   } finally {
     deskProviderSearchBusy = false;
-    search.disabled = false;
+    if (search) search.disabled = deskProviderSearchDisabled(deskSelectedProvider(), false);
   }
 }
 

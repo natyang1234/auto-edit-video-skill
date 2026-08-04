@@ -515,6 +515,28 @@ class EditorBrowserSmokeTests(unittest.TestCase):
                     "network_disclosure": "搜尋會連線至 Wikimedia Commons；匯入後保存本機副本。",
                     "consented": True,
                 },
+                {
+                    "id": "heroicons",
+                    "label": "Heroicons",
+                    "kind": "svg",
+                    "available": False,
+                    "availability_code": "svg_rasterizer_unavailable",
+                    "consent_required": True,
+                    "cost_class": "free",
+                    "network_disclosure": "SVG 只保存本機 PNG 衍生檔。",
+                    "consented": False,
+                },
+                {
+                    "id": "tabler",
+                    "label": "Tabler Icons",
+                    "kind": "svg",
+                    "available": True,
+                    "availability_code": "available",
+                    "consent_required": True,
+                    "cost_class": "free",
+                    "network_disclosure": "SVG 只保存本機 PNG 衍生檔。",
+                    "consented": True,
+                },
             ],
         }
         result_payload = {
@@ -532,6 +554,22 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             "height": 480,
             "attribution_required": True,
         }
+        svg_result_payload = {
+            "import_token": "svg-token-secret",
+            "provider_id": "tabler",
+            "kind": "svg",
+            "candidate_id": "tabler-arrow-right",
+            "title": "Arrow right <script>alert(1)</script>",
+            "landing_url": "https://tabler.io/icons/icon/arrow-right",
+            "creator": "Tabler",
+            "license_spdx": "MIT",
+            "license_url": "https://opensource.org/license/mit/",
+            "attribution_text": "Tabler Icons",
+            "mime_type": "image/svg+xml",
+            "width": 24,
+            "height": 24,
+            "attribution_required": False,
+        }
 
         def fulfill(route: object, payload: object, status: int = 200) -> None:
             route.fulfill(
@@ -546,7 +584,14 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             )
             page = browser.new_page(viewport={"width": 1440, "height": 1100})
             console_errors: list[str] = []
+            rights_gets: list[str] = []
             page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.on(
+                "request",
+                lambda request: rights_gets.append(request.url)
+                if request.method == "GET" and request.url.rstrip("/").endswith("/api/rights")
+                else None,
+            )
             page.on(
                 "console",
                 lambda message: console_errors.append(message.text)
@@ -566,7 +611,10 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             def asset_search(route: object) -> None:
                 body = route.request.post_data_json
                 events.append(("search", body))
-                fulfill(route, {"ok": True, "provider_id": "openverse", "items": [result_payload]})
+                if body["provider_id"] == "tabler":
+                    fulfill(route, {"ok": True, "provider_id": "tabler", "items": [svg_result_payload]})
+                else:
+                    fulfill(route, {"ok": True, "provider_id": "openverse", "items": [result_payload]})
 
             def asset_import(route: object) -> None:
                 body = route.request.post_data_json
@@ -575,11 +623,11 @@ class EditorBrowserSmokeTests(unittest.TestCase):
                     route,
                     {
                         "ok": True,
-                        "source": "assets/imported/river.jpg",
-                        "url": "/assets/imported/river.jpg",
+                        "source": "assets/generated/svg/icon.png" if body["import_token"] == "svg-token-secret" else "assets/imported/river.jpg",
+                        "url": "/assets/generated/svg/icon.png" if body["import_token"] == "svg-token-secret" else "/assets/imported/river.jpg",
                         "sha256": "a" * 64,
-                        "provider_id": "openverse",
-                        "license_spdx": "CC-BY-4.0",
+                        "provider_id": "tabler" if body["import_token"] == "svg-token-secret" else "openverse",
+                        "license_spdx": "MIT" if body["import_token"] == "svg-token-secret" else "CC-BY-4.0",
                     },
                 )
 
@@ -590,10 +638,32 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             page.goto(f"http://{host}:{port}/", wait_until="networkidle")
             page.locator("#desk-assets summary").click()
             page.wait_for_function(
-                "() => document.querySelectorAll('#desk-provider-select option').length === 2",
+                "() => document.querySelectorAll('#desk-provider-select option').length === 4",
                 timeout=8000,
             )
-            self.assertEqual(page.locator("#desk-provider-select option").count(), 2)
+            self.assertEqual(page.locator("#desk-provider-select option").count(), 4)
+            self.assertIn("（不可用）", page.locator("#desk-provider-select option").nth(2).inner_text())
+            page.locator("#desk-provider-select").select_option("heroicons")
+            self.assertTrue(page.locator("#desk-provider-consent").is_disabled())
+            self.assertTrue(page.locator("#desk-provider-search").is_disabled())
+            unavailable_reason = page.locator("#desk-provider-status").inner_text()
+            self.assertIn("安全轉檔引擎未就緒", unavailable_reason)
+            self.assertNotRegex(unavailable_reason, r"/|hash|sha|http")
+
+            # SVG candidates are metadata-only DOM rows and still expose an
+            # opaque import token for the server-side PNG conversion.
+            page.locator("#desk-provider-select").select_option("tabler")
+            page.locator("#desk-provider-query").fill("arrow-right")
+            page.locator("#desk-provider-search").click()
+            svg_row = page.locator("#desk-provider-results .provider-result-row").first
+            svg_row.wait_for(timeout=8000)
+            self.assertEqual(svg_row.get_attribute("data-kind"), "svg")
+            self.assertEqual(svg_row.locator("img,object,embed").count(), 0)
+            svg_row.get_by_role("button", name="匯入").click()
+            page.get_by_role("button", name="已匯入").wait_for(timeout=8000)
+            self.assertEqual(rights_gets, [], "SVG import must not refresh rights as a side-channel")
+
+            page.locator("#desk-provider-select").select_option("openverse")
             self.assertIn("尚未同意", page.locator("#desk-provider-disclosure").inner_text())
             self.assertFalse(page.locator("#desk-provider-consent").is_checked())
 
@@ -601,7 +671,10 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             page.locator("#desk-provider-search").click()
             page.wait_for_timeout(300)
             self.assertFalse(
-                any(kind == "search" for kind, _body in events),
+                any(
+                    kind == "search" and body.get("provider_id") == "openverse"
+                    for kind, body in events
+                ),
                 "search must not be sent without consent",
             )
             self.assertIn("勾選", page.locator("#desk-provider-status").inner_text())
@@ -609,7 +682,12 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             page.locator("#desk-provider-consent").check()
             page.locator("#desk-provider-search").click()
             page.locator("#desk-provider-results .provider-result-row").first.wait_for(timeout=8000)
-            mutation_events = [(kind, body) for kind, body in events if kind in {"consent", "search"}]
+            mutation_events = [
+                (kind, body)
+                for kind, body in events
+                if kind in {"consent", "search"}
+                and body.get("provider_id") == "openverse"
+            ]
             self.assertEqual([kind for kind, _body in mutation_events], ["consent", "search"])
             self.assertEqual(
                 mutation_events[0][1],
@@ -634,8 +712,12 @@ class EditorBrowserSmokeTests(unittest.TestCase):
 
             result_row.get_by_role("button", name="匯入").click()
             page.get_by_role("button", name="已匯入").wait_for(timeout=8000)
+            self.assertEqual(len(rights_gets), 1, "image import keeps the existing rights refresh")
             import_events = [body for kind, body in events if kind == "import"]
-            self.assertEqual(import_events, [{"import_token": "token-secret"}])
+            self.assertEqual(
+                import_events,
+                [{"import_token": "svg-token-secret"}, {"import_token": "token-secret"}],
+            )
             self.assertIn("已匯入", result_row.inner_text())
             self.assertEqual(console_errors, [])
             browser.close()

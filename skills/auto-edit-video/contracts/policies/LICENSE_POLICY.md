@@ -2,7 +2,7 @@
 
 ## Allowlist（可進 final）
 CC0-1.0、CC-BY-4.0（須 attribution）、CC-BY-SA-4.0（須 attribution＋同條款標示）、
-OFL-1.1（字型）、Apache-2.0、MIT、Unlicense、`internal-original`（自產）、
+OFL-1.1（字型）、Apache-2.0、MIT、ISC、Unlicense、`internal-original`（自產）、
 `user-owned`（rights assertion 核可）。
 
 ## 拒絕
@@ -18,7 +18,9 @@ CC-BY-NC／ND 系列、未知授權、來源不可考、以及來源條款禁 AI
 4. 本機資料夾素材：未經 rights assertion（`rights_assertion.schema.json`）不得進 final。
 5. rights assertion 與 license 記錄都綁 hash；素材檔變更→記錄失效。
 6. 內建 provider 自動核可還必須同時符合固定 provider ID、
-   `assets/providers/<provider-id>/` 路徑、canonical Creative Commons license URL，並有
+   image provider 必須符合 `assets/providers/<provider-id>/` 路徑與 canonical Creative
+   Commons license URL；SVG repository provider 必須符合 `assets/generated/svg/` 路徑，且
+   license evidence 是固定 provider ID→SPDX→official GitHub repo→pinned ref→LICENSE path；並有
    server 匯入流程產生、與 registry item/hash 一致的 consistency evidence；單獨新增或修改
    `assets/provenance.json` 不足以自動核可。
 

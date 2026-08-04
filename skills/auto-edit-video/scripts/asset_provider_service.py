@@ -41,16 +41,40 @@ from open_asset_providers import (
     parse_wikimedia,
     wikimedia_search_url,
 )
+from open_svg_providers import (
+    SVG_MIME,
+    SvgAssetCandidate,
+    heroicons_candidate,
+    lucide_candidate,
+    parse_wikimedia_svg,
+    tabler_candidate,
+    wikimedia_svg_search_url,
+)
 
 
 CONSENT_REL = Path("working/provider_consents.json")
 SEARCH_CACHE_REL = Path("working/provider-cache")
 SEARCH_MAX_BYTES = 1024 * 1024
 ASSET_MAX_BYTES = 25 * 1024 * 1024
+SVG_MAX_BYTES = 2 * 1024 * 1024
 MAX_DIMENSION = 8192
 MAX_PIXELS = 32_000_000
 MAX_IMPORT_TOKENS = 200
 MAX_SEARCH_METADATA_FILES = 200
+_SVG_PREFLIGHT_FIELDS = frozenset({"available", "checks_ok", "code", "identity"})
+_SVG_RASTERIZER_IDENTITY_FIELDS = frozenset(
+    {
+        "version",
+        "executable_sha256",
+        "sandbox_executable_sha256",
+        "sandbox_profile_sha256",
+    }
+)
+_SVG_RASTER_RESULT_FIELDS = frozenset(
+    {"png_bytes", "png_sha256", "width", "height", "metadata"}
+)
+_LOWER_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 _PROVIDERS: tuple[dict[str, Any], ...] = (
     {
@@ -69,15 +93,52 @@ _PROVIDERS: tuple[dict[str, Any], ...] = (
         "cost_class": "free",
         "network_disclosure": "會將最多 6 個搜尋詞傳送至 Wikimedia Commons。",
     },
+    {
+        "id": "heroicons",
+        "label": "Heroicons",
+        "kind": "svg",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "會從固定的 Heroicons GitHub pinned revision 下載指定圖示。",
+    },
+    {
+        "id": "lucide",
+        "label": "Lucide",
+        "kind": "svg",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "會從固定的 Lucide GitHub pinned revision 下載指定圖示。",
+    },
+    {
+        "id": "tabler",
+        "label": "Tabler Icons",
+        "kind": "svg",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "會從固定的 Tabler Icons GitHub pinned revision 下載指定圖示。",
+    },
+    {
+        "id": "wikimedia-svg",
+        "label": "Wikimedia Commons SVG",
+        "kind": "svg",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "會將最多 6 個搜尋詞傳送至 Wikimedia Commons，僅搜尋 SVG 檔案。",
+    },
 )
 _PROVIDER_BY_ID = {item["id"]: item for item in _PROVIDERS}
 _SEARCH_HOSTS = {
     "openverse": frozenset({"api.openverse.org"}),
     "wikimedia": frozenset({"commons.wikimedia.org"}),
+    "wikimedia-svg": frozenset({"commons.wikimedia.org"}),
 }
 _IMPORT_HOSTS = {
     "openverse": frozenset({"api.openverse.org"}),
     "wikimedia": frozenset({"upload.wikimedia.org"}),
+    "heroicons": frozenset({"raw.githubusercontent.com"}),
+    "lucide": frozenset({"raw.githubusercontent.com"}),
+    "tabler": frozenset({"raw.githubusercontent.com"}),
+    "wikimedia-svg": frozenset({"upload.wikimedia.org"}),
 }
 _MIME_EXTENSION = {
     "image/jpeg": ".jpg",
@@ -98,15 +159,25 @@ class AssetProviderError(RuntimeError):
 
 @dataclass(frozen=True)
 class _ImportGrant:
-    candidate: OpenAssetCandidate
+    candidate: OpenAssetCandidate | SvgAssetCandidate
     provider_id: str
     query_hash: str
     expires_at: float
 
 
+@dataclass(frozen=True)
+class _ValidatedSvgRasterResult:
+    png_bytes: bytes
+    png_sha256: str
+    width: int
+    height: int
+    identity: dict[str, str]
+
+
 Downloader = Callable[..., Any]
 Resolver = Callable[[str, int], Sequence[str]]
 VisualValidator = Callable[[Path], bool]
+SvgPipeline = Any
 Clock = Callable[[], float]
 
 
@@ -300,6 +371,7 @@ class AssetProviderService:
         downloader: Downloader = download_https,
         resolver: Resolver = system_resolver,
         transport: Any = None,
+        svg_pipeline: SvgPipeline | None = None,
         clock: Clock = time.monotonic,
         token_ttl_s: float = 1800,
     ) -> None:
@@ -316,6 +388,21 @@ class AssetProviderService:
         self._downloader = downloader
         self._resolver = resolver
         self._transport = transport
+        # The production pipeline is deliberately unavailable unless the
+        # hardened rasterizer can prove its pinned executable/sandbox setup.
+        # Tests must inject an explicit pipeline; an absent dependency never
+        # silently turns SVG network access on.
+        if svg_pipeline is None:
+            try:
+                from svg_security import ResvgRasterizer  # type: ignore[import-not-found]
+
+                svg_pipeline = ResvgRasterizer(None)
+            except ImportError:
+                svg_pipeline = None
+        self._svg_pipeline = svg_pipeline
+        self._svg_preflight_identity = self._validate_svg_preflight(
+            self._probe_svg_pipeline(svg_pipeline)
+        )
         self._clock = clock
         self._token_ttl_s = float(token_ttl_s)
         self._tokens: OrderedDict[str, _ImportGrant] = OrderedDict()
@@ -415,7 +502,7 @@ class AssetProviderService:
             if (
                 not isinstance(provider_id, str)
                 or provider_id not in _PROVIDER_BY_ID
-                or item.get("kind") != "image"
+                or item.get("kind") != _PROVIDER_BY_ID[provider_id]["kind"]
                 or not isinstance(item.get("consented"), bool)
                 or not _valid_utc_z(item.get("consented_at"))
                 or not _valid_confirmer(item.get("confirmed_by"))
@@ -464,15 +551,116 @@ class AssetProviderService:
             providers = []
             for catalog_item in _PROVIDERS:
                 consent = consents.get(catalog_item["id"])
+                available = True
+                availability_code = "available"
+                if catalog_item["kind"] == "svg":
+                    available, availability_code = self._svg_available()
                 providers.append(
                     {
                         **catalog_item,
+                        "available": available,
+                        "availability_code": availability_code,
                         "consented": bool(consent and consent["consented"]),
                         "consented_at": consent.get("consented_at") if consent else None,
                         "confirmed_by": consent.get("confirmed_by") if consent else None,
                     }
                 )
             return {"providers": providers}
+
+    @staticmethod
+    def _probe_svg_pipeline(pipeline: SvgPipeline | None) -> Any:
+        """Probe once per service instance; status/GET paths only read this cache."""
+        if pipeline is None:
+            return None
+        try:
+            return pipeline.preflight()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _validate_svg_preflight(preflight: Any) -> dict[str, str] | None:
+        """Accept only the exact successful result emitted by the hardened rasterizer."""
+        if preflight is None or isinstance(preflight, Mapping):
+            return None
+        try:
+            fields = vars(preflight)
+        except TypeError:
+            return None
+        if type(fields) is not dict or set(fields) != _SVG_PREFLIGHT_FIELDS:
+            return None
+        if fields["available"] is not True or fields["checks_ok"] is not True:
+            return None
+        if type(fields["code"]) is not str or fields["code"] != "OK":
+            return None
+        return AssetProviderService._validate_svg_rasterizer_identity(fields["identity"])
+
+    @staticmethod
+    def _validate_svg_rasterizer_identity(identity: Any) -> dict[str, str] | None:
+        """Return a defensive copy of an exact, well-formed rasterizer identity."""
+        if type(identity) is not dict or set(identity) != _SVG_RASTERIZER_IDENTITY_FIELDS:
+            return None
+        version = identity["version"]
+        if (
+            type(version) is not str
+            or not 1 <= len(version) <= 200
+            or _CONTROL_RE.search(version) is not None
+        ):
+            return None
+        for field in _SVG_RASTERIZER_IDENTITY_FIELDS - {"version"}:
+            value = identity[field]
+            if type(value) is not str or _LOWER_SHA256_RE.fullmatch(value) is None:
+                return None
+        return dict(identity)
+
+    @staticmethod
+    def _validate_svg_raster_result(result: Any) -> _ValidatedSvgRasterResult | None:
+        """Snapshot an exact raster result without invoking result properties."""
+        if result is None or isinstance(result, Mapping):
+            return None
+        try:
+            fields = vars(result)
+        except Exception:
+            return None
+        if type(fields) is not dict or set(fields) != _SVG_RASTER_RESULT_FIELDS:
+            return None
+        png_bytes = fields["png_bytes"]
+        png_sha256 = fields["png_sha256"]
+        width = fields["width"]
+        height = fields["height"]
+        if type(png_bytes) is not bytes:
+            return None
+        if type(png_sha256) is not str or _LOWER_SHA256_RE.fullmatch(png_sha256) is None:
+            return None
+        if (
+            type(width) is not int
+            or type(height) is not int
+            or width <= 0
+            or height <= 0
+            or width > MAX_DIMENSION
+            or height > MAX_DIMENSION
+            or width * height > MAX_PIXELS
+        ):
+            return None
+        identity = AssetProviderService._validate_svg_rasterizer_identity(fields["metadata"])
+        if identity is None:
+            return None
+        return _ValidatedSvgRasterResult(
+            png_bytes=png_bytes,
+            png_sha256=png_sha256,
+            width=width,
+            height=height,
+            identity=identity,
+        )
+
+    def _svg_available(self) -> tuple[bool, str]:
+        if self._svg_preflight_identity is not None:
+            return True, "available"
+        return False, "svg_rasterizer_unavailable"
+
+    def _require_svg_available(self) -> None:
+        available, _code = self._svg_available()
+        if not available:
+            raise _error("SVG rasterizer is unavailable", 503, "svg_rasterizer_unavailable")
 
     def set_consent(
         self, provider_id: str, consented: bool, confirmed_by: str
@@ -532,6 +720,27 @@ class AssetProviderService:
             and candidate.width * candidate.height <= MAX_PIXELS
         ]
 
+    def _parse_wikimedia_svg_payload(self, path: Path) -> list[SvgAssetCandidate]:
+        try:
+            payload = path.read_bytes()
+            if len(payload) > SEARCH_MAX_BYTES:
+                raise ValueError("provider JSON exceeds limit")
+            parsed = _strict_json_bytes(payload)
+            return parse_wikimedia_svg(parsed)
+        except (OSError, ValueError, ProviderDataError) as exc:
+            raise _error("provider returned invalid data", 422, "provider_data_invalid") from exc
+
+    def _repo_svg_candidate(self, provider_id: str, query: str) -> SvgAssetCandidate:
+        builders = {
+            "heroicons": heroicons_candidate,
+            "lucide": lucide_candidate,
+            "tabler": tabler_candidate,
+        }
+        try:
+            return builders[provider_id](query)
+        except (KeyError, ProviderDataError) as exc:
+            raise _error("search query violates provider policy", 422, "policy_rejected") from exc
+
     def _download(
         self,
         url: str,
@@ -560,14 +769,43 @@ class AssetProviderService:
             provider = self._provider(provider_id)
             root = self._root()
             self._require_consent(root, provider_id)
+            if provider["kind"] == "svg":
+                # This must precede query normalization, cache creation, and
+                # downloader construction.  SVG ingestion has no degraded
+                # raw-SVG mode.
+                self._require_svg_available()
             if isinstance(page, bool) or not isinstance(page, int):
                 raise _error("page must be an integer", 400, "malformed_request")
+            if provider_id in {"heroicons", "lucide", "tabler"}:
+                candidate = self._repo_svg_candidate(provider_id, query)
+                query_hash = hashlib.sha256(candidate.candidate_id.encode("utf-8")).hexdigest()
+                now = self._clock()
+                token = secrets.token_urlsafe(32)
+                self._tokens[token] = _ImportGrant(
+                    candidate=candidate,
+                    provider_id=provider_id,
+                    query_hash=query_hash,
+                    expires_at=now + self._token_ttl_s,
+                )
+                while len(self._tokens) > MAX_IMPORT_TOKENS:
+                    self._tokens.popitem(last=False)
+                # Exact-slug repository adapters never make a search request
+                # and retain no plaintext query metadata on disk.
+                return {
+                    "provider_id": provider_id,
+                    "page": page,
+                    "items": [{**candidate.public_dict(), "import_token": token}],
+                }
             try:
                 normalized_query = normalize_query(query)
                 search_url = (
                     openverse_search_url(normalized_query, page=page, page_size=20)
                     if provider_id == "openverse"
-                    else wikimedia_search_url(normalized_query, page=page, page_size=20)
+                    else (
+                        wikimedia_svg_search_url(normalized_query, page=page, page_size=20)
+                        if provider_id == "wikimedia-svg"
+                        else wikimedia_search_url(normalized_query, page=page, page_size=20)
+                    )
                 )
             except ProviderDataError as exc:
                 raise _error("search query violates provider policy", 422, "policy_rejected") from exc
@@ -577,7 +815,10 @@ class AssetProviderService:
             raw_path = cache_dir / f"search-{provider_id}-{cache_id}.json"
 
             def validate_json(path: Path) -> None:
-                self._parse_provider_payload(provider_id, path)
+                if provider_id == "wikimedia-svg":
+                    self._parse_wikimedia_svg_payload(path)
+                else:
+                    self._parse_provider_payload(provider_id, path)
 
             try:
                 self._download(
@@ -590,7 +831,11 @@ class AssetProviderService:
                 )
                 if not raw_path.is_file() or raw_path.is_symlink():
                     raise _error("provider download did not produce data", 502, "provider_failure")
-                candidates = self._parse_provider_payload(provider_id, raw_path)
+                candidates = (
+                    self._parse_wikimedia_svg_payload(raw_path)
+                    if provider_id == "wikimedia-svg"
+                    else self._parse_provider_payload(provider_id, raw_path)
+                )
             except AssetProviderError:
                 raw_path.unlink(missing_ok=True)
                 raise
@@ -661,7 +906,10 @@ class AssetProviderService:
             if (
                 candidate.provider_id != provider_id
                 or provider_id not in _PROVIDER_BY_ID
-                or candidate.mime_type not in _MIME_EXTENSION
+                or (
+                    candidate.mime_type not in _MIME_EXTENSION
+                    and candidate.mime_type != SVG_MIME
+                )
             ):
                 raise _error("import token was not found", 404, "import_token_not_found")
             if not callable(visual_validator):
@@ -675,6 +923,9 @@ class AssetProviderService:
 
             root = self._root()
             self._require_consent(root, provider_id)
+            if isinstance(candidate, SvgAssetCandidate):
+                self._require_svg_available()
+                return self._import_svg_candidate(root, provider_id, candidate, grant.query_hash)
             safe_id = _safe_candidate_id(candidate.candidate_id)
             extension = _MIME_EXTENSION[candidate.mime_type]
             relative = Path("assets/providers") / provider_id / f"{safe_id}{extension}"
@@ -822,6 +1073,240 @@ class AssetProviderService:
                 "url": f"/{relative.as_posix()}",
                 "idempotent": False,
             }
+
+    def _import_svg_candidate(
+        self, root: Path, provider_id: str, candidate: SvgAssetCandidate, query_hash: str
+    ) -> dict[str, Any]:
+        """Download hostile SVG privately, sanitize/rasterize, then publish PNG only."""
+        safe_id = _safe_candidate_id(candidate.candidate_id)
+        try:
+            current = asset_registry.current_svg_provider_item(
+                root,
+                provider_id=provider_id,
+                candidate_id=candidate.candidate_id,
+                query_hash=query_hash,
+                download_url=candidate.download_url,
+            )
+        except asset_registry.AssetRegistryError as exc:
+            raise _error("asset registry is invalid", 409, "registry_conflict") from exc
+        if current is not None:
+            return {
+                "item": current,
+                "source": current["path"],
+                "url": f"/{current['path']}",
+                "idempotent": True,
+            }
+
+        staging_relative = Path("working/source_artifacts/svg") / f".{uuid.uuid4().hex}.svg.part"
+        staging = self._safe_directory(root, staging_relative.parent) / staging_relative.name
+        created_paths: list[Path] = []
+        publication_snapshot: dict[str, bytes | None] | None = None
+
+        def rollback() -> None:
+            errors: list[str] = []
+            for path in reversed(created_paths):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    errors.append(str(exc))
+            if publication_snapshot is not None:
+                try:
+                    asset_registry.restore_publication(root, publication_snapshot)
+                except asset_registry.AssetRegistryError as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise _error(
+                    "SVG import rollback failed", 409, "registry_rollback_failed"
+                )
+
+        try:
+            self._download(
+                candidate.download_url,
+                staging,
+                root,
+                allowed_hosts=_IMPORT_HOSTS[provider_id],
+                max_bytes=SVG_MAX_BYTES,
+                validator=lambda path: None,
+            )
+            if not staging.is_file() or staging.is_symlink():
+                raise _error("provider download did not produce an SVG", 502, "provider_failure")
+            raw = staging.read_bytes()
+            raw_sha = hashlib.sha256(raw).hexdigest()
+            from svg_security import (
+                SvgSecurityError,
+                sanitize_and_rasterize,
+                validate_png_bytes,
+            )
+
+            try:
+                sanitized, png = sanitize_and_rasterize(
+                    raw,
+                    requested_width=candidate.width,
+                    requested_height=candidate.height,
+                    rasterizer=self._svg_pipeline,
+                )
+            except SvgSecurityError as exc:
+                if exc.code.startswith(("SVG_", "PNG_")):
+                    raise _error("SVG failed security policy", 422, "policy_rejected") from exc
+                raise _error(
+                    "SVG rasterizer is unavailable", 503, "svg_rasterizer_unavailable"
+                ) from exc
+            except Exception as exc:
+                raise _error(
+                    "SVG rasterizer returned an invalid result",
+                    503,
+                    "svg_rasterizer_unavailable",
+                ) from exc
+            # Receipt identities are security evidence, not optional labels.
+            identity = self._svg_preflight_identity
+            if identity is None:
+                raise _error("SVG rasterizer identity is incomplete", 503, "svg_rasterizer_unavailable")
+            raster_result = self._validate_svg_raster_result(png)
+            if not isinstance(sanitized.metadata, dict) or raster_result is None:
+                raise _error("SVG security evidence is incomplete", 503, "svg_rasterizer_unavailable")
+            if raster_result.identity != identity:
+                raise _error(
+                    "SVG rasterizer identity does not match preflight",
+                    503,
+                    "svg_rasterizer_unavailable",
+                )
+            try:
+                validated_png = validate_png_bytes(
+                    raster_result.png_bytes,
+                    expected_width=candidate.width,
+                    expected_height=candidate.height,
+                )
+            except SvgSecurityError as exc:
+                raise _error("SVG PNG failed validation", 422, "policy_rejected") from exc
+            if (
+                raster_result.png_sha256 != validated_png.png_sha256
+                or raster_result.width != candidate.width
+                or raster_result.height != candidate.height
+            ):
+                raise _error("SVG security evidence is incomplete", 503, "svg_rasterizer_unavailable")
+            raw_relative = Path("working/source_artifacts/svg") / f"{raw_sha}.svg.untrusted"
+            sanitized_relative = Path("working/sanitized_svg") / f"{sanitized.sanitized_sha256}.svg"
+            png_relative = Path("assets/generated/svg") / f"{raster_result.png_sha256}.png"
+            asset_id = f"provider-{provider_id}-{safe_id}-{raster_result.png_sha256[:16]}"
+            review_status = "pending" if provider_id == "wikimedia-svg" else "approved"
+            verified_at = _utc_now()
+            item = {
+                "asset_id": asset_id,
+                "path": png_relative.as_posix(),
+                "sha256": raster_result.png_sha256,
+                "origin": "provider",
+                "provider_id": provider_id,
+                "source_url": candidate.landing_url,
+                "license": {"spdx": candidate.license_spdx, "evidence_url": candidate.license_url,
+                            "attribution_required": candidate.attribution_required,
+                            "attribution_text": candidate.attribution_text, "verified_at": verified_at},
+                "review_status": review_status,
+            }
+
+            try:
+                publication_snapshot = asset_registry.snapshot_publication(root)
+                # Content-addressed targets must be absent or byte-identical.
+                # Track only files this transaction created; rollback must not
+                # remove a pre-existing identical cache entry.
+                for relative, payload in (
+                    (raw_relative, raw),
+                    (sanitized_relative, sanitized.canonical_svg),
+                    (png_relative, raster_result.png_bytes),
+                ):
+                    target = root / relative
+                    if target.exists() or target.is_symlink():
+                        if (
+                            target.is_symlink()
+                            or not target.is_file()
+                            or target.read_bytes() != payload
+                        ):
+                            raise _error(
+                                "SVG content-addressed path conflicts",
+                                409,
+                                "registry_conflict",
+                            )
+                    else:
+                        try:
+                            self._atomic_write(root, relative, payload)
+                        except Exception:
+                            # Atomic publication may have replaced the final
+                            # name before a later fsync failure. Track that
+                            # exact payload so rollback still owns it.
+                            if (
+                                target.is_file()
+                                and not target.is_symlink()
+                                and target.read_bytes() == payload
+                            ):
+                                created_paths.append(target)
+                            raise
+                        else:
+                            created_paths.append(target)
+
+                receipt = asset_registry.save_svg_provider_receipt(
+                    root,
+                    item,
+                    candidate_id=candidate.candidate_id,
+                    query_hash=query_hash,
+                    download_url=candidate.download_url,
+                    raw_sha256=raw_sha,
+                    raw_path=raw_relative.as_posix(),
+                    raw_size=len(raw),
+                    sanitized_sha256=sanitized.sanitized_sha256,
+                    sanitized_path=sanitized_relative.as_posix(),
+                    sanitized_size=len(sanitized.canonical_svg),
+                    png_size=len(raster_result.png_bytes),
+                    png_width=raster_result.width,
+                    png_height=raster_result.height,
+                    sanitizer_identity=sanitized.metadata,
+                    rasterizer_identity=dict(identity),
+                )
+                receipt_path = (
+                    root
+                    / asset_registry.PROVIDER_RECEIPTS_REL
+                    / (hashlib.sha256(asset_id.encode("utf-8")).hexdigest() + ".json")
+                )
+                created_paths.append(receipt_path)
+                if not isinstance(receipt, dict) or not receipt_path.is_file() or receipt_path.is_symlink():
+                    raise asset_registry.AssetRegistryError(
+                        "SVG provider receipt publication failed"
+                    )
+                asset_registry.upsert_item(root, item)
+            except (AssetProviderError, asset_registry.AssetRegistryError, OSError) as exc:
+                try:
+                    rollback()
+                except AssetProviderError:
+                    raise
+                if isinstance(exc, AssetProviderError):
+                    raise
+                raise _error(
+                    "SVG registry transaction failed", 409, "registry_conflict"
+                ) from exc
+            return {
+                "item": item,
+                "source": png_relative.as_posix(),
+                "url": f"/{png_relative.as_posix()}",
+                "idempotent": False,
+            }
+        except AssetProviderError:
+            raise
+        except DownloadValidationError as exc:
+            raise _error("provider SVG failed validation", 422, "policy_rejected") from exc
+        except DownloadError as exc:
+            raise _error("provider SVG import failed", 502, "provider_failure") from exc
+        except asset_registry.AssetRegistryError as exc:
+            raise _error("asset registry is invalid", 409, "registry_conflict") from exc
+        except OSError as exc:
+            if publication_snapshot is not None:
+                try:
+                    rollback()
+                except AssetProviderError:
+                    raise
+            raise _error("SVG project storage failed", 409, "registry_conflict") from exc
+        finally:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 __all__ = ["AssetProviderError", "AssetProviderService"]

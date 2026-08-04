@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import binascii
+import hashlib
 import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+import struct
 from typing import Any
 from unittest.mock import patch
+import zlib
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -149,6 +154,72 @@ def jpeg_bytes(width: int = 2, height: int = 2) -> bytes:
     return b"\xff\xd8\xff\xc0" + (17).to_bytes(2, "big") + sof_payload + b"\xff\xd9"
 
 
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    checksum = binascii.crc32(kind)
+    checksum = binascii.crc32(payload, checksum) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+
+def strict_png(width: int, height: int) -> bytes:
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    rows = b"".join(b"\0" + b"\x22" * (width * 4) for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(rows))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+BENIGN_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    b'<path fill="currentColor" d="M2 2h20v20H2z"/></svg>'
+)
+_DEFAULT_RASTER_METADATA = object()
+
+
+class FakeSvgPipeline:
+    """Available test pipeline that never impersonates ResvgRasterizer."""
+
+    def __init__(
+        self,
+        *,
+        png_payload: bytes | None = None,
+        raster_metadata: Any = _DEFAULT_RASTER_METADATA,
+    ) -> None:
+        self.preflight_calls = 0
+        self.rasterize_calls = 0
+        self.png_payload = png_payload
+        self.raster_metadata = raster_metadata
+        self.identity = {
+            "version": "resvg-test-1",
+            "executable_sha256": "a" * 64,
+            "sandbox_executable_sha256": "b" * 64,
+            "sandbox_profile_sha256": "c" * 64,
+        }
+
+    def preflight(self) -> SimpleNamespace:
+        self.preflight_calls += 1
+        return SimpleNamespace(available=True, checks_ok=True, code="OK", identity=dict(self.identity))
+
+    def rasterize(self, sanitized: Any) -> SimpleNamespace:
+        self.rasterize_calls += 1
+        width = sanitized.metadata["requested_width"]
+        height = sanitized.metadata["requested_height"]
+        payload = self.png_payload or strict_png(width, height)
+        return SimpleNamespace(
+            png_bytes=payload,
+            png_sha256=hashlib.sha256(payload).hexdigest(),
+            width=width,
+            height=height,
+            metadata=(
+                dict(self.identity)
+                if self.raster_metadata is _DEFAULT_RASTER_METADATA
+                else self.raster_metadata
+            ),
+        )
+
+
 class AssetProviderServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -167,8 +238,18 @@ class AssetProviderServiceTests(unittest.TestCase):
 
     def test_catalog_and_consent_are_project_scoped_persisted_and_secret_free(self) -> None:
         status = self.service.status()
-        self.assertEqual([item["id"] for item in status["providers"]], ["openverse", "wikimedia"])
-        self.assertTrue(all(item["kind"] == "image" for item in status["providers"]))
+        self.assertEqual(
+            [item["id"] for item in status["providers"]],
+            ["openverse", "wikimedia", "heroicons", "lucide", "tabler", "wikimedia-svg"],
+        )
+        self.assertEqual(
+            [item["kind"] for item in status["providers"]],
+            ["image", "image", "svg", "svg", "svg", "svg"],
+        )
+        self.assertTrue(all(item["available"] for item in status["providers"][:2]))
+        self.assertTrue(all(item["availability_code"] == "available" for item in status["providers"][:2]))
+        self.assertTrue(all(not item["available"] for item in status["providers"][2:]))
+        self.assertTrue(all(item["availability_code"] == "svg_rasterizer_unavailable" for item in status["providers"][2:]))
         self.assertTrue(all(item["consent_required"] for item in status["providers"]))
         self.assertTrue(all(item["cost_class"] == "free" for item in status["providers"]))
         self.assertTrue(all(item["network_disclosure"] for item in status["providers"]))
@@ -201,6 +282,19 @@ class AssetProviderServiceTests(unittest.TestCase):
 
         revoked = restarted.revoke_consent("openverse", "nat")
         self.assertFalse(revoked["consented"])
+
+    def test_unavailable_svg_rejects_before_query_or_download(self) -> None:
+        downloader = FakeDownloader([])
+        service = AssetProviderService(
+            self.project, downloader=downloader,
+            resolver=lambda host, port: ["93.184.216.34"], clock=self.clock,
+        )
+        service.grant_consent("heroicons", "nat")
+        with self.assertRaises(AssetProviderError) as rejected:
+            service.search("heroicons", "arrow-right")
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+        self.assertEqual(downloader.calls, [])
 
     def test_search_uses_hardened_policy_and_returns_only_opaque_import_capability(self) -> None:
         downloader = FakeDownloader([openverse_payload()])
@@ -549,6 +643,409 @@ class AssetProviderServiceTests(unittest.TestCase):
                     self.service.status()
                 self.assertEqual(rejected.exception.status_code, 409)
                 self.assertNotIn("secret", str(rejected.exception))
+
+    def _svg_service(
+        self, payloads: list[bytes], *, pipeline: FakeSvgPipeline | None = None
+    ) -> tuple[AssetProviderService, FakeDownloader, FakeSvgPipeline]:
+        downloader = FakeDownloader(payloads)
+        selected = pipeline or FakeSvgPipeline()
+        service = AssetProviderService(
+            self.project,
+            downloader=downloader,
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+            svg_pipeline=selected,
+        )
+        return service, downloader, selected
+
+    def _import_repo_svg(
+        self, service: AssetProviderService, provider_id: str, slug: str
+    ) -> dict[str, Any]:
+        service.grant_consent(provider_id, "nat")
+        token = service.search(provider_id, slug)["items"][0]["import_token"]
+        return service.import_candidate(token, lambda _path: True)
+
+    def test_svg_preflight_is_cached_once_and_status_is_pure_read(self) -> None:
+        pipeline = FakeSvgPipeline()
+        service, downloader, _pipeline = self._svg_service([], pipeline=pipeline)
+        self.assertEqual(pipeline.preflight_calls, 1)
+        before = sorted(path.relative_to(self.project) for path in self.project.rglob("*"))
+        for _ in range(3):
+            status = service.status()
+            self.assertTrue(
+                all(item["available"] for item in status["providers"] if item["kind"] == "svg")
+            )
+        self.assertEqual(pipeline.preflight_calls, 1)
+        self.assertEqual(downloader.calls, [])
+        self.assertEqual(
+            sorted(path.relative_to(self.project) for path in self.project.rglob("*")),
+            before,
+        )
+
+    def test_svg_preflight_fails_closed_on_untrusted_success_shapes(self) -> None:
+        identity = {
+            "version": "resvg-test-1",
+            "executable_sha256": "a" * 64,
+            "sandbox_executable_sha256": "b" * 64,
+            "sandbox_profile_sha256": "c" * 64,
+        }
+        malformed = {
+            "checks_false": SimpleNamespace(
+                available=True, checks_ok=False, code="OK", identity=dict(identity)
+            ),
+            "arbitrary_code": SimpleNamespace(
+                available=True, checks_ok=True, code="arbitrary", identity=dict(identity)
+            ),
+            "empty_identity": SimpleNamespace(
+                available=True, checks_ok=True, code="OK", identity={}
+            ),
+            "extra_identity": SimpleNamespace(
+                available=True,
+                checks_ok=True,
+                code="OK",
+                identity={**identity, "unexpected": "value"},
+            ),
+            "uppercase_hash": SimpleNamespace(
+                available=True,
+                checks_ok=True,
+                code="OK",
+                identity={**identity, "executable_sha256": "A" * 64},
+            ),
+            "control_version": SimpleNamespace(
+                available=True,
+                checks_ok=True,
+                code="OK",
+                identity={**identity, "version": "resvg\nforged"},
+            ),
+            "boolish_available": SimpleNamespace(
+                available=1, checks_ok=True, code="OK", identity=dict(identity)
+            ),
+            "missing_field": SimpleNamespace(
+                available=True, checks_ok=True, identity=dict(identity)
+            ),
+            "extra_field": SimpleNamespace(
+                available=True,
+                checks_ok=True,
+                code="OK",
+                identity=dict(identity),
+                unexpected=True,
+            ),
+            "mapping": {
+                "available": True,
+                "checks_ok": True,
+                "code": "OK",
+                "identity": dict(identity),
+            },
+        }
+
+        for label, preflight in malformed.items():
+            with self.subTest(label=label):
+                pipeline = FakeSvgPipeline()
+                pipeline.preflight = lambda value=preflight: value  # type: ignore[method-assign]
+                service, downloader, _pipeline = self._svg_service([], pipeline=pipeline)
+                for _ in range(2):
+                    svg_status = [
+                        item for item in service.status()["providers"] if item["kind"] == "svg"
+                    ]
+                    self.assertTrue(svg_status)
+                    self.assertTrue(all(item["available"] is False for item in svg_status))
+                    self.assertTrue(
+                        all(
+                            item["availability_code"] == "svg_rasterizer_unavailable"
+                            for item in svg_status
+                        )
+                    )
+                service.grant_consent("heroicons", "nat")
+                with self.assertRaises(AssetProviderError) as rejected:
+                    service.search("heroicons", "arrow-right")
+                self.assertEqual(rejected.exception.status_code, 503)
+                self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+                self.assertEqual(downloader.calls, [])
+
+    def test_unpinned_available_preflight_cannot_reach_svg_import(self) -> None:
+        unpinned = FakeSvgPipeline()
+
+        def unpinned_preflight() -> SimpleNamespace:
+            unpinned.preflight_calls += 1
+            return SimpleNamespace(
+                available=True,
+                checks_ok=False,
+                code="arbitrary",
+                identity={},
+            )
+
+        unpinned.preflight = unpinned_preflight  # type: ignore[method-assign]
+        blocked, downloader, _pipeline = self._svg_service([], pipeline=unpinned)
+        self.assertEqual(unpinned.preflight_calls, 1)
+        for _ in range(2):
+            svg_status = [
+                item for item in blocked.status()["providers"] if item["kind"] == "svg"
+            ]
+            self.assertTrue(all(item["available"] is False for item in svg_status))
+        self.assertEqual(unpinned.preflight_calls, 1)
+
+        issuer, _issuer_downloader, _issuer_pipeline = self._svg_service([])
+        issuer.grant_consent("heroicons", "nat")
+        token = issuer.search("heroicons", "arrow-right")["items"][0]["import_token"]
+        blocked._tokens[token] = issuer._tokens.pop(token)
+        with self.assertRaises(AssetProviderError) as rejected:
+            blocked.import_candidate(token, lambda _path: True)
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+        self.assertEqual(downloader.calls, [])
+        self.assertEqual(unpinned.rasterize_calls, 0)
+        self.assertEqual(unpinned.preflight_calls, 1)
+
+    def _assert_no_svg_publication(self, project: Path | None = None) -> None:
+        root = project or self.project
+        for relative in (
+            "working/source_artifacts/svg",
+            "working/sanitized_svg",
+            "assets/generated/svg",
+            asset_registry.PROVIDER_RECEIPTS_REL,
+        ):
+            directory = root / relative
+            if directory.exists():
+                self.assertEqual(
+                    [path for path in directory.rglob("*") if path.is_file() or path.is_symlink()],
+                    [],
+                )
+        self.assertFalse((root / asset_registry.PROVENANCE_REL).exists())
+        self.assertFalse((root / asset_registry.ATTRIBUTION_REL).exists())
+        self.assertEqual(list(root.rglob("*.part")), [])
+
+    def test_raster_metadata_cannot_override_cached_preflight_identity(self) -> None:
+        pipeline = FakeSvgPipeline()
+        service, downloader, _pipeline = self._svg_service([BENIGN_SVG], pipeline=pipeline)
+        pipeline.identity["executable_sha256"] = "d" * 64
+        service.grant_consent("heroicons", "nat")
+        token = service.search("heroicons", "arrow-right")["items"][0]["import_token"]
+
+        with self.assertRaises(AssetProviderError) as rejected:
+            service.import_candidate(token, lambda _path: True)
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+        self.assertEqual(len(downloader.calls), 1)
+        self.assertEqual(pipeline.rasterize_calls, 1)
+        self._assert_no_svg_publication()
+        with self.assertRaises(AssetProviderError) as replayed:
+            service.import_candidate(token, lambda _path: True)
+        self.assertEqual(replayed.exception.status_code, 404)
+        self.assertEqual(replayed.exception.code, "import_token_not_found")
+
+    def test_raster_metadata_requires_exact_plain_cached_identity(self) -> None:
+        identity = {
+            "version": "resvg-test-1",
+            "executable_sha256": "a" * 64,
+            "sandbox_executable_sha256": "b" * 64,
+            "sandbox_profile_sha256": "c" * 64,
+        }
+
+        class IdentityMapping(dict[str, str]):
+            pass
+
+        malformed = {
+            "missing": {key: value for key, value in identity.items() if key != "version"},
+            "extra": {**identity, "unexpected": "value"},
+            "mapping_subclass": IdentityMapping(identity),
+            "changed_version": {**identity, "version": "resvg-test-2"},
+            "changed_hash": {**identity, "executable_sha256": "d" * 64},
+            "uppercase_hash": {**identity, "executable_sha256": "A" * 64},
+        }
+        for label, metadata in malformed.items():
+            with self.subTest(label=label):
+                pipeline = FakeSvgPipeline(raster_metadata=metadata)
+                service, downloader, _pipeline = self._svg_service(
+                    [BENIGN_SVG], pipeline=pipeline
+                )
+                service.grant_consent("heroicons", "nat")
+                token = service.search("heroicons", "arrow-right")["items"][0][
+                    "import_token"
+                ]
+                with self.assertRaises(AssetProviderError) as rejected:
+                    service.import_candidate(token, lambda _path: True)
+                self.assertEqual(rejected.exception.status_code, 503)
+                self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+                self.assertEqual(len(downloader.calls), 1)
+                self._assert_no_svg_publication()
+
+    def test_malformed_raster_result_shapes_fail_closed_without_publication(self) -> None:
+        class ThrowingProperties:
+            @property
+            def png_bytes(self) -> bytes:
+                raise RuntimeError("hostile getter")
+
+        factories = {
+            "none": lambda _valid: None,
+            "mapping": lambda valid: dict(valid),
+            "missing_metadata": lambda valid: SimpleNamespace(
+                **{key: value for key, value in valid.items() if key != "metadata"}
+            ),
+            "extra_field": lambda valid: SimpleNamespace(**valid, unexpected=True),
+            "throwing_property": lambda _valid: ThrowingProperties(),
+            "png_bytes_type": lambda valid: SimpleNamespace(**{**valid, "png_bytes": "PNG"}),
+            "hash_type": lambda valid: SimpleNamespace(**{**valid, "png_sha256": 7}),
+            "width_type": lambda valid: SimpleNamespace(**{**valid, "width": True}),
+            "height_type": lambda valid: SimpleNamespace(**{**valid, "height": "24"}),
+            "metadata_type": lambda valid: SimpleNamespace(**{**valid, "metadata": []}),
+        }
+        for label, factory in factories.items():
+            with self.subTest(label=label):
+                project = self.project / label
+                project.mkdir()
+                pipeline = FakeSvgPipeline()
+
+                def malformed_rasterize(
+                    sanitized: Any,
+                    *,
+                    selected: Any = factory,
+                    selected_pipeline: FakeSvgPipeline = pipeline,
+                ) -> Any:
+                    selected_pipeline.rasterize_calls += 1
+                    width = sanitized.metadata["requested_width"]
+                    height = sanitized.metadata["requested_height"]
+                    payload = strict_png(width, height)
+                    valid = {
+                        "png_bytes": payload,
+                        "png_sha256": hashlib.sha256(payload).hexdigest(),
+                        "width": width,
+                        "height": height,
+                        "metadata": dict(selected_pipeline.identity),
+                    }
+                    return selected(valid)
+
+                pipeline.rasterize = malformed_rasterize  # type: ignore[method-assign]
+                downloader = FakeDownloader([BENIGN_SVG])
+                service = AssetProviderService(
+                    project,
+                    downloader=downloader,
+                    resolver=lambda host, port: ["93.184.216.34"],
+                    clock=self.clock,
+                    svg_pipeline=pipeline,
+                )
+                service.grant_consent("heroicons", "nat")
+                token = service.search("heroicons", "arrow-right")["items"][0][
+                    "import_token"
+                ]
+                with self.assertRaises(AssetProviderError) as rejected:
+                    service.import_candidate(token, lambda _path: True)
+                self.assertEqual(rejected.exception.status_code, 503)
+                self.assertEqual(rejected.exception.code, "svg_rasterizer_unavailable")
+                self.assertEqual(len(downloader.calls), 1)
+                self._assert_no_svg_publication(project)
+                with self.assertRaises(AssetProviderError) as replayed:
+                    service.import_candidate(token, lambda _path: True)
+                self.assertEqual(replayed.exception.status_code, 404)
+
+    def test_repo_svg_import_publishes_png_receipt_provenance_and_is_idempotent(self) -> None:
+        service, downloader, pipeline = self._svg_service([BENIGN_SVG])
+        imported = self._import_repo_svg(service, "heroicons", "arrow-right")
+        self.assertFalse(imported["idempotent"])
+        self.assertEqual(len(downloader.calls), 1, "exact repo search must not download")
+        self.assertEqual(pipeline.rasterize_calls, 1)
+        self.assertTrue(imported["source"].startswith("assets/generated/svg/"))
+        self.assertTrue(imported["source"].endswith(".png"))
+        self.assertNotIn(".svg", imported["source"])
+        item = imported["item"]
+        self.assertEqual(asset_registry.provider_consistency_errors(self.project, item), [])
+        receipt_path = (
+            self.project
+            / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["decision"], "approved")
+        self.assertRegex(receipt["evidence_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(receipt["issued_at"], item["license"]["verified_at"])
+        self.assertEqual(receipt["png"]["mime"], "image/png")
+        self.assertTrue((self.project / receipt["raw"]["path"]).is_file())
+        self.assertTrue((self.project / receipt["sanitized"]["path"]).is_file())
+        self.assertTrue((self.project / receipt["png"]["path"]).is_file())
+        self.assertIn("Tailwind Labs", (self.project / "ATTRIBUTION.md").read_text("utf-8"))
+        self.assertEqual(list(self.project.rglob("*.part")), [])
+
+        again = self._import_repo_svg(service, "heroicons", "arrow-right")
+        self.assertTrue(again["idempotent"])
+        self.assertEqual(len(downloader.calls), 1, "current v2 receipt must avoid re-download")
+        self.assertEqual(pipeline.rasterize_calls, 1)
+
+    def test_svg_registry_failure_rolls_back_exact_bytes_and_only_new_files(self) -> None:
+        baseline = {
+            "asset_id": "baseline",
+            "path": "assets/baseline.png",
+            "sha256": "d" * 64,
+            "origin": "folder-import",
+            "provider_id": None,
+            "source_url": None,
+            "license": {
+                "spdx": "CC0-1.0",
+                "evidence_url": None,
+                "attribution_required": False,
+                "attribution_text": "",
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+            "review_status": "approved",
+        }
+        asset_registry.upsert_item(self.project, baseline)
+        registry_path = self.project / asset_registry.PROVENANCE_REL
+        attribution_path = self.project / asset_registry.ATTRIBUTION_REL
+        registry_before = registry_path.read_bytes()
+        attribution_before = attribution_path.read_bytes()
+        service, _downloader, _pipeline = self._svg_service([BENIGN_SVG])
+        service.grant_consent("heroicons", "nat")
+        token = service.search("heroicons", "arrow-right")["items"][0]["import_token"]
+
+        def corrupt_then_fail(_root: Path, _item: dict[str, Any]) -> dict[str, Any]:
+            registry_path.write_bytes(b"corrupt-registry")
+            attribution_path.write_bytes(b"corrupt-attribution")
+            raise asset_registry.AssetRegistryError("simulated registry failure")
+
+        with patch.object(asset_registry, "upsert_item", side_effect=corrupt_then_fail):
+            with self.assertRaises(AssetProviderError) as rejected:
+                service.import_candidate(token, lambda _path: True)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.code, "registry_conflict")
+        self.assertEqual(registry_path.read_bytes(), registry_before)
+        self.assertEqual(attribution_path.read_bytes(), attribution_before)
+        self.assertEqual(list((self.project / "assets/generated/svg").glob("*.png")), [])
+        self.assertEqual(list((self.project / "working/provider-receipts").glob("*.json")), [])
+        self.assertEqual(list((self.project / "working/source_artifacts/svg").glob("*.untrusted")), [])
+        self.assertEqual(list((self.project / "working/sanitized_svg").glob("*.svg")), [])
+        self.assertEqual(list(self.project.rglob("*.part")), [])
+
+    def test_different_candidate_same_png_is_conflict_without_merging_attribution(self) -> None:
+        service, downloader, _pipeline = self._svg_service([BENIGN_SVG, BENIGN_SVG])
+        first = self._import_repo_svg(service, "heroicons", "arrow-right")
+        before_registry = (self.project / asset_registry.PROVENANCE_REL).read_bytes()
+        before_attribution = (self.project / asset_registry.ATTRIBUTION_REL).read_bytes()
+        with self.assertRaises(AssetProviderError) as rejected:
+            self._import_repo_svg(service, "tabler", "arrow-left")
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.code, "registry_conflict")
+        self.assertEqual((self.project / asset_registry.PROVENANCE_REL).read_bytes(), before_registry)
+        self.assertEqual((self.project / asset_registry.ATTRIBUTION_REL).read_bytes(), before_attribution)
+        self.assertEqual(len(list((self.project / "working/provider-receipts").glob("*.json"))), 1)
+        self.assertEqual(len(json.loads(before_registry)["items"]), 1)
+        self.assertEqual(len(downloader.calls), 2)
+        self.assertEqual((self.project / first["source"]).read_bytes(), strict_png(24, 24))
+
+    def test_svg_content_collision_preserves_preexisting_and_cleans_new_files(self) -> None:
+        pipeline = FakeSvgPipeline()
+        payload = strict_png(24, 24)
+        digest = hashlib.sha256(payload).hexdigest()
+        collision = self.project / f"assets/generated/svg/{digest}.png"
+        collision.parent.mkdir(parents=True)
+        collision.write_bytes(b"preexisting-conflict")
+        service, _downloader, _pipeline = self._svg_service([BENIGN_SVG], pipeline=pipeline)
+        with self.assertRaises(AssetProviderError) as rejected:
+            self._import_repo_svg(service, "heroicons", "arrow-right")
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(collision.read_bytes(), b"preexisting-conflict")
+        self.assertEqual(list((self.project / "working/source_artifacts/svg").glob("*.untrusted")), [])
+        self.assertEqual(list((self.project / "working/sanitized_svg").glob("*.svg")), [])
+        self.assertFalse((self.project / asset_registry.PROVENANCE_REL).exists())
+        self.assertEqual(list(self.project.rglob("*.part")), [])
 
 
 if __name__ == "__main__":
