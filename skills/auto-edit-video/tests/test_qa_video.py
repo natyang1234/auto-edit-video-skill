@@ -809,8 +809,10 @@ class QaVideoGateTest(unittest.TestCase):
             capture_output=True,
         )
         report, ok = self.inspect(video)
-        self.assertFalse(ok, "a short second picture must not shorten the delivery")
-        self.assertGreater(report["media"]["duration_s"], 10)
+        self.assertFalse(ok, "a second picture makes the delivery ambiguous")
+        self.assertTrue(
+            any("ambiguous" in item for item in report["failures"]), report["failures"]
+        )
 
     def make_half_black_video(self, name: str, extra: list[str] | None = None) -> Path:
         video = self.dir / name
@@ -907,7 +909,8 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertFalse(ok, "a longer second stream must not dilute coverage")
         self.assertTrue(
-            any("black" in item for item in report["failures"]), report["failures"]
+            any("black" in item or "ambiguous" in item for item in report["failures"]),
+            report["failures"],
         )
 
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:

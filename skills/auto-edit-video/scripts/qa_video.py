@@ -157,6 +157,8 @@ def probe(video: Path) -> dict[str, Any]:
     return {
         "duration_s": round(duration, 3),
         "container_duration_s": round(float(data.get("format", {}).get("duration") or 0.0), 3),
+        "video_stream_count": len(visuals),
+        "audio_stream_count": len([item for item in streams if item.get("codec_type") == "audio"]),
         "size_bytes": int(data.get("format", {}).get("size") or video.stat().st_size),
         "video": visual,
         "audio": audio,
@@ -197,8 +199,13 @@ def picture_analysis(
         [
             ffmpeg,
             "-hide_banner",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-i",
             str(video),
+            "-map",
+            "0:V:0",
             "-vf",
             f"blackdetect=d={min_duration}"
             f":pic_th={BLACK_DETECT_PICTURE_RATIO}"
@@ -225,16 +232,13 @@ def picture_analysis(
             else "picture analysis failed"
         )
     decoded = 0.0
-    # Only progress lines carry the decoded position. The rest of stderr
-    # echoes the input's filename and metadata tags, which are attacker
-    # controlled: the renderer copies source metadata into the delivery.
-    for line in re.split(r"[\r\n]", text):
-        if not line.startswith("frame=") and not line.startswith("size="):
-            continue
-        match = re.search(r"\stime=(\d+):(\d\d):(\d\d(?:\.\d+)?)", line)
-        if match:
-            hours, minutes, seconds = match.groups()
-            decoded = max(decoded, int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    # Read the position from the machine-readable progress stream on stdout.
+    # Parsing stderr instead would also read the input's filename and
+    # metadata tags back: both are attacker supplied (a filename containing
+    # a newline puts arbitrary text at the start of a line), and the
+    # renderer copies source metadata into deliveries.
+    for match in re.finditer(r"^out_time_us=(\d+)$", result.stdout or "", re.MULTILINE):
+        decoded = max(decoded, int(match.group(1)) / 1_000_000)
     return segments, decoded
 
 
@@ -272,6 +276,8 @@ def momentary_loudness(video: Path) -> list[float]:
             "-nostats",
             "-i",
             str(video),
+            "-map",
+            "0:a:0",
             "-af",
             "ebur128",
             "-vn",
@@ -368,7 +374,21 @@ def peak_level_dbfs(video: Path) -> float | None:
     if not ffmpeg:
         return None
     result = run(
-        [ffmpeg, "-hide_banner", "-nostats", "-i", str(video), "-af", "volumedetect", "-vn", "-f", "null", "-"]
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(video),
+            "-map",
+            "0:a:0",
+            "-af",
+            "volumedetect",
+            "-vn",
+            "-f",
+            "null",
+            "-",
+        ]
     )
     match = re.search(r"max_volume:\s*(-?[0-9.]+) dB", result.stderr or "")
     return float(match.group(1)) if match else None
@@ -446,6 +466,15 @@ def inspect(
     audio = media["audio"]
     if not visual:
         failures.append("video stream is missing")
+    # Which stream plays is a player's choice, and the measurements here,
+    # ffprobe's stream order and a player's selection rule need not agree —
+    # so a second stream can carry the picture that ships while a decoy is
+    # the one inspected. A delivery from this pipeline holds one of each.
+    if media["video_stream_count"] > 1 or media["audio_stream_count"] > 1:
+        failures.append(
+            f"delivery carries {media['video_stream_count']} video and "
+            f"{media['audio_stream_count']} audio streams; which one plays is ambiguous"
+        )
     if media["duration_s"] <= 0:
         failures.append("duration must be positive")
     width = int(visual.get("width") or 0)
@@ -467,9 +496,20 @@ def inspect(
     # thins every ratio. What decoded is what plays, and it is the same pass
     # the black segments came from, so ratios stay measured against their own
     # source rather than against a number from somewhere else.
+    declared = media["duration_s"]
     if decoded > 0:
         media["duration_s"] = round(decoded, 3)
     media["decoded_seconds"] = round(decoded, 3)
+    # Anchoring to the decode keeps every ratio self-consistent, which is
+    # exactly why a delivery that stops early would otherwise look like a
+    # clean shorter one: ffmpeg reports success on a truncated file. The two
+    # readings sat side by side in the report without ever being compared.
+    tolerance = max(0.5, declared * 0.02)
+    if declared > 0 and decoded > 0 and abs(declared - decoded) > tolerance:
+        failures.append(
+            f"only {decoded:.2f}s of picture decoded from a {declared:.2f}s delivery "
+            f"(truncated or damaged)"
+        )
     longest_black = max((item["duration"] for item in blacks), default=0.0)
     if longest_black >= policy.max_black_segment_seconds:
         failures.append(
