@@ -1328,6 +1328,10 @@ def single_delivery_qa_errors(
     report = read_json(resolved.get("report", Path("/nonexistent")), None)
     if not isinstance(report, dict) or report.get("status") != "pass":
         errors.append("delivery QA report is missing a passing status")
+    elif not isinstance(report.get("policy"), dict):
+        errors.append(
+            "delivery QA report predates the enforced QA policy; re-run the final render QA"
+        )
     render_receipt = read_json(resolved.get("render_receipt", Path("/nonexistent")), None)
     if not isinstance(render_receipt, dict):
         errors.append("render receipt is unreadable")
@@ -1462,6 +1466,10 @@ def batch_delivery_qa_errors(
         report = read_json(resolved.get("report", Path("/nonexistent")), None)
         if not isinstance(report, dict) or report.get("status") != "pass":
             errors.append(f"batch item {clip_id or index} QA report is not passing")
+        elif not isinstance(report.get("policy"), dict):
+            errors.append(
+                f"batch item {clip_id or index} QA report predates the enforced QA policy"
+            )
         render_receipt = read_json(
             resolved.get("render_receipt", Path("/nonexistent")),
             None,

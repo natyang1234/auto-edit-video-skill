@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -28,6 +29,21 @@ class QaPolicy:
     allow_missing_audio: bool = False
     min_integrated_lufs: float = -45.0
     max_true_peak_dbfs: float = 0.0
+
+    def __post_init__(self) -> None:
+        # NaN compares false against everything, which would silently disable
+        # a threshold; reject non-finite values outright.
+        for name in (
+            "max_black_segment_seconds",
+            "max_black_ratio",
+            "min_integrated_lufs",
+            "max_true_peak_dbfs",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"QA policy {name} must be a finite number, got {value!r}")
+        if self.max_black_segment_seconds < 0 or self.max_black_ratio < 0:
+            raise ValueError("QA policy black thresholds must be non-negative")
 
 
 def now_utc() -> str:
@@ -69,7 +85,19 @@ def probe(video: Path) -> dict[str, Any]:
     }
 
 
-def black_segments(video: Path) -> list[dict[str, float]]:
+BLACK_DETECT_MIN_SECONDS = 0.02
+BLACK_DETECT_PIXEL_THRESHOLD = 0.10
+
+
+def black_segments(
+    video: Path, min_duration: float = BLACK_DETECT_MIN_SECONDS
+) -> list[dict[str, float]]:
+    """Detect black segments down to roughly two frames.
+
+    The detection floor must stay well below the policy thresholds: coverage
+    is summed from detected segments, so segments shorter than the floor are
+    invisible and fragmented black frames would otherwise evade the gate.
+    """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ValueError("ffmpeg is required")
@@ -81,7 +109,7 @@ def black_segments(video: Path) -> list[dict[str, float]]:
             "-i",
             str(video),
             "-vf",
-            "blackdetect=d=0.5:pix_th=0.10",
+            f"blackdetect=d={min_duration}:pix_th={BLACK_DETECT_PIXEL_THRESHOLD}",
             "-an",
             "-f",
             "null",
@@ -94,7 +122,7 @@ def black_segments(video: Path) -> list[dict[str, float]]:
         r"black_start:(?P<start>[0-9.]+)\s+black_end:(?P<end>[0-9.]+)\s+black_duration:(?P<duration>[0-9.]+)"
     )
     for match in pattern.finditer(text):
-        segments.append({key: round(float(value), 3) for key, value in match.groupdict().items()})
+        segments.append({key: float(value) for key, value in match.groupdict().items()})
     return segments
 
 
@@ -194,7 +222,7 @@ def inspect(
     elif longest_black >= 1.0:
         warnings.append("black segment of at least one second detected")
     if media["duration_s"] > 0:
-        black_ratio = round(sum(item["duration"] for item in blacks) / media["duration_s"], 3)
+        black_ratio = sum(item["duration"] for item in blacks) / media["duration_s"]
         if black_ratio >= policy.max_black_ratio:
             failures.append(
                 f"black frames cover {black_ratio:.1%} of the video, at or above the "
@@ -213,7 +241,10 @@ def inspect(
                 f"{policy.min_integrated_lufs:.1f} LUFS fail threshold (near-silent audio)"
             )
         true_peak = (levels or {}).get("true_peak_dbfs")
-        if true_peak is not None and true_peak > policy.max_true_peak_dbfs:
+        if true_peak is None:
+            if integrated is not None:
+                failures.append("true peak could not be measured (silent or unreadable audio)")
+        elif true_peak > policy.max_true_peak_dbfs:
             failures.append(
                 f"true peak {true_peak:.1f} dBFS is above the "
                 f"{policy.max_true_peak_dbfs:.1f} dBFS fail threshold (clipping)"
@@ -226,6 +257,10 @@ def inspect(
         "status": "pass" if not failures else "fail",
         "media": media,
         "black_segments": blacks,
+        "black_detection": {
+            "min_segment_seconds": BLACK_DETECT_MIN_SECONDS,
+            "pixel_threshold": BLACK_DETECT_PIXEL_THRESHOLD,
+        },
         "loudness": levels,
         "policy": asdict(policy),
         "contact_sheet": str(contact_path),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
 import hashlib
 import http.client
 import json
@@ -28,6 +29,7 @@ RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import editor_server  # noqa: E402
+import qa_video  # noqa: E402
 from editor_server import (  # noqa: E402
     EditorServer,
     caption_effect_spans,
@@ -38,6 +40,10 @@ from editor_server import (  # noqa: E402
     render_download_errors,
     validate_editor_state,
 )
+
+# Mirrors what the policy-enforcing qa_video writes; delivery validation
+# rejects QA reports that lack this block (pre-policy reports).
+SYNTHETIC_QA_POLICY = dataclasses.asdict(qa_video.QaPolicy())
 from render_editor_timeline import build_render_command, text_filter  # noqa: E402
 
 
@@ -563,6 +569,7 @@ class EditorServerTests(unittest.TestCase):
                         {
                             "schema_version": 1,
                             "status": "fail" if qa_failed else "pass",
+                            "policy": SYNTHETIC_QA_POLICY,
                             "warnings": [],
                             "failures": ["synthetic QA failure"] if qa_failed else [],
                         }
@@ -1504,7 +1511,10 @@ class EditorServerTests(unittest.TestCase):
         contact = self.project / "qa/final-test-contact.png"
         render_receipt = self.project / "working/render_receipts/render_delivery_test.json"
         output.write_bytes(b"verified-final-output")
-        self.write_json("qa/final-test-report.json", {"schema_version": 1, "status": "pass"})
+        self.write_json(
+            "qa/final-test-report.json",
+            {"schema_version": 1, "status": "pass", "policy": SYNTHETIC_QA_POLICY},
+        )
         contact.write_bytes(b"\x89PNG\r\n\x1a\nverified-contact")
         self.write_json(
             "working/render_receipts/render_delivery_test.json",
@@ -2023,14 +2033,22 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, _body = self.request("GET", "/renders/mystery.mp4")
         self.assertEqual(status, 403)
 
-    def _install_synthetic_final_delivery(self) -> dict[str, object]:
+    def _install_synthetic_final_delivery(
+        self, report_payload: dict[str, object] | None = None
+    ) -> dict[str, object]:
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
         state = json.loads(body.decode("utf-8"))["state"]
         state_revision = editor_state_revision(state)
         output_bytes = b"approved-final-bytes"
         (self.project / "renders/final-ok.mp4").write_bytes(output_bytes)
-        report_payload = {"status": "pass", "failures": [], "warnings": []}
+        if report_payload is None:
+            report_payload = {
+                "status": "pass",
+                "policy": SYNTHETIC_QA_POLICY,
+                "failures": [],
+                "warnings": [],
+            }
         report_text = json.dumps(report_payload, ensure_ascii=False, indent=2) + "\n"
         (self.project / "qa/final-ok.json").write_text(report_text, encoding="utf-8")
         contact_bytes = b"contact-sheet-bytes"
@@ -2078,6 +2096,19 @@ class EditorServerTests(unittest.TestCase):
         }
         self.write_json("project.json", manifest)
         return state
+
+    def test_pre_policy_qa_report_blocks_final_download(self) -> None:
+        # A hash-consistent delivery whose QA report predates the enforced
+        # QaPolicy (no "policy" block) must not unlock the final download.
+        state = self._install_synthetic_final_delivery(
+            report_payload={"status": "pass", "failures": [], "warnings": []}
+        )
+        errors = editor_server.delivery_qa_errors(self.project, state)
+        self.assertTrue(
+            any("predates the enforced QA policy" in item for item in errors), errors
+        )
+        status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
+        self.assertEqual(status, 403)
 
     def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:
         (self.project / "qa/stale-old.json").write_text(

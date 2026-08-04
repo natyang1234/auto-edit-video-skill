@@ -108,6 +108,110 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertFalse(ok, "default policy must fail a fully black final")
 
+    def test_fragmented_black_frames_cannot_evade_the_ratio_gate(self) -> None:
+        # 0.45s black pulses every 0.5s: ~90% black overall, yet every segment
+        # stays under the 0.5s blackdetect floor the gate previously relied on.
+        video = self.dir / "strobe-black.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=320x240:r=30:d=4,"
+            "geq=lum='if(lt(mod(T,0.5),0.45),16,235)':cb=128:cr=128",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "fragmented black frames must not evade the coverage gate")
+        self.assertTrue(
+            any("black frames cover" in item for item in report["failures"]),
+            report["failures"],
+        )
+
+    def test_short_fully_black_video_fails(self) -> None:
+        video = self.dir / "short-black.mp4"
+        make_video(
+            video,
+            video_source="color=c=black",
+            audio_source="sine=frequency=440",
+            duration=0.4,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a fully black clip under 0.5s must still fail")
+
+    def test_non_finite_policy_values_are_rejected(self) -> None:
+        for field in (
+            "max_black_segment_seconds",
+            "max_black_ratio",
+            "min_integrated_lufs",
+            "max_true_peak_dbfs",
+        ):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with self.assertRaises(ValueError, msg=f"{field}={bad}"):
+                    qa_video.QaPolicy(**{field: bad})
+
+        video = self.dir / "nan-flags.mp4"
+        make_video(video, video_source="color=c=black", audio_source=None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "qa_video.py"),
+                "--video",
+                str(video),
+                "--report",
+                str(self.dir / "nan-report.json"),
+                "--contact",
+                str(self.dir / "nan-contact.png"),
+                "--max-black-segment-seconds",
+                "nan",
+                "--max-black-ratio",
+                "nan",
+                "--allow-missing-audio",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0, "NaN thresholds must not produce a pass")
+        self.assertNotIn('"status": "pass"', result.stdout)
+
+    def test_true_peak_clipping_and_unmeasured_peak_fail(self) -> None:
+        video = self.dir / "peak-check.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        from unittest.mock import patch
+
+        with patch.object(
+            qa_video, "loudness", return_value={"integrated_lufs": -14.0, "true_peak_dbfs": 0.5}
+        ):
+            report, ok = self.inspect(video)
+        self.assertFalse(ok)
+        self.assertTrue(any("clipping" in item for item in report["failures"]), report["failures"])
+
+        with patch.object(qa_video, "loudness", return_value={"integrated_lufs": -14.0}):
+            report, ok = self.inspect(video)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("true peak could not be measured" in item for item in report["failures"]),
+            report["failures"],
+        )
+
     def test_cli_exit_codes_and_flags(self) -> None:
         bad = self.dir / "cli-black-silent.mp4"
         make_video(bad, video_source="color=c=black", audio_source="anullsrc=r=48000:cl=stereo")
