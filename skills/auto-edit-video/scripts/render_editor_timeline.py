@@ -857,9 +857,12 @@ def render_project(
         clip = None
         if quality == "final":
             approval = manifest.get("approvals", {}).get("timeline", {})
+            from editor_server import gate_revision
+
             if (
                 not approval.get("approved")
-                or approval.get("state_revision") != editor_state_revision(state)
+                or approval.get("state_revision")
+                != gate_revision(project_dir, "timeline", state)
             ):
                 raise ValueError("current timeline revision must be approved before final render")
     else:

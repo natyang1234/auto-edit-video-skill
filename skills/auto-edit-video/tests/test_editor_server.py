@@ -2260,7 +2260,7 @@ class EditorRendererTests(unittest.TestCase):
         )
         manifest["approvals"]["timeline"] = {
             "approved": True,
-            "state_revision": editor_state_revision(state),
+            "state_revision": gate_revision(self.project, "timeline", state),
         }
         self.write_json("project.json", manifest)
         self.run_renderer("--quality", "final", "--output", str(final))

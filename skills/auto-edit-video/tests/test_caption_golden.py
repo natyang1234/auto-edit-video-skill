@@ -23,7 +23,7 @@ SCRIPTS = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import caption_compositor  # noqa: E402
-from editor_server import editor_state_revision  # noqa: E402
+from editor_server import gate_revision  # noqa: E402
 from render_editor_timeline import ffmpeg_path  # noqa: E402
 
 BG = (62, 62, 62)  # 0x3E3E3E flat background
@@ -207,7 +207,7 @@ class CaptionGoldenTests(unittest.TestCase):
             manifest["approvals"] = {
                 "timeline": {
                     "approved": True,
-                    "state_revision": editor_state_revision(state),
+                    "state_revision": gate_revision(self.project, "timeline", state),
                 }
             }
             (self.project / "project.json").write_text(json.dumps(manifest), "utf-8")
