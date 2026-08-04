@@ -166,6 +166,7 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         "schema_version": state.get("schema_version"),
         "project_id": state.get("project_id"),
         "segments": state.get("segments"),
+        "style_pack": state.get("style_pack"),
         "canvas": {
             key: canvas.get(key)
             for key in ("platform_id", "width", "height", "fps", "fit")
@@ -521,22 +522,39 @@ VISUAL_PLAN_REL = Path("working/visual_plan_v2.json")
 LAYER_TXN_JOURNAL_REL = Path("working/.layer-txn-journal.json")
 
 
+_LAYER_TXN_LOCK = threading.Lock()
+
+
 def recover_layer_transaction(project_dir: Path) -> None:
     """Roll an interrupted layer transaction FORWARD from its journal.
 
-    The journal stores the full new contents of every file in the
-    transaction, so recovery is always deterministic: rewrite, then clear.
+    The journal stores the full new contents AND target hashes. It is only
+    cleared after every file verifiably matches its target hash; any failure
+    keeps the journal (the only recovery data) and fails closed.
     """
     journal_path = project_dir / LAYER_TXN_JOURNAL_REL
     if not journal_path.is_file():
         return
-    try:
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        for rel, content in (journal.get("files") or {}).items():
-            atomic_write_json(project_dir / rel, content)
-    except (ValueError, OSError):
-        pass
-    journal_path.unlink(missing_ok=True)
+    with _LAYER_TXN_LOCK:
+        if not journal_path.is_file():
+            return
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            files = journal.get("files") or {}
+            hashes = journal.get("hashes") or {}
+            for rel, content in files.items():
+                atomic_write_json(project_dir / rel, content)
+            for rel in files:
+                written = read_json(project_dir / rel, None)
+                expected = hashes.get(rel)
+                if expected is not None and canonical_revision(written) != expected:
+                    raise OSError(f"layer txn recovery verification failed for {rel}")
+        except (ValueError, OSError) as exc:
+            raise RuntimeError(
+                "layer transaction journal could not be recovered; the journal "
+                f"was kept for manual inspection: {exc}"
+            ) from exc
+        journal_path.unlink(missing_ok=True)
 
 
 def publish_layer_bundle(
@@ -558,17 +576,26 @@ def publish_layer_bundle(
     errors = contract_registry.validate_bundle(bundle)
     if errors:
         raise ValueError("layer bundle rejected: " + "; ".join(errors))
+    files = {
+        LAYERS_REL.as_posix(): layers,
+        VISUAL_PLAN_REL.as_posix(): visual_plan,
+    }
     journal = {
         "generation": now_utc(),
-        "files": {
-            LAYERS_REL.as_posix(): layers,
-            VISUAL_PLAN_REL.as_posix(): visual_plan,
-        },
+        "files": files,
+        "hashes": {rel: canonical_revision(content) for rel, content in files.items()},
     }
-    atomic_write_json(project_dir / LAYER_TXN_JOURNAL_REL, journal)
-    atomic_write_json(project_dir / LAYERS_REL, layers)
-    atomic_write_json(project_dir / VISUAL_PLAN_REL, visual_plan)
-    (project_dir / LAYER_TXN_JOURNAL_REL).unlink(missing_ok=True)
+    with _LAYER_TXN_LOCK:
+        atomic_write_json(project_dir / LAYER_TXN_JOURNAL_REL, journal)
+        for rel, content in files.items():
+            atomic_write_json(project_dir / rel, content)
+        for rel, content in files.items():
+            if canonical_revision(read_json(project_dir / rel, None)) != journal["hashes"][rel]:
+                raise RuntimeError(
+                    f"layer bundle publish verification failed for {rel}; "
+                    "journal kept for recovery"
+                )
+        (project_dir / LAYER_TXN_JOURNAL_REL).unlink(missing_ok=True)
 
 
 def load_layer_bundle(project_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -654,30 +681,68 @@ def variant_state_for(state: dict[str, Any], variant_id: str) -> dict[str, Any]:
     return shaped
 
 
+def compute_variant_snapshot(
+    project_dir: Path,
+    state: dict[str, Any],
+    variant_id: str,
+) -> dict[str, Any]:
+    """Frozen render identity for a variant (plan v2 B2) — PURE computation.
+
+    Pins every render input identity: editor state, layer bundle, evidence,
+    resolved pack, canvas, caption plan content revision and compiler
+    versions. Gates hash this; renders re-derive and compare.
+    """
+    import caption_compositor
+    import structured_card_compositor
+
+    shaped = variant_state_for(state, variant_id)
+    layers, visual_plan = load_layer_bundle(project_dir)
+    evidence = read_json(project_dir / "working/evidence_map.json", None)
+    caption_identity = None
+    if caption_compositor.compositor_available():
+        caption_identity = caption_compositor.caption_content_revision(
+            shaped, shaped.get("canvas") or {}, 1.0
+        )
+    snapshot = {
+        "schema_version": 2,
+        "variant_id": variant_id,
+        "editor_state_revision": editor_state_revision(shaped),
+        "structured_layers": canonical_revision(layers),
+        "layer_hashes": {
+            str(layer.get("id")): canonical_revision(layer)
+            for layer in layers.get("items", [])
+        },
+        "visual_plan_v2": canonical_revision(visual_plan),
+        "evidence_map_revision": (evidence or {}).get("revision"),
+        "style_pack": shaped.get("style_pack"),
+        "caption_content_revision": caption_identity,
+        "compilers": {
+            "caption": caption_compositor.engine_descriptor(),
+            "structured": structured_card_compositor.capability_status(),
+        },
+        "canvas": shaped.get("canvas"),
+    }
+    snapshot["snapshot_hash"] = canonical_revision(snapshot)
+    return snapshot
+
+
+def persist_variant_snapshot(
+    project_dir: Path, snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    snapshot_dir = project_dir / VARIANT_SNAPSHOTS_REL
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(snapshot_dir / f"{snapshot['variant_id']}.json", snapshot)
+    return snapshot
+
+
 def build_variant_snapshot(
     project_dir: Path,
     state: dict[str, Any],
     variant_id: str,
 ) -> dict[str, Any]:
-    """Frozen render identity for a variant (plan v2 B2) — gates hash THIS."""
-    shaped = variant_state_for(state, variant_id)
-    layers, visual_plan = load_layer_bundle(project_dir)
-    evidence = read_json(project_dir / "working/evidence_map.json", None)
-    snapshot = {
-        "schema_version": 1,
-        "variant_id": variant_id,
-        "editor_state_revision": editor_state_revision(shaped),
-        "structured_layers": canonical_revision(layers),
-        "visual_plan_v2": canonical_revision(visual_plan),
-        "evidence_map_revision": (evidence or {}).get("revision"),
-        "style_pack": shaped.get("style_pack"),
-        "canvas": shaped.get("canvas"),
-    }
-    snapshot["snapshot_hash"] = canonical_revision(snapshot)
-    snapshot_dir = project_dir / VARIANT_SNAPSHOTS_REL
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(snapshot_dir / f"{variant_id}.json", snapshot)
-    return snapshot
+    return persist_variant_snapshot(
+        project_dir, compute_variant_snapshot(project_dir, state, variant_id)
+    )
 
 
 def variant_gate_revision(
@@ -686,7 +751,7 @@ def variant_gate_revision(
     state: dict[str, Any],
     variant_id: str,
 ) -> str:
-    snapshot = build_variant_snapshot(project_dir, state, variant_id)
+    snapshot = compute_variant_snapshot(project_dir, state, variant_id)
     if gate == "timeline":
         return snapshot["snapshot_hash"]
     if gate == "final":
@@ -766,6 +831,10 @@ def referenced_render_inputs(
     for overlay in state.get("overlays", []):
         if isinstance(overlay, dict) and overlay.get("type") in {"image", "gif", "video"}:
             add(str(overlay.get("source") or ""), "overlay-asset")
+    template = state.get("video_template") or {}
+    background = template.get("background") or {}
+    if isinstance(background, dict) and background.get("asset"):
+        add(str(background["asset"]), "template-background")
     _layers, visual_plan = load_layer_bundle(project_dir)
     for item in visual_plan.get("items", []):
         if item.get("selected_asset"):

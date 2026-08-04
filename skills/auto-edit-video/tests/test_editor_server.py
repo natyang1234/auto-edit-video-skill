@@ -2977,6 +2977,47 @@ class EditorRendererTests(unittest.TestCase):
             (self.project / "working/delivery_qa/portrait-main.json").exists()
         )
 
+        # full lifecycle: final approve AFTER render (receipt-bound), then
+        # the download gate opens for exactly this variant
+        state_on_disk = json.loads(
+            (self.project / "working/editor_state.json").read_text("utf-8")
+        )
+        final_revision = editor_server.variant_gate_revision(
+            self.project, "final", state_on_disk, "landscape-yt"
+        )
+        manifest = json.loads((self.project / "project.json").read_text("utf-8"))
+        manifest["approvals"]["final_by_variant"] = {
+            "landscape-yt": {"approved": True, "state_revision": final_revision}
+        }
+        self.write_json("project.json", manifest)
+        self.assertEqual(
+            editor_server.render_download_errors(
+                self.project, "renders/landscape-final.mp4"
+            ),
+            [],
+            "approved variant final must be downloadable",
+        )
+        # the OTHER (unapproved) variant path stays gated
+        errors = editor_server.render_download_errors(
+            self.project, "renders/portrait-main.mp4"
+        )
+        # portrait preview is a preview receipt-less CLI render output — not
+        # covered by any receipt → fail closed
+        self.assertTrue(errors)
+
+        # probe height too: landscape final must actually be 1920x1080
+        probe = subprocess.run(
+            [
+                shutil.which("ffprobe") or "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                str(self.project / "renders/landscape-final.mp4"),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(probe.stdout.strip(), "1920x1080")
+
         # master edit → variant approval stale
         state["overlays"][0]["style"]["font_size"] = 46
         self.write_json("working/editor_state.json", state)
@@ -2988,4 +3029,10 @@ class EditorRendererTests(unittest.TestCase):
                 self.project, manifest, "timeline", fresh, "landscape-yt"
             ),
             "editing the master must invalidate variant approvals",
+        )
+        self.assertTrue(
+            editor_server.render_download_errors(
+                self.project, "renders/landscape-final.mp4"
+            ),
+            "master edit must re-lock the variant download",
         )

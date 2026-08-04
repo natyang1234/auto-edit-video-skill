@@ -532,9 +532,16 @@ def build_render_command(
                     "unavailable on this host; final would silently lose content"
                 )
         else:
+            selection = state.get("style_pack") or {}
+            if selection.get("project_default") or selection.get("per_highlight"):
+                resolved_pack = structured_card_compositor.load_default_pack()
+            else:
+                # No pack selected: cards render with the compositor's own
+                # fallback tokens; an empty pack keeps the hash distinct so
+                # selecting a pack later verifiably re-renders.
+                resolved_pack = {"id": "none", "tokens": {}}
             artifacts_index = structured_card_compositor.build_structured_artifacts(
-                project_dir, state, layers_bundle,
-                structured_card_compositor.load_default_pack(), render_scale,
+                project_dir, state, layers_bundle, resolved_pack, render_scale,
             )
             key = structured_card_compositor.canvas_key(canvas, render_scale)
             artifact_by_layer = {
@@ -857,19 +864,29 @@ def render_project(
             )
         clip = None
         if variant_id:
-            from editor_server import variant_approval_is_current, variant_state_for
+            from editor_server import (
+                build_variant_snapshot,
+                rights_gate_errors,
+                variant_approval_is_current,
+                variant_state_for,
+            )
 
-            if quality == "final" and not variant_approval_is_current(
-                project_dir, manifest, "timeline", state, variant_id
-            ):
-                raise ValueError(
-                    f"variant {variant_id}: current timeline snapshot must be "
-                    "approved before final render"
-                )
+            if quality == "final":
+                if not variant_approval_is_current(
+                    project_dir, manifest, "timeline", state, variant_id
+                ):
+                    raise ValueError(
+                        f"variant {variant_id}: current timeline snapshot must be "
+                        "approved before final render"
+                    )
+                rights_errors = rights_gate_errors(project_dir, state)
+                if rights_errors:
+                    raise ValueError("rights gate: " + "; ".join(rights_errors))
+                build_variant_snapshot(project_dir, state, variant_id)
             state = variant_state_for(state, variant_id)
         elif quality == "final":
             approval = manifest.get("approvals", {}).get("timeline", {})
-            from editor_server import gate_revision
+            from editor_server import gate_revision, rights_gate_errors
 
             if (
                 not approval.get("approved")
@@ -877,6 +894,9 @@ def render_project(
                 != gate_revision(project_dir, "timeline", state)
             ):
                 raise ValueError("current timeline revision must be approved before final render")
+            rights_errors = rights_gate_errors(project_dir, state)
+            if rights_errors:
+                raise ValueError("rights gate: " + "; ".join(rights_errors))
     else:
         manifest, state, clip = load_render_snapshot(project_dir, snapshot_path, quality)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -941,16 +961,56 @@ def render_project(
             raise RuntimeError("ffmpeg render timed out") from exc
         if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
             raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
-        os.replace(temporary, output)
         if variant_id and quality == "final":
-            write_variant_delivery_receipt(project_dir, state, output, variant_id)
+            # QA runs on the temporary output; only a passing QA publishes
+            # the file + receipt together (no receipt-less final on disk).
+            receipt = qa_variant_output(project_dir, temporary, variant_id)
+            os.replace(temporary, output)
+            finalize_variant_delivery_receipt(project_dir, receipt, output, variant_id)
+        else:
+            os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def write_variant_delivery_receipt(
+def qa_variant_output(
+    project_dir: Path, candidate: Path, variant_id: str
+) -> dict[str, Any]:
+    """Run QA on the still-unpublished output; raise before anything lands."""
+    qa_dir = project_dir / "qa"
+    qa_dir.mkdir(exist_ok=True)
+    report_path = qa_dir / f"variant-{variant_id}.json"
+    contact_path = qa_dir / f"variant-{variant_id}-contact.png"
+    qa_result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("qa_video.py")),
+            "--video", str(candidate),
+            "--report", str(report_path),
+            "--contact", str(contact_path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if qa_result.returncode != 0:
+        report_path.unlink(missing_ok=True)
+        contact_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "variant QA failed; final output was NOT published: "
+            + (qa_result.stderr or qa_result.stdout)[-2000:]
+        )
+    return {
+        "report": report_path.relative_to(project_dir).as_posix(),
+        "report_sha256": file_sha256(report_path),
+        "contact_sheet": contact_path.relative_to(project_dir).as_posix(),
+        "contact_sheet_sha256": file_sha256(contact_path),
+        "output_sha256": file_sha256(candidate),
+    }
+
+
+def finalize_variant_delivery_receipt(
     project_dir: Path,
-    shaped_state: dict[str, Any],
+    qa_receipt: dict[str, Any],
     output: Path,
     variant_id: str,
 ) -> None:
@@ -962,24 +1022,6 @@ def write_variant_delivery_receipt(
         read_json as server_read_json,
     )
 
-    qa_dir = project_dir / "qa"
-    qa_dir.mkdir(exist_ok=True)
-    report_path = qa_dir / f"variant-{variant_id}.json"
-    qa_result = subprocess.run(
-        [
-            sys.executable,
-            str(Path(__file__).with_name("qa_video.py")),
-            "--video", str(output),
-            "--report", str(report_path),
-            "--contact", str(qa_dir / f"variant-{variant_id}-contact.png"),
-        ],
-        text=True,
-        capture_output=True,
-    )
-    if qa_result.returncode != 0:
-        raise RuntimeError(
-            "variant QA failed: " + (qa_result.stderr or qa_result.stdout)[-2000:]
-        )
     snapshot = server_read_json(
         project_dir / VARIANT_SNAPSHOTS_REL / f"{variant_id}.json", {}
     )
@@ -990,9 +1032,7 @@ def write_variant_delivery_receipt(
         "snapshot_hash": (snapshot or {}).get("snapshot_hash"),
         "status": "pass",
         "output": output.relative_to(project_dir).as_posix(),
-        "output_sha256": file_sha256(output),
-        "report": report_path.relative_to(project_dir).as_posix(),
-        "report_sha256": file_sha256(report_path),
+        **qa_receipt,
     }
     delivery_dir = project_dir / VARIANT_DELIVERY_REL
     delivery_dir.mkdir(parents=True, exist_ok=True)
