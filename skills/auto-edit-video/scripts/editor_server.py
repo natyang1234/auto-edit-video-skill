@@ -432,7 +432,10 @@ def _variant_report_errors(
     if not isinstance(report, dict) or report.get("status") != "pass":
         return [f"variant {variant_id} QA report is not passing"]
     if not isinstance(report.get("policy"), dict):
-        return [f"variant {variant_id} QA report predates the enforced QA policy"]
+        return [
+            f"variant {variant_id} QA report predates the enforced QA policy; "
+            "render the variant again"
+        ]
     return []
 
 
@@ -1364,7 +1367,7 @@ def single_delivery_qa_errors(
         errors.append("delivery QA report is missing a passing status")
     elif not isinstance(report.get("policy"), dict):
         errors.append(
-            "delivery QA report predates the enforced QA policy; re-run the final render QA"
+            "delivery QA report predates the enforced QA policy; render the final again"
         )
     render_receipt = read_json(resolved.get("render_receipt", Path("/nonexistent")), None)
     if not isinstance(render_receipt, dict):
@@ -1502,7 +1505,7 @@ def batch_delivery_qa_errors(
             errors.append(f"batch item {clip_id or index} QA report is not passing")
         elif not isinstance(report.get("policy"), dict):
             errors.append(
-                f"batch item {clip_id or index} QA report predates the enforced QA policy"
+                f"batch item {clip_id or index} QA report predates the enforced QA policy; render the batch again"
             )
         render_receipt = read_json(
             resolved.get("render_receipt", Path("/nonexistent")),

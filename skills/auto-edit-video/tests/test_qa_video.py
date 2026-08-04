@@ -913,6 +913,156 @@ class QaVideoGateTest(unittest.TestCase):
             report["failures"],
         )
 
+    def test_truncated_delivery_fails(self) -> None:
+        # ffmpeg reports success on a truncated file, so a delivery that lost
+        # half its length would otherwise be judged as a clean shorter one.
+        source = self.dir / "full-length.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=10",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                # Header first, so a truncated copy still parses — which is
+                # exactly the case that must not read as a shorter delivery.
+                "-movflags",
+                "+faststart",
+                "-shortest",
+                str(source),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        video = self.dir / "truncated.mp4"
+        data = source.read_bytes()
+        video.write_bytes(data[: len(data) // 2])
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a delivery that stops early must fail")
+        self.assertTrue(
+            any("truncated" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_ordinary_delivery_is_not_reported_as_truncated(self) -> None:
+        # The truncation check compares two independent readings of length;
+        # ordinary encodings must not drift far enough apart to trip it.
+        for name, rate in (("cfr-30.mp4", "30"), ("cfr-2997.mp4", "30000/1001")):
+            with self.subTest(name):
+                video = self.dir / name
+                subprocess.run(
+                    [
+                        FFMPEG,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"testsrc=size=320x240:rate={rate}:duration=6",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:duration=6",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-g",
+                        "120",
+                        "-c:a",
+                        "aac",
+                        "-movflags",
+                        "+faststart",
+                        "-shortest",
+                        str(video),
+                    ],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                report, ok = self.inspect(video)
+                self.assertTrue(ok, f"{name} must pass: {report['failures']}")
+
+    def test_a_second_audio_track_is_ambiguous(self) -> None:
+        video = self.dir / "two-audio-streams.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo:d=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:a",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a second soundtrack makes the delivery ambiguous")
+        self.assertTrue(
+            any("ambiguous" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_clean_delivery_reports_no_dead_air(self) -> None:
+        # Window counting must not invent a trailing gap on a delivery that
+        # carries sound throughout.
+        video = self.dir / "clean-audio.mp4"
+        make_video(
+            video, video_source="testsrc", audio_source="sine=frequency=440", duration=5
+        )
+        report, ok = self.inspect(video)
+        self.assertTrue(ok, report["failures"])
+        self.assertEqual(report["silence"]["silent_seconds"], 0.0)
+        self.assertEqual(report["silence"]["unmeasured_seconds"], 0.0)
+
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal
         # delivery, not a dropout.

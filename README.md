@@ -278,10 +278,18 @@ python3 "$SKILL/scripts/qa_video.py" \
   --video /absolute/path/project/renders/final.mp4
 ```
 
-QA fails closed on black-frame coverage, missing or near-silent audio, and
-clipping; each threshold can be relaxed explicitly via
-`--max-black-segment-seconds`, `--max-black-ratio`, `--allow-missing-audio`,
-`--min-integrated-lufs`, and `--max-true-peak-dbfs`.
+QA fails closed on black-frame coverage, on audio that is missing, silent,
+dropping out or clipping, and on a delivery that decodes shorter than it
+claims or carries more than one picture or soundtrack. Each threshold can be
+relaxed explicitly: `--max-black-segment-seconds`, `--max-black-ratio`,
+`--allow-missing-audio`, `--min-integrated-lufs`, `--max-true-peak-dbfs`,
+`--max-silent-ratio`, `--max-silent-run-ratio`, `--max-silent-run-seconds`,
+`--min-silent-run-seconds`, `--min-audible-ratio`.
+
+Those flags apply to this command only. Renders started from the Studio run
+QA with the built-in defaults and no per-project override, and a final that
+fails QA is not published — a deliberately silent delivery cannot currently
+be rendered there.
 Final approval is a separate human gate after QA and visual inspection.
 
 ## Optional integration discovery

@@ -12,7 +12,20 @@
   3. 請求的 canonical relative path 出現在 current delivery receipt
      （single：`output`；batch：各 item `output`；ZIP：`archive`）；
   4. 磁碟檔 SHA-256 等於 receipt 記載值（`output_sha256`／`archive_sha256`）。
+- **variant 產物**（`working/delivery_qa/<variant_id>.json` 有對應 receipt）走自己的
+  核可槽，條件同上但以該 variant 為 scope：`variant_approval_is_current()` 成立、
+  輸出檔 SHA-256 等於 receipt 的 `output_sha256`，再加下面第五條。
 - 無法歸類（不在任何 receipt、也非 preview 命名）→ **fail closed 403**。
+
+### 第五條：QA report 必須經得起重驗（2026-08-05 新增）
+三條路（single／batch／variant）在放行前都要重讀 receipt 指向的 QA report，全部成立才過：
+- 路徑經 `scoped_project_path(..., "qa")` 解析，**拒絕 symlink（含中繼目錄）**、
+  絕對路徑、`..`、以及 `qa/` 以外的位置；
+- 檔案 SHA-256 等於 receipt 的 `report_sha256`；
+- `status == "pass"`；
+- **含 `policy` 區塊**——這是強制門檻上線前的舊報告與之後的分界。
+  舊專案會被擋下，補救是**重新 render**（只重跑 `qa_video.py` 會讓報告位元組改變、
+  `report_sha256` 對不上 receipt，撞到另一個錯誤）。
 
 ## /qa/ 規則
 - final approval 尚未成立：可讀（人要先看 QA 才核可）。

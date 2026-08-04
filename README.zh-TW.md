@@ -186,9 +186,16 @@ python3 "$SKILL/scripts/qa_video.py" \
   --video /專案/絕對路徑/renders/final.mp4
 ```
 
-QA 對黑幕覆蓋、缺音軌／近無聲與爆音一律 fail closed；門檻可用
+QA 對黑幕覆蓋、缺音軌／近無聲／中途斷音／爆音，以及「解碼長度短於宣告長度」
+與「含一條以上畫面或聲軌」一律 fail closed；門檻可逐項明示放寬：
 `--max-black-segment-seconds`、`--max-black-ratio`、`--allow-missing-audio`、
-`--min-integrated-lufs`、`--max-true-peak-dbfs` 逐項明示放寬。
+`--min-integrated-lufs`、`--max-true-peak-dbfs`、`--max-silent-ratio`、
+`--max-silent-run-ratio`、`--max-silent-run-seconds`、`--min-silent-run-seconds`、
+`--min-audible-ratio`。
+
+⚠️ 這些旗標只作用於手動執行本指令。**從 Studio 發起的 render 一律使用內建預設值、
+沒有 per-project 放寬管道**，且 QA 不過的 final 不會發佈——刻意無聲的成品目前在
+Studio 裡渲染不出來。
 通過 QA 與人工畫面檢查後，仍須另取得 final 核准。
 
 ## 選配整合探索

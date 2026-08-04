@@ -253,9 +253,6 @@ AUDIBLE_RELATIVE_LU = 25.0
 AUDIBLE_ABSOLUTE_LUFS = -50.0
 # ebur128 reports momentary loudness every 100ms.
 MOMENTARY_WINDOW_SECONDS = 0.1
-# A silence this long is a dropout rather than a pause; counting how many
-# there are separates a quiet ending from a soundtrack that keeps cutting out.
-LONG_SILENT_RUN_SECONDS = 3.5
 # EBU R128 integrates over 400ms, so shorter clips always measure -70 LUFS;
 # they are judged on peak level instead.
 LOUDNESS_MIN_MEASURABLE_SECONDS = 0.4
@@ -323,10 +320,10 @@ def silent_coverage(
     # Momentary loudness integrates over 400ms, so the opening windows always
     # read near-silent while the measurement fills; counting them invents a
     # leading silent run and swamps a short delivery.
-    ramp = int(LOUDNESS_MIN_MEASURABLE_SECONDS / MOMENTARY_WINDOW_SECONDS)
+    ramp = round(LOUDNESS_MIN_MEASURABLE_SECONDS / MOMENTARY_WINDOW_SECONDS)
     # Audio running past the picture is not part of the delivery and must not
     # dilute the dead air inside it.
-    limit = ramp + max(0, int((duration - LOUDNESS_MIN_MEASURABLE_SECONDS) / MOMENTARY_WINDOW_SECONDS))
+    limit = ramp + max(0, round((duration - LOUDNESS_MIN_MEASURABLE_SECONDS) / MOMENTARY_WINDOW_SECONDS))
     windows = windows[ramp:limit]
     threshold = (
         integrated - AUDIBLE_RELATIVE_LU
@@ -362,9 +359,6 @@ def silent_coverage(
         "audible_threshold_lufs": threshold,
         "measured_seconds": measured,
         "unmeasured_seconds": uncovered,
-        "long_silent_runs": float(
-            sum(1 for item in runs if item >= LONG_SILENT_RUN_SECONDS)
-        ),
     }
 
 
