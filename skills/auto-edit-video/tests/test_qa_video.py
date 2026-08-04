@@ -334,6 +334,108 @@ class QaVideoGateTest(unittest.TestCase):
             any("silent" in item for item in report["failures"]), report["failures"]
         )
 
+    def make_audio_shaped_video(self, name: str, volume_expr: str, duration: float) -> Path:
+        video = self.dir / name
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"testsrc=size=320x240:rate=30:duration={duration}",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency=440:sample_rate=48000:duration={duration}",
+                "-af",
+                f"volume='{volume_expr}':eval=frame",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return video
+
+    def test_long_dead_air_fails_even_when_proportionally_small(self) -> None:
+        # 20s delivery losing audio at 13s: 35% of the timeline, under any
+        # proportional limit, but seven unbroken seconds of dead air.
+        video = self.make_audio_shaped_video(
+            "long-dead-air.mp4", "if(lt(t,13),0.3,0)", 20
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "seven seconds of unbroken dead air must fail")
+        self.assertTrue(
+            any("unbroken" in item for item in report["failures"]), report["failures"]
+        )
+
+    def test_sparse_audio_fails_even_when_each_gap_is_short(self) -> None:
+        # Sound for 1.5s out of every 8s: no single gap is large and total
+        # coverage stays under the blanket limit, yet the delivery is silent
+        # for four fifths of its length.
+        video = self.make_audio_shaped_video(
+            "sparse-audio.mp4", "if(lt(mod(t,8),1.5),0.3,0)", 24
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a mostly silent delivery must fail")
+        self.assertTrue(
+            any("carries sound" in item or "silent" in item for item in report["failures"]),
+            report["failures"],
+        )
+
+    def test_short_clip_clipping_still_fails(self) -> None:
+        video = self.dir / "short-clipping.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=0.3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=997:sample_rate=48000:duration=0.3,volume=10",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a clipping short clip must fail on peak level")
+        self.assertTrue(
+            any("clipping" in item for item in report["failures"]), report["failures"]
+        )
+
     def test_narration_with_pauses_is_not_flagged(self) -> None:
         # Repeated short gaps are normal pacing, not a dropout.
         video = self.dir / "narration-pauses.mp4"

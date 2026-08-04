@@ -34,8 +34,15 @@ class QaPolicy:
     # catches that; normal pacing leaves well under this share silent.
     max_silent_ratio: float = 0.8
     # One unbroken silent stretch this large means the audio stopped rather
-    # than paused, which total coverage alone lets through.
-    max_silent_run_ratio: float = 0.5
+    # than paused, which total coverage alone lets through. The absolute
+    # limit matters because a proportional one lets a long delivery swallow
+    # arbitrarily long dead air.
+    max_silent_run_ratio: float = 0.4
+    max_silent_run_seconds: float = 6.0
+    # Floor on how much of the timeline actually carries sound. Without it,
+    # silence chopped into runs that each stay under the limits adds up to a
+    # near-silent delivery that no other threshold catches.
+    min_audible_ratio: float = 0.25
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_missing_audio, bool):
@@ -51,6 +58,8 @@ class QaPolicy:
             "max_true_peak_dbfs",
             "max_silent_ratio",
             "max_silent_run_ratio",
+            "max_silent_run_seconds",
+            "min_audible_ratio",
         ):
             value = getattr(self, name)
             if (
@@ -64,6 +73,8 @@ class QaPolicy:
             or self.max_black_ratio < 0
             or self.max_silent_ratio < 0
             or self.max_silent_run_ratio < 0
+            or self.max_silent_run_seconds < 0
+            or self.min_audible_ratio < 0
         ):
             raise ValueError("QA policy coverage thresholds must be non-negative")
 
@@ -199,11 +210,13 @@ def silent_coverage(video: Path, duration: float) -> dict[str, float] | None:
         runs.append(max(0.0, duration - starts[-1]))
     total = sum(runs)
     longest = max(runs, default=0.0)
+    silent_ratio = min(total / duration, 1.0)
     return {
         "silent_seconds": total,
-        "silent_ratio": min(total / duration, 1.0),
+        "silent_ratio": silent_ratio,
         "longest_silent_seconds": longest,
         "longest_silent_ratio": min(longest / duration, 1.0),
+        "audible_ratio": max(0.0, 1.0 - silent_ratio),
     }
 
 
@@ -330,23 +343,33 @@ def inspect(
                 f"audio is silent for {silence['silent_ratio']:.1%} of the video, at or above "
                 f"the {policy.max_silent_ratio:.1%} fail threshold (truncated or missing audio)"
             )
-        elif silence["longest_silent_ratio"] >= policy.max_silent_run_ratio:
+        elif (
+            silence["longest_silent_ratio"] >= policy.max_silent_run_ratio
+            or silence["longest_silent_seconds"] >= policy.max_silent_run_seconds
+        ):
             failures.append(
                 f"audio is silent for an unbroken {silence['longest_silent_seconds']:.1f}s "
                 f"({silence['longest_silent_ratio']:.1%} of the video), at or above the "
-                f"{policy.max_silent_run_ratio:.1%} fail threshold (audio stopped)"
+                f"{policy.max_silent_run_ratio:.1%} / {policy.max_silent_run_seconds:.1f}s "
+                f"fail thresholds (audio stopped)"
             )
-    if audio and short_clip:
-        # Too short for R128; judge on peak level so brief clips are neither
-        # falsely failed nor waved through.
-        peak = peak_level_dbfs(video)
-        if peak is None or peak < policy.min_integrated_lufs:
+        elif silence["audible_ratio"] < policy.min_audible_ratio:
             failures.append(
-                "clip is too short to measure loudness and its peak level is silent"
+                f"only {silence['audible_ratio']:.1%} of the video carries sound, below the "
+                f"{policy.min_audible_ratio:.1%} minimum (audio is mostly missing)"
             )
-    elif audio:
+    if audio:
         integrated = (levels or {}).get("integrated_lufs")
-        if integrated is None:
+        true_peak = (levels or {}).get("true_peak_dbfs")
+        if short_clip:
+            # Too short for R128; judge level on the sample peak so brief
+            # clips are neither falsely failed nor waved through.
+            peak = peak_level_dbfs(video)
+            if peak is None or peak < policy.min_integrated_lufs:
+                failures.append(
+                    "clip is too short to measure loudness and its peak level is silent"
+                )
+        elif integrated is None:
             failures.append(
                 "integrated loudness could not be measured (silent or unreadable audio)"
             )
@@ -355,9 +378,9 @@ def inspect(
                 f"integrated loudness {integrated:.1f} LUFS is below the "
                 f"{policy.min_integrated_lufs:.1f} LUFS fail threshold (near-silent audio)"
             )
-        true_peak = (levels or {}).get("true_peak_dbfs")
+        # Clipping applies at every duration: a short clip is still a delivery.
         if true_peak is None:
-            if integrated is not None:
+            if not short_clip and integrated is not None:
                 failures.append("true peak could not be measured (silent or unreadable audio)")
         elif true_peak > policy.max_true_peak_dbfs:
             failures.append(
@@ -426,6 +449,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail when one unbroken silence covers at least this fraction of the duration",
     )
     parser.add_argument(
+        "--max-silent-run-seconds",
+        type=float,
+        default=defaults.max_silent_run_seconds,
+        help="fail when one unbroken silence lasts at least this many seconds",
+    )
+    parser.add_argument(
+        "--min-audible-ratio",
+        type=float,
+        default=defaults.min_audible_ratio,
+        help="fail when less than this fraction of the duration carries sound",
+    )
+    parser.add_argument(
         "--min-integrated-lufs",
         type=float,
         default=defaults.min_integrated_lufs,
@@ -447,6 +482,8 @@ def policy_from_args(args: argparse.Namespace) -> QaPolicy:
         allow_missing_audio=args.allow_missing_audio,
         max_silent_ratio=args.max_silent_ratio,
         max_silent_run_ratio=args.max_silent_run_ratio,
+        max_silent_run_seconds=args.max_silent_run_seconds,
+        min_audible_ratio=args.min_audible_ratio,
         min_integrated_lufs=args.min_integrated_lufs,
         max_true_peak_dbfs=args.max_true_peak_dbfs,
     )
