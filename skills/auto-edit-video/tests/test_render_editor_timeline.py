@@ -58,4 +58,3 @@ class ProjectFontResolverTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "unavailable"):
                 font_path(self.project, {"caption_defaults": {"font_asset_id": asset_id}})
-
