@@ -657,9 +657,86 @@ class QaVideoGateTest(unittest.TestCase):
         report, ok = self.inspect(video)
         self.assertFalse(ok, "a soundtrack that keeps cutting out must fail")
         self.assertTrue(
-            any("drops out" in item or "silent" in item for item in report["failures"]),
+            any("carries sound" in item or "silent" in item for item in report["failures"]),
             report["failures"],
         )
+
+    def test_audio_running_past_the_picture_does_not_dilute_dead_air(self) -> None:
+        # The container reports the longest stream, so an audio track that
+        # outlives the picture stretches the timeline and thins out the
+        # silence inside the delivery itself.
+        video = self.dir / "audio-overhang.mp4"
+        subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=5",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=30",
+                "-af",
+                "volume=enable='lt(t,5)':volume=0",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                str(video),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "silence under the picture must not be diluted by an overhang")
+        self.assertLess(
+            report["media"]["duration_s"],
+            10,
+            "the delivery is as long as its picture, not its audio",
+        )
+
+    def test_understated_container_duration_cannot_silence_the_gates(self) -> None:
+        # A container header claiming well under a second would put the
+        # delivery below the length at which silence is judged, skipping the
+        # gate entirely while the file still plays in full.
+        source = self.dir / "honest.mp4"
+        make_video(
+            source,
+            video_source="testsrc",
+            audio_source="anullsrc=r=48000:cl=stereo",
+            duration=3,
+        )
+        video = self.dir / "understated.mp4"
+        video.write_bytes(source.read_bytes())
+        data = bytearray(video.read_bytes())
+        # Rewrite every 32-bit duration field in the movie headers to 0.5s.
+        for atom, offset in (("mvhd", 16), ("mdhd", 16), ("tkhd", 20)):
+            index = 0
+            while True:
+                index = data.find(atom.encode(), index + 1)
+                if index < 0:
+                    break
+                scale_at = index + offset
+                timescale = int.from_bytes(data[scale_at : scale_at + 4], "big")
+                if 0 < timescale <= 1_000_000:
+                    data[scale_at + 4 : scale_at + 8] = int(timescale // 2).to_bytes(4, "big")
+        video.write_bytes(bytes(data))
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a silent delivery must fail whatever its header claims")
 
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal

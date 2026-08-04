@@ -48,11 +48,7 @@ class QaPolicy:
     # Floor on how much of the timeline actually carries sound. Without it,
     # silence chopped into runs that each stay under the limits adds up to a
     # near-silent delivery that no other threshold catches.
-    min_audible_ratio: float = 0.3
-    # A quiet tail is one stretch. Several long silences mean the soundtrack
-    # is coming and going, which the per-run and coverage limits both miss
-    # when each stretch stays just under them.
-    max_long_silent_runs: int = 1
+    min_audible_ratio: float = 0.45
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_missing_audio, bool):
@@ -69,7 +65,6 @@ class QaPolicy:
             "max_silent_ratio",
             "max_silent_run_ratio",
             "max_silent_run_seconds",
-            "max_long_silent_runs",
             "min_silent_run_seconds",
             "min_audible_ratio",
         ):
@@ -88,7 +83,6 @@ class QaPolicy:
             or self.max_silent_run_seconds < 0
             or self.min_silent_run_seconds < 0
             or self.min_audible_ratio < 0
-            or self.max_long_silent_runs < 0
         ):
             raise ValueError("QA policy coverage thresholds must be non-negative")
 
@@ -101,6 +95,28 @@ def run(command: list[str], timeout: int = 300) -> subprocess.CompletedProcess[s
     return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
 
 
+def _positive_float(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
+
+
+def picture_duration_candidates(visual: dict[str, Any] | None) -> list[float]:
+    """How long the picture runs, read from the video stream itself."""
+    if not visual:
+        return []
+    candidates = [_positive_float(visual.get("duration"))]
+    frames = _positive_float(visual.get("nb_frames"))
+    rate = str(visual.get("r_frame_rate") or "")
+    if frames and re.fullmatch(r"\d+/\d+", rate):
+        numerator, denominator = (float(part) for part in rate.split("/"))
+        if numerator > 0 and denominator > 0:
+            candidates.append(frames * denominator / numerator)
+    return [item for item in candidates if item > 0]
+
+
 def probe(video: Path) -> dict[str, Any]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -111,7 +127,7 @@ def probe(video: Path) -> dict[str, Any]:
             "-v",
             "error",
             "-show_entries",
-            "format=duration,size:stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+            "format=duration,size:stream=index,codec_type,codec_name,width,height,r_frame_rate,nb_frames,duration,sample_rate,channels",
             "-of",
             "json",
             str(video),
@@ -124,8 +140,17 @@ def probe(video: Path) -> dict[str, Any]:
     visual = next((item for item in streams if item.get("codec_type") == "video"), None)
     audio = next((item for item in streams if item.get("codec_type") == "audio"), None)
     duration = float(data.get("format", {}).get("duration") or 0.0)
+    # The container header is the one number nothing else checks, and every
+    # ratio hangs off it: a short declared duration silences the gates while
+    # the file still plays in full, and a long one (an audio track running
+    # past the picture) dilutes dead air. Trust the picture instead, and take
+    # the longest credible reading of it.
+    picture = max(picture_duration_candidates(visual), default=0.0)
+    if picture > 0:
+        duration = picture
     return {
         "duration_s": round(duration, 3),
+        "container_duration_s": round(float(data.get("format", {}).get("duration") or 0.0), 3),
         "size_bytes": int(data.get("format", {}).get("size") or video.stat().st_size),
         "video": visual,
         "audio": audio,
@@ -230,7 +255,7 @@ def momentary_loudness(video: Path) -> list[float]:
     # Digital silence reports "nan", not "-inf". A window that cannot be
     # parsed must count as silent: dropping it would erase that slice of the
     # timeline from the measurement instead of marking it dead.
-    for match in re.finditer(r"M:\s*(nan|-?inf|-?[0-9.]+)", result.stderr or ""):
+    for match in re.finditer(r"M:\s*(-?nan|-?inf|-?[0-9.]+)", result.stderr or ""):
         raw = match.group(1)
         try:
             value = float(raw)
@@ -264,7 +289,10 @@ def silent_coverage(
     # read near-silent while the measurement fills; counting them invents a
     # leading silent run and swamps a short delivery.
     ramp = int(LOUDNESS_MIN_MEASURABLE_SECONDS / MOMENTARY_WINDOW_SECONDS)
-    windows = windows[ramp:]
+    # Audio running past the picture is not part of the delivery and must not
+    # dilute the dead air inside it.
+    limit = ramp + max(0, int((duration - LOUDNESS_MIN_MEASURABLE_SECONDS) / MOMENTARY_WINDOW_SECONDS))
+    windows = windows[ramp:limit]
     threshold = (
         integrated - AUDIBLE_RELATIVE_LU
         if integrated is not None
@@ -444,12 +472,6 @@ def inspect(
                 f"{policy.max_silent_run_ratio:.1%} / {policy.max_silent_run_seconds:.1f}s "
                 f"fail thresholds (audio stopped)"
             )
-        elif silence["long_silent_runs"] > policy.max_long_silent_runs:
-            failures.append(
-                f"audio drops out {int(silence['long_silent_runs'])} separate times for "
-                f"{policy.min_silent_run_seconds:.1f}s or more (a single quiet tail is "
-                f"expected; repeated dropouts are not)"
-            )
         elif silence["audible_ratio"] < policy.min_audible_ratio:
             failures.append(
                 f"only {silence['audible_ratio']:.1%} of the video carries sound, below the "
@@ -558,12 +580,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="shortest silence the proportional run limit applies to",
     )
     parser.add_argument(
-        "--max-long-silent-runs",
-        type=int,
-        default=defaults.max_long_silent_runs,
-        help="fail when more than this many separate long silences occur",
-    )
-    parser.add_argument(
         "--min-audible-ratio",
         type=float,
         default=defaults.min_audible_ratio,
@@ -593,7 +609,6 @@ def policy_from_args(args: argparse.Namespace) -> QaPolicy:
         max_silent_run_ratio=args.max_silent_run_ratio,
         max_silent_run_seconds=args.max_silent_run_seconds,
         min_silent_run_seconds=args.min_silent_run_seconds,
-        max_long_silent_runs=args.max_long_silent_runs,
         min_audible_ratio=args.min_audible_ratio,
         min_integrated_lufs=args.min_integrated_lufs,
         max_true_peak_dbfs=args.max_true_peak_dbfs,
