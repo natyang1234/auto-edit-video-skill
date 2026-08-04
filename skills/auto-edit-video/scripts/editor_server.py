@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import caption_engine
 from local_http_security import (
     csrf_token_matches,
     host_header_allowed,
@@ -429,6 +430,62 @@ def qa_download_errors(project_dir: Path, relative: str) -> list[str]:
     if relative in allowed:
         return []
     return ["only current delivery QA evidence can be read after final approval"]
+
+
+def migrate_caption_spans(state: dict[str, Any]) -> list[str]:
+    """N0 migration: normalise caption text and snap legacy spans to clusters.
+
+    Returns human-readable warnings for spans that had to move or be removed.
+    Only runs when the macOS caption engine is available; without it legacy
+    spans stay untouched (and the effect-span final gate keeps them out of
+    final renders).
+    """
+    if not caption_engine.available():
+        return []
+    warnings: list[str] = []
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict) or overlay.get("type") not in {"caption", "emphasis"}:
+            continue
+        text = str(overlay.get("text") or "")
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        if normalized != text:
+            overlay["text"] = normalized
+            warnings.append(f"overlay {overlay.get('id')}: caption text CR normalised")
+            text = normalized
+        spans = overlay.get("effect_spans")
+        if not isinstance(spans, list) or not spans:
+            continue
+        kept: list[dict[str, Any]] = []
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            try:
+                start = int(span.get("start_char"))
+                end = int(span.get("end_char"))
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"overlay {overlay.get('id')}: effect span {span.get('id')} removed (invalid range)"
+                )
+                continue
+            snapped = caption_engine.snap_span(text, start, end)
+            if snapped is None:
+                warnings.append(
+                    f"overlay {overlay.get('id')}: effect span {span.get('id')} removed "
+                    "(cannot align to grapheme clusters)"
+                )
+                continue
+            new_start, new_end = snapped
+            if (new_start, new_end) != (start, end):
+                warnings.append(
+                    f"overlay {overlay.get('id')}: effect span {span.get('id')} snapped "
+                    f"{start}-{end} → {new_start}-{new_end}"
+                )
+            span["start_char"] = new_start
+            span["end_char"] = new_end
+            span["text"] = caption_engine.slice_utf16(text, new_start, new_end)
+            kept.append(span)
+        overlay["effect_spans"] = kept
+    return warnings
 
 
 def effect_span_final_errors(
@@ -1235,8 +1292,8 @@ def caption_effect_spans(
             {
                 "id": f"planned-fx-{index:04d}",
                 "text": phrase,
-                "start_char": offset,
-                "end_char": span_end,
+                "start_char": caption_engine.utf16_length(text[:offset]),
+                "end_char": caption_engine.utf16_length(text[:span_end]),
                 "style": {
                     "effect": "pop",
                     "color": color,
@@ -1268,8 +1325,8 @@ def caption_effect_spans(
             {
                 "id": f"keyword-fx-{keyword_index:04d}",
                 "text": matched_phrase,
-                "start_char": offset,
-                "end_char": span_end,
+                "start_char": caption_engine.utf16_length(text[:offset]),
+                "end_char": caption_engine.utf16_length(text[:span_end]),
                 "style": {
                     "effect": effect,
                     "color": color,
@@ -1624,12 +1681,29 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
                     or not isinstance(end_char, int)
                     or start_char < 0
                     or end_char <= start_char
-                    or end_char > len(overlay_text)
+                    or end_char > caption_engine.utf16_length(overlay_text)
                 ):
                     errors.append(f"overlay {overlay_id or index} effect span {span_index} range is invalid")
                     continue
-                if overlay_text[start_char:end_char] != str(span.get("text") or ""):
+                # Contract offsets are UTF-16 code units (browser selection
+                # semantics) — never Python code points.
+                try:
+                    span_text = caption_engine.slice_utf16(overlay_text, start_char, end_char)
+                except ValueError:
+                    errors.append(
+                        f"overlay {overlay_id or index} effect span {span_index} "
+                        "splits a surrogate pair"
+                    )
+                    continue
+                if span_text != str(span.get("text") or ""):
                     errors.append(f"overlay {overlay_id or index} effect span text does not match its range")
+                if caption_engine.available() and not caption_engine.span_on_boundaries(
+                    overlay_text, start_char, end_char
+                ):
+                    errors.append(
+                        f"overlay {overlay_id or index} effect span {span_index} does not "
+                        "sit on grapheme cluster boundaries; snap it via POST /api/captions/snap"
+                    )
                 if any(start_char < used_end and end_char > used_start for used_start, used_end in occupied):
                     errors.append(f"overlay {overlay_id or index} effect spans cannot overlap")
                 occupied.append((start_char, end_char))
@@ -1888,6 +1962,43 @@ class EditorHandler(BaseHTTPRequestHandler):
             raise ValueError("request body was truncated")
         return body
 
+    def handle_caption_snap(self) -> None:
+        """Server-authoritative cluster snapping for browser selections."""
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if not caption_engine.available():
+            self.send_json(
+                {"ok": False, "error": "caption engine unavailable on this host"},
+                status=503,
+            )
+            return
+        text = str(body.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+        try:
+            start = int(body.get("start_char"))
+            end = int(body.get("end_char"))
+        except (TypeError, ValueError):
+            self.send_json(
+                {"ok": False, "error": "start_char/end_char must be integers"}, status=422
+            )
+            return
+        snapped = caption_engine.snap_span(text, start, end)
+        if snapped is None:
+            self.send_json({"ok": True, "removed": True})
+            return
+        snapped_start, snapped_end = snapped
+        self.send_json(
+            {
+                "ok": True,
+                "removed": False,
+                "start_char": snapped_start,
+                "end_char": snapped_end,
+                "text": caption_engine.slice_utf16(text, snapped_start, snapped_end),
+            }
+        )
+
     def read_json_body(self) -> Any:
         raw = self.read_body(MAX_JSON_BYTES)
         try:
@@ -1967,6 +2078,11 @@ class EditorHandler(BaseHTTPRequestHandler):
                 state = default_editor_state(project, manifest)
             else:
                 state, _migrated = migrate_editor_state_v1_to_v2(project, manifest, state)
+                span_warnings = migrate_caption_spans(state)
+                if span_warnings:
+                    state["updated_at"] = now_utc()
+                    state["revision"] = editor_state_revision(state)
+                    atomic_write_json(project / STATE_REL, state)
                 upgraded = upgrade_editor_state_layout_effects(project, state)
                 upgraded = upgrade_video_template_state(state) or upgraded
                 state["asset_digests"] = referenced_asset_digests(project, state)
@@ -1977,6 +2093,8 @@ class EditorHandler(BaseHTTPRequestHandler):
             source_rel = str(manifest.get("source", {}).get("staged_path", ""))
             payload = {
                 "csrf_token": self.server.csrf_token,
+                "caption_span_migration": locals().get("span_warnings") or [],
+                "caption_engine": caption_engine.engine_descriptor(),
                 "manifest": manifest,
                 "state": state,
                 "platform_presets": PLATFORM_PRESETS,
@@ -2423,6 +2541,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/plan-highlights":
             self.handle_plan_highlights()
+            return
+        if path == "/api/captions/snap":
+            self.handle_caption_snap()
             return
         if path == "/api/approve":
             self.handle_approval()

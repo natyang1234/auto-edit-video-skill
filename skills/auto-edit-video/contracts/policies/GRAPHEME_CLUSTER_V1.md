@@ -16,5 +16,10 @@
 3. effect_span 的 start_char/end_char 必須落在 cluster 邊界上，否則 validation fail closed。
 4. Shaping engine 與 Unicode 版本 pin 進 `caption_render_plan.receipt`；版本變更→
    boundary map 全量重算→caption revision 變更→下游 stale。
-5. 測試 corpus：`fixtures/grapheme_corpus.json`（CJK／NFD 組合字／ZWJ emoji／
-   膚色修飾／國旗／CRLF／中英混排），實作的 segmenter 必須逐案吻合 cluster 數。
+5. 測試 corpus：`fixtures/grapheme_corpus.json` v2（15 案例：CJK／NFD／ZWJ／膚色／
+   國旗／VS16／keycap／tag emoji／Indic／中英混排）。穩定案例逐案吻合 cluster 數
+   **與 UTF-16 邊界對**；`version_sensitive` 案例（ZWJ family／RI／tag／Indic）在記錄
+   runtime 上精確吻合、新 runtime 差異＝engine version 變更事件而非測試失敗。
+6. **Caption 文字 intake 正規化**：`\r\n`／`\r` 一律轉 `\n` 後再分段——NSString
+   composed character sequences 不遵守 UAX29 GB3（CRLF 不斷開），正規化把這條差異
+   從輸出面移除。

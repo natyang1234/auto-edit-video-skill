@@ -8,6 +8,8 @@ import html
 import json
 import os
 import re
+
+import caption_engine
 import shutil
 import subprocess
 import uuid
@@ -131,7 +133,13 @@ def _normalized_effect_spans(
         end = span.get("end_char")
         if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
             continue
-        if start < 0 or end <= start or end > len(text) or text[start:end] != str(span.get("text") or ""):
+        if start < 0 or end <= start or end > caption_engine.utf16_length(text):
+            continue
+        try:
+            span_text = caption_engine.slice_utf16(text, start, end)
+        except ValueError:
+            continue
+        if span_text != str(span.get("text") or ""):
             continue
         raw_style = span.get("style") if isinstance(span.get("style"), dict) else {}
         effect = str(raw_style.get("effect") or "pop")
@@ -140,7 +148,7 @@ def _normalized_effect_spans(
         normalized.append(
             {
                 "id": re.sub(r"[^A-Za-z0-9_-]", "-", str(span.get("id") or f"fx-{index}"))[:80],
-                "text": text[start:end],
+                "text": span_text,
                 "start_char": start,
                 "end_char": end,
                 "style": {
@@ -154,10 +162,12 @@ def _normalized_effect_spans(
         cursor = 0
         for index, phrase_value in enumerate(legacy_phrases[:50], start=1):
             phrase = str(phrase_value or "")
-            start = text.find(phrase, cursor) if phrase else -1
-            if start < 0:
+            start_cp = text.find(phrase, cursor) if phrase else -1
+            if start_cp < 0:
                 continue
-            end = start + len(phrase)
+            end_cp = start_cp + len(phrase)
+            start = caption_engine.utf16_length(text[:start_cp])
+            end = caption_engine.utf16_length(text[:end_cp])
             normalized.append(
                 {
                     "id": f"legacy-fx-{index}",

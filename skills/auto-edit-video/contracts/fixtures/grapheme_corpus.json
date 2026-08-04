@@ -1,56 +1,261 @@
 {
- "x_schema_version": 1,
+ "x_schema_version": 2,
  "contract": "grapheme_cluster_v1",
+ "runtime": "macos-nsstring-egc (single supported runtime, nat 2026-08-04)",
+ "recorded_on": "macos-26.5",
+ "notes": [
+  "caption intake normalizes \\r\\n and \\r to \\n before segmentation",
+  "version_sensitive cases assert recorded values on the recording runtime; a differing newer runtime is a recorded engine-version change, not a test failure",
+  "utf16_boundaries are asserted exactly for stable cases"
+ ],
  "cases": [
   {
    "text": "你好世界",
    "clusters": 4,
-   "note": "CJK basic"
+   "note": "CJK basic",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ]
+   ]
   },
   {
    "text": "café",
    "clusters": 4,
-   "note": "combining acute (NFC)"
+   "note": "combining acute (NFC)",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ]
+   ]
   },
   {
-   "text": "é",
+   "text": "é",
    "clusters": 1,
-   "note": "combining acute (NFD) = one cluster"
+   "note": "combining acute (NFD) = one cluster",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ]
+   ]
   },
   {
    "text": "👩‍👩‍👧‍👦",
    "clusters": 1,
-   "note": "ZWJ family emoji = one cluster"
+   "note": "ZWJ family emoji = one cluster",
+   "version_sensitive": true
   },
   {
    "text": "👍🏽",
    "clusters": 1,
-   "note": "emoji + skin tone modifier"
+   "note": "emoji + skin tone modifier",
+   "utf16_boundaries": [
+    [
+     0,
+     4
+    ]
+   ]
   },
   {
    "text": "中English混排ok",
-   "clusters": 13,
-   "note": "zh-en code switch"
+   "clusters": 12,
+   "note": "zh-en code switch",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     6,
+     7
+    ],
+    [
+     7,
+     8
+    ],
+    [
+     8,
+     9
+    ],
+    [
+     9,
+     10
+    ],
+    [
+     10,
+     11
+    ],
+    [
+     11,
+     12
+    ]
+   ]
   },
   {
    "text": "ㄅㄆㄇ",
    "clusters": 3,
-   "note": "bopomofo"
+   "note": "bopomofo",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ]
+   ]
   },
   {
    "text": "台灣No.1！",
-   "clusters": 9,
-   "note": "fullwidth punctuation"
+   "clusters": 7,
+   "note": "fullwidth punctuation",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     6,
+     7
+    ]
+   ]
   },
   {
    "text": "🇹🇼",
    "clusters": 1,
-   "note": "regional indicator pair"
+   "note": "regional indicator pair",
+   "version_sensitive": true
   },
   {
-   "text": "a\r\nb",
+   "text": "a\nb",
    "clusters": 3,
-   "note": "CRLF is a single cluster"
+   "note": "LF separates; \\r is normalized away at caption intake (NSString does not honor UAX29 GB3)",
+   "utf16_boundaries": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ]
+   ]
+  },
+  {
+   "text": "☂️",
+   "clusters": 1,
+   "note": "VS16 emoji presentation",
+   "utf16_boundaries": [
+    [
+     0,
+     2
+    ]
+   ]
+  },
+  {
+   "text": "1️⃣",
+   "clusters": 1,
+   "note": "keycap sequence",
+   "utf16_boundaries": [
+    [
+     0,
+     3
+    ]
+   ]
+  },
+  {
+   "text": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+   "clusters": 1,
+   "note": "tag-sequence flag (England)",
+   "version_sensitive": true
+  },
+  {
+   "text": "🇹🇼🇯🇵",
+   "clusters": 2,
+   "note": "adjacent flags = two clusters (RI parity)",
+   "version_sensitive": true
+  },
+  {
+   "text": "नमस्ते",
+   "clusters": 3,
+   "note": "Devanagari with virama (Indic tailoring)",
+   "version_sensitive": true
   }
  ]
 }

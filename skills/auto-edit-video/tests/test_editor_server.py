@@ -1828,6 +1828,97 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("evidence re-anchor", app_js)
         self.assertIn("規格待重核", app_js)
 
+    def test_caption_snap_endpoint_and_boundary_validation(self) -> None:
+        payload = {"text": "我愛👩‍👩‍👧‍👦你", "start_char": 3, "end_char": 5}
+        status, snapped = self.json_request("POST", "/api/captions/snap", payload)
+        self.assertEqual(status, 200, snapped)
+        self.assertFalse(snapped["removed"])
+        self.assertEqual((snapped["start_char"], snapped["end_char"]), (2, 13))
+        self.assertEqual(snapped["text"], "👩‍👩‍👧‍👦")
+
+        status, _headers, body = self.request("GET", "/api/project")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("caption_engine", payload)
+        state = payload["state"]
+        state["overlays"] = [
+            {
+                "id": "caption-emoji",
+                "type": "caption",
+                "text": "我愛👩‍👩‍👧‍👦你",
+                "start": 0.0,
+                "end": 1.0,
+                "visible": True,
+                "style": {},
+                "layout": {"x": 10, "y": 70, "width": 80, "height": 20},
+                "effect_spans": [
+                    {
+                        "id": "fx-bad",
+                        "text": "愛👩",
+                        "start_char": 1,
+                        "end_char": 4,
+                        "style": {"effect": "pop", "color": "#FF5533", "font_scale": 1.2},
+                    }
+                ],
+            }
+        ]
+        status, rejected = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 422, rejected)
+        self.assertTrue(
+            any("grapheme" in str(e) or "surrogate" in str(e) for e in rejected["errors"]),
+            rejected,
+        )
+
+        state["overlays"][0]["effect_spans"] = [
+            {
+                "id": "fx-good",
+                "text": "👩‍👩‍👧‍👦",
+                "start_char": 2,
+                "end_char": 13,
+                "style": {"effect": "pop", "color": "#FF5533", "font_scale": 1.2},
+            }
+        ]
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+
+    def test_legacy_span_migration_snaps_or_removes(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["overlays"] = [
+            {
+                "id": "caption-legacy",
+                "type": "caption",
+                "text": "去🇹🇼旅行",
+                "start": 0.0,
+                "end": 1.0,
+                "visible": True,
+                "style": {},
+                "layout": {"x": 10, "y": 70, "width": 80, "height": 20},
+                "effect_spans": [
+                    {
+                        "id": "fx-mid-flag",
+                        "text": "🇹",
+                        "start_char": 1,
+                        "end_char": 3,
+                        "style": {"effect": "highlight", "color": "#F5A623", "font_scale": 1.1},
+                    }
+                ],
+            }
+        ]
+        # Write directly to disk (legacy state that predates boundary rules).
+        self.write_json("working/editor_state.json", state)
+        status, _headers, body = self.request("GET", "/api/project")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        warnings = payload["caption_span_migration"]
+        self.assertTrue(warnings, "migration must report span adjustments")
+        migrated = payload["state"]["overlays"][0]["effect_spans"]
+        self.assertEqual(len(migrated), 1)
+        self.assertEqual(
+            (migrated[0]["start_char"], migrated[0]["end_char"]), (1, 5),
+            "span must snap outward to the full flag cluster",
+        )
+        self.assertEqual(migrated[0]["text"], "🇹🇼")
+
 
 class EditorRendererTests(unittest.TestCase):
     @classmethod

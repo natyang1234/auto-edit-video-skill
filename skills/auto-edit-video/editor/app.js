@@ -1195,17 +1195,36 @@ function renderEffectSpanList(overlay) {
   });
 }
 
-function addEffectSpan() {
+async function addEffectSpan() {
   const overlay = currentOverlay();
   if (!overlay || !["caption", "emphasis"].includes(overlay.type) || overlay.design_role) return;
   const input = elements["overlay-text"];
-  const start = input.selectionStart;
-  const end = input.selectionEnd;
-  const text = input.value.slice(start, end);
+  let start = input.selectionStart;
+  let end = input.selectionEnd;
+  let text = input.value.slice(start, end);
   if (!text.trim() || end <= start) {
     showToast("請先在字幕文字中選取要強調的字詞", "error");
     input.focus();
     return;
+  }
+  // Server is the boundary authority: snap the raw selection to grapheme
+  // cluster boundaries so emoji/combining marks can never be half-selected.
+  try {
+    const snapped = await request("/api/captions/snap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: input.value, start_char: start, end_char: end }),
+    });
+    if (snapped.removed) {
+      showToast("選取範圍無法對齊完整字元，請重新選取", "error");
+      return;
+    }
+    start = snapped.start_char;
+    end = snapped.end_char;
+    text = snapped.text;
+  } catch (_error) {
+    // Engine unavailable: keep the raw selection; server-side validation
+    // will reject only when boundary enforcement is active.
   }
   const spans = Array.isArray(overlay.effect_spans) ? overlay.effect_spans : [];
   if (spans.some((span) => start < span.end_char && end > span.start_char)) {
