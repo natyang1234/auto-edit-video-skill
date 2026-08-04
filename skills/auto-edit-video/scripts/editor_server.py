@@ -728,6 +728,86 @@ def variant_approval_is_current(
     return entry.get("state_revision") == expected
 
 
+RIGHTS_REL = Path("working/rights_assertion.json")
+
+
+def referenced_render_inputs(
+    project_dir: Path, state: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Closure of local render inputs for the rights gate (plan v2).
+
+    Collects overlay asset sources, visual-plan selected assets, and any
+    project-local font. System fonts (outside the project) and the owned
+    source video are recorded but exempt; registry pack assets are exempt by
+    their declared license.
+    """
+    inputs: dict[str, dict[str, Any]] = {}
+
+    def add(path_text: str, kind: str) -> None:
+        if not path_text:
+            return
+        candidate = (project_dir / path_text).resolve()
+        try:
+            inside = project_dir.resolve() in candidate.parents
+        except OSError:
+            inside = False
+        if not inside or not candidate.is_file():
+            return
+        rel = candidate.relative_to(project_dir.resolve()).as_posix()
+        requires = rel.startswith("assets/")
+        if rel not in inputs:
+            inputs[rel] = {
+                "path": rel,
+                "kind": kind,
+                "sha256": file_sha256(candidate),
+                "requires_assertion": requires,
+            }
+
+    for overlay in state.get("overlays", []):
+        if isinstance(overlay, dict) and overlay.get("type") in {"image", "gif", "video"}:
+            add(str(overlay.get("source") or ""), "overlay-asset")
+    _layers, visual_plan = load_layer_bundle(project_dir)
+    for item in visual_plan.get("items", []):
+        if item.get("selected_asset"):
+            add(str(item["selected_asset"]), "visual-plan-asset")
+    try:
+        from render_editor_timeline import font_path
+
+        font_file = font_path()
+        if project_dir.resolve() in font_file.resolve().parents:
+            add(font_file.resolve().relative_to(project_dir.resolve()).as_posix(), "font")
+    except (ValueError, OSError):
+        pass
+    return sorted(inputs.values(), key=lambda item: item["path"])
+
+
+def rights_gate_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
+    """Final gate: every render input that needs a rights assertion has a
+    CURRENT one (sha-bound; a changed file voids its assertion)."""
+    required = [
+        item
+        for item in referenced_render_inputs(project_dir, state)
+        if item["requires_assertion"]
+    ]
+    if not required:
+        return []
+    assertion = read_json(project_dir / RIGHTS_REL, None)
+    by_sha: dict[str, dict[str, Any]] = {}
+    if isinstance(assertion, dict):
+        for item in assertion.get("items", []):
+            if item.get("asserted"):
+                by_sha[str(item.get("asset_sha256"))] = item
+    errors = []
+    for item in required:
+        matched = by_sha.get(item["sha256"])
+        if matched is None:
+            errors.append(
+                f"asset {item['path']} needs a rights assertion before final "
+                "(POST /api/rights/assert)"
+            )
+    return errors
+
+
 def effect_span_final_errors(
     state: dict[str, Any],
     clip: dict[str, Any] | None,
@@ -850,6 +930,7 @@ def approval_prerequisite_errors(
         if not approval_is_current(project_dir, manifest, "timeline", state):
             errors.append("timeline must be approved for its current revision first")
         errors.extend(effect_span_final_errors(state, active_clip))
+        errors.extend(rights_gate_errors(project_dir, state))
         if approved_destructive_deletes(project_dir):
             errors.append(
                 "reviewed delete decisions are not applied by the page-editor renderer; "
@@ -2634,6 +2715,13 @@ class EditorHandler(BaseHTTPRequestHandler):
             if find_variant(state, variant_id) is None:
                 self.send_json({"ok": False, "error": "unknown variant"}, status=404)
                 return
+            if gate == "final":
+                rights_errors = rights_gate_errors(self.server.project_dir, state)
+                if rights_errors:
+                    self.send_json(
+                        {"ok": False, "errors": rights_errors}, status=409
+                    )
+                    return
             try:
                 expected = variant_gate_revision(
                     self.server.project_dir, gate, state, variant_id
@@ -2669,6 +2757,76 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "approval": slot[variant_id],
             }
         )
+
+    def handle_rights_status(self, project: Path) -> None:
+        with self.server.project_lock:
+            state = read_json(project / STATE_REL, {}) or {}
+            inputs = referenced_render_inputs(project, state)
+            assertion = read_json(project / RIGHTS_REL, None)
+        asserted = {
+            str(item.get("asset_sha256"))
+            for item in (assertion or {}).get("items", [])
+            if item.get("asserted")
+        }
+        for item in inputs:
+            item["asserted"] = item["sha256"] in asserted
+        self.send_json({"ok": True, "inputs": inputs})
+
+    def handle_rights_assert(self) -> None:
+        """Record a hash-bound rights assertion for one render input."""
+        import contract_registry
+
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        basis = str(body.get("basis") or "")
+        if basis not in {"own_work", "licensed", "public_domain", "other"}:
+            self.send_json({"ok": False, "error": "invalid basis"}, status=422)
+            return
+        raw_path = str(body.get("asset_path") or "")
+        with self.server.project_lock:
+            try:
+                asset = scoped_project_path(self.server.project_dir, raw_path, "assets")
+            except ValueError:
+                self.send_json({"ok": False, "error": "asset path is invalid"}, status=422)
+                return
+            if not asset.is_file():
+                self.send_json({"ok": False, "error": "asset not found"}, status=404)
+                return
+            digest = file_sha256(asset)
+            assertion = read_json(self.server.project_dir / RIGHTS_REL, None) or {
+                "schema_version": 1,
+                "items": [],
+            }
+            assertion["items"] = [
+                item
+                for item in assertion.get("items", [])
+                if item.get("asset_sha256") != digest
+            ]
+            assertion["items"].append(
+                {
+                    "asset_id": f"asset-{digest[:16]}",
+                    "asserted": True,
+                    "asserted_by": str(body.get("asserted_by") or "nat"),
+                    "asserted_at": now_utc(),
+                    "basis": basis,
+                    "note": str(body.get("note") or ""),
+                    "asset_sha256": digest,
+                    "provenance_revision": None,
+                    "license_proof": str(body.get("license_proof") or "") or None,
+                }
+            )
+            assertion["revision"] = canonical_revision(
+                {k: v for k, v in assertion.items() if k != "revision"}
+            )
+            errors = contract_registry.validate_artifact("rights_assertion", assertion)
+            if errors:
+                self.send_json({"ok": False, "errors": errors}, status=422)
+                return
+            atomic_write_json(self.server.project_dir / RIGHTS_REL, assertion)
+        self.send_json({"ok": True, "asset_sha256": digest, "basis": basis})
 
     def handle_caption_snap(self) -> None:
         """Server-authoritative cluster snapping for browser selections."""
@@ -2970,6 +3128,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self.serve_file(asset, allow_range=asset.suffix.lower() in {".mp4", ".mov"})
+            return
+        if path == "/api/rights":
+            self.handle_rights_status(project)
             return
         if path == "/api/captions/status":
             self.handle_caption_status(project)
@@ -3292,6 +3453,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/structured-layers":
             self.handle_structured_layers()
+            return
+        if path == "/api/rights/assert":
+            self.handle_rights_assert()
             return
         if path == "/api/approve":
             self.handle_approval()

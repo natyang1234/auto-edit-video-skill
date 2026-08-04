@@ -38,6 +38,22 @@
      },
      "note": {
       "type": "string"
+     },
+     "asset_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "provenance_revision": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "license_proof": {
+      "type": [
+       "string",
+       "null"
+      ]
      }
     },
     "required": [
@@ -45,6 +61,7 @@
      "asserted_at",
      "asserted_by",
      "asset_id",
+     "asset_sha256",
      "basis",
      "note"
     ],

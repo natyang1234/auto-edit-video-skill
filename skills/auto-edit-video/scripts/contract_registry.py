@@ -347,12 +347,23 @@ def semantic_approval_receipt(receipt) -> list[str]:
     return errors
 
 
+def semantic_rights_assertion(assertion) -> list[str]:
+    errors = []
+    for index, item in enumerate(assertion.get("items", [])):
+        if item.get("basis") == "licensed" and not item.get("license_proof"):
+            errors.append(
+                f"$.items[{index}]: basis 'licensed' requires a license_proof path"
+            )
+    return errors
+
+
 SEMANTIC_VALIDATORS = {
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
     "master_timeline": semantic_master_timeline,
     "approval_receipt": semantic_approval_receipt,
     "structured_layer": semantic_structured_layer,
     "video_analysis": semantic_video_analysis,
+    "rights_assertion": semantic_rights_assertion,
 }
 
 

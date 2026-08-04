@@ -2120,6 +2120,61 @@ class EditorServerTests(unittest.TestCase):
             "journal must clear after roll-forward",
         )
 
+    def test_rights_gate_closure_assert_and_hash_invalidation(self) -> None:
+        # a referenced project asset appears in the closure and blocks final
+        (self.project / "assets/imported").mkdir(parents=True, exist_ok=True)
+        asset = self.project / "assets/imported/broll.png"
+        asset.write_bytes(b"\x89PNG\r\n\x1a\n" + b"broll-bytes")
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["overlays"] = [
+            {
+                "id": "broll-1",
+                "type": "image",
+                "source": "assets/imported/broll.png",
+                "start": 0.1,
+                "end": 0.5,
+                "visible": True,
+                "style": {"width": 40, "x": 50, "y": 50},
+                "layout": {"x": 10, "y": 10, "width": 40, "height": 40},
+            }
+        ]
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+
+        status, _headers, body = self.request("GET", "/api/rights")
+        payload = json.loads(body.decode("utf-8"))
+        target = next(i for i in payload["inputs"] if i["path"].endswith("broll.png"))
+        self.assertTrue(target["requires_assertion"])
+        self.assertFalse(target["asserted"])
+
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text("utf-8")
+        )
+        errors = editor_server.rights_gate_errors(self.project, state)
+        self.assertTrue(errors and "rights assertion" in errors[0])
+
+        status, asserted = self.json_request(
+            "POST",
+            "/api/rights/assert",
+            {"asset_path": "assets/imported/broll.png", "basis": "own_work"},
+        )
+        self.assertEqual(status, 200, asserted)
+        self.assertEqual(editor_server.rights_gate_errors(self.project, state), [])
+
+        # licensed without proof must be rejected by the contract
+        status, rejected = self.json_request(
+            "POST",
+            "/api/rights/assert",
+            {"asset_path": "assets/imported/broll.png", "basis": "licensed"},
+        )
+        self.assertEqual(status, 422, rejected)
+
+        # changing the file bytes voids the assertion (sha binding)
+        asset.write_bytes(b"\x89PNG\r\n\x1a\n" + b"different-bytes")
+        errors = editor_server.rights_gate_errors(self.project, state)
+        self.assertTrue(errors, "hash change must invalidate the assertion")
+
 
 class EditorRendererTests(unittest.TestCase):
     @classmethod
