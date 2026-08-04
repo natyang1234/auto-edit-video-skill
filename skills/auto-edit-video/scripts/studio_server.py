@@ -58,6 +58,20 @@ DEFAULT_MAX_DURATION_S = 6 * 60 * 60
 DEFAULT_MAX_SOURCE_PIXELS = 7680 * 4320
 MAX_SOURCE_FPS = 240.0
 MAX_STREAMS = 16
+FOLDER_MAX_FILES = 5000
+FOLDER_MAX_TOTAL_BYTES = 50 * 1024 * 1024 * 1024
+FOLDER_MAX_VIDEO_BYTES = 20 * 1024 * 1024 * 1024
+FOLDER_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+FOLDER_MAX_JSON_BYTES = 2 * 1024 * 1024
+FOLDER_ALLOWED_EXTENSIONS = {
+    ".mp4", ".mov", ".m4v", ".webm", ".mkv",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac",
+    ".ttf", ".otf", ".woff2",
+    ".srt", ".vtt", ".ass",
+    ".md", ".txt", ".pdf",
+}
+FOLDER_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 SOURCE_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 SOURCE_MIME_TYPES = {
     ".mp4": {"video/mp4", "application/mp4"},
@@ -593,22 +607,40 @@ class StudioHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self.allow_request(mutation=True):
             return
-        if self.route() != "/api/imports":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
+        route = self.route()
         try:
-            self.handle_create_import()
+            if route == "/api/imports":
+                self.handle_create_import()
+                return
+            if route == "/api/folder-imports":
+                self.handle_create_folder_import()
+                return
+            finalize = re.fullmatch(
+                r"/api/folder-imports/(fol_[0-9a-f]{32})/finalize", route
+            )
+            if finalize:
+                self.handle_folder_finalize(finalize.group(1))
+                return
         except StudioRequestError as exc:
             self.send_problem(exc)
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_PUT(self) -> None:
         if not self.allow_request(mutation=True):
             return
         match = re.fullmatch(r"/api/imports/(imp_[0-9a-f]{32})/content", self.route())
-        if not match:
-            self.send_error(HTTPStatus.NOT_FOUND)
+        if match:
+            self.handle_upload(match.group(1))
             return
-        self.handle_upload(match.group(1))
+        folder = re.fullmatch(r"/api/folder-imports/(fol_[0-9a-f]{32})/file", self.route())
+        if folder:
+            try:
+                self.handle_folder_file_upload(folder.group(1))
+            except StudioRequestError as exc:
+                self.send_problem(exc)
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def handle_create_import(self) -> None:
         body = self.read_json_body()
@@ -716,6 +748,255 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.server.imports[import_id] = session
             self.server.active_upload_id = import_id
         self.send_json({"ok": True, "import": import_public_payload(session)}, status=201)
+
+
+    def read_folder_json_body(self) -> Any:
+        length = self.content_length()
+        if length > FOLDER_MAX_JSON_BYTES:
+            raise StudioRequestError(413, "metadata_too_large", "folder metadata is too large")
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise StudioRequestError(400, "invalid_json", "request body is not valid JSON") from exc
+
+    @staticmethod
+    def validate_folder_relative_path(raw: str) -> str:
+        path = str(raw)
+        if (
+            not path
+            or len(path) > 400
+            or "\x00" in path
+            or path.startswith("/")
+            or path.startswith("~")
+            or ".." in Path(path).parts
+            or any(not part or part.startswith(".") for part in Path(path).parts)
+        ):
+            raise StudioRequestError(422, "invalid_path", f"folder path is invalid: {raw!r}")
+        return Path(path).as_posix()
+
+    def handle_create_folder_import(self) -> None:
+        body = self.read_folder_json_body()
+        if not isinstance(body, dict) or not isinstance(body.get("files"), list):
+            raise StudioRequestError(422, "invalid_metadata", "files metadata is required")
+        raw_files = body["files"]
+        if not raw_files:
+            raise StudioRequestError(422, "empty_folder", "the folder contains no files")
+        if len(raw_files) > FOLDER_MAX_FILES:
+            raise StudioRequestError(
+                413, "too_many_files", f"folder exceeds the {FOLDER_MAX_FILES}-file limit"
+            )
+        expected: dict[str, dict[str, Any]] = {}
+        total = 0
+        has_video = False
+        for meta in raw_files:
+            if not isinstance(meta, dict):
+                raise StudioRequestError(422, "invalid_metadata", "file entries must be objects")
+            path = self.validate_folder_relative_path(str(meta.get("path", "")))
+            suffix = Path(path).suffix.lower()
+            if suffix not in FOLDER_ALLOWED_EXTENSIONS:
+                raise StudioRequestError(
+                    415, "unsupported_extension", f"unsupported file type: {path}"
+                )
+            size = meta.get("size_bytes")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise StudioRequestError(422, "invalid_size", f"invalid size for {path}")
+            is_video = suffix in FOLDER_VIDEO_EXTENSIONS
+            limit = FOLDER_MAX_VIDEO_BYTES if is_video else FOLDER_MAX_FILE_BYTES
+            if size > limit:
+                raise StudioRequestError(413, "file_too_large", f"file exceeds limits: {path}")
+            if path in expected:
+                raise StudioRequestError(422, "duplicate_path", f"duplicate path: {path}")
+            expected[path] = {"size": size, "received": False, "video": is_video}
+            total += size
+            has_video = has_video or is_video
+        if total > FOLDER_MAX_TOTAL_BYTES:
+            raise StudioRequestError(413, "folder_too_large", "folder exceeds the total size limit")
+        if not has_video:
+            raise StudioRequestError(422, "no_video", "the folder must contain at least one video")
+        main_path = body.get("main_path")
+        if main_path is not None:
+            main_path = self.validate_folder_relative_path(str(main_path))
+            if main_path not in expected or not expected[main_path]["video"]:
+                raise StudioRequestError(422, "invalid_main", "main_path must be a video in the folder")
+        source_language = str((body.get("settings") or {}).get("source_language", "auto"))
+        if source_language not in SOURCE_LANGUAGES:
+            raise StudioRequestError(422, "invalid_settings", "source language is unsupported")
+        session_id = f"fol_{secrets.token_hex(16)}"
+        staging = self.server.projects_root / f".folder-creating-{session_id}"
+        created = now_utc()
+        session = {
+            "id": session_id,
+            "kind": "folder",
+            "state": "open",
+            "staging_dir": str(staging),
+            "files": expected,
+            "main_path": main_path,
+            "root_display_name": str(body.get("root_display_name") or "資料夾")[:120],
+            "project_name": str(body.get("project_name") or "folder-import")[:120],
+            "source_language": source_language,
+            "created_at": created,
+            "updated_at": created,
+        }
+        with self.server.import_lock:
+            with self.server.pipeline_lock:
+                pipeline_busy = self.server.active_pipeline_project is not None
+            if self.server.active_upload_id is not None or pipeline_busy:
+                raise StudioRequestError(409, "import_busy", "another import or pipeline is already active")
+            staging.mkdir(parents=True, exist_ok=False)
+            self.server.imports[session_id] = session
+            self.server.active_upload_id = session_id
+        self.send_json(
+            {
+                "ok": True,
+                "session": {
+                    "id": session_id,
+                    "state": "open",
+                    "files_expected": len(expected),
+                    "upload_url_template": f"/api/folder-imports/{session_id}/file?path=",
+                    "finalize_url": f"/api/folder-imports/{session_id}/finalize",
+                },
+            },
+            status=201,
+        )
+
+    def folder_session(self, session_id: str) -> dict[str, Any]:
+        session = self.server.imports.get(session_id)
+        if not session or session.get("kind") != "folder":
+            raise StudioRequestError(404, "not_found", "folder import session not found")
+        return session
+
+    def handle_folder_file_upload(self, session_id: str) -> None:
+        session = self.folder_session(session_id)
+        if session.get("state") not in {"open", "uploading"}:
+            raise StudioRequestError(409, "session_closed", "folder session cannot accept files")
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        raw_path = (query.get("path") or [""])[0]
+        path = self.validate_folder_relative_path(raw_path)
+        entry = session["files"].get(path)
+        if entry is None:
+            raise StudioRequestError(422, "unexpected_file", f"file was not declared: {path}")
+        if entry["received"]:
+            raise StudioRequestError(409, "duplicate_upload", f"file already uploaded: {path}")
+        length = self.content_length()
+        if length != int(entry["size"]):
+            self.close_connection = True
+            raise StudioRequestError(413, "length_mismatch", "uploaded byte count does not match metadata")
+        destination = Path(session["staging_dir"]) / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(destination, flags, 0o600)
+        received = 0
+        with os.fdopen(descriptor, "wb") as handle:
+            while received < length:
+                chunk = self.rfile.read(min(1024 * 1024, length - received))
+                if not chunk:
+                    raise StudioRequestError(400, "short_upload", "upload was truncated")
+                handle.write(chunk)
+                received += len(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if entry["video"] and not source_magic_matches(destination, Path(path).suffix.lower()):
+            destination.unlink(missing_ok=True)
+            raise StudioRequestError(415, "invalid_video_magic", f"not a valid video container: {path}")
+        entry["received"] = True
+        session["state"] = "uploading"
+        session["updated_at"] = now_utc()
+        remaining = sum(1 for item in session["files"].values() if not item["received"])
+        self.send_json({"ok": True, "remaining": remaining})
+
+    def handle_folder_finalize(self, session_id: str) -> None:
+        session = self.folder_session(session_id)
+        if session.get("state") not in {"open", "uploading"}:
+            raise StudioRequestError(409, "session_closed", "folder session cannot be finalized")
+        missing = [path for path, item in session["files"].items() if not item["received"]]
+        if missing:
+            raise StudioRequestError(409, "incomplete_upload", f"{len(missing)} files not uploaded yet")
+        session["state"] = "importing"
+        session["updated_at"] = now_utc()
+        staging = Path(session["staging_dir"])
+        project_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dt%H%M%Sz').lower()}-" \
+            f"{safe_project_slug(session['project_name'])}-{secrets.token_hex(2)}"
+        final_project = self.server.projects_root / project_id
+        command = [
+            sys.executable,
+            str(AUTO_EDIT_SCRIPT),
+            "ingest-folder",
+            "--folder", str(staging),
+            "--project-dir", str(final_project),
+            "--source-language", session["source_language"],
+        ]
+        if session.get("main_path"):
+            command.extend(["--main", str(staging / session["main_path"])])
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired as exc:
+            session["state"] = "aborted"
+            raise StudioRequestError(500, "ingest_timeout", "folder ingest timed out") from exc
+        if result.returncode != 0:
+            session["state"] = "aborted"
+            self.log_error("folder ingest failed: %s", result.stderr[-500:])
+            raise StudioRequestError(500, "ingest_failed", "folder ingest failed; see server log")
+        try:
+            import contract_registry
+
+            artifact = {
+                "schema_version": 1,
+                "session_id": session_id,
+                "csrf_bound": True,
+                "staging_dir": staging.name,
+                "limits": {
+                    "max_files": FOLDER_MAX_FILES,
+                    "max_total_bytes": FOLDER_MAX_TOTAL_BYTES,
+                    "max_video_bytes": FOLDER_MAX_VIDEO_BYTES,
+                    "max_file_bytes": FOLDER_MAX_FILE_BYTES,
+                },
+                "state": "completed",
+            }
+            errors = contract_registry.validate_artifact("folder_import_session", artifact)
+            if errors:
+                raise ValueError("; ".join(errors))
+            session_path = final_project / "working/folder_import_session.json"
+            session_path.write_text(
+                json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except (OSError, ValueError, ImportError) as exc:
+            session["state"] = "aborted"
+            raise StudioRequestError(
+                500, "session_artifact_failed", f"session artifact failed: {exc}"
+            ) from exc
+        shutil.rmtree(staging, ignore_errors=True)
+        editor_url = self.server.start_editor(final_project)
+        try:
+            self.server.start_local_pipeline(
+                final_project, "teacher-punch", "", True, "qwen2.5:7b"
+            )
+            message = "資料夾已匯入；正在排程本機分析"
+        except OSError:
+            message = "資料夾已匯入；本機自動處理尚未啟動"
+        session.update(
+            {
+                "state": "ready",
+                "updated_at": now_utc(),
+                "project_id": project_id,
+                "editor_url": editor_url,
+                "message": message,
+            }
+        )
+        with self.server.import_lock:
+            if self.server.active_upload_id == session_id:
+                self.server.active_upload_id = None
+        self.send_json(
+            {
+                "ok": True,
+                "project": {"id": project_id},
+                "editor_url": editor_url,
+                "message": message,
+            },
+            status=201,
+        )
 
     def handle_upload(self, import_id: str) -> None:
         incoming: Path | None = None

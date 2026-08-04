@@ -147,6 +147,18 @@
       <button class="primary-button import-submit" id="start-import" type="button" disabled>建立剪輯專案</button>
       <p class="import-privacy">Studio 不接受本機路徑，只讀取你在瀏覽器明確選擇的檔案內容。</p>
     </section>
+
+    <section class="import-card" aria-label="資料夾匯入（Phase 1a）">
+      <h2>或匯入整個素材資料夾</h2>
+      <p>選擇含主影片與素材（圖片、GIF、B-roll、字型、字幕）的資料夾；Studio 會自動判定最長的影片為主片並建立專案。</p>
+      <input id="folder-input" type="file" webkitdirectory multiple hidden>
+      <button id="choose-folder" class="secondary" type="button">選擇資料夾</button>
+      <div id="folder-summary" hidden>
+        <strong id="folder-name">—</strong>
+        <span id="folder-count">—</span>
+      </div>
+      <button id="start-folder-import" type="button" disabled>匯入資料夾</button>
+    </section>
   </main>
 </body>
 </html>

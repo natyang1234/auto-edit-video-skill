@@ -23,7 +23,7 @@ from auto_edit import validate_manifest  # noqa: E402
 from studio_server import StudioServer  # noqa: E402
 
 
-class StudioServerTests(unittest.TestCase):
+class StudioHarness(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.ffmpeg = shutil.which("ffmpeg")
@@ -150,6 +150,8 @@ class StudioServerTests(unittest.TestCase):
             },
         )
 
+
+class StudioServerTests(StudioHarness):
     def test_import_creates_owned_project_and_launches_scoped_editor(self) -> None:
         html_status, _headers, html = self.request("GET", "/")
         self.assertEqual(html_status, 200)
@@ -421,3 +423,96 @@ class StudioServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FolderImportTests(StudioHarness):
+    """Phase 1a M4b: folder-first import sessions."""
+
+    def folder_headers(self) -> dict[str, str]:
+        return {"X-Auto-Edit-CSRF": self.csrf_token}
+
+    def create_folder_session(self, files, **extra):
+        payload = {
+            "root_display_name": "素材夾",
+            "project_name": "folder-e2e",
+            "settings": {"source_language": "auto"},
+            "files": files,
+        }
+        payload.update(extra)
+        return self.json_response(
+            "POST", "/api/folder-imports", payload, self.folder_headers()
+        )
+
+    def test_folder_session_rejects_traversal_and_undeclared_files(self) -> None:
+        status, payload = self.create_folder_session(
+            [{"path": "../evil.mp4", "size_bytes": 10}]
+        )
+        self.assertEqual(status, 422, payload)
+
+        status, payload = self.create_folder_session(
+            [{"path": "main.mp4", "size_bytes": len(self.source_bytes)}]
+        )
+        self.assertEqual(status, 201, payload)
+        session = payload["session"]
+        status, _headers, raw = self.request(
+            "PUT",
+            session["upload_url_template"] + "sneaky.bin",
+            b"x" * 10,
+            {"Content-Type": "application/octet-stream", **self.folder_headers()},
+        )
+        self.assertEqual(status, 422, raw)
+
+    def test_folder_import_end_to_end(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        files = [
+            {"path": "main.mp4", "size_bytes": len(self.source_bytes)},
+            {"path": "assets/封面.png", "size_bytes": len(png)},
+        ]
+        status, payload = self.create_folder_session(files)
+        self.assertEqual(status, 201, payload)
+        session = payload["session"]
+        for path, body in (("main.mp4", self.source_bytes), ("assets/封面.png", png)):
+            status, _headers, raw = self.request(
+                "PUT",
+                session["upload_url_template"] + urllib.parse.quote(path),
+                body,
+                {"Content-Type": "application/octet-stream", **self.folder_headers()},
+            )
+            self.assertEqual(status, 200, raw)
+        # duplicate upload must be refused
+        status, _headers, raw = self.request(
+            "PUT",
+            session["upload_url_template"] + "main.mp4",
+            self.source_bytes,
+            {"Content-Type": "application/octet-stream", **self.folder_headers()},
+        )
+        self.assertEqual(status, 409, raw)
+
+        self.server.start_local_pipeline = lambda *args, **kwargs: None
+        status, finalized = self.json_response(
+            "POST", str(session["finalize_url"]), None, self.folder_headers()
+        )
+        self.assertEqual(status, 201, finalized)
+        project_dir = self.projects_root / finalized["project"]["id"]
+        self.assertTrue(project_dir.is_dir())
+        inventory = json.loads(
+            (project_dir / "working/folder_inventory.json").read_text("utf-8")
+        )
+        self.assertEqual(inventory["main_video_path"], "main.mp4")
+        session_artifact = json.loads(
+            (project_dir / "working/folder_import_session.json").read_text("utf-8")
+        )
+        self.assertEqual(session_artifact["state"], "completed")
+        self.assertTrue(session_artifact["csrf_bound"])
+        self.assertFalse(
+            (self.projects_root / f".folder-creating-{session['id']}").exists(),
+            "staging directory must be removed after finalize",
+        )
+        self.assertIn("editor_url", finalized)
+
+    def test_folder_session_requires_a_video(self) -> None:
+        status, payload = self.create_folder_session(
+            [{"path": "notes.txt", "size_bytes": 5}]
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(payload.get("error_code"), "no_video")

@@ -184,3 +184,106 @@ async function initialize() {
 }
 
 initialize();
+
+let folderFiles = [];
+
+function bindFolderEvents() {
+  const input = byId("folder-input");
+  const chooseButton = byId("choose-folder");
+  const startButton = byId("start-folder-import");
+  if (!input || !chooseButton || !startButton) return;
+  chooseButton.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    folderFiles = Array.from(input.files || []).filter(
+      (file) => file.webkitRelativePath && !file.name.startsWith(".")
+    );
+    const summary = byId("folder-summary");
+    if (folderFiles.length) {
+      const root = folderFiles[0].webkitRelativePath.split("/")[0];
+      byId("folder-name").textContent = root;
+      byId("folder-count").textContent =
+        `${folderFiles.length} 個檔案｜` +
+        formatBytes(folderFiles.reduce((sum, file) => sum + file.size, 0));
+      summary.hidden = false;
+      startButton.disabled = false;
+    } else {
+      summary.hidden = true;
+      startButton.disabled = true;
+    }
+  });
+  startButton.addEventListener("click", () => {
+    startFolderImport().catch((error) => {
+      showError(error.message || String(error));
+      setProgress(0, "資料夾匯入失敗", "修正後可重試。");
+    });
+  });
+}
+
+function folderRelativePath(file) {
+  return file.webkitRelativePath.split("/").slice(1).join("/") || file.name;
+}
+
+async function startFolderImport() {
+  clearError();
+  if (!folderFiles.length) throw new Error("請先選擇資料夾。");
+  const root = folderFiles[0].webkitRelativePath.split("/")[0];
+  setProgress(2, "建立資料夾匯入工作階段…");
+  const createResponse = await fetch("/api/folder-imports", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Auto-Edit-CSRF": studio.bootstrap.csrf_token,
+    },
+    body: JSON.stringify({
+      root_display_name: root,
+      project_name: root,
+      settings: { source_language: "auto" },
+      files: folderFiles.map((file) => ({
+        path: folderRelativePath(file),
+        size_bytes: file.size,
+      })),
+    }),
+  });
+  const created = await createResponse.json();
+  if (!createResponse.ok) {
+    throw new Error(created.message || created.error || "無法建立資料夾匯入。");
+  }
+  const session = created.session;
+  for (let index = 0; index < folderFiles.length; index += 1) {
+    const file = folderFiles[index];
+    const path = folderRelativePath(file);
+    setProgress(
+      2 + Math.round((index / folderFiles.length) * 88),
+      `上傳中（${index + 1}/${folderFiles.length}）`,
+      path
+    );
+    const uploadResponse = await fetch(
+      session.upload_url_template + encodeURIComponent(path),
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Auto-Edit-CSRF": studio.bootstrap.csrf_token,
+        },
+        body: file,
+      }
+    );
+    if (!uploadResponse.ok) {
+      const failure = await uploadResponse.json().catch(() => ({}));
+      throw new Error(failure.message || `檔案上傳失敗：${path}`);
+    }
+  }
+  setProgress(92, "建立專案與清單…");
+  const finalizeResponse = await fetch(session.finalize_url, {
+    method: "POST",
+    headers: { "X-Auto-Edit-CSRF": studio.bootstrap.csrf_token },
+  });
+  const finalized = await finalizeResponse.json();
+  if (!finalizeResponse.ok) {
+    throw new Error(finalized.message || finalized.error || "資料夾匯入失敗。");
+  }
+  setProgress(100, "完成，正在開啟剪輯室…");
+  window.location.href = finalized.editor_url;
+}
+
+bindFolderEvents();
