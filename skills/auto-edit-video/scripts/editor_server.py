@@ -405,6 +405,37 @@ def render_receipt_index(project_dir: Path) -> tuple[set[str], set[str]]:
     return final_paths, preview_paths
 
 
+def _variant_report_errors(
+    project_dir: Path, receipt: dict[str, Any], variant_id: str
+) -> list[str]:
+    """Re-verify the QA report a variant delivery receipt points at.
+
+    The variant download slot must reject receipts whose QA report is
+    missing, tampered, failing, or generated before the enforced QaPolicy —
+    otherwise pre-policy (black/silent) variant finals stay downloadable.
+    """
+    report_rel = str(receipt.get("report") or "")
+    declared = str(receipt.get("report_sha256") or "")
+    report_path = project_dir / Path(report_rel) if report_rel else None
+    if (
+        not report_rel
+        or Path(report_rel).is_absolute()
+        or ".." in Path(report_rel).parts
+        or not re.fullmatch(r"[0-9a-f]{64}", declared)
+        or report_path is None
+        or report_path.is_symlink()
+        or not report_path.is_file()
+        or file_sha256(report_path) != declared
+    ):
+        return [f"variant {variant_id} QA report is missing or does not match its receipt"]
+    report = read_json(report_path, None)
+    if not isinstance(report, dict) or report.get("status") != "pass":
+        return [f"variant {variant_id} QA report is not passing"]
+    if not isinstance(report.get("policy"), dict):
+        return [f"variant {variant_id} QA report predates the enforced QA policy"]
+    return []
+
+
 def render_download_errors(project_dir: Path, relative: str) -> list[str]:
     """Server-side final download gate (contracts/policies/DOWNLOAD_GATE.md).
 
@@ -442,6 +473,9 @@ def render_download_errors(project_dir: Path, relative: str) -> list[str]:
             target = project_dir / relative
             if not target.is_file() or file_sha256(target) != receipt.get("output_sha256"):
                 return ["variant output does not match its delivery receipt"]
+            report_errors = _variant_report_errors(project_dir, receipt, variant_id)
+            if report_errors:
+                return report_errors
             return []
     if not approval_is_current(project_dir, manifest, "final", state):
         return ["final output requires a current final approval before download"]

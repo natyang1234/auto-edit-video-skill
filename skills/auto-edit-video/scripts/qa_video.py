@@ -85,7 +85,10 @@ def probe(video: Path) -> dict[str, Any]:
     }
 
 
-BLACK_DETECT_MIN_SECONDS = 0.02
+# Must stay below one frame at any realistic delivery fps (200fps -> 5ms);
+# a floor above the frame duration makes single-frame black flicker
+# invisible to blackdetect and lets fragmented black evade the coverage gate.
+BLACK_DETECT_MIN_SECONDS = 0.005
 BLACK_DETECT_PIXEL_THRESHOLD = 0.10
 
 

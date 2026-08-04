@@ -2110,6 +2110,61 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
         self.assertEqual(status, 403)
 
+    def test_pre_policy_variant_qa_report_blocks_variant_download(self) -> None:
+        # The variant download slot must re-verify the QA report: a
+        # hash-consistent variant delivery whose report lacks the enforced
+        # policy block (pre-policy pipeline output) stays locked.
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["variants"] = [
+            {"variant_id": "variant-x", "preset_id": "youtube-landscape", "overrides": []}
+        ]
+        self.write_json("working/editor_state.json", state)
+        output_bytes = b"variant-final-bytes"
+        (self.project / "renders/variant-x-final.mp4").write_bytes(output_bytes)
+        report_payload = {"status": "pass", "failures": [], "warnings": []}
+        report_text = json.dumps(report_payload, ensure_ascii=False, indent=2) + "\n"
+        (self.project / "qa").mkdir(parents=True, exist_ok=True)
+        (self.project / "qa/variant-x.json").write_text(report_text, encoding="utf-8")
+        self.write_json(
+            "working/render_receipts/render-variant-x.json",
+            {
+                "schema_version": 1,
+                "render_id": "render-variant-x",
+                "quality": "final",
+                "output": "renders/variant-x-final.mp4",
+            },
+        )
+        self.write_json(
+            "working/delivery_qa/variant-x.json",
+            {
+                "schema_version": 1,
+                "variant_id": "variant-x",
+                "status": "pass",
+                "output": "renders/variant-x-final.mp4",
+                "output_sha256": self._sha256_bytes(output_bytes),
+                "report": "qa/variant-x.json",
+                "report_sha256": self._sha256_bytes(report_text.encode("utf-8")),
+            },
+        )
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        revision = editor_server.variant_gate_revision(
+            self.project, "final", state, "variant-x"
+        )
+        manifest.setdefault("approvals", {})["final_by_variant"] = {
+            "variant-x": {"approved": True, "state_revision": revision}
+        }
+        self.write_json("project.json", manifest)
+        errors = editor_server.render_download_errors(
+            self.project, "renders/variant-x-final.mp4"
+        )
+        self.assertTrue(
+            any("predates the enforced QA policy" in item for item in errors), errors
+        )
+        status, _headers, _body = self.request("GET", "/renders/variant-x-final.mp4")
+        self.assertEqual(status, 403)
+
     def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:
         (self.project / "qa/stale-old.json").write_text(
             json.dumps({"status": "pass"}), encoding="utf-8"

@@ -146,6 +146,45 @@ class QaVideoGateTest(unittest.TestCase):
             report["failures"],
         )
 
+    def test_single_frame_black_flicker_at_60fps_fails(self) -> None:
+        # Alternating black/white single frames at 60fps: 50% black overall,
+        # each black run lasting one frame (~16.7ms) — below any detection
+        # floor that sits above the frame duration.
+        video = self.dir / "flicker-60fps.mp4"
+        command = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=320x240:r=60:d=4,"
+            "geq=lum='if(mod(N,2),16,235)':cb=128:cr=128",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True)
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "50% single-frame black flicker must fail the coverage gate")
+        self.assertTrue(
+            any("black frames cover" in item for item in report["failures"]),
+            report["failures"],
+        )
+
     def test_short_fully_black_video_fails(self) -> None:
         video = self.dir / "short-black.mp4"
         make_video(
