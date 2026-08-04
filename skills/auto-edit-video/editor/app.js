@@ -10,6 +10,8 @@ let history = [];
 let redoStack = [];
 let captionPreviews = {};
 let captionPollTimer = null;
+let editGeneration = 0;
+let lastHistoryPushAt = 0;
 let sourceMediaUrl = null;
 let showingRenderedMedia = false;
 let lastOverlaySignature = "";
@@ -259,6 +261,14 @@ function currentOverlay() {
 
 function pushHistory() {
   if (!state) return;
+  const now = Date.now();
+  if (now - lastHistoryPushAt < 500 && history.length) {
+    // Coalesce a typing burst into one undo step: the snapshot taken at the
+    // start of the burst already captures the pre-burst state.
+    redoStack = [];
+    return;
+  }
+  lastHistoryPushAt = now;
   history.push(deepCopy(state));
   if (history.length > 40) history.shift();
   redoStack = [];
@@ -304,6 +314,7 @@ function ensureSourcePreview() {
 
 function markDirty(message = "尚未儲存") {
   stateDirty = true;
+  editGeneration += 1;
   captionPreviews = {};
   ensureSourcePreview();
   setSaveState(message, "dirty");
@@ -314,10 +325,13 @@ function markDirty(message = "尚未儲存") {
   renderTimeline();
 }
 
-async function pollCaptionPreviews(attempt = 0) {
+async function pollCaptionPreviews(attempt = 0, generation = editGeneration) {
   clearTimeout(captionPollTimer);
   try {
     const status = await request("/api/captions/status");
+    if (generation !== editGeneration || stateDirty) {
+      return; // the user edited again — this poll cycle is stale
+    }
     if (status.engine?.status !== "present") return;
     if (status.ready) {
       captionPreviews = {};
@@ -334,8 +348,10 @@ async function pollCaptionPreviews(attempt = 0) {
   } catch (_error) {
     return;
   }
-  if (attempt < 16) {
-    captionPollTimer = setTimeout(() => pollCaptionPreviews(attempt + 1), 500);
+  if (attempt < 16 && generation === editGeneration) {
+    captionPollTimer = setTimeout(
+      () => pollCaptionPreviews(attempt + 1, generation), 500
+    );
   }
 }
 
@@ -346,7 +362,9 @@ async function saveState(showConfirmation = true) {
     const payload = await request("/api/editor-state", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state),
+      // CAS: the server 409s if someone else saved since our last sync,
+      // instead of silently clobbering their edits.
+      body: JSON.stringify({ ...state, x_expected_revision: state.revision || null }),
     });
     state.updated_at = payload.updated_at;
     state.revision = payload.revision;
@@ -377,7 +395,11 @@ async function saveState(showConfirmation = true) {
     if (showConfirmation) showToast("時間軸已儲存", "success");
   } catch (error) {
     setSaveState("儲存失敗", "error");
-    showToast(`儲存失敗：${error.message}`, "error");
+    if (String(error.message).includes("reload before saving")) {
+      showToast("另一個視窗已修改此專案；請重新整理頁面後再編輯", "error");
+    } else {
+      showToast(`儲存失敗：${error.message}`, "error");
+    }
   }
 }
 
@@ -2717,6 +2739,7 @@ async function applyCaptionScopeStyle() {
   const scope = byIdSafe("caption-style-scope")?.value || "single";
   pushHistory();
   try {
+    const generation = editGeneration;
     const response = await request("/api/captions/apply-style", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2726,6 +2749,10 @@ async function applyCaptionScopeStyle() {
         style: overlay.style || {},
       }),
     });
+    if (generation !== editGeneration) {
+      showToast("套用完成，但你已繼續編輯——保留目前編輯內容", "success");
+      return;
+    }
     state = response.state;
     stateDirty = false;
     setSaveState("已儲存", "saved");
@@ -2747,9 +2774,13 @@ async function renderFontPanel() {
   try {
     const info = await request("/api/fonts");
     const fontName = (info.project_font || "").split("/").pop() || "（未解析）";
+    const details = info.project_font_details || {};
     const lines = [
       `字型引擎：${info.engine?.status === "present" ? info.engine.version : "不可用（drawtext 後備）"}`,
-      `專案字型：${fontName}`,
+      `專案字型：${details.family || fontName}` +
+        (details.postscript_name ? `（${details.postscript_name}）` : "") +
+        (details.sha256 ? `｜hash ${details.sha256.slice(0, 8)}` : "") +
+        (details.license ? `｜授權 ${details.license}` : ""),
       `許可 fallback：${(info.sanctioned_fallbacks || []).join("、") || "無"}`,
     ];
     for (const name of info.disallowed_fallbacks || []) {

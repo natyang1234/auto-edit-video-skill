@@ -1892,6 +1892,7 @@ class EditorServer(ThreadingHTTPServer):
         # threat model (contracts/policies/DOWNLOAD_GATE.md).
         self.csrf_token = secrets.token_urlsafe(32)
         self.caption_job_lock = threading.Lock()
+        self.caption_render_serial = threading.Lock()
         self.caption_job: dict[str, Any] = {
             "state": "idle",
             "caption_revision": None,
@@ -1927,9 +1928,12 @@ class EditorServer(ThreadingHTTPServer):
         import caption_compositor
 
         try:
-            with self.project_lock:
-                state = read_json(self.project_dir / STATE_REL, {}) or {}
-            plan = caption_compositor.build_render_plan(self.project_dir, state, 1.0)
+            # Serialise read→render→publish: two overlapping saves would
+            # otherwise let the older render publish last (Codex review M3).
+            with self.caption_render_serial:
+                with self.project_lock:
+                    state = read_json(self.project_dir / STATE_REL, {}) or {}
+                plan = caption_compositor.build_render_plan(self.project_dir, state, 1.0)
             with self.caption_job_lock:
                 if self.caption_job["sequence"] != sequence:
                     return  # a newer save superseded this run
@@ -2049,7 +2053,16 @@ class EditorHandler(BaseHTTPRequestHandler):
                         }
                     )
         self.send_json(
-            {"ok": True, "engine": engine, "job": job, "ready": ready, "items": items}
+            {
+                "ok": True,
+                "engine": engine,
+                "job": job,
+                "ready": ready,
+                "items": items,
+                "caption_revision": (plan or {}).get("caption_revision")
+                if isinstance(plan, dict)
+                else None,
+            }
         )
 
     def handle_font_info(self, project: Path) -> None:
@@ -2063,11 +2076,29 @@ class EditorHandler(BaseHTTPRequestHandler):
             resolved = str(font_path())
         except ValueError:
             resolved = ""
+        font_details: dict[str, Any] = {}
+        if resolved and caption_compositor.compositor_available():
+            try:
+                modules = caption_compositor._load_coretext()
+                ct_module = modules[0]
+                base_font = caption_compositor._make_base_font(
+                    ct_module, 24.0, Path(resolved)
+                )
+                font_details = {
+                    "postscript_name": str(ct_module.CTFontCopyPostScriptName(base_font)),
+                    "family": str(ct_module.CTFontCopyFamilyName(base_font)),
+                    "sha256": caption_compositor.font_digest(Path(resolved)),
+                    "source": "project" if str(self.server.project_dir) in resolved else "system",
+                    "license": "unverified",
+                }
+            except Exception:  # noqa: BLE001 - informational endpoint
+                font_details = {}
         self.send_json(
             {
                 "ok": True,
                 "engine": caption_compositor.engine_descriptor(),
                 "project_font": resolved,
+                "project_font_details": font_details,
                 "sanctioned_fallbacks": sorted(
                     caption_compositor.SANCTIONED_FALLBACK_PS_NAMES
                 ),
@@ -2097,7 +2128,15 @@ class EditorHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(HTTPStatus.FORBIDDEN)
             return
-        # Immutable content-addressed URL: safe to cache forever.
+        try:
+            if file_sha256(artifact) != artifact_hash:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        # Immutable content-addressed URL: safe to cache forever (hash just
+        # re-verified against the bytes on disk).
         self._cache_immutable = True
         try:
             self.serve_file(artifact)
@@ -2135,6 +2174,15 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         with self.server.project_lock:
             state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+            return self._apply_caption_style_locked(state, scope, overlay_id, style_patch)
+
+    def _apply_caption_style_locked(
+        self,
+        state: dict[str, Any],
+        scope: str,
+        overlay_id: str,
+        style_patch: dict[str, Any],
+    ) -> None:
         plain = [
             overlay
             for overlay in state.get("overlays", [])
@@ -2150,7 +2198,12 @@ class EditorHandler(BaseHTTPRequestHandler):
             recipients = [target]
         elif scope == "selection":
             highlight = target.get("highlight_id")
-            recipients = [o for o in plain if o.get("highlight_id") == highlight]
+            if not highlight:
+                # No highlight scope on the target: an implicit "all unscoped
+                # captions" match would be surprising — degrade to single.
+                recipients = [target]
+            else:
+                recipients = [o for o in plain if o.get("highlight_id") == highlight]
         else:
             recipients = plain
         for overlay in recipients:
@@ -2531,6 +2584,22 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         try:
             state = self.read_json_body()
+            expected_revision = None
+            if isinstance(state, dict):
+                expected_revision = state.pop("x_expected_revision", None)
+            if expected_revision:
+                with self.server.project_lock:
+                    on_disk = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                if on_disk.get("revision") and on_disk["revision"] != expected_revision:
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "error": "editor state changed on the server; reload before saving",
+                            "error_code": "revision_conflict",
+                        },
+                        status=409,
+                    )
+                    return
             errors, response = self.persist_editor_state(state)
             if errors:
                 self.send_json({"ok": False, "errors": errors}, status=422)

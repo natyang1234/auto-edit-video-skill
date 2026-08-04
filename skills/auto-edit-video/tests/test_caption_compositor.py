@@ -106,3 +106,120 @@ class CompositorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+class CompositorRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="caption-compositor-reg-")
+        self.project = Path(self._tmp.name)
+        (self.project / "working").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def render_ppm(self, plan: dict) -> tuple[int, int, bytes]:
+        import subprocess
+
+        artifact = plan["items"][0]["artifact"]
+        png = self.project / artifact["rgba_path"]
+        ppm = self.project / "check.ppm"
+        subprocess.run(
+            [
+                "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", "-y",
+                "-f", "lavfi", "-i",
+                f"color=c=0x202020:s={artifact['width']}x{artifact['height']}",
+                "-i", str(png),
+                "-filter_complex", "overlay=0:0",
+                "-frames:v", "1", "-f", "image2", "-c:v", "ppm", str(ppm),
+            ],
+            check=True, capture_output=True,
+        )
+        data = ppm.read_bytes()
+        parts = data.split(b"\n", 3)
+        width, height = map(int, parts[1].split())
+        return width, height, parts[3]
+
+    def test_vertical_orientation_is_not_flipped(self) -> None:
+        state = {
+            "canvas": {"width": 1080, "height": 1920},
+            "overlays": [
+                {
+                    "id": "cap-flip",
+                    "type": "caption",
+                    "text": "上上上上\n下下下下",
+                    "start": 0, "end": 1, "visible": True,
+                    "style": {"font_size": 60, "color": "#FFFFFF", "stroke_width": 0},
+                    "effect_spans": [
+                        {
+                            "id": "fx-top", "text": "上上上上",
+                            "start_char": 0, "end_char": 4,
+                            "style": {"effect": "pop", "color": "#FF0000", "font_scale": 1.0},
+                        }
+                    ],
+                }
+            ],
+        }
+        plan = cc.build_render_plan(self.project, state)
+        width, height, pixels = self.render_ppm(plan)
+        red_rows = [
+            y for y in range(height)
+            if any(
+                pixels[(y * width + x) * 3] > 150
+                and pixels[(y * width + x) * 3 + 1] < 90
+                and pixels[(y * width + x) * 3 + 2] < 90
+                for x in range(width)
+            )
+        ]
+        self.assertTrue(red_rows, "red top line must be visible")
+        self.assertLess(
+            max(red_rows), height / 2,
+            "the FIRST text line must appear in the TOP half — orientation flipped?",
+        )
+
+    def test_highlight_effect_paints_a_backdrop(self) -> None:
+        state = {
+            "canvas": {"width": 1080, "height": 1920},
+            "overlays": [
+                {
+                    "id": "cap-hl",
+                    "type": "caption",
+                    "text": "重點標記測試",
+                    "start": 0, "end": 1, "visible": True,
+                    "style": {"font_size": 60, "color": "#FFFFFF", "stroke_width": 0},
+                    "effect_spans": [
+                        {
+                            "id": "fx-hl", "text": "標記",
+                            "start_char": 2, "end_char": 4,
+                            "style": {"effect": "highlight", "color": "#F5A623", "font_scale": 1.0},
+                        }
+                    ],
+                }
+            ],
+        }
+        plan = cc.build_render_plan(self.project, state)
+        width, height, pixels = self.render_ppm(plan)
+        amber = sum(
+            1
+            for i in range(0, len(pixels), 3)
+            if pixels[i] > pixels[i + 1] + 25 and pixels[i + 1] > pixels[i + 2] + 15
+        )
+        self.assertGreater(amber, 100, "highlight span must paint a visible backdrop")
+
+    def test_tampered_artifact_is_rerendered_not_reused(self) -> None:
+        state = make_state()
+        plan = cc.build_render_plan(self.project, state)
+        png = self.project / plan["items"][0]["artifact"]["rgba_path"]
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"tampered")
+        again = cc.build_render_plan(self.project, state)
+        fresh = self.project / again["items"][0]["artifact"]["rgba_path"]
+        self.assertEqual(
+            again["items"][0]["artifact"]["artifact_hash"],
+            plan["items"][0]["artifact"]["artifact_hash"],
+            "deterministic re-render must restore the same artifact",
+        )
+        import hashlib
+
+        self.assertEqual(
+            hashlib.sha256(fresh.read_bytes()).hexdigest(),
+            again["items"][0]["artifact"]["artifact_hash"],
+            "tampered bytes must be replaced by an honest re-render",
+        )

@@ -1988,6 +1988,40 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 422, rejected)
 
+    def test_put_cas_rejects_stale_revision(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        stale = json.loads(json.dumps(state))
+        stale["x_expected_revision"] = "0" * 64
+        status, payload = self.json_request("PUT", "/api/editor-state", stale)
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload.get("error_code"), "revision_conflict")
+
+    def test_tampered_caption_png_is_not_served(self) -> None:
+        import caption_compositor
+
+        if not caption_compositor.compositor_available():
+            self.skipTest("needs macOS CoreText")
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        status, _saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200)
+        for _ in range(60):
+            status, _headers, body = self.request("GET", "/api/captions/status")
+            payload = json.loads(body.decode("utf-8"))
+            if payload.get("ready"):
+                break
+            time.sleep(0.25)
+        self.assertTrue(payload.get("ready"))
+        item = payload["items"][0]
+        plan = json.loads(
+            (self.project / "working/caption_render_plan.json").read_text("utf-8")
+        )
+        png = self.project / plan["items"][0]["artifact"]["rgba_path"]
+        png.write_bytes(b"\x89PNG\r\n\x1a\ntampered")
+        status, _headers, _body = self.request("GET", item["url"])
+        self.assertEqual(status, 404, "tampered artifact bytes must never be served")
+
 
 class EditorRendererTests(unittest.TestCase):
     @classmethod
@@ -2648,3 +2682,42 @@ class EditorRendererTests(unittest.TestCase):
         }
         stripped = strip_caption_overlays(state)
         self.assertEqual([o["id"] for o in stripped["overlays"]], ["d1"])
+
+    def test_designed_route_still_overlays_compositor_captions(self) -> None:
+        import caption_compositor
+
+        if not caption_compositor.compositor_available():
+            self.skipTest("needs macOS CoreText")
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["overlays"] = [
+            {
+                "id": "caption-designed",
+                "type": "caption",
+                "text": "designed 也要有字幕",
+                "start": 0.05,
+                "end": 0.40,
+                "visible": True,
+                "style": {"font_size": 40, "animation": "pop"},
+                "layout": {"x": 10, "y": 70, "width": 80, "height": 20},
+            }
+        ]
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        graphics_dir = self.project / "working/graphic_packages"
+        graphics_dir.mkdir(parents=True, exist_ok=True)
+        fake_package = graphics_dir / "package.mp4"
+        fake_package.write_bytes(b"fake")
+        command = build_render_command(
+            self.project, state, manifest,
+            self.project / "renders/designed-caption.mp4", "preview",
+            None, fake_package,
+        )
+        joined = " ".join(command)
+        self.assertIn(
+            "working/captions/caption-designed-", joined,
+            "designed route must still overlay the compositor caption PNG",
+        )
+        self.assertIn("scale=eval=frame", joined, "pop must carry a timing scale")

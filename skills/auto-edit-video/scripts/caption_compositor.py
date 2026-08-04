@@ -69,6 +69,21 @@ def _font_file(project_dir: Path) -> Path:
     return font_path()
 
 
+_FONT_DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def font_digest(path: Path) -> str:
+    """SHA-256 of a (possibly large) font file, cached by (path,mtime,size)."""
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _FONT_DIGEST_CACHE.get(key)
+    if cached is None:
+        cached = _file_sha256(path)
+        _FONT_DIGEST_CACHE.clear()
+        _FONT_DIGEST_CACHE[key] = cached
+    return cached
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -145,11 +160,17 @@ def render_caption_png(
         span_range = foundation.NSMakeRange(start, end - start)
         scale = max(0.5, min(3.0, float(span_style.get("font_scale", 1.0))))
         max_span_scale = max(max_span_scale, scale)
-        span_attrs = {
-            ct.kCTForegroundColorAttributeName: _cg_color(
-                quartz, str(span_style.get("color") or "#FF5533")
-            )
-        }
+        effect_kind = str(span_style.get("effect") or "pop")
+        if effect_kind == "highlight":
+            # Highlight = backdrop marker: keep the base text colour and
+            # paint a translucent pill behind the span (drawn below).
+            span_attrs = {}
+        else:
+            span_attrs = {
+                ct.kCTForegroundColorAttributeName: _cg_color(
+                    quartz, str(span_style.get("color") or "#FF5533")
+                )
+            }
         if scale != 1.0:
             span_attrs[ct.kCTFontAttributeName] = ct.CTFontCreateCopyWithAttributes(
                 base_font, font_size * scale, None, None
@@ -187,6 +208,49 @@ def render_caption_png(
         quartz.CGRectMake(padding, padding, fitted.width, fitted.height),
     )
     frame = ct.CTFramesetterCreateFrame(framesetter, foundation.NSMakeRange(0, 0), path, None)
+
+    highlight_spans = [
+        (int(span.get("start_char", 0)), int(span.get("end_char", 0)), span.get("style") or {})
+        for span in overlay.get("effect_spans") or []
+        if (span.get("style") or {}).get("effect") == "highlight"
+        and int(span.get("end_char", 0)) > int(span.get("start_char", 0))
+    ]
+    if highlight_spans:
+        lines = ct.CTFrameGetLines(frame)
+        origins = ct.CTFrameGetLineOrigins(
+            frame, foundation.NSMakeRange(0, len(lines)), None
+        )
+        for line, origin in zip(lines, origins):
+            line_range = ct.CTLineGetStringRange(line)
+            _width, ascent, descent, _leading = ct.CTLineGetTypographicBounds(
+                line, None, None, None
+            )
+            for span_start, span_end, span_style in highlight_spans:
+                clipped_start = max(span_start, line_range.location)
+                clipped_end = min(span_end, line_range.location + line_range.length)
+                if clipped_end <= clipped_start:
+                    continue
+
+                def line_offset(index: int) -> float:
+                    result = ct.CTLineGetOffsetForStringIndex(line, index, None)
+                    return float(result[0] if isinstance(result, tuple) else result)
+
+                x_start = line_offset(clipped_start)
+                x_end = line_offset(clipped_end)
+                quartz.CGContextSetFillColorWithColor(
+                    context,
+                    _cg_color(quartz, str(span_style.get("color") or "#F5A623"), 0.45),
+                )
+                quartz.CGContextFillRect(
+                    context,
+                    quartz.CGRectMake(
+                        padding + origin.x + min(x_start, x_end),
+                        padding + origin.y - descent - 2,
+                        abs(x_end - x_start),
+                        ascent + descent + 4,
+                    ),
+                )
+
     ct.CTFrameDraw(frame, context)
 
     # Glyph-run font accounting (plan v2 B2): map every run back to a
@@ -273,8 +337,13 @@ def caption_overlays(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def caption_content_revision(state: dict[str, Any], canvas: dict[str, Any], render_scale: float) -> str:
+    try:
+        font_identity = font_digest(_font_file(None))
+    except (OSError, ValueError):
+        font_identity = "unresolved"
     payload = {
         "engine": engine_descriptor(),
+        "font_sha256": font_identity,
         "canvas": {"width": canvas.get("width"), "height": canvas.get("height")},
         "render_scale": round(float(render_scale), 4),
         "items": [
@@ -306,6 +375,8 @@ def build_render_plan(
             existing = contract_registry.load_artifact_text(plan_path.read_text("utf-8"))
             if existing.get("caption_revision") == content_revision and all(
                 (project_dir / item["artifact"]["rgba_path"]).is_file()
+                and _file_sha256(project_dir / item["artifact"]["rgba_path"])
+                == item["artifact"]["artifact_hash"]
                 for item in existing.get("items", [])
             ):
                 return existing
@@ -330,7 +401,7 @@ def build_render_plan(
             "fonts": {
                 PROJECT_FONT_ASSET_ID: {
                     "path": str(font_file),
-                    "sha256": _file_sha256(font_file),
+                    "sha256": font_digest(font_file),
                 },
                 EMOJI_FONT_ASSET_ID: {"path": "system:Apple Color Emoji", "sha256": ""},
             },

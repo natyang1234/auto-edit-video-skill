@@ -240,7 +240,7 @@ def image_filter(
     height: int,
 ) -> str:
     style = overlay.get("style") or {}
-    asset_width = even(width * max(5.0, min(100.0, float(style.get("width", 32)))) / 100.0)
+    asset_width = even(width * max(0.5, min(100.0, float(style.get("width", 32)))) / 100.0)
     x_pct = max(0.0, min(100.0, float(style.get("x", 50))))
     y_pct = max(0.0, min(100.0, float(style.get("y", 50))))
     x = f"{width * x_pct / 100.0:.3f}-overlay_w/2"
@@ -262,6 +262,12 @@ def image_filter(
             f",fade=t=out:st={max(start, end - fade_duration):.3f}:"
             f"d={fade_duration:.3f}:alpha=1"
         )
+    if animation == "pop":
+        pop_duration = min(0.22, max(0.05, duration * 0.28))
+        asset_filters += (
+            ",scale=eval=frame:"
+            f"w='iw*(0.86+0.14*min(1,max(0,(t-{start:.3f})/{pop_duration:.3f})))':h=-2"
+        )
     return (
         f"{asset_filters}[{scaled}];"
         f"[{input_label}][{scaled}]overlay=x='{x}':y='{y}':"
@@ -270,6 +276,12 @@ def image_filter(
 
 
 CAPTION_TYPES = {"caption", "emphasis"}
+
+
+def _compositor_available_cached() -> bool:
+    import caption_compositor
+
+    return caption_compositor.compositor_available()
 
 
 def is_plain_caption(overlay: dict[str, Any]) -> bool:
@@ -482,10 +494,16 @@ def build_render_command(
         clip_id = str(clip.get("id") or "") if clip is not None else ""
         if scoped_highlight and scoped_highlight != clip_id:
             continue
-        if visual_source is not None and (
-            source_overlay.get("design_role")
-            or source_overlay.get("type") in {"caption", "emphasis"}
+        if visual_source is not None and source_overlay.get("design_role"):
+            # design-role cards are baked by the graphic package
+            continue
+        if (
+            visual_source is not None
+            and source_overlay.get("type") in {"caption", "emphasis"}
+            and not _compositor_available_cached()
         ):
+            # Legacy designed path only: without the compositor the package
+            # bakes captions itself, so skip them here (route table).
             continue
         raw_start = float(source_overlay.get("start", 0.0))
         raw_end = float(source_overlay.get("end", 0.0))
