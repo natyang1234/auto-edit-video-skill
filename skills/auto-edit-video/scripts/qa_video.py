@@ -16,12 +16,28 @@ from pathlib import Path
 from typing import Any
 
 
+# A project declares what kind of delivery it is making, rather than dialling
+# individual thresholds: an open set of numbers is an open set of ways to turn
+# the gate off. Every profile here is reviewed and covered by tests.
+QA_PROFILES = ("strict", "silent_delivery", "long_pause_delivery")
+# Checks that describe how the file is damaged, rather than what the delivery
+# is meant to sound or look like. No profile relaxes these.
+UNRELAXABLE = (
+    "truncated or damaged picture",
+    "more than one picture or soundtrack",
+    "clipping",
+    "black frames",
+)
+
+
 @dataclass(frozen=True)
 class QaPolicy:
-    """Configurable fail thresholds for delivery QA (contracts M7).
+    """Fail thresholds for delivery QA (contracts M7).
 
-    Defaults are fail-closed: a fully black or silent final must never pass.
-    Callers may relax individual thresholds explicitly per project.
+    Defaults are fail-closed: a black, truncated or silent final must never
+    pass. A project can declare a profile to allow a delivery that is
+    deliberately silent or deliberately paused; nothing relaxes the checks
+    that detect a damaged file.
     """
 
     max_black_segment_seconds: float = 2.0
@@ -49,8 +65,64 @@ class QaPolicy:
     # silence chopped into runs that each stay under the limits adds up to a
     # near-silent delivery that no other threshold catches.
     min_audible_ratio: float = 0.45
+    # Silence that is the point of the delivery rather than a fault. Set only
+    # by the silent_delivery profile, which also covers a soundtrack the
+    # renderer filled with digital silence because the source had none.
+    allow_silent_delivery: bool = False
+    profile: str = "strict"
+    intent: str = ""
+
+    @classmethod
+    def for_profile(cls, profile: str, intent: str = "") -> "QaPolicy":
+        if profile not in QA_PROFILES:
+            raise ValueError(
+                f"unknown QA profile {profile!r}; expected one of {', '.join(QA_PROFILES)}"
+            )
+        if profile != "strict" and not intent.strip():
+            raise ValueError(f"QA profile {profile!r} requires a stated intent")
+        if profile == "silent_delivery":
+            return cls(
+                allow_missing_audio=True,
+                allow_silent_delivery=True,
+                profile=profile,
+                intent=intent,
+            )
+        if profile == "long_pause_delivery":
+            return cls(
+                max_silent_run_seconds=20.0,
+                max_silent_run_ratio=0.8,
+                min_audible_ratio=0.2,
+                max_silent_ratio=0.9,
+                profile=profile,
+                intent=intent,
+            )
+        return cls(profile=profile, intent=intent)
+
+    def relaxed_fields(self) -> dict[str, Any]:
+        """Which thresholds differ from strict, and by how much."""
+        strict = QaPolicy()
+        return {
+            name: {"default": getattr(strict, name), "used": getattr(self, name)}
+            for name in (
+                "allow_missing_audio",
+                "allow_silent_delivery",
+                "min_integrated_lufs",
+                "max_silent_ratio",
+                "max_silent_run_ratio",
+                "max_silent_run_seconds",
+                "min_silent_run_seconds",
+                "min_audible_ratio",
+            )
+            if getattr(self, name) != getattr(strict, name)
+        }
 
     def __post_init__(self) -> None:
+        if self.profile not in QA_PROFILES:
+            raise ValueError(f"QA policy profile must be one of {', '.join(QA_PROFILES)}")
+        if not isinstance(self.allow_silent_delivery, bool):
+            raise ValueError("QA policy allow_silent_delivery must be a bool")
+        if not isinstance(self.intent, str):
+            raise ValueError("QA policy intent must be a string")
         if not isinstance(self.allow_missing_audio, bool):
             raise ValueError(
                 f"QA policy allow_missing_audio must be a bool, got {self.allow_missing_audio!r}"
@@ -478,7 +550,7 @@ def inspect(
     elif width % 2 or height % 2:
         warnings.append("video dimensions are not even")
     if not audio:
-        if policy.allow_missing_audio:
+        if policy.allow_missing_audio or policy.allow_silent_delivery:
             warnings.append("audio stream is missing")
         else:
             failures.append("audio stream is missing")
@@ -526,9 +598,14 @@ def inspect(
         if audio and not short_clip
         else None
     )
-    if audio and media["duration_s"] >= SILENCE_MIN_MEASURABLE_SECONDS and silence is None:
+    if (
+        audio
+        and not policy.allow_silent_delivery
+        and media["duration_s"] >= SILENCE_MIN_MEASURABLE_SECONDS
+        and silence is None
+    ):
         failures.append("audio could not be measured for silence")
-    if audio and silence:
+    if audio and silence and not policy.allow_silent_delivery:
         if silence["silent_ratio"] >= policy.max_silent_ratio:
             failures.append(
                 f"audio is silent for {silence['silent_ratio']:.1%} of the video, at or above "
@@ -552,7 +629,9 @@ def inspect(
     if audio:
         integrated = (levels or {}).get("integrated_lufs")
         true_peak = (levels or {}).get("true_peak_dbfs")
-        if short_clip:
+        if policy.allow_silent_delivery:
+            pass
+        elif short_clip:
             # Too short for R128; judge level on the sample peak so brief
             # clips are neither falsely failed nor waved through.
             peak = peak_level_dbfs(video)
@@ -571,7 +650,7 @@ def inspect(
             )
         # Clipping applies at every duration: a short clip is still a delivery.
         if true_peak is None:
-            if not short_clip and integrated is not None:
+            if not short_clip and not policy.allow_silent_delivery and integrated is not None:
                 failures.append("true peak could not be measured (silent or unreadable audio)")
         elif true_peak > policy.max_true_peak_dbfs:
             failures.append(
@@ -580,8 +659,11 @@ def inspect(
             )
     contact_sheet(video, contact_path, media["duration_s"])
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": now_utc(),
+        "profile": policy.profile,
+        "intent": policy.intent,
+        "relaxed_fields": policy.relaxed_fields(),
         "video": str(video),
         "status": "pass" if not failures else "fail",
         "media": media,
@@ -626,6 +708,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-missing-audio",
         action="store_true",
         help="downgrade a missing audio stream from failure to warning",
+    )
+    parser.add_argument(
+        "--qa-profile",
+        choices=QA_PROFILES,
+        help="declare the kind of delivery; anything but strict needs --qa-intent",
+    )
+    parser.add_argument(
+        "--qa-intent",
+        default="",
+        help="why this delivery is deliberately silent or paused",
     )
     parser.add_argument(
         "--max-silent-ratio",
@@ -673,6 +765,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def policy_from_args(args: argparse.Namespace) -> QaPolicy:
+    if args.qa_profile:
+        # A declared profile is a reviewed set; individual dials do not apply.
+        return QaPolicy.for_profile(args.qa_profile, args.qa_intent)
     return QaPolicy(
         max_black_segment_seconds=args.max_black_segment_seconds,
         max_black_ratio=args.max_black_ratio,

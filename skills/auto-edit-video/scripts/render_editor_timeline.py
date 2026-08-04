@@ -1026,7 +1026,7 @@ def render_project(
         if variant_id and quality == "final":
             # QA runs on the temporary output; only a passing QA publishes
             # the file + receipt together (no receipt-less final on disk).
-            receipt = qa_variant_output(project_dir, temporary, variant_id)
+            receipt = qa_variant_output(project_dir, temporary, variant_id, state)
             os.replace(temporary, output)
             finalize_variant_delivery_receipt(project_dir, receipt, output, variant_id)
         else:
@@ -1035,8 +1035,19 @@ def render_project(
         temporary.unlink(missing_ok=True)
 
 
+def qa_policy_args(state: dict[str, Any] | None) -> list[str]:
+    """QA flags for the project's declared delivery kind; empty means strict."""
+    declared = (state or {}).get("qa_policy")
+    if not isinstance(declared, dict):
+        return []
+    profile = declared.get("profile")
+    if not isinstance(profile, str) or profile == "strict":
+        return []
+    return ["--qa-profile", profile, "--qa-intent", str(declared.get("intent", ""))]
+
+
 def qa_variant_output(
-    project_dir: Path, candidate: Path, variant_id: str
+    project_dir: Path, candidate: Path, variant_id: str, state: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Run QA on the still-unpublished output; raise before anything lands."""
     qa_dir = project_dir / "qa"
@@ -1050,6 +1061,7 @@ def qa_variant_output(
             "--video", str(candidate),
             "--report", str(report_path),
             "--contact", str(contact_path),
+            *qa_policy_args(state),
         ],
         text=True,
         capture_output=True,

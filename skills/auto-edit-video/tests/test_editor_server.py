@@ -2204,6 +2204,69 @@ class EditorServerTests(unittest.TestCase):
             any("missing or does not match" in item for item in errors), errors
         )
 
+    def test_qa_policy_declaration_is_closed_and_binds_approvals(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        before = editor_server.editor_state_revision(state)
+
+        # Closed schema: only a known profile with a stated intent.
+        for bad in (
+            {"profile": "anything_goes", "intent": "x"},
+            {"profile": "silent_delivery"},
+            {"profile": "silent_delivery", "intent": "  "},
+            {"profile": "strict", "extra": 1},
+            "silent_delivery",
+        ):
+            with self.subTest(repr(bad)):
+                self.assertTrue(editor_server.qa_policy_errors(bad), f"{bad!r} must be rejected")
+        self.assertEqual(editor_server.qa_policy_errors(None), [])
+        self.assertEqual(
+            editor_server.qa_policy_errors({"profile": "silent_delivery", "intent": "b-roll"}),
+            [],
+        )
+
+        # Declaring a different kind of delivery re-opens every approval.
+        state["qa_policy"] = {"profile": "silent_delivery", "intent": "b-roll"}
+        self.assertNotEqual(editor_server.editor_state_revision(state), before)
+        self.assertEqual(
+            editor_server.qa_policy_args(state),
+            ["--qa-profile", "silent_delivery", "--qa-intent", "b-roll"],
+        )
+        self.assertEqual(editor_server.qa_policy_args({"qa_policy": {"profile": "strict"}}), [])
+
+    def test_report_profile_must_match_what_the_project_authorizes(self) -> None:
+        strict_state: dict[str, object] = {}
+        relaxed_state = {"qa_policy": {"profile": "silent_delivery", "intent": "b-roll"}}
+        relaxed_report = {"schema_version": 2, "profile": "silent_delivery", "policy": {}}
+        strict_report = {"schema_version": 2, "profile": "strict", "policy": {}}
+        legacy_report = {"schema_version": 1, "policy": {}}
+
+        # A relaxed report cannot be presented to a project that never
+        # authorized relaxing anything.
+        self.assertTrue(
+            editor_server.qa_profile_binding_errors(relaxed_report, strict_state, "delivery")
+        )
+        # Nor can a report that does not say what it ran under.
+        self.assertTrue(
+            editor_server.qa_profile_binding_errors(
+                {"schema_version": 2, "policy": {}}, strict_state, "delivery"
+            )
+        )
+        self.assertEqual(
+            editor_server.qa_profile_binding_errors(strict_report, strict_state, "delivery"), []
+        )
+        self.assertEqual(
+            editor_server.qa_profile_binding_errors(relaxed_report, relaxed_state, "delivery"), []
+        )
+        # Reports predating profiles could only have run strict, so they stay
+        # valid for a strict project and are rejected for a relaxed one.
+        self.assertEqual(
+            editor_server.qa_profile_binding_errors(legacy_report, strict_state, "delivery"), []
+        )
+        self.assertTrue(
+            editor_server.qa_profile_binding_errors(legacy_report, relaxed_state, "delivery")
+        )
+
     def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:
         (self.project / "qa/stale-old.json").write_text(
             json.dumps({"status": "pass"}), encoding="utf-8"

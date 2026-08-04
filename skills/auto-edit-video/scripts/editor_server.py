@@ -186,6 +186,9 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         "asset_digests": state.get("asset_digests"),
         "caption_defaults": state.get("caption_defaults"),
         "overlays": revision_overlays,
+        # Which QA gates apply is part of what was approved: relaxing them
+        # must invalidate an approval given under stricter ones.
+        "qa_policy": state.get("qa_policy"),
     }
     canonical = json.dumps(
         payload,
@@ -406,7 +409,10 @@ def render_receipt_index(project_dir: Path) -> tuple[set[str], set[str]]:
 
 
 def _variant_report_errors(
-    project_dir: Path, receipt: dict[str, Any], variant_id: str
+    project_dir: Path,
+    receipt: dict[str, Any],
+    variant_id: str,
+    state: dict[str, Any] | None = None,
 ) -> list[str]:
     """Re-verify the QA report a variant delivery receipt points at.
 
@@ -436,7 +442,7 @@ def _variant_report_errors(
             f"variant {variant_id} QA report predates the enforced QA policy; "
             "render the variant again"
         ]
-    return []
+    return qa_profile_binding_errors(report, state, f"variant {variant_id}")
 
 
 def render_download_errors(project_dir: Path, relative: str) -> list[str]:
@@ -476,7 +482,7 @@ def render_download_errors(project_dir: Path, relative: str) -> list[str]:
             target = project_dir / relative
             if not target.is_file() or file_sha256(target) != receipt.get("output_sha256"):
                 return ["variant output does not match its delivery receipt"]
-            report_errors = _variant_report_errors(project_dir, receipt, variant_id)
+            report_errors = _variant_report_errors(project_dir, receipt, variant_id, state)
             if report_errors:
                 return report_errors
             return []
@@ -1369,6 +1375,8 @@ def single_delivery_qa_errors(
         errors.append(
             "delivery QA report predates the enforced QA policy; render the final again"
         )
+    else:
+        errors.extend(qa_profile_binding_errors(report, state, "delivery"))
     render_receipt = read_json(resolved.get("render_receipt", Path("/nonexistent")), None)
     if not isinstance(render_receipt, dict):
         errors.append("render receipt is unreadable")
@@ -1506,6 +1514,10 @@ def batch_delivery_qa_errors(
         elif not isinstance(report.get("policy"), dict):
             errors.append(
                 f"batch item {clip_id or index} QA report predates the enforced QA policy; render the batch again"
+            )
+        else:
+            errors.extend(
+                qa_profile_binding_errors(report, state, f"batch item {clip_id or index}")
             )
         render_receipt = read_json(
             resolved.get("render_receipt", Path("/nonexistent")),
@@ -2200,6 +2212,77 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
     return state
 
 
+QA_PROFILES = ("strict", "silent_delivery", "long_pause_delivery")
+
+
+def qa_policy_errors(declared: Any) -> list[str]:
+    """Validate the delivery-kind declaration as a closed set.
+
+    The surrounding state schema tolerates unknown keys; this one must not,
+    because everything it can say loosens a gate.
+    """
+    if declared is None:
+        return []
+    if not isinstance(declared, dict):
+        return ["qa_policy must be an object"]
+    unknown = sorted(set(declared) - {"profile", "intent"})
+    if unknown:
+        return [f"qa_policy has unsupported fields: {', '.join(unknown)}"]
+    profile = declared.get("profile")
+    if profile not in QA_PROFILES:
+        return [f"qa_policy.profile must be one of {', '.join(QA_PROFILES)}"]
+    intent = declared.get("intent", "")
+    if not isinstance(intent, str):
+        return ["qa_policy.intent must be a string"]
+    if profile != "strict" and not intent.strip():
+        return [f"qa_policy.profile {profile} requires a non-empty intent"]
+    return []
+
+
+def authorized_qa_profile(state: dict[str, Any] | None) -> str:
+    """The delivery kind the current state authorizes."""
+    declared = (state or {}).get("qa_policy")
+    if not isinstance(declared, dict):
+        return "strict"
+    profile = declared.get("profile")
+    return profile if profile in QA_PROFILES else "strict"
+
+
+def qa_profile_binding_errors(
+    report: dict[str, Any], state: dict[str, Any] | None, label: str
+) -> list[str]:
+    """The report must have run under the profile the state authorizes.
+
+    Comparing the report against the receipt alone only shows that two
+    mutable files agree; neither is the authority. The state is.
+    """
+    authorized = authorized_qa_profile(state)
+    if report.get("schema_version", 1) < 2:
+        # Reports predating profiles could only have run strict.
+        used = "strict"
+    else:
+        used = report.get("profile")
+        if not isinstance(used, str):
+            return [f"{label} QA report does not record which profile it ran under"]
+    if used != authorized:
+        return [
+            f"{label} QA report ran under the {used!r} profile but this project "
+            f"authorizes {authorized!r}; render again"
+        ]
+    return []
+
+
+def qa_policy_args(state: dict[str, Any] | None) -> list[str]:
+    """QA flags for the declared delivery kind; empty means strict."""
+    declared = (state or {}).get("qa_policy")
+    if not isinstance(declared, dict):
+        return []
+    profile = declared.get("profile")
+    if profile not in QA_PROFILES or profile == "strict":
+        return []
+    return ["--qa-profile", str(profile), "--qa-intent", str(declared.get("intent", ""))]
+
+
 def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     errors: list[str] = []
     if not isinstance(state, dict):
@@ -2211,6 +2294,7 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
         ]
     if state.get("schema_version") != EDITOR_STATE_SCHEMA_VERSION:
         return [f"editor state schema_version must be {EDITOR_STATE_SCHEMA_VERSION}"]
+    errors.extend(qa_policy_errors(state.get("qa_policy")))
     segments = state.get("segments")
     if not isinstance(segments, list) or not segments:
         errors.append("segments must be a non-empty list (unified timeline contract)")
@@ -5064,6 +5148,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                 str(qa_report),
                 "--contact",
                 str(qa_contact),
+                # Every clip shares the declaration frozen into the batch's
+                # snapshot, not whatever the project says now.
+                *qa_policy_args(read_json(snapshot_path, {}).get("state")),
             ]
             try:
                 qa_result = subprocess.run(
@@ -5483,6 +5570,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                     str(qa_report),
                     "--contact",
                     str(qa_contact),
+                    # The declaration frozen into the snapshot this render was
+                    # authorized against, not whatever the project says now.
+                    *qa_policy_args(read_json(snapshot_path, {}).get("state")),
                 ]
                 try:
                     qa_result = subprocess.run(

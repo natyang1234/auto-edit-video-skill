@@ -1063,6 +1063,78 @@ class QaVideoGateTest(unittest.TestCase):
         self.assertEqual(report["silence"]["silent_seconds"], 0.0)
         self.assertEqual(report["silence"]["unmeasured_seconds"], 0.0)
 
+    def make_silent_delivery(self, name: str = "silent-delivery.mp4") -> Path:
+        # What the renderer actually emits when the source has no audio: a
+        # digital-silence bed, not an absent track.
+        video = self.dir / name
+        subprocess.run(
+            [
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=8",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=8",
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000",
+                "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-shortest", str(video),
+            ],
+            check=True, text=True, capture_output=True,
+        )
+        return video
+
+    def test_silent_delivery_profile_passes_a_deliberately_silent_final(self) -> None:
+        video = self.make_silent_delivery()
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a silent final must fail without a declaration")
+
+        policy = qa_video.QaPolicy.for_profile("silent_delivery", "b-roll loop, no score")
+        report, ok = self.inspect(video, policy=policy)
+        self.assertTrue(ok, report["failures"])
+        self.assertEqual(report["profile"], "silent_delivery")
+        self.assertEqual(report["intent"], "b-roll loop, no score")
+        self.assertIn("allow_silent_delivery", report["relaxed_fields"])
+
+    def test_long_pause_profile_passes_a_long_deliberate_pause(self) -> None:
+        video = self.make_audio_shaped_video(
+            "long-pause.mp4", "if(lt(t,6)+gt(t,20),0.3,0)", 30
+        )
+        report, ok = self.inspect(video)
+        self.assertFalse(ok, "a fourteen second gap must fail without a declaration")
+        policy = qa_video.QaPolicy.for_profile("long_pause_delivery", "documentary pacing")
+        report, ok = self.inspect(video, policy=policy)
+        self.assertTrue(ok, report["failures"])
+
+    def test_no_profile_relaxes_a_damaged_delivery(self) -> None:
+        # Whatever the delivery declares itself to be, these say the file is
+        # broken rather than deliberate.
+        black = self.dir / "declared-black.mp4"
+        make_video(black, video_source="color=c=black", audio_source="sine=frequency=440")
+        multi = self.dir / "declared-two-audio.mp4"
+        subprocess.run(
+            [
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=3",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                "-f", "lavfi", "-i", "sine=frequency=880:duration=3",
+                "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-shortest", str(multi),
+            ],
+            check=True, text=True, capture_output=True,
+        )
+        for profile in ("silent_delivery", "long_pause_delivery"):
+            policy = qa_video.QaPolicy.for_profile(profile, "declared")
+            for label, video in (("black", black), ("two soundtracks", multi)):
+                with self.subTest(f"{profile}/{label}"):
+                    _report, ok = self.inspect(video, policy=policy)
+                    self.assertFalse(ok, f"{label} must fail under {profile}")
+
+    def test_profile_requires_a_stated_intent(self) -> None:
+        for profile in ("silent_delivery", "long_pause_delivery"):
+            with self.assertRaises(ValueError):
+                qa_video.QaPolicy.for_profile(profile, "   ")
+        with self.assertRaises(ValueError):
+            qa_video.QaPolicy.for_profile("anything_goes", "x")
+        self.assertEqual(qa_video.QaPolicy.for_profile("strict").profile, "strict")
+
     def test_short_call_to_action_tail_is_not_flagged(self) -> None:
         # A ten second clip closing on a four second silent card is a normal
         # delivery, not a dropout.
