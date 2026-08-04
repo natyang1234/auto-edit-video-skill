@@ -2165,6 +2165,28 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, _body = self.request("GET", "/renders/variant-x-final.mp4")
         self.assertEqual(status, 403)
 
+        # Intermediate-directory symlink escape: a receipt whose report path
+        # tunnels through a project-internal symlink to an outside file must
+        # stay rejected even with a matching sha256.
+        outside = Path(self._tmp.name) / "outside-qa"
+        outside.mkdir(parents=True, exist_ok=True)
+        outside_report = outside / "outside-report.json"
+        outside_text = json.dumps(
+            {"status": "pass", "policy": SYNTHETIC_QA_POLICY, "failures": [], "warnings": []}
+        )
+        outside_report.write_text(outside_text, encoding="utf-8")
+        (self.project / "qalink").symlink_to(outside, target_is_directory=True)
+        receipt = json.loads(
+            (self.project / "working/delivery_qa/variant-x.json").read_text(encoding="utf-8")
+        )
+        receipt["report"] = "qalink/outside-report.json"
+        receipt["report_sha256"] = self._sha256_bytes(outside_text.encode("utf-8"))
+        self.write_json("working/delivery_qa/variant-x.json", receipt)
+        errors = editor_server._variant_report_errors(self.project, receipt, "variant-x")
+        self.assertTrue(
+            any("missing or does not match" in item for item in errors), errors
+        )
+
     def test_current_final_approval_unlocks_receipt_bound_download_only(self) -> None:
         (self.project / "qa/stale-old.json").write_text(
             json.dumps({"status": "pass"}), encoding="utf-8"

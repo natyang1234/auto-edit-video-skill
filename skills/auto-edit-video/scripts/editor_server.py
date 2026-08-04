@@ -416,17 +416,15 @@ def _variant_report_errors(
     """
     report_rel = str(receipt.get("report") or "")
     declared = str(receipt.get("report_sha256") or "")
-    report_path = project_dir / Path(report_rel) if report_rel else None
-    if (
-        not report_rel
-        or Path(report_rel).is_absolute()
-        or ".." in Path(report_rel).parts
-        or not re.fullmatch(r"[0-9a-f]{64}", declared)
-        or report_path is None
-        or report_path.is_symlink()
-        or not report_path.is_file()
-        or file_sha256(report_path) != declared
-    ):
+    if not report_rel or not re.fullmatch(r"[0-9a-f]{64}", declared):
+        return [f"variant {variant_id} QA report is missing or does not match its receipt"]
+    try:
+        # Same fence as single/batch: resolves symlinks (including
+        # intermediate directories) and confines the report to qa/.
+        report_path = scoped_project_path(project_dir, report_rel, "qa")
+    except ValueError:
+        return [f"variant {variant_id} QA report is missing or does not match its receipt"]
+    if not report_path.is_file() or file_sha256(report_path) != declared:
         return [f"variant {variant_id} QA report is missing or does not match its receipt"]
     report = read_json(report_path, None)
     if not isinstance(report, dict) or report.get("status") != "pass":
