@@ -217,10 +217,8 @@ class Phase1aRoughCutE2ETests(unittest.TestCase):
         # Criterion 3: Subtitle overlay positioning (basic check)
         # Verify captions are present in the state (they should be auto-generated from transcript)
         self.assertIn("overlays", state)
-        # At least one caption should exist
-        captions = [o for o in state.get("overlays", []) if o.get("type") == "caption"]
-        # With current implementation, we may not have auto-generated captions,
-        # but the structure should support them
+        # Captions are not auto-generated in this CLI-only flow; the structure
+        # must simply be present for later stages to fill.
 
         # Criterion 4: Approval gate and revision binding
         # Render final (which requires approval)
