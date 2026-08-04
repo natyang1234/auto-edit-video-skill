@@ -7,6 +7,9 @@ let toastTimer = null;
 let renderPollTimer = null;
 let pipelinePollTimer = null;
 let history = [];
+let redoStack = [];
+let captionPreviews = {};
+let captionPollTimer = null;
 let sourceMediaUrl = null;
 let showingRenderedMedia = false;
 let lastOverlaySignature = "";
@@ -258,6 +261,7 @@ function pushHistory() {
   if (!state) return;
   history.push(deepCopy(state));
   if (history.length > 40) history.shift();
+  redoStack = [];
 }
 
 function undo() {
@@ -265,10 +269,25 @@ function undo() {
     showToast("目前沒有可撤銷的變更");
     return;
   }
+  redoStack.push(deepCopy(state));
+  if (redoStack.length > 40) redoStack.shift();
   state = history.pop();
   selectedOverlayId = state.review?.selected_overlay_id || null;
   activeTemplateGroup = projectPayload.video_templates?.[state.video_template?.id]?.group || "fixed";
   markDirty("已撤銷上一個變更");
+  renderAll();
+}
+
+function redo() {
+  if (!redoStack.length) {
+    showToast("目前沒有可重做的變更");
+    return;
+  }
+  history.push(deepCopy(state));
+  if (history.length > 40) history.shift();
+  state = redoStack.pop();
+  selectedOverlayId = state.review?.selected_overlay_id || null;
+  markDirty("已重做變更");
   renderAll();
 }
 
@@ -285,6 +304,7 @@ function ensureSourcePreview() {
 
 function markDirty(message = "尚未儲存") {
   stateDirty = true;
+  captionPreviews = {};
   ensureSourcePreview();
   setSaveState(message, "dirty");
   clearTimeout(saveTimer);
@@ -292,6 +312,31 @@ function markDirty(message = "尚未儲存") {
   renderPreviewOverlays(true);
   renderLayerList();
   renderTimeline();
+}
+
+async function pollCaptionPreviews(attempt = 0) {
+  clearTimeout(captionPollTimer);
+  try {
+    const status = await request("/api/captions/status");
+    if (status.engine?.status !== "present") return;
+    if (status.ready) {
+      captionPreviews = {};
+      for (const item of status.items || []) {
+        captionPreviews[item.id] = item;
+      }
+      renderPreviewOverlays(true);
+      return;
+    }
+    if (status.job?.state === "failed") {
+      showToast(`字幕渲染失敗：${status.job.error || "未知錯誤"}`, "error");
+      return;
+    }
+  } catch (_error) {
+    return;
+  }
+  if (attempt < 16) {
+    captionPollTimer = setTimeout(() => pollCaptionPreviews(attempt + 1), 500);
+  }
 }
 
 async function saveState(showConfirmation = true) {
@@ -328,6 +373,7 @@ async function saveState(showConfirmation = true) {
       renderDeliveryQa();
     }
     setSaveState("已儲存", "saved");
+    pollCaptionPreviews();
     if (showConfirmation) showToast("時間軸已儲存", "success");
   } catch (error) {
     setSaveState("儲存失敗", "error");
@@ -1068,6 +1114,7 @@ function renderPreviewOverlays(force = false) {
   const signature = JSON.stringify(active.map((overlay) => [
     overlay.id, overlay.text, overlay.source, overlay.style, overlay.layout,
     overlay.emphasis, overlay.effect_spans, selectedOverlayId,
+    captionPreviews[overlay.id]?.artifact_hash || null,
   ]));
   if (!force && signature === lastOverlaySignature) return;
   lastOverlaySignature = signature;
@@ -1078,7 +1125,21 @@ function renderPreviewOverlays(force = false) {
     const layout = overlay.layout || {};
     const assetType = ["image", "gif", "video"].includes(overlay.type);
     let node;
-    if (assetType) {
+    const captionRaster =
+      !designCard && ["caption", "emphasis"].includes(overlay.type)
+        ? captionPreviews[overlay.id]
+        : null;
+    if (captionRaster && overlay.id !== selectedOverlayId) {
+      // WYSIWYG: the compositor PNG IS the output pixel source; CSS only
+      // downsizes the canvas-native raster (never upscales a smaller one).
+      node = document.createElement("img");
+      node.src = captionRaster.url;
+      node.alt = overlay.text || "字幕";
+      const rasterScale =
+        elements["stage-frame"].clientWidth / Math.max(1, state.canvas.width);
+      node.style.width = `${captionRaster.width * rasterScale}px`;
+      node.classList.add("is-caption-raster");
+    } else if (assetType) {
       node = overlay.type === "video" ? document.createElement("video") : document.createElement("img");
       node.src = sourcePathToUrl(overlay.source);
       if (node.tagName === "VIDEO") {
@@ -2583,7 +2644,11 @@ function bindEvents() {
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
       event.preventDefault();
-      undo();
+      if (event.shiftKey) {
+        redo();
+      } else {
+        undo();
+      }
     }
     if (event.code === "Space" && !["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(document.activeElement.tagName)) {
       event.preventDefault();
@@ -2642,3 +2707,60 @@ async function initialize() {
 }
 
 initialize();
+
+async function applyCaptionScopeStyle() {
+  const overlay = currentOverlay();
+  if (!overlay || !["caption", "emphasis"].includes(overlay.type) || overlay.design_role) {
+    showToast("請先選取一個字幕圖層", "error");
+    return;
+  }
+  const scope = byIdSafe("caption-style-scope")?.value || "single";
+  pushHistory();
+  try {
+    const response = await request("/api/captions/apply-style", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scope,
+        overlay_id: overlay.id,
+        style: overlay.style || {},
+      }),
+    });
+    state = response.state;
+    stateDirty = false;
+    setSaveState("已儲存", "saved");
+    showToast(`樣式已套用到 ${response.applied_to.length} 個字幕`, "success");
+    renderAll();
+    pollCaptionPreviews();
+  } catch (error) {
+    showToast(`樣式套用失敗：${error.message}`, "error");
+  }
+}
+
+function byIdSafe(id) {
+  return document.getElementById(id);
+}
+
+async function renderFontPanel() {
+  const panel = byIdSafe("font-panel");
+  if (!panel) return;
+  try {
+    const info = await request("/api/fonts");
+    const fontName = (info.project_font || "").split("/").pop() || "（未解析）";
+    const lines = [
+      `字型引擎：${info.engine?.status === "present" ? info.engine.version : "不可用（drawtext 後備）"}`,
+      `專案字型：${fontName}`,
+      `許可 fallback：${(info.sanctioned_fallbacks || []).join("、") || "無"}`,
+    ];
+    for (const name of info.disallowed_fallbacks || []) {
+      lines.push(`⚠ 未許可的系統字型 fallback：${name}（final 會被擋）`);
+    }
+    panel.textContent = lines.join("｜");
+    panel.style.cssText = "font-size:11px;opacity:0.75;margin-top:6px;line-height:1.6";
+  } catch (_error) {
+    panel.textContent = "";
+  }
+}
+
+byIdSafe("apply-caption-scope")?.addEventListener("click", applyCaptionScopeStyle);
+renderFontPanel();

@@ -283,6 +283,16 @@
                 <label class="field range-field"><span>倍率 <output id="effect-scale-output">1.18×</output></span><input id="effect-scale" type="range" min="0.8" max="2" step="0.01" value="1.18"></label>
               </div>
               <div class="effect-span-list" id="effect-span-list" aria-live="polite"></div>
+              <div class="caption-scope-row">
+                <label for="caption-style-scope">樣式套用範圍</label>
+                <select id="caption-style-scope">
+                  <option value="single">目前字幕</option>
+                  <option value="selection">同精華的字幕</option>
+                  <option value="track">整條字幕軌</option>
+                </select>
+                <button class="button button-secondary compact-button" id="apply-caption-scope" type="button">套用目前樣式</button>
+              </div>
+              <div id="font-panel" class="font-panel" aria-live="polite"></div>
             </section>
 
             <div class="field-pair">

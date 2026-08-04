@@ -1891,6 +1891,13 @@ class EditorServer(ThreadingHTTPServer):
         # requests only — local processes reading loopback are outside this
         # threat model (contracts/policies/DOWNLOAD_GATE.md).
         self.csrf_token = secrets.token_urlsafe(32)
+        self.caption_job_lock = threading.Lock()
+        self.caption_job: dict[str, Any] = {
+            "state": "idle",
+            "caption_revision": None,
+            "error": None,
+            "sequence": 0,
+        }
         self.voice_catalog = load_voice_catalog()
         self.project_lock = threading.RLock()
         self.render_lock = threading.Lock()
@@ -1899,6 +1906,45 @@ class EditorServer(ThreadingHTTPServer):
             "message": "尚未輸出預覽",
             "output": None,
         }
+
+    def schedule_caption_render(self) -> None:
+        """Latest-wins background caption rendering after a state save."""
+        import caption_compositor
+
+        if not caption_compositor.compositor_available():
+            with self.caption_job_lock:
+                self.caption_job.update({"state": "unavailable", "error": None})
+            return
+        with self.caption_job_lock:
+            self.caption_job["sequence"] += 1
+            sequence = self.caption_job["sequence"]
+            self.caption_job.update({"state": "rendering", "error": None})
+        threading.Thread(
+            target=self._caption_render_worker, args=(sequence,), daemon=True
+        ).start()
+
+    def _caption_render_worker(self, sequence: int) -> None:
+        import caption_compositor
+
+        try:
+            with self.project_lock:
+                state = read_json(self.project_dir / STATE_REL, {}) or {}
+            plan = caption_compositor.build_render_plan(self.project_dir, state, 1.0)
+            with self.caption_job_lock:
+                if self.caption_job["sequence"] != sequence:
+                    return  # a newer save superseded this run
+                self.caption_job.update(
+                    {
+                        "state": "ready",
+                        "caption_revision": plan.get("caption_revision"),
+                        "error": None,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - reported through status
+            with self.caption_job_lock:
+                if self.caption_job["sequence"] != sequence:
+                    return
+                self.caption_job.update({"state": "failed", "error": str(exc)[:300]})
 
 
 class EditorHandler(BaseHTTPRequestHandler):
@@ -1913,7 +1959,10 @@ class EditorHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_cache_immutable", False):
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "no-store")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; "
@@ -1967,6 +2016,157 @@ class EditorHandler(BaseHTTPRequestHandler):
         if len(body) != length:
             raise ValueError("request body was truncated")
         return body
+
+    def handle_caption_status(self, project: Path) -> None:
+        import caption_compositor
+
+        engine = caption_compositor.engine_descriptor()
+        with self.server.caption_job_lock:
+            job = dict(self.server.caption_job)
+        plan = read_json(project / "working/caption_render_plan.json", None)
+        items: list[dict[str, Any]] = []
+        ready = False
+        if engine["status"] == "present":
+            with self.server.project_lock:
+                state = read_json(project / STATE_REL, {}) or {}
+            expected = caption_compositor.caption_content_revision(
+                state, state.get("canvas") or {}, 1.0
+            )
+            if isinstance(plan, dict) and plan.get("caption_revision") == expected:
+                ready = True
+                for item in plan.get("items", []):
+                    artifact = item.get("artifact", {})
+                    items.append(
+                        {
+                            "id": item.get("caption_item_id"),
+                            "artifact_hash": artifact.get("artifact_hash"),
+                            "url": (
+                                f"/captions/{item.get('caption_item_id')}/"
+                                f"{artifact.get('artifact_hash')}.png"
+                            ),
+                            "width": artifact.get("width"),
+                            "height": artifact.get("height"),
+                        }
+                    )
+        self.send_json(
+            {"ok": True, "engine": engine, "job": job, "ready": ready, "items": items}
+        )
+
+    def handle_font_info(self, project: Path) -> None:
+        import caption_compositor
+
+        plan = read_json(project / "working/caption_render_plan.json", None)
+        receipt = plan.get("receipt", {}) if isinstance(plan, dict) else {}
+        try:
+            from render_editor_timeline import font_path
+
+            resolved = str(font_path())
+        except ValueError:
+            resolved = ""
+        self.send_json(
+            {
+                "ok": True,
+                "engine": caption_compositor.engine_descriptor(),
+                "project_font": resolved,
+                "sanctioned_fallbacks": sorted(
+                    caption_compositor.SANCTIONED_FALLBACK_PS_NAMES
+                ),
+                "receipt_fonts": receipt.get("fonts", {}),
+                "disallowed_fallbacks": receipt.get("disallowed_fallbacks", []),
+            }
+        )
+
+    def handle_caption_png(self, project: Path, item_id: str, artifact_hash: str) -> None:
+        plan = read_json(project / "working/caption_render_plan.json", None)
+        entry = None
+        if isinstance(plan, dict):
+            for item in plan.get("items", []):
+                if (
+                    item.get("caption_item_id") == item_id
+                    and item.get("artifact", {}).get("artifact_hash") == artifact_hash
+                ):
+                    entry = item
+                    break
+        if entry is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            artifact = scoped_project_path(
+                project, str(entry["artifact"]["rgba_path"]), "working/captions"
+            )
+        except ValueError:
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        # Immutable content-addressed URL: safe to cache forever.
+        self._cache_immutable = True
+        try:
+            self.serve_file(artifact)
+        finally:
+            self._cache_immutable = False
+
+    CAPTION_STYLE_KEYS = {
+        "color", "font_size", "stroke_color", "stroke_width", "box", "box_color",
+        "max_width", "animation", "font_weight", "font_family", "emphasis_color",
+    }
+
+    def handle_caption_apply_style(self) -> None:
+        """Server-side style application across a scope (single/selection/track).
+
+        Scope semantics are enforced here, not by front-end batch edits:
+        only whitelisted style keys move, timing and unlisted fields never.
+        """
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        scope = str(body.get("scope") or "")
+        if scope not in {"single", "selection", "track"}:
+            self.send_json({"ok": False, "error": "scope must be single/selection/track"}, status=422)
+            return
+        overlay_id = str(body.get("overlay_id") or "")
+        style_patch = {
+            key: value
+            for key, value in (body.get("style") or {}).items()
+            if key in self.CAPTION_STYLE_KEYS
+        }
+        if not style_patch:
+            self.send_json({"ok": False, "error": "no applicable style keys"}, status=422)
+            return
+        with self.server.project_lock:
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+        plain = [
+            overlay
+            for overlay in state.get("overlays", [])
+            if isinstance(overlay, dict)
+            and overlay.get("type") in {"caption", "emphasis"}
+            and not overlay.get("design_role")
+        ]
+        target = next((o for o in plain if str(o.get("id")) == overlay_id), None)
+        if scope != "track" and target is None:
+            self.send_json({"ok": False, "error": "overlay not found"}, status=404)
+            return
+        if scope == "single":
+            recipients = [target]
+        elif scope == "selection":
+            highlight = target.get("highlight_id")
+            recipients = [o for o in plain if o.get("highlight_id") == highlight]
+        else:
+            recipients = plain
+        for overlay in recipients:
+            overlay_style = overlay.get("style")
+            if not isinstance(overlay_style, dict):
+                overlay_style = {}
+                overlay["style"] = overlay_style
+            overlay_style.update(style_patch)
+        errors, response = self.persist_editor_state(state)
+        if errors:
+            self.send_json({"ok": False, "errors": errors}, status=422)
+            return
+        self.server.schedule_caption_render()
+        response["state"] = state
+        response["applied_to"] = [str(o.get("id")) for o in recipients]
+        self.send_json(response)
 
     def handle_caption_snap(self) -> None:
         """Server-authoritative cluster snapping for browser selections."""
@@ -2269,6 +2469,18 @@ class EditorHandler(BaseHTTPRequestHandler):
                 return
             self.serve_file(asset, allow_range=asset.suffix.lower() in {".mp4", ".mov"})
             return
+        if path == "/api/captions/status":
+            self.handle_caption_status(project)
+            return
+        if path == "/api/fonts":
+            self.handle_font_info(project)
+            return
+        caption_match = re.fullmatch(
+            r"/captions/([A-Za-z0-9_-]{1,80})/([0-9a-f]{64})\.png", path
+        )
+        if caption_match:
+            self.handle_caption_png(project, caption_match.group(1), caption_match.group(2))
+            return
         if path.startswith("/renders/"):
             relative = urllib.parse.unquote(path.removeprefix("/"))
             try:
@@ -2319,66 +2531,72 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         try:
             state = self.read_json_body()
-            with self.server.project_lock:
-                manifest = read_json(self.server.project_dir / "project.json", {}) or {}
-                duration = float(manifest.get("source", {}).get("duration_s", 0.0))
-                plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
-                state["source_sha256"] = manifest.get("source", {}).get("sha256")
-                state["highlight_plan_revision"] = plan.get("plan_revision")
-                upgrade_video_template_state(state)
-                state["project_dir"] = str(self.server.project_dir)
-                errors = validate_editor_state(state, duration)
-                state.pop("project_dir", None)
-                try:
-                    state["asset_digests"] = referenced_asset_digests(self.server.project_dir, state)
-                except ValueError as exc:
-                    errors.append(str(exc))
-                if errors:
-                    self.send_json({"ok": False, "errors": errors}, status=422)
-                    return
-                state["updated_at"] = now_utc()
-                state["revision"] = editor_state_revision(state)
-                atomic_write_json(self.server.project_dir / STATE_REL, state)
-                current_revisions = approval_revisions(self.server.project_dir, state)
-                invalidated_gates: list[str] = []
-                approvals = manifest.setdefault("approvals", {})
-                for gate in ("highlight_selection", "timeline", "final"):
-                    approval = approvals.get(gate)
-                    if not isinstance(approval, dict) or not approval.get("approved"):
-                        continue
-                    if approval.get("state_revision") == current_revisions[gate]:
-                        continue
-                    approvals[gate] = {
-                        "approved": False,
-                        "confirmed_by": None,
-                        "at": None,
-                        "note": f"Invalidated because the {gate} revision changed",
-                        "invalidated_at": now_utc(),
-                    }
-                    invalidated_gates.append(gate)
-                if invalidated_gates:
-                    stages = manifest.setdefault("stages", {})
-                    if "highlight_selection" in invalidated_gates:
-                        stages["highlight_plan"] = "needs_review"
-                    if "timeline" in invalidated_gates:
-                        stages["timeline_review"] = "needs_review"
-                    if "final" in invalidated_gates:
-                        stages["render"] = "pending"
-                        stages["qa"] = "pending"
-                    manifest["updated_at"] = now_utc()
-                    atomic_write_json(self.server.project_dir / "project.json", manifest)
+            errors, response = self.persist_editor_state(state)
+            if errors:
+                self.send_json({"ok": False, "errors": errors}, status=422)
+                return
         except (ValueError, TypeError) as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
-        self.send_json(
-            {
-                "ok": True,
-                "updated_at": state["updated_at"],
-                "revision": state["revision"],
-                "invalidated_gates": invalidated_gates,
-                "approval_revisions": current_revisions,
-            }
-        )
+        self.server.schedule_caption_render()
+        self.send_json(response)
+
+    def persist_editor_state(self, state: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        """Shared validated persistence for PUT and server-side style patches."""
+        with self.server.project_lock:
+            manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+            duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+            plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
+            state["source_sha256"] = manifest.get("source", {}).get("sha256")
+            state["highlight_plan_revision"] = plan.get("plan_revision")
+            upgrade_video_template_state(state)
+            state["project_dir"] = str(self.server.project_dir)
+            errors = validate_editor_state(state, duration)
+            state.pop("project_dir", None)
+            try:
+                state["asset_digests"] = referenced_asset_digests(self.server.project_dir, state)
+            except ValueError as exc:
+                errors.append(str(exc))
+            if errors:
+                return errors, {}
+            state["updated_at"] = now_utc()
+            state["revision"] = editor_state_revision(state)
+            atomic_write_json(self.server.project_dir / STATE_REL, state)
+            current_revisions = approval_revisions(self.server.project_dir, state)
+            invalidated_gates: list[str] = []
+            approvals = manifest.setdefault("approvals", {})
+            for gate in ("highlight_selection", "timeline", "final"):
+                approval = approvals.get(gate)
+                if not isinstance(approval, dict) or not approval.get("approved"):
+                    continue
+                if approval.get("state_revision") == current_revisions[gate]:
+                    continue
+                approvals[gate] = {
+                    "approved": False,
+                    "confirmed_by": None,
+                    "at": None,
+                    "note": f"Invalidated because the {gate} revision changed",
+                    "invalidated_at": now_utc(),
+                }
+                invalidated_gates.append(gate)
+            if invalidated_gates:
+                stages = manifest.setdefault("stages", {})
+                if "highlight_selection" in invalidated_gates:
+                    stages["highlight_plan"] = "needs_review"
+                if "timeline" in invalidated_gates:
+                    stages["timeline_review"] = "needs_review"
+                if "final" in invalidated_gates:
+                    stages["render"] = "pending"
+                    stages["qa"] = "pending"
+                manifest["updated_at"] = now_utc()
+                atomic_write_json(self.server.project_dir / "project.json", manifest)
+        return [], {
+            "ok": True,
+            "updated_at": state["updated_at"],
+            "revision": state["revision"],
+            "invalidated_gates": invalidated_gates,
+            "approval_revisions": current_revisions,
+        }
 
     def handle_voice_selection(self) -> None:
         try:
@@ -2550,6 +2768,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/captions/snap":
             self.handle_caption_snap()
+            return
+        if path == "/api/captions/apply-style":
+            self.handle_caption_apply_style()
             return
         if path == "/api/approve":
             self.handle_approval()

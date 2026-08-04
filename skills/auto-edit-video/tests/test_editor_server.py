@@ -1929,6 +1929,65 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(migrated[0]["text"], "🇹🇼")
 
+    def test_caption_status_immutable_png_and_apply_style(self) -> None:
+        import caption_compositor
+
+        if not caption_compositor.compositor_available():
+            self.skipTest("needs macOS CoreText")
+        status, _headers, body = self.request("GET", "/api/project")
+        state = json.loads(body.decode("utf-8"))["state"]
+        captions = [
+            o for o in state.get("overlays", [])
+            if o.get("type") in {"caption", "emphasis"} and not o.get("design_role")
+        ]
+        self.assertTrue(captions, "default state should include captions")
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+
+        ready_payload = None
+        for _ in range(60):
+            status, _headers, body = self.request("GET", "/api/captions/status")
+            self.assertEqual(status, 200)
+            payload = json.loads(body.decode("utf-8"))
+            if payload.get("ready"):
+                ready_payload = payload
+                break
+            time.sleep(0.25)
+        self.assertIsNotNone(ready_payload, "caption render job never became ready")
+        self.assertTrue(ready_payload["items"])
+        item = ready_payload["items"][0]
+
+        status, headers, png = self.request("GET", item["url"])
+        self.assertEqual(status, 200)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertIn("immutable", headers.get("Cache-Control", ""))
+
+        bogus = item["url"].replace(item["artifact_hash"], "0" * 64)
+        status, _headers, _body = self.request("GET", bogus)
+        self.assertEqual(status, 404, "wrong artifact hash must not serve a file")
+
+        target = captions[0]["id"]
+        status, applied = self.json_request(
+            "POST",
+            "/api/captions/apply-style",
+            {"scope": "track", "overlay_id": target, "style": {"color": "#00CC88"}},
+        )
+        self.assertEqual(status, 200, applied)
+        self.assertGreaterEqual(len(applied["applied_to"]), len(captions))
+        persisted = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        for overlay in persisted["overlays"]:
+            if overlay.get("type") in {"caption", "emphasis"} and not overlay.get("design_role"):
+                self.assertEqual(overlay["style"].get("color"), "#00CC88")
+
+        status, rejected = self.json_request(
+            "POST",
+            "/api/captions/apply-style",
+            {"scope": "single", "overlay_id": target, "style": {"start": 99}},
+        )
+        self.assertEqual(status, 422, rejected)
+
 
 class EditorRendererTests(unittest.TestCase):
     @classmethod
