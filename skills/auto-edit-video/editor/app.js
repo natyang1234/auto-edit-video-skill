@@ -25,6 +25,11 @@ let renderBusy = false;
 let deskProviderRecords = [];
 let deskProviderStatusLoaded = false;
 let deskProviderSearchBusy = false;
+let projectFonts = [];
+let projectFontInfo = null;
+const loadedProjectFontIds = new Set();
+const loadingProjectFontIds = new Set();
+let projectFontPreviewError = "";
 const PROVIDER_AVAILABILITY_MESSAGES = Object.freeze({
   svg_rasterizer_unavailable: "SVG 匯入目前不可用：本機安全轉檔引擎未就緒。",
   provider_disabled: "此素材來源目前已停用。",
@@ -1197,7 +1202,7 @@ function renderPreviewOverlays(force = false) {
     node.style.setProperty("--overlay-color", style.color || "#f7f2e8");
     node.style.setProperty("--overlay-emphasis", style.emphasis_color || "#ffd447");
     node.style.setProperty("--overlay-stroke", style.stroke_color || "#17130f");
-    node.style.setProperty("--overlay-font", `"${style.font_family || "PingFang TC"}"`);
+    node.style.setProperty("--overlay-font", projectFontCssFamily(style));
     const stageScale = elements["stage-frame"].clientWidth / Math.max(1, state.canvas.width);
     node.style.setProperty("--overlay-font-size", `${Math.max(12, (style.font_size || 58) * stageScale)}px`);
     node.style.setProperty("--overlay-weight", String(style.font_weight || 800));
@@ -1481,7 +1486,7 @@ function renderInspector() {
   elements["overlay-text"].value = overlay.text || "";
   elements["overlay-start"].value = overlay.start;
   elements["overlay-end"].value = overlay.end;
-  elements["font-family"].value = style.font_family || "PingFang TC";
+  populateFontSelect(style);
   elements["font-family"].closest("label").hidden = assetType || designCard;
   elements["font-size"].value = style.font_size || 58;
   elements["font-size-output"].value = style.font_size || 58;
@@ -1579,7 +1584,16 @@ function updateOverlayFromForm() {
   overlay.text = nextText;
   overlay.start = Math.max(0, Number(elements["overlay-start"].value) || 0);
   overlay.end = Math.min(duration(), Math.max(overlay.start + 0.01, Number(elements["overlay-end"].value) || overlay.start + 0.01));
-  style.font_family = elements["font-family"].value;
+  const chosenFont = projectFonts.find((font) => font.asset_id === elements["font-family"].value);
+  if (chosenFont) {
+    style.font_asset_id = chosenFont.asset_id;
+    style.font_family = chosenFont.family || "";
+    if (chosenFont.weight !== undefined) style.font_weight = chosenFont.weight;
+  } else if (elements["font-family"].value === "__legacy__") {
+    // The legacy option is intentionally explicit.  Never fabricate an asset
+    // id from a family name: renderer trust comes only from a verified id.
+    delete style.font_asset_id;
+  } // Unknown/loading options deliberately preserve an existing binding.
   style.font_size = Number(elements["font-size"].value);
   style.width = Number(elements["asset-width"].value);
   style.color = elements["font-color"].value;
@@ -2592,6 +2606,10 @@ function bindEvents() {
   elements["asset-input"].addEventListener("change", () => uploadAsset(elements["asset-input"].files[0]));
   elements["delete-layer"].addEventListener("click", deleteSelectedOverlay);
   elements["layer-form"].addEventListener("input", updateOverlayFromForm);
+  // Native selects dispatch ``change`` reliably, while ``input`` propagation
+  // varies across browser automation and embedded WebKit. Font selection is a
+  // render-affecting edit in its own right, so make that path explicit.
+  elements["font-family"].addEventListener("change", updateOverlayFromForm);
   elements["add-effect-span"].addEventListener("click", addEffectSpan);
   ["select", "mouseup", "keyup"].forEach((eventName) => {
     elements["overlay-text"].addEventListener(eventName, prepareEffectCreation);
@@ -2785,23 +2803,106 @@ async function renderFontPanel() {
   if (!panel) return;
   try {
     const info = await request("/api/fonts");
-    const fontName = (info.project_font || "").split("/").pop() || "（未解析）";
-    const details = info.project_font_details || {};
+    projectFontInfo = info;
+    projectFonts = Array.isArray(info.fonts) ? info.fonts.filter((font) => font && font.asset_id) : [];
+    populateFontSelect(currentOverlay()?.style || state?.caption_defaults || {});
+    const legacy = info.legacy || {};
     const lines = [
       `字型引擎：${info.engine?.status === "present" ? info.engine.version : "不可用（drawtext 後備）"}`,
-      `專案字型：${details.family || fontName}` +
-        (details.postscript_name ? `（${details.postscript_name}）` : "") +
-        (details.sha256 ? `｜hash ${details.sha256.slice(0, 8)}` : "") +
-        (details.license ? `｜授權 ${details.license}` : ""),
+      projectFonts.length
+        ? `已驗證專案字型：${projectFonts.length} 種${info.selected?.asset_id ? `｜目前 ${info.selected.family || info.selected.asset_id}` : ""}`
+        : "未選專案字型；將使用未驗證的本機 legacy 字型。",
+      info.selection_status === "unavailable"
+        ? "⚠ 已選專案字型已缺失、竄改或不覆蓋目前文字；preview/final 會被擋。"
+        : "",
+      legacy.current ? `Legacy：${legacy.current}（未驗證，不能當作專案字型）` : "Legacy：未解析",
       `許可 fallback：${(info.sanctioned_fallbacks || []).join("、") || "無"}`,
     ];
     for (const name of info.disallowed_fallbacks || []) {
       lines.push(`⚠ 未許可的系統字型 fallback：${name}（final 會被擋）`);
     }
-    panel.textContent = lines.join("｜");
+    if (projectFontPreviewError) lines.push(`⚠ ${projectFontPreviewError}`);
+    panel.textContent = lines.filter(Boolean).join("｜");
     panel.style.cssText = "font-size:11px;opacity:0.75;margin-top:6px;line-height:1.6";
   } catch (_error) {
-    panel.textContent = "";
+    panel.textContent = "⚠ 字型清單載入失敗；已選專案字型預覽不可用，請重試或以 MP4 preview/final 為準。";
+    panel.style.cssText = "font-size:11px;opacity:0.75;margin-top:6px;line-height:1.6";
+  }
+}
+
+function populateFontSelect(style = {}) {
+  const select = elements["font-family"];
+  if (!select) return;
+  const currentId = String(style.font_asset_id || "");
+  const currentFamily = String(style.font_family || "");
+  select.replaceChildren();
+  for (const font of projectFonts) {
+    const option = document.createElement("option");
+    option.value = String(font.asset_id);
+    option.textContent = `${String(font.family || font.asset_id)}${font.style ? ` · ${String(font.style)}` : ""}${font.weight ? ` · ${String(font.weight)}` : ""}`;
+    option.dataset.fontAssetId = String(font.asset_id);
+    select.append(option);
+  }
+  const legacy = projectFontInfo?.legacy || {};
+  // Always retain an explicit legacy choice. This prevents a project font
+  // silently becoming selected for old projects on their next ordinary save.
+  {
+    const option = document.createElement("option");
+    option.value = "__legacy__";
+    option.textContent = `Legacy：${currentFamily || legacy.family || legacy.current || "系統字型"}（未驗證）`;
+    select.append(option);
+  }
+  const matching = projectFonts.find((font) => String(font.asset_id) === currentId);
+  if (currentId && !matching) {
+    const option = document.createElement("option");
+    option.value = `__unavailable__:${currentId}`;
+    option.textContent = `專案字型 ${currentId}（載入中或不可用；保留既有綁定）`;
+    option.disabled = true;
+    select.append(option);
+    select.value = option.value;
+  } else {
+    select.value = matching ? currentId : "__legacy__";
+  }
+}
+
+function projectFontCssFamily(style = {}) {
+  const assetId = String(style.font_asset_id || "");
+  if (!assetId) {
+    return `"${style.font_family || "PingFang TC"}"`;
+  }
+  if (!projectFonts.some((font) => String(font.asset_id) === assetId)) {
+    return `"ProjectFont-${assetId}"`;
+  }
+  void loadProjectFont(assetId);
+  // Do not add the display family as a silent fallback: while the browser
+  // bytes are unavailable this is an explicitly degraded preview, never a
+  // claim that it matches the selected project asset.
+  return `"ProjectFont-${assetId}"`;
+}
+
+async function loadProjectFont(assetId) {
+  if (!assetId || loadedProjectFontIds.has(assetId) || loadingProjectFontIds.has(assetId)) return;
+  if (typeof FontFace === "undefined") {
+    projectFontPreviewError = "此瀏覽器不支援專案字型預覽；請以 MP4 preview/final 為準。";
+    renderFontPanel();
+    return;
+  }
+  loadingProjectFontIds.add(assetId);
+  try {
+    const face = new FontFace(`ProjectFont-${assetId}`, `url(/api/fonts/${encodeURIComponent(assetId)}/bytes)`);
+    await face.load();
+    document.fonts.add(face);
+    loadedProjectFontIds.add(assetId);
+    projectFontPreviewError = "";
+    renderPreviewOverlays(true);
+  } catch (_error) {
+    // Final rendering remains authoritative. Do not replace a failed project
+    // preview font with an arbitrary browser-family fallback.
+    loadedProjectFontIds.delete(assetId);
+    projectFontPreviewError = "瀏覽器預覽字型載入失敗；請重試，MP4 preview/final 會阻擋未驗證字型。";
+    renderFontPanel();
+  } finally {
+    loadingProjectFontIds.delete(assetId);
   }
 }
 
@@ -3112,6 +3213,11 @@ function deskProviderResultIsSvg(result, provider = deskSelectedProvider()) {
     || String(result?.mime_type || "").toLowerCase() === "image/svg+xml";
 }
 
+function deskProviderResultIsFont(result, provider = deskSelectedProvider()) {
+  return provider?.kind === "font" || result?.kind === "font"
+    || /^font\//i.test(String(result?.mime_type || ""));
+}
+
 async function deskImportProviderAsset(result, row, button, importStatus) {
   const importToken = typeof result?.import_token === "string" ? result.import_token : "";
   if (!importToken || !button || button.disabled) return;
@@ -3132,7 +3238,9 @@ async function deskImportProviderAsset(result, row, button, importStatus) {
     // SVG imports publish only a receipt-bound PNG derivative.  Refresh the
     // asset library; rights UI is intentionally not used as an SVG import
     // side-channel.  Preserve the existing image-provider refresh behavior.
-    if (deskProviderResultIsSvg(result, providerAtImport)) {
+    if (deskProviderResultIsFont(result, providerAtImport)) {
+      await Promise.all([deskRefreshAssets(), renderFontPanel()]);
+    } else if (deskProviderResultIsSvg(result, providerAtImport)) {
       await deskRefreshAssets();
     } else {
       await Promise.all([deskRefreshAssets(), deskRefreshRights()]);
@@ -3159,7 +3267,8 @@ function deskRenderProviderResults(results) {
     const row = document.createElement("article");
     row.className = "provider-result-row";
     const isSvgResult = deskProviderResultIsSvg(result, provider);
-    row.dataset.kind = isSvgResult ? "svg" : "image";
+    const isFontResult = deskProviderResultIsFont(result, provider);
+    row.dataset.kind = isFontResult ? "font" : (isSvgResult ? "svg" : "image");
 
     const title = document.createElement("strong");
     title.textContent = deskProviderResultText(result?.title, "（未命名素材）");
@@ -3175,7 +3284,9 @@ function deskRenderProviderResults(results) {
       : "尺寸未知";
     const details = document.createElement("span");
     details.className = "provider-result-details";
-    details.textContent = `${isSvgResult ? "格式：SVG｜" : ""}授權：${deskProviderResultText(result?.license_spdx, "UNKNOWN")}｜尺寸：${dimensions}｜${result?.attribution_required ? "需列名" : "可免列名"}`;
+    details.textContent = isFontResult
+      ? `字型｜授權：${deskProviderResultText(result?.license_spdx, "UNKNOWN")}｜覆蓋：${deskProviderResultText(result?.coverage || result?.scripts)}｜${deskProviderResultText(result?.family, "未命名字族")}`
+      : `${isSvgResult ? "格式：SVG｜" : ""}授權：${deskProviderResultText(result?.license_spdx, "UNKNOWN")}｜尺寸：${dimensions}｜${result?.attribution_required ? "需列名" : "可免列名"}`;
     row.append(details);
 
     const actions = document.createElement("div");

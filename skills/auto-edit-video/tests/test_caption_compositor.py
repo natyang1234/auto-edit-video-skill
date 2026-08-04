@@ -68,10 +68,10 @@ class CompositorTests(unittest.TestCase):
     def test_emoji_runs_use_sanctioned_fallback(self) -> None:
         plan = cc.build_render_plan(self.project, make_state())
         fonts = {run["font_asset_id"] for run in plan["items"][0]["glyph_runs"]}
-        self.assertIn(cc.PROJECT_FONT_ASSET_ID, fonts)
+        self.assertIn("font-legacy-system", fonts)
         self.assertIn(cc.EMOJI_FONT_ASSET_ID, fonts)
         self.assertEqual(plan["receipt"]["disallowed_fallbacks"], [])
-        self.assertTrue(plan["receipt"]["fonts"][cc.PROJECT_FONT_ASSET_ID]["sha256"])
+        self.assertTrue(plan["receipt"]["fonts"]["font-legacy-system"]["sha256"])
 
     def test_span_style_change_changes_artifact(self) -> None:
         baseline = cc.build_render_plan(self.project, make_state(span_color="#FF5533"))

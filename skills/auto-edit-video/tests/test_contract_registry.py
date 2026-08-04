@@ -392,6 +392,47 @@ class AssetProvenanceSemanticTests(unittest.TestCase):
                     )
                 )
 
+    def test_font_license_evidence_requires_pinned_google_or_versioned_fontsource_url(self) -> None:
+        cases = (
+            (
+                "google-fonts",
+                "OFL-1.1",
+                "https://raw.githubusercontent.com/google/fonts/"
+                "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/ofl/roboto/OFL.txt",
+            ),
+            (
+                "fontsource",
+                "Ubuntu-font-1.0",
+                "https://cdn.jsdelivr.net/npm/@fontsource/ubuntu@5.1.0/LICENSE",
+            ),
+        )
+        for provider_id, spdx, evidence_url in cases:
+            with self.subTest(provider_id=provider_id):
+                provider = self._asset(
+                    origin="provider",
+                    provider_id=provider_id,
+                    source_url="https://fontsource.org/fonts/ubuntu",
+                    path="assets/fonts/" + "a" * 64 + ".ttf",
+                    license={
+                        "spdx": spdx,
+                        "evidence_url": evidence_url,
+                        "attribution_required": True,
+                        "attribution_text": "Font authors",
+                        "verified_at": "2026-08-04T03:00:00Z",
+                    },
+                )
+                self.assertEqual(semantic_asset_provenance({"items": [provider]}), [])
+                for hostile_url in (
+                    evidence_url.replace("2796410152d4f9524b68ed46e69c1b60f8e0f7c3", "main"),
+                    evidence_url.replace("@5.1.0", "@latest"),
+                    evidence_url.replace(".com/", ".com:443/"),
+                ):
+                    hostile = json.loads(json.dumps(provider))
+                    hostile["license"]["evidence_url"] = hostile_url
+                    if hostile_url == evidence_url:
+                        continue
+                    self.assertTrue(semantic_asset_provenance({"items": [hostile]}))
+
 
 class BundleSuiteTests(unittest.TestCase):
     def test_bundle_suite_is_green(self) -> None:

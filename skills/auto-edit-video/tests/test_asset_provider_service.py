@@ -17,6 +17,7 @@ import zlib
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
+sys.path.insert(0, str(SKILL_DIR / "tests"))
 
 from asset_provider_service import AssetProviderError, AssetProviderService  # noqa: E402
 from hardened_downloader import (  # noqa: E402
@@ -24,6 +25,7 @@ from hardened_downloader import (  # noqa: E402
     ValidationError as DownloadValidationError,
 )
 import asset_registry  # noqa: E402
+from font_test_fixture import build_ttf  # noqa: E402
 
 
 class FakeClock:
@@ -175,6 +177,70 @@ BENIGN_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
     b'<path fill="currentColor" d="M2 2h20v20H2z"/></svg>'
 )
+
+OFL_LICENSE = (SKILL_DIR / "contracts/licenses/OFL-1.1.txt").read_bytes()
+APACHE_LICENSE = (SKILL_DIR / "contracts/licenses/Apache-2.0.txt").read_bytes()
+
+
+def google_font_payload(
+    *,
+    name: str = "PhaseTwo.ttf",
+    sha: str | None = None,
+    root: str = "ofl",
+    license_raw: bytes = OFL_LICENSE,
+) -> bytes:
+    license_name = {"ofl": "OFL.txt", "apache": "LICENSE.txt", "ufl": "UFL.txt"}[root]
+    if sha is None:
+        font = build_ttf()
+        sha = hashlib.sha1(
+            f"blob {len(font)}\0".encode("ascii") + font,
+            usedforsecurity=False,
+        ).hexdigest()
+    return json.dumps(
+        [
+            {
+                "name": name,
+                "path": f"{root}/phasetwotest/{name}",
+                "type": "file",
+                "size": 2048,
+                "sha": sha,
+            },
+            {
+                "name": license_name,
+                "path": f"{root}/phasetwotest/{license_name}",
+                "type": "file",
+                "size": len(license_raw),
+                "sha": "b" * 40,
+            },
+        ]
+    ).encode("utf-8")
+
+
+def fontsource_font_payload(*, license_spdx: str = "OFL-1.1") -> bytes:
+    return json.dumps(
+        {
+            "id": "phase-two-test",
+            "family": "Phase Two Test",
+            "version": "5.1.0",
+            "license": {
+                "id": license_spdx,
+                "url": {
+                    "OFL-1.1": "https://scripts.sil.org/OFL",
+                    "Apache-2.0": "https://www.apache.org/licenses/LICENSE-2.0",
+                }[license_spdx],
+            },
+            "variants": {
+                "400": {
+                    "normal": {
+                        "latin": {
+                            "url": "https://cdn.jsdelivr.net/fontsource/fonts/phase-two-test@5.1.0/latin-400-normal.ttf",
+                            "unicodeRange": "U+0000-00FF",
+                        }
+                    }
+                }
+            },
+        }
+    ).encode("utf-8")
 _DEFAULT_RASTER_METADATA = object()
 
 
@@ -240,16 +306,20 @@ class AssetProviderServiceTests(unittest.TestCase):
         status = self.service.status()
         self.assertEqual(
             [item["id"] for item in status["providers"]],
-            ["openverse", "wikimedia", "heroicons", "lucide", "tabler", "wikimedia-svg"],
+            [
+                "openverse", "wikimedia", "heroicons", "lucide", "tabler",
+                "wikimedia-svg", "google-fonts", "fontsource",
+            ],
         )
         self.assertEqual(
             [item["kind"] for item in status["providers"]],
-            ["image", "image", "svg", "svg", "svg", "svg"],
+            ["image", "image", "svg", "svg", "svg", "svg", "font", "font"],
         )
         self.assertTrue(all(item["available"] for item in status["providers"][:2]))
         self.assertTrue(all(item["availability_code"] == "available" for item in status["providers"][:2]))
-        self.assertTrue(all(not item["available"] for item in status["providers"][2:]))
-        self.assertTrue(all(item["availability_code"] == "svg_rasterizer_unavailable" for item in status["providers"][2:]))
+        self.assertTrue(all(not item["available"] for item in status["providers"][2:6]))
+        self.assertTrue(all(item["availability_code"] == "svg_rasterizer_unavailable" for item in status["providers"][2:6]))
+        self.assertTrue(all(item["available"] for item in status["providers"][6:]))
         self.assertTrue(all(item["consent_required"] for item in status["providers"]))
         self.assertTrue(all(item["cost_class"] == "free" for item in status["providers"]))
         self.assertTrue(all(item["network_disclosure"] for item in status["providers"]))
@@ -1046,6 +1116,416 @@ class AssetProviderServiceTests(unittest.TestCase):
         self.assertEqual(list((self.project / "working/sanitized_svg").glob("*.svg")), [])
         self.assertFalse((self.project / asset_registry.PROVENANCE_REL).exists())
         self.assertEqual(list(self.project.rglob("*.part")), [])
+
+    def _write_font_state(self, text: str, *, metadata_title: str = "") -> None:
+        path = self.project / "working/editor_state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "title": metadata_title,
+                    "overlays": [
+                        {
+                            "id": "caption-1",
+                            "type": "caption",
+                            "text": text,
+                            "start": 0.0,
+                            "end": 1.0,
+                            "style": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_font_catalog_search_and_google_import_are_private_bound_and_idempotent(self) -> None:
+        self._write_font_state("A中", metadata_title="龍 is UI metadata only")
+        font = build_ttf()
+        listing = google_font_payload(root="apache", license_raw=APACHE_LICENSE)
+        downloader = FakeDownloader([listing, APACHE_LICENSE, font, listing])
+        service = AssetProviderService(
+            self.project,
+            downloader=downloader,
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+        )
+        service.grant_consent("google-fonts", "nat")
+        result = service.search("google-fonts", "apache/phasetwotest")
+        public = result["items"][0]
+        self.assertNotIn("download_url", public)
+        self.assertNotIn("license_download_url", public)
+        self.assertNotIn("raw.githubusercontent.com", json.dumps(public))
+        search_url, _path, search_policy = downloader.calls[0]
+        self.assertEqual(
+            search_url,
+            "https://api.github.com/repos/google/fonts/contents/apache/phasetwotest"
+            "?ref=2796410152d4f9524b68ed46e69c1b60f8e0f7c3",
+        )
+        self.assertEqual(search_policy["allowed_hosts"], frozenset({"api.github.com"}))
+
+        imported = service.import_candidate(public["import_token"])
+        self.assertFalse(imported["idempotent"])
+        item = imported["item"]
+        self.assertRegex(
+            item["asset_id"],
+            r"^font-google-fonts-[0-9a-f]{16}-[0-9a-f]{16}$",
+        )
+        self.assertTrue(item["path"].startswith("assets/fonts/"))
+        receipt_path = (
+            self.project
+            / asset_registry.PROVIDER_RECEIPTS_REL
+            / f"{hashlib.sha256(item['asset_id'].encode()).hexdigest()}.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertNotIn("query", receipt)
+        self.assertEqual(
+            receipt["query_hash"],
+            hashlib.sha256(b"apache/phasetwotest").hexdigest(),
+        )
+        self.assertEqual(asset_registry.provider_consistency_errors(self.project, item), [])
+        resolved = asset_registry.resolve_project_font(self.project, item["asset_id"])
+        self.assertEqual(resolved["family"], "Phase Two Test")
+        self.assertEqual(resolved["license_spdx"], "Apache-2.0")
+        self.assertIn("required_glyphs", resolved)
+        self.assertIn("validation_receipt", resolved)
+        self.assertNotIn("validation", resolved)
+        self.assertEqual(len(asset_registry.list_project_fonts(self.project)), 1)
+        self.assertEqual(downloader.calls[1][2]["max_bytes"], 512 * 1024)
+        self.assertEqual(downloader.calls[2][2]["max_bytes"], 32 * 1024 * 1024)
+        self.assertEqual(downloader.calls[1][2]["allowed_hosts"], frozenset({"raw.githubusercontent.com"}))
+
+        second = service.search("google-fonts", "apache/phasetwotest")["items"][0]
+        again = service.import_candidate(second["import_token"])
+        self.assertTrue(again["idempotent"])
+        self.assertEqual(len(downloader.calls), 4, "idempotent import only repeats metadata search")
+
+    def test_fontsource_exact_semver_import_uses_versioned_private_license(self) -> None:
+        self._write_font_state("A")
+        font = build_ttf()
+        downloader = FakeDownloader(
+            [fontsource_font_payload(license_spdx="Apache-2.0"), APACHE_LICENSE, font]
+        )
+        service = AssetProviderService(
+            self.project,
+            downloader=downloader,
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+        )
+        service.grant_consent("fontsource", "nat")
+        result = service.search("fontsource", "phase-two-test@5.1.0")
+        public = result["items"][0]
+        self.assertNotIn("license_download_url", public)
+        imported = service.import_candidate(public["import_token"])
+        self.assertEqual(imported["item"]["provider_id"], "fontsource")
+        self.assertEqual(
+            downloader.calls[1][0],
+            "https://cdn.jsdelivr.net/npm/@fontsource/phase-two-test@5.1.0/LICENSE",
+        )
+        self.assertEqual(asset_registry.provider_consistency_errors(self.project, imported["item"]), [])
+        resolved = asset_registry.resolve_project_font(
+            self.project, imported["item"]["asset_id"]
+        )
+        self.assertEqual(resolved["license_spdx"], "Apache-2.0")
+
+    def test_font_search_query_grammars_are_exact_and_reject_before_network(self) -> None:
+        downloader = FakeDownloader([])
+        service = AssetProviderService(
+            self.project,
+            downloader=downloader,
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+        )
+        for provider_id in ("google-fonts", "fontsource"):
+            service.grant_consent(provider_id, "nat")
+        cases = (
+            ("google-fonts", "OFL/roboto"),
+            ("google-fonts", "ofl/roboto/evil"),
+            ("google-fonts", "main/roboto"),
+            ("fontsource", "roboto@latest"),
+            ("fontsource", "roboto@5.1"),
+            ("fontsource", "Roboto@5.1.0"),
+        )
+        for provider_id, query in cases:
+            with self.subTest(provider_id=provider_id, query=query):
+                with self.assertRaises(AssetProviderError) as rejected:
+                    service.search(provider_id, query)
+                self.assertEqual(rejected.exception.status_code, 422)
+        self.assertEqual(downloader.calls, [])
+
+    def test_font_import_rejects_license_html_spdx_mismatch_bad_magic_and_missing_glyph(self) -> None:
+        apache = b"Apache License\nVersion 2.0, January 2004\nhttp://www.apache.org/licenses/\n"
+        cases = {
+            "html_license": (b"<!doctype html><html>login</html>", build_ttf(), "A"),
+            "wrong_license": (apache, build_ttf(), "A"),
+            "bad_magic": (OFL_LICENSE, b"not-a-font", "A"),
+            "missing_glyph": (OFL_LICENSE, build_ttf(), "龍"),
+        }
+        for label, (license_raw, font_raw, text) in cases.items():
+            with self.subTest(label=label):
+                project = self.project / label
+                project.mkdir()
+                state = project / "working/editor_state.json"
+                state.parent.mkdir()
+                state.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "overlays": [
+                                {
+                                    "type": "caption",
+                                    "text": text,
+                                    "start": 0.0,
+                                    "end": 1.0,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                downloader = FakeDownloader([google_font_payload(), license_raw, font_raw])
+                service = AssetProviderService(
+                    project,
+                    downloader=downloader,
+                    resolver=lambda host, port: ["93.184.216.34"],
+                    clock=self.clock,
+                )
+                service.grant_consent("google-fonts", "nat")
+                token = service.search("google-fonts", "ofl/phasetwotest")["items"][0]["import_token"]
+                with self.assertRaises(AssetProviderError) as rejected:
+                    service.import_candidate(token)
+                self.assertEqual(rejected.exception.status_code, 422)
+                self.assertFalse((project / asset_registry.PROVENANCE_REL).exists())
+                self.assertEqual(list(project.rglob("*.part")), [])
+
+    def test_custom_font_validator_without_exact_capability_cannot_enable_provider(self) -> None:
+        from dataclasses import replace
+
+        from font_security import (
+            FONT_VALIDATOR_VERSION,
+            LIMITS_SHA256,
+            POLICY_VERSION,
+            validate_font_bytes,
+        )
+
+        valid = validate_font_bytes(
+            build_ttf(),
+            "A",
+            license_spdx="OFL-1.1",
+            declared_mime="font/ttf",
+        )
+
+        def forged_validator(raw: bytes, *_args: Any, **_kwargs: Any) -> Any:
+            digest = hashlib.sha256(raw).hexdigest()
+            return replace(
+                valid,
+                byte_length=len(raw),
+                sha256=digest,
+                receipt={
+                    **valid.receipt,
+                    "byte_length": len(raw),
+                    "font_sha256": digest,
+                },
+            )
+
+        service = AssetProviderService(
+            self.project,
+            downloader=FakeDownloader([]),
+            resolver=lambda host, port: ["93.184.216.34"],
+            font_validator=forged_validator,
+            font_capability_probe=lambda: SimpleNamespace(
+                available=True,
+                checks_ok=True,
+                code="OK",
+                identity={
+                    "fonttools_version": "4.62.1",
+                    "validator_version": FONT_VALIDATOR_VERSION,
+                    "policy_version": POLICY_VERSION,
+                    "limits_sha256": LIMITS_SHA256,
+                },
+            ),
+            clock=self.clock,
+        )
+        status = [item for item in service.status()["providers"] if item["kind"] == "font"]
+        self.assertTrue(all(item["available"] is False for item in status))
+        service.grant_consent("google-fonts", "nat")
+        with self.assertRaises(AssetProviderError) as rejected:
+            service.search("google-fonts", "ofl/phasetwotest")
+        self.assertEqual(rejected.exception.code, "font_validator_unavailable")
+        self.assertFalse((self.project / asset_registry.PROVENANCE_REL).exists())
+        self.assertEqual(list(self.project.rglob("*.part")), [])
+
+    def test_malformed_font_capability_and_result_shapes_fail_closed(self) -> None:
+        from font_security import FONT_VALIDATOR_VERSION, LIMITS_SHA256, POLICY_VERSION
+
+        identity = {
+            "fonttools_version": "4.62.1",
+            "validator_version": FONT_VALIDATOR_VERSION,
+            "policy_version": POLICY_VERSION,
+            "limits_sha256": LIMITS_SHA256,
+        }
+        malformed = (
+            {"available": True, "checks_ok": True, "code": "OK", "identity": identity},
+            SimpleNamespace(available=True, checks_ok=False, code="OK", identity=identity),
+            SimpleNamespace(available=True, checks_ok=True, code="OK", identity={}),
+            SimpleNamespace(
+                available=True,
+                checks_ok=True,
+                code="OK",
+                identity={**identity, "fonttools_version": "latest"},
+            ),
+        )
+        for index, capability in enumerate(malformed):
+            with self.subTest(index=index):
+                service = AssetProviderService(
+                    self.project,
+                    downloader=FakeDownloader([]),
+                    resolver=lambda host, port: ["93.184.216.34"],
+                    font_validator=lambda *_args, **_kwargs: True,
+                    font_capability_probe=lambda value=capability: value,
+                    clock=self.clock,
+                )
+                font_status = [
+                    item for item in service.status()["providers"] if item["kind"] == "font"
+                ]
+                self.assertTrue(all(item["available"] is False for item in font_status))
+
+        self._write_font_state("A")
+        service = AssetProviderService(
+            self.project,
+            downloader=FakeDownloader([google_font_payload(), OFL_LICENSE, build_ttf()]),
+            resolver=lambda host, port: ["93.184.216.34"],
+            font_validator=lambda *_args, **_kwargs: True,
+            font_capability_probe=lambda: SimpleNamespace(
+                available=True, checks_ok=True, code="OK", identity=dict(identity)
+            ),
+            clock=self.clock,
+        )
+        service.grant_consent("google-fonts", "nat")
+        with self.assertRaises(AssetProviderError) as rejected:
+            service.search("google-fonts", "ofl/phasetwotest")
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertEqual(rejected.exception.code, "font_validator_unavailable")
+        self.assertFalse((self.project / asset_registry.PROVENANCE_REL).exists())
+
+    def test_font_transaction_rollback_restores_publication_and_preserves_existing_hash(self) -> None:
+        self._write_font_state("A")
+        baseline = {
+            "asset_id": "baseline",
+            "path": "assets/baseline.png",
+            "sha256": "d" * 64,
+            "origin": "folder-import",
+            "provider_id": None,
+            "source_url": None,
+            "license": {
+                "spdx": "CC0-1.0",
+                "evidence_url": None,
+                "attribution_required": False,
+                "attribution_text": "",
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+            "review_status": "approved",
+        }
+        asset_registry.upsert_item(self.project, baseline)
+        registry_path = self.project / asset_registry.PROVENANCE_REL
+        attribution_path = self.project / asset_registry.ATTRIBUTION_REL
+        registry_before = registry_path.read_bytes()
+        attribution_before = attribution_path.read_bytes()
+        license_hash = hashlib.sha256(OFL_LICENSE).hexdigest()
+        existing_license = self.project / f"licenses/{license_hash}.txt"
+        existing_license.parent.mkdir()
+        existing_license.write_bytes(OFL_LICENSE)
+        service = AssetProviderService(
+            self.project,
+            downloader=FakeDownloader([google_font_payload(), OFL_LICENSE, build_ttf()]),
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+        )
+        service.grant_consent("google-fonts", "nat")
+        token = service.search("google-fonts", "ofl/phasetwotest")["items"][0]["import_token"]
+
+        def corrupt_then_fail(_root: Path, _item: dict[str, Any]) -> dict[str, Any]:
+            registry_path.write_bytes(b"corrupt")
+            attribution_path.write_bytes(b"corrupt")
+            raise asset_registry.AssetRegistryError("simulated publication failure")
+
+        with patch.object(asset_registry, "upsert_item", side_effect=corrupt_then_fail):
+            with self.assertRaises(AssetProviderError) as rejected:
+                service.import_candidate(token)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(registry_path.read_bytes(), registry_before)
+        self.assertEqual(attribution_path.read_bytes(), attribution_before)
+        self.assertEqual(existing_license.read_bytes(), OFL_LICENSE)
+        self.assertEqual(list((self.project / "assets/fonts").glob("*")), [])
+        self.assertEqual(list((self.project / asset_registry.PROVIDER_RECEIPTS_REL).glob("*.json")), [])
+        self.assertEqual(list(self.project.rglob("*.part")), [])
+
+    def test_font_receipt_collision_preserves_preexisting_evidence(self) -> None:
+        self._write_font_state("A")
+        font = build_ttf()
+        blob_sha = hashlib.sha1(
+            f"blob {len(font)}\0".encode("ascii") + font,
+            usedforsecurity=False,
+        ).hexdigest()
+        candidate_id = f"{blob_sha}:PhaseTwo.ttf"
+        asset_id = (
+            "font-google-fonts-"
+            f"{hashlib.sha256(candidate_id.encode()).hexdigest()[:16]}-"
+            f"{hashlib.sha256(font).hexdigest()[:16]}"
+        )
+        receipt_path = (
+            self.project
+            / asset_registry.PROVIDER_RECEIPTS_REL
+            / f"{hashlib.sha256(asset_id.encode()).hexdigest()}.json"
+        )
+        receipt_path.parent.mkdir(parents=True)
+        sentinel = b'{"sentinel":"preexisting"}\n'
+        receipt_path.write_bytes(sentinel)
+        service = AssetProviderService(
+            self.project,
+            downloader=FakeDownloader([google_font_payload(), OFL_LICENSE, font]),
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+        )
+        service.grant_consent("google-fonts", "nat")
+        token = service.search("google-fonts", "ofl/phasetwotest")["items"][0]["import_token"]
+
+        with self.assertRaises(AssetProviderError) as rejected:
+            service.import_candidate(token)
+
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(receipt_path.read_bytes(), sentinel)
+        self.assertFalse((self.project / asset_registry.PROVENANCE_REL).exists())
+
+    def test_different_font_candidate_same_binary_is_409_without_provenance_merge(self) -> None:
+        self._write_font_state("A")
+        font = build_ttf()
+        downloader = FakeDownloader(
+            [
+                google_font_payload(), OFL_LICENSE, font,
+                google_font_payload(name="PhaseTwoAlt.ttf"), OFL_LICENSE, font,
+            ]
+        )
+        service = AssetProviderService(
+            self.project,
+            downloader=downloader,
+            resolver=lambda host, port: ["93.184.216.34"],
+            clock=self.clock,
+        )
+        service.grant_consent("google-fonts", "nat")
+        first = service.search("google-fonts", "ofl/phasetwotest")["items"][0]
+        imported = service.import_candidate(first["import_token"])
+        before_registry = (self.project / asset_registry.PROVENANCE_REL).read_bytes()
+        before_attribution = (self.project / asset_registry.ATTRIBUTION_REL).read_bytes()
+        second = service.search("google-fonts", "ofl/phasetwotest")["items"][0]
+        with self.assertRaises(AssetProviderError) as rejected:
+            service.import_candidate(second["import_token"])
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual((self.project / asset_registry.PROVENANCE_REL).read_bytes(), before_registry)
+        self.assertEqual((self.project / asset_registry.ATTRIBUTION_REL).read_bytes(), before_attribution)
+        self.assertEqual(len(list((self.project / asset_registry.PROVIDER_RECEIPTS_REL).glob("*.json"))), 1)
+        self.assertTrue((self.project / imported["source"]).is_file())
 
 
 if __name__ == "__main__":

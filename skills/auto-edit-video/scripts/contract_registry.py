@@ -250,6 +250,7 @@ LICENSE_FINAL_ALLOWLIST = frozenset(
         "CC-BY-SA-4.0",
         "OFL-1.1",
         "Apache-2.0",
+        "Ubuntu-font-1.0",
         "MIT",
         "ISC",
         "Unlicense",
@@ -329,6 +330,41 @@ def _canonical_provider_license_evidence(value, spdx) -> bool:
     )
 
 
+def _canonical_font_license_evidence(provider_id, value, spdx) -> bool:
+    if provider_id not in {"google-fonts", "fontsource"} or spdx not in {
+        "OFL-1.1", "Apache-2.0", "Ubuntu-font-1.0",
+    }:
+        return False
+    if not _https_url_without_credentials(value):
+        return False
+    parsed = urlsplit(value)
+    if parsed.query or parsed.fragment or parsed.port is not None:
+        return False
+    if provider_id == "google-fonts":
+        commit = "2796410152d4f9524b68ed46e69c1b60f8e0f7c3"
+        match = re.fullmatch(
+            rf"/google/fonts/{commit}/(ofl|apache|ufl)/[a-z0-9]{{1,80}}/(OFL\.txt|LICENSE\.txt|UFL\.txt)",
+            parsed.path,
+        )
+        expected = {
+            "ofl": ("OFL-1.1", "OFL.txt"),
+            "apache": ("Apache-2.0", "LICENSE.txt"),
+            "ufl": ("Ubuntu-font-1.0", "UFL.txt"),
+        }
+        return bool(
+            parsed.netloc == "raw.githubusercontent.com"
+            and match
+            and expected[match.group(1)] == (spdx, match.group(2))
+        )
+    return bool(
+        parsed.netloc == "cdn.jsdelivr.net"
+        and re.fullmatch(
+            r"/npm/@fontsource/[a-z0-9]+(?:-[a-z0-9]+)*@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)/LICENSE",
+            parsed.path,
+        )
+    )
+
+
 def semantic_asset_provenance(provenance) -> list[str]:
     """Validate asset identity, provenance, path, license, and review rules."""
     errors = []
@@ -370,6 +406,8 @@ def semantic_asset_provenance(provenance) -> list[str]:
                 license_info.get("evidence_url"), license_info.get("spdx")
             ) and license_info.get("evidence_url") != _SVG_REPO_LICENSE_EVIDENCE.get(
                 (provider_id, license_info.get("spdx"))
+            ) and not _canonical_font_license_evidence(
+                provider_id, license_info.get("evidence_url"), license_info.get("spdx")
             ):
                 errors.append(
                     f"{path}.license.evidence_url: must match the canonical SPDX license URL"

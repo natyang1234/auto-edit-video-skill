@@ -15,13 +15,20 @@ import zlib
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
+sys.path.insert(0, str(SKILL_DIR / "tests"))
 
 import asset_registry  # noqa: E402
+from font_security import validate_font_bytes  # noqa: E402
+from font_test_fixture import build_ttf  # noqa: E402
 from svg_security import (  # noqa: E402
     LIMITS_SHA256,
     POLICY_VERSION,
     SANITIZER_VERSION,
 )
+
+OFL_LICENSE = (SKILL_DIR / "contracts/licenses/OFL-1.1.txt").read_bytes()
+APACHE_LICENSE = (SKILL_DIR / "contracts/licenses/Apache-2.0.txt").read_bytes()
+UBUNTU_FONT_LICENSE = (SKILL_DIR / "contracts/licenses/Ubuntu-font-1.0.txt").read_bytes()
 
 
 def strict_png(width: int = 24, height: int = 24) -> bytes:
@@ -187,6 +194,83 @@ class AssetRegistryTests(unittest.TestCase):
                 "sandbox_profile_sha256": "6" * 64,
             },
         )
+
+    def publish_font_receipt(self, *, required_text: str = "A") -> tuple[dict, dict]:
+        raw = build_ttf()
+        result = validate_font_bytes(
+            raw,
+            required_text,
+            license_spdx="OFL-1.1",
+            declared_mime="font/ttf",
+        )
+        blob_sha = hashlib.sha1(
+            f"blob {len(raw)}\0".encode("ascii") + raw,
+            usedforsecurity=False,
+        ).hexdigest()
+        candidate_id = f"{blob_sha}:PhaseTwo.ttf"
+        candidate_hash = hashlib.sha256(candidate_id.encode()).hexdigest()[:16]
+        item = {
+            "asset_id": f"font-google-fonts-{candidate_hash}-{result.sha256[:16]}",
+            "path": f"assets/fonts/{result.sha256}.ttf",
+            "sha256": result.sha256,
+            "origin": "provider",
+            "provider_id": "google-fonts",
+            "source_url": (
+                "https://github.com/google/fonts/blob/"
+                "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/ofl/phasetwotest/PhaseTwo.ttf"
+            ),
+            "license": {
+                "spdx": "OFL-1.1",
+                "evidence_url": (
+                    "https://raw.githubusercontent.com/google/fonts/"
+                    "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/ofl/phasetwotest/OFL.txt"
+                ),
+                "attribution_required": True,
+                "attribution_text": "Phase Two Test — OFL-1.1",
+                "verified_at": "2026-08-04T03:00:00Z",
+            },
+            "review_status": "approved",
+        }
+        license_raw = OFL_LICENSE
+        normalized, normalized_sha = asset_registry.validate_font_license_text(
+            license_raw, "OFL-1.1"
+        )
+        self.assertTrue(normalized)
+        for relative, payload in (
+            (item["path"], raw),
+            (f"licenses/{hashlib.sha256(license_raw).hexdigest()}.txt", license_raw),
+        ):
+            path = self.project / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        receipt = asset_registry.save_font_provider_receipt(
+            self.project,
+            item,
+            candidate_id=candidate_id,
+            query="ofl/phasetwotest",
+            download_url=(
+                "https://raw.githubusercontent.com/google/fonts/"
+                "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/ofl/phasetwotest/PhaseTwo.ttf"
+            ),
+            license_download_url=item["license"]["evidence_url"],
+            candidate_metadata={
+                "family": "phasetwotest",
+                "style": "",
+                "weight": None,
+                "subset": "",
+                "unicode_range": "",
+                "version": "2796410152d4f9524b68ed46e69c1b60f8e0f7c3",
+                "source_url": item["source_url"],
+            },
+            font_result=result,
+            license_path=f"licenses/{hashlib.sha256(license_raw).hexdigest()}.txt",
+            license_sha256=hashlib.sha256(license_raw).hexdigest(),
+            license_normalized_sha256=normalized_sha,
+            license_size=len(license_raw),
+            capability_identity=asset_registry._font_capability_identity(),
+        )
+        asset_registry.upsert_item(self.project, item)
+        return item, receipt
 
     def test_missing_registry_returns_empty_v1_artifact(self) -> None:
         self.assertEqual(
@@ -505,6 +589,264 @@ class AssetRegistryTests(unittest.TestCase):
         errors = asset_registry.provider_consistency_errors(self.project, item)
         self.assertTrue(errors)
         self.assertTrue(any("review_status" in error for error in errors))
+
+    def test_font_v3_resolve_is_physical_json_safe_and_metadata_does_not_expand_coverage(self) -> None:
+        item, receipt = self.publish_font_receipt(required_text="A")
+        state = self.project / "working/editor_state.json"
+        state.parent.mkdir(exist_ok=True)
+        state.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "title": "龍 metadata must not be rendered",
+                    "provider": {"label": "龍"},
+                    "caption_defaults": {"font_asset_id": item["asset_id"]},
+                    "overlays": [
+                        {
+                            "type": "caption",
+                            "text": "A",
+                            "start": 0.0,
+                            "end": 1.0,
+                            "style": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(asset_registry.provider_consistency_errors(self.project, item), [])
+        resolved = asset_registry.resolve_project_font(self.project, item["asset_id"])
+        json.dumps(resolved, ensure_ascii=False)
+        self.assertEqual(resolved["receipt"]["schema_version"], 3)
+        self.assertEqual(resolved["validation_receipt"]["font_sha256"], item["sha256"])
+        self.assertEqual(len(asset_registry.list_project_fonts(self.project)), 1)
+        self.assertEqual(receipt["font"]["path"], item["path"])
+
+        current = json.loads(state.read_text("utf-8"))
+        current["overlays"][0]["text"] = "龍"
+        state.write_text(json.dumps(current), encoding="utf-8")
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_project_font(self.project, item["asset_id"])
+        self.assertEqual(asset_registry.list_project_fonts(self.project), [])
+
+    def test_font_v3_rejects_receipt_path_binary_license_and_symlink_tamper(self) -> None:
+        item, receipt = self.publish_font_receipt()
+        receipt_path = (
+            self.project / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        original_receipt = receipt_path.read_bytes()
+        self.assertNotIn("query", receipt)
+        bad_query_hash = json.loads(original_receipt)
+        bad_query_hash["query_hash"] = "0" * 64
+        receipt_path.write_text(json.dumps(bad_query_hash), encoding="utf-8")
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+        receipt_path.write_bytes(original_receipt)
+        traversal = json.loads(original_receipt)
+        traversal["font"]["path"] = "../outside.ttf"
+        receipt_path.write_text(json.dumps(traversal), encoding="utf-8")
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+        receipt_path.write_bytes(original_receipt)
+
+        font_path = self.project / receipt["font"]["path"]
+        original_font = font_path.read_bytes()
+        font_path.write_bytes(original_font + b"tamper")
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+        font_path.write_bytes(original_font)
+
+        license_path = self.project / receipt["license"]["path"]
+        original_license = license_path.read_bytes()
+        license_path.write_bytes(original_license.replace(b"SIL OPEN", b"BAD OPEN"))
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+        license_path.write_bytes(original_license)
+
+        outside = self.project / "outside.ttf"
+        outside.write_bytes(original_font)
+        font_path.unlink()
+        font_path.symlink_to(outside)
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+
+    def test_font_manual_registry_or_old_receipt_cannot_pass_final_consistency(self) -> None:
+        item, _receipt = self.publish_font_receipt()
+        receipt_path = (
+            self.project / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        receipt_path.unlink()
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+        receipt_path.parent.mkdir(exist_ok=True)
+        receipt_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+        self.assertTrue(asset_registry.provider_consistency_errors(self.project, item))
+
+    def test_font_license_text_fingerprint_rejects_empty_html_controls_and_cross_spdx(self) -> None:
+        apache = b"Apache License\nVersion 2.0, January 2004\nhttp://www.apache.org/licenses/\n"
+        ubuntu = b"UBUNTU FONT LICENCE Version 1.0\nPREAMBLE\nDEFINITIONS\n"
+        self.assertTrue(asset_registry.validate_font_license_text(OFL_LICENSE, "OFL-1.1")[0])
+        self.assertTrue(asset_registry.validate_font_license_text(APACHE_LICENSE, "Apache-2.0")[0])
+        self.assertTrue(
+            asset_registry.validate_font_license_text(
+                UBUNTU_FONT_LICENSE, "Ubuntu-font-1.0"
+            )[0]
+        )
+        ofl_with_header = (
+            b"Copyright (c) 2026, Fixture Authors\n"
+            b"This Font Software is licensed under the SIL Open Font License, Version 1.1.\n"
+            b"This license is copied below, and is also available with a FAQ at:\n"
+            b"https://openfontlicense.org\n\n"
+            + OFL_LICENSE
+        )
+        self.assertTrue(
+            asset_registry.validate_font_license_text(ofl_with_header, "OFL-1.1")[0]
+        )
+        mutated_ofl = OFL_LICENSE.replace(
+            b"Permission is hereby granted", b"Permission is not granted", 1
+        )
+        hostile = (
+            (b"", "OFL-1.1"),
+            (b"<!doctype html><html>login</html>", "OFL-1.1"),
+            (b"SIL OPEN FONT LICENSE Version 1.1\x00PREAMBLE\nPERMISSION & CONDITIONS", "OFL-1.1"),
+            (b"SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007\nPREAMBLE\nPERMISSION & CONDITIONS\n", "OFL-1.1"),
+            (apache, "OFL-1.1"),
+            (apache, "Apache-2.0"),
+            (ubuntu, "Ubuntu-font-1.0"),
+            (ubuntu, "Apache-2.0"),
+            (mutated_ofl, "OFL-1.1"),
+        )
+        for raw, spdx in hostile:
+            with self.subTest(spdx=spdx, raw=raw[:20]):
+                with self.assertRaises(asset_registry.AssetRegistryError):
+                    asset_registry.validate_font_license_text(raw, spdx)
+
+    def test_font_license_text_accepts_bounded_headers_for_all_templates(self) -> None:
+        bounded_font_header = (
+            b"Copyright (c) 2026, Fixture Authors\n"
+            b"with Reserved Font Name Fixture Sans\n"
+        )
+        accepted = (
+            (bounded_font_header + OFL_LICENSE, "OFL-1.1"),
+            (b"Copyright (c) 2026, Fixture Authors\n" + APACHE_LICENSE, "Apache-2.0"),
+            (bounded_font_header + UBUNTU_FONT_LICENSE, "Ubuntu-font-1.0"),
+        )
+        for raw, spdx in accepted:
+            with self.subTest(spdx=spdx):
+                self.assertTrue(asset_registry.validate_font_license_text(raw, spdx)[0])
+
+    def test_apache_template_matches_official_canonical_bytes(self) -> None:
+        self.assertEqual(len(APACHE_LICENSE), 11_358)
+        self.assertEqual(
+            hashlib.sha256(APACHE_LICENSE).hexdigest(),
+            "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        )
+
+    def test_apache_official_body_and_bounded_header_reject_personalized_substitution(self) -> None:
+        prefix = b"Copyright (c) 2026, Fixture Authors\n"
+        self.assertTrue(
+            asset_registry.validate_font_license_text(APACHE_LICENSE, "Apache-2.0")[0]
+        )
+        self.assertTrue(
+            asset_registry.validate_font_license_text(
+                prefix + APACHE_LICENSE, "Apache-2.0"
+            )[0]
+        )
+        personalized = APACHE_LICENSE.replace(
+            b"Copyright [yyyy] [name of copyright owner]",
+            b"Copyright 2026 Yagiz Nizipli",
+            1,
+        )
+        self.assertNotEqual(personalized, APACHE_LICENSE)
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.validate_font_license_text(personalized, "Apache-2.0")
+
+    def test_font_license_templates_reject_every_line_mutation_and_structural_edit(self) -> None:
+        templates = (
+            (OFL_LICENSE, "OFL-1.1"),
+            (APACHE_LICENSE, "Apache-2.0"),
+            (UBUNTU_FONT_LICENSE, "Ubuntu-font-1.0"),
+        )
+        for raw, spdx in templates:
+            lines = raw.decode("utf-8").splitlines()
+            for index, line in enumerate(lines):
+                mutated = list(lines)
+                mutated[index] = line + " [unauthorized mutation]"
+                with self.subTest(spdx=spdx, operation="mutate", line=index):
+                    with self.assertRaises(asset_registry.AssetRegistryError):
+                        asset_registry.validate_font_license_text(
+                            ("\n".join(mutated) + "\n").encode("utf-8"), spdx
+                        )
+                if line:
+                    deleted = lines[:index] + lines[index + 1 :]
+                    with self.subTest(spdx=spdx, operation="delete", line=index):
+                        with self.assertRaises(asset_registry.AssetRegistryError):
+                            asset_registry.validate_font_license_text(
+                                ("\n".join(deleted) + "\n").encode("utf-8"), spdx
+                            )
+
+            inserted = lines[:2] + ["UNAUTHORIZED INSERTED TERM"] + lines[2:]
+            with self.subTest(spdx=spdx, operation="insert"):
+                with self.assertRaises(asset_registry.AssetRegistryError):
+                    asset_registry.validate_font_license_text(
+                        ("\n".join(inserted) + "\n").encode("utf-8"), spdx
+                    )
+            with self.subTest(spdx=spdx, operation="stub"):
+                with self.assertRaises(asset_registry.AssetRegistryError):
+                    asset_registry.validate_font_license_text(
+                        ("\n".join(lines[:3]) + "\n").encode("utf-8"), spdx
+                    )
+
+        for raw, actual_spdx in templates:
+            for _other_raw, declared_spdx in templates:
+                if declared_spdx == actual_spdx:
+                    continue
+                with self.subTest(
+                    operation="cross-spdx", actual=actual_spdx, declared=declared_spdx
+                ):
+                    with self.assertRaises(asset_registry.AssetRegistryError):
+                        asset_registry.validate_font_license_text(raw, declared_spdx)
+
+    def test_project_required_font_text_matches_effective_visible_render_windows(self) -> None:
+        state_path = self.project / "working/editor_state.json"
+        state_path.parent.mkdir()
+        (self.project / "project.json").write_text(
+            json.dumps({"source": {"duration_s": 10.0}}), encoding="utf-8"
+        )
+        font_a = "font-google-fonts-" + "a" * 16 + "-" + "1" * 16
+        font_b = "font-fontsource-" + "b" * 16 + "-" + "2" * 16
+        state = {
+            "schema_version": 2,
+            "segments": [
+                {"source_start": 0.0, "source_end": 5.0},
+                {"source_start": 7.0, "source_end": 10.0},
+            ],
+            "caption_defaults": {"font_asset_id": font_a},
+            "overlays": [
+                {"type": "caption", "text": "default-a", "start": 0, "end": 1, "style": {}},
+                {"type": "title", "text": "explicit-b", "start": 1, "end": 2, "style": {"font_asset_id": font_b}},
+                {"type": "card", "text": "hidden", "visible": False, "start": 1, "end": 2, "style": {}},
+                {"type": "caption", "text": "zero", "start": 3, "end": 3, "style": {}},
+                {"type": "caption", "text": "outside", "start": 11, "end": 12, "style": {}},
+                {"type": "caption", "text": "cut-away", "start": 5.5, "end": 6.5, "style": {}},
+                {"type": "image", "text": "media", "start": 1, "end": 2, "style": {}},
+                {"type": "animation", "text": "龍-animation", "start": 1, "end": 2, "style": {}},
+            ],
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        self.assertEqual(asset_registry.project_required_font_text(self.project), "")
+        self.assertEqual(
+            asset_registry.project_required_font_text(self.project, font_a),
+            "default-a\n龍-animation",
+        )
+        self.assertEqual(asset_registry.project_required_font_text(self.project, font_b), "explicit-b")
+
+        del state["caption_defaults"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(
+            asset_registry.project_required_font_text(self.project),
+            "default-a\n龍-animation",
+        )
+        self.assertEqual(asset_registry.project_required_font_text(self.project, font_a), "")
+        self.assertEqual(asset_registry.project_required_font_text(self.project, font_b), "explicit-b")
 
     def test_attribution_is_sorted_and_control_text_is_one_line(self) -> None:
         first = self.item(

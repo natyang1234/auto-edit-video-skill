@@ -50,6 +50,17 @@ from open_svg_providers import (
     tabler_candidate,
     wikimedia_svg_search_url,
 )
+from open_font_providers import (
+    FONT_MIME,
+    FontAssetCandidate,
+    fontsource_discovery_url,
+    google_fonts_contents_url,
+    normalize_fontsource_id,
+    normalize_fontsource_version,
+    normalize_google_family_id,
+    parse_fontsource,
+    parse_google_fonts_contents,
+)
 
 
 CONSENT_REL = Path("working/provider_consents.json")
@@ -57,6 +68,8 @@ SEARCH_CACHE_REL = Path("working/provider-cache")
 SEARCH_MAX_BYTES = 1024 * 1024
 ASSET_MAX_BYTES = 25 * 1024 * 1024
 SVG_MAX_BYTES = 2 * 1024 * 1024
+FONT_MAX_BYTES = 32 * 1024 * 1024
+FONT_LICENSE_MAX_BYTES = 512 * 1024
 MAX_DIMENSION = 8192
 MAX_PIXELS = 32_000_000
 MAX_IMPORT_TOKENS = 200
@@ -125,12 +138,30 @@ _PROVIDERS: tuple[dict[str, Any], ...] = (
         "cost_class": "free",
         "network_disclosure": "會將最多 6 個搜尋詞傳送至 Wikimedia Commons，僅搜尋 SVG 檔案。",
     },
+    {
+        "id": "google-fonts",
+        "label": "Google Fonts repository",
+        "kind": "font",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "會將 exact family id 傳送至 GitHub，搜尋固定 Google Fonts commit 的字型 metadata。",
+    },
+    {
+        "id": "fontsource",
+        "label": "Fontsource",
+        "kind": "font",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "會將 exact package id 傳送至 Fontsource API，並要求指定 strict semver。",
+    },
 )
 _PROVIDER_BY_ID = {item["id"]: item for item in _PROVIDERS}
 _SEARCH_HOSTS = {
     "openverse": frozenset({"api.openverse.org"}),
     "wikimedia": frozenset({"commons.wikimedia.org"}),
     "wikimedia-svg": frozenset({"commons.wikimedia.org"}),
+    "google-fonts": frozenset({"api.github.com"}),
+    "fontsource": frozenset({"api.fontsource.org"}),
 }
 _IMPORT_HOSTS = {
     "openverse": frozenset({"api.openverse.org"}),
@@ -139,6 +170,8 @@ _IMPORT_HOSTS = {
     "lucide": frozenset({"raw.githubusercontent.com"}),
     "tabler": frozenset({"raw.githubusercontent.com"}),
     "wikimedia-svg": frozenset({"upload.wikimedia.org"}),
+    "google-fonts": frozenset({"raw.githubusercontent.com"}),
+    "fontsource": frozenset({"cdn.jsdelivr.net"}),
 }
 _MIME_EXTENSION = {
     "image/jpeg": ".jpg",
@@ -159,9 +192,10 @@ class AssetProviderError(RuntimeError):
 
 @dataclass(frozen=True)
 class _ImportGrant:
-    candidate: OpenAssetCandidate | SvgAssetCandidate
+    candidate: OpenAssetCandidate | SvgAssetCandidate | FontAssetCandidate
     provider_id: str
     query_hash: str
+    query: str
     expires_at: float
 
 
@@ -172,6 +206,20 @@ class _ValidatedSvgRasterResult:
     width: int
     height: int
     identity: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _FontCapabilityProbeResult:
+    available: bool
+    checks_ok: bool
+    code: str
+    identity: dict[str, str]
+
+
+_FONT_CAPABILITY_FIELDS = frozenset({"available", "checks_ok", "code", "identity"})
+_FONT_CAPABILITY_IDENTITY_FIELDS = frozenset(
+    {"fonttools_version", "validator_version", "policy_version", "limits_sha256"}
+)
 
 
 Downloader = Callable[..., Any]
@@ -372,6 +420,8 @@ class AssetProviderService:
         resolver: Resolver = system_resolver,
         transport: Any = None,
         svg_pipeline: SvgPipeline | None = None,
+        font_validator: Callable[..., Any] | None = None,
+        font_capability_probe: Callable[[], Any] | None = None,
         clock: Clock = time.monotonic,
         token_ttl_s: float = 1800,
     ) -> None:
@@ -402,6 +452,37 @@ class AssetProviderService:
         self._svg_pipeline = svg_pipeline
         self._svg_preflight_identity = self._validate_svg_preflight(
             self._probe_svg_pipeline(svg_pipeline)
+        )
+        custom_font_validator = font_validator is not None
+        custom_font_probe = font_capability_probe is not None
+        if font_validator is None and not custom_font_probe:
+            try:
+                from font_security import validate_font_bytes
+
+                font_validator = (
+                    validate_font_bytes
+                    if validate_font_bytes is asset_registry.validate_font_bytes
+                    else None
+                )
+            except ImportError:
+                font_validator = None
+        if font_validator is not None and not callable(font_validator):
+            raise TypeError("font_validator must be callable or None")
+        if font_capability_probe is not None and not callable(font_capability_probe):
+            raise TypeError("font_capability_probe must be callable or None")
+        # Font parsing is an untrusted-binary boundary.  Public constructor
+        # injection must never turn production providers on, even when a
+        # substitute returns an object shaped like the built-in capability.
+        # Only the exact built-in validator plus its built-in probe can enable
+        # network font search/import.
+        if custom_font_validator or custom_font_probe:
+            font_validator = None
+            probe = self._probe_unavailable
+        else:
+            probe = self._default_font_capability_probe
+        self._font_validator = font_validator
+        self._font_capability_identity = self._validate_font_capability(
+            self._probe_font_capability(probe)
         )
         self._clock = clock
         self._token_ttl_s = float(token_ttl_s)
@@ -555,6 +636,8 @@ class AssetProviderService:
                 availability_code = "available"
                 if catalog_item["kind"] == "svg":
                     available, availability_code = self._svg_available()
+                elif catalog_item["kind"] == "font":
+                    available, availability_code = self._font_available()
                 providers.append(
                     {
                         **catalog_item,
@@ -662,6 +745,79 @@ class AssetProviderService:
         if not available:
             raise _error("SVG rasterizer is unavailable", 503, "svg_rasterizer_unavailable")
 
+    @staticmethod
+    def _default_font_capability_probe() -> _FontCapabilityProbeResult:
+        try:
+            from fontTools import __version__ as runtime_version
+            from font_security import (
+                FONT_VALIDATOR_VERSION,
+                LIMITS_SHA256,
+                PINNED_FONTTOOLS_VERSION,
+                POLICY_VERSION,
+            )
+        except ImportError:
+            return _FontCapabilityProbeResult(False, False, "FONTTOOLS_UNAVAILABLE", {})
+        identity = {
+            "fonttools_version": runtime_version,
+            "validator_version": FONT_VALIDATOR_VERSION,
+            "policy_version": POLICY_VERSION,
+            "limits_sha256": LIMITS_SHA256,
+        }
+        valid = runtime_version == PINNED_FONTTOOLS_VERSION
+        return _FontCapabilityProbeResult(
+            valid,
+            valid,
+            "OK" if valid else "FONTTOOLS_VERSION_MISMATCH",
+            identity,
+        )
+
+    @staticmethod
+    def _probe_unavailable() -> None:
+        return None
+
+    @staticmethod
+    def _probe_font_capability(probe: Callable[[], Any]) -> Any:
+        try:
+            return probe()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _validate_font_capability(preflight: Any) -> dict[str, str] | None:
+        if preflight is None or isinstance(preflight, Mapping):
+            return None
+        try:
+            fields = vars(preflight)
+        except Exception:
+            return None
+        if type(fields) is not dict or set(fields) != _FONT_CAPABILITY_FIELDS:
+            return None
+        if fields["available"] is not True or fields["checks_ok"] is not True or fields["code"] != "OK":
+            return None
+        identity = fields["identity"]
+        if type(identity) is not dict or set(identity) != _FONT_CAPABILITY_IDENTITY_FIELDS:
+            return None
+        if identity.get("fonttools_version") != "4.62.1":
+            return None
+        for key in ("validator_version", "policy_version"):
+            value = identity.get(key)
+            if type(value) is not str or not value or len(value) > 200 or _CONTROL_RE.search(value):
+                return None
+        digest = identity.get("limits_sha256")
+        if type(digest) is not str or _LOWER_SHA256_RE.fullmatch(digest) is None:
+            return None
+        return dict(identity)
+
+    def _font_available(self) -> tuple[bool, str]:
+        if self._font_validator is not None and self._font_capability_identity is not None:
+            return True, "available"
+        return False, "font_validator_unavailable"
+
+    def _require_font_available(self) -> None:
+        available, _code = self._font_available()
+        if not available:
+            raise _error("font validator is unavailable", 503, "font_validator_unavailable")
+
     def set_consent(
         self, provider_id: str, consented: bool, confirmed_by: str
     ) -> dict[str, Any]:
@@ -741,6 +897,47 @@ class AssetProviderService:
         except (KeyError, ProviderDataError) as exc:
             raise _error("search query violates provider policy", 422, "policy_rejected") from exc
 
+    @staticmethod
+    def _font_query(provider_id: str, query: str) -> tuple[str, tuple[str, ...], str]:
+        """Return exact normalized query, parser identity, and discovery URL."""
+        try:
+            if provider_id == "google-fonts":
+                match = re.fullmatch(r"(ofl|apache|ufl)/([a-z0-9]{1,80})", query)
+                if match is None:
+                    raise ProviderDataError("Google query must be root/family")
+                root, family = match.groups()
+                family = normalize_google_family_id(family)
+                normalized = f"{root}/{family}"
+                return normalized, (root, family), google_fonts_contents_url(root, family)
+            if provider_id == "fontsource":
+                match = re.fullmatch(
+                    r"([a-z0-9]+(?:-[a-z0-9]+)*)@((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))",
+                    query,
+                )
+                if match is None:
+                    raise ProviderDataError("Fontsource query must be id@x.y.z")
+                font_id = normalize_fontsource_id(match.group(1))
+                version = normalize_fontsource_version(match.group(2))
+                normalized = f"{font_id}@{version}"
+                return normalized, (font_id, version), fontsource_discovery_url(font_id)
+        except ProviderDataError as exc:
+            raise _error("search query violates provider policy", 422, "policy_rejected") from exc
+        raise _error("provider was not found", 404, "provider_not_found")
+
+    def _parse_font_payload(
+        self, path: Path, provider_id: str, identity: tuple[str, ...]
+    ) -> list[FontAssetCandidate]:
+        try:
+            payload = path.read_bytes()
+            if len(payload) > SEARCH_MAX_BYTES:
+                raise ValueError("font provider JSON exceeds limit")
+            parsed = _strict_json_bytes(payload)
+            if provider_id == "google-fonts":
+                return parse_google_fonts_contents(parsed, identity[0], identity[1])
+            return parse_fontsource(parsed, identity[0], identity[1])
+        except (OSError, ValueError, ProviderDataError) as exc:
+            raise _error("font provider returned invalid data", 422, "provider_data_invalid") from exc
+
     def _download(
         self,
         url: str,
@@ -774,6 +971,8 @@ class AssetProviderService:
                 # downloader construction.  SVG ingestion has no degraded
                 # raw-SVG mode.
                 self._require_svg_available()
+            elif provider["kind"] == "font":
+                self._require_font_available()
             if isinstance(page, bool) or not isinstance(page, int):
                 raise _error("page must be an integer", 400, "malformed_request")
             if provider_id in {"heroicons", "lucide", "tabler"}:
@@ -785,6 +984,7 @@ class AssetProviderService:
                     candidate=candidate,
                     provider_id=provider_id,
                     query_hash=query_hash,
+                    query=candidate.candidate_id,
                     expires_at=now + self._token_ttl_s,
                 )
                 while len(self._tokens) > MAX_IMPORT_TOKENS:
@@ -796,6 +996,76 @@ class AssetProviderService:
                     "page": page,
                     "items": [{**candidate.public_dict(), "import_token": token}],
                 }
+            if provider["kind"] == "font":
+                if page != 1:
+                    raise _error("font metadata search only supports page 1", 422, "policy_rejected")
+                normalized_query, identity, search_url = self._font_query(provider_id, query)
+                cache_dir = self._safe_directory(root, SEARCH_CACHE_REL)
+                cache_id = secrets.token_hex(16)
+                raw_path = cache_dir / f"search-{provider_id}-{cache_id}.json"
+                try:
+                    self._download(
+                        search_url,
+                        raw_path,
+                        root,
+                        allowed_hosts=_SEARCH_HOSTS[provider_id],
+                        max_bytes=SEARCH_MAX_BYTES,
+                        validator=lambda path: self._parse_font_payload(
+                            path, provider_id, identity
+                        ),
+                    )
+                    if not raw_path.is_file() or raw_path.is_symlink():
+                        raise _error("font provider download did not produce data", 502, "provider_failure")
+                    candidates = self._parse_font_payload(raw_path, provider_id, identity)
+                except AssetProviderError:
+                    raw_path.unlink(missing_ok=True)
+                    raise
+                except DownloadValidationError as exc:
+                    raw_path.unlink(missing_ok=True)
+                    raise _error("font provider returned invalid data", 422, "provider_data_invalid") from exc
+                except DownloadError as exc:
+                    raw_path.unlink(missing_ok=True)
+                    raise _error("font provider request failed", 502, "provider_failure") from exc
+                except Exception as exc:
+                    raw_path.unlink(missing_ok=True)
+                    raise _error("font provider request failed", 502, "provider_failure") from exc
+                try:
+                    raw_path.unlink()
+                except OSError as exc:
+                    raise _error("provider cache cleanup failed", 409, "storage_conflict") from exc
+                query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
+                self._atomic_write(
+                    root,
+                    SEARCH_CACHE_REL / f"search-{provider_id}-{cache_id}.meta.json",
+                    _json_bytes(
+                        {
+                            "schema_version": 1,
+                            "provider_id": provider_id,
+                            "kind": "font",
+                            "query_hash": query_hash,
+                            "page": 1,
+                            "raw_file": raw_path.name,
+                            "candidate_count": len(candidates),
+                            "created_at": _utc_now(),
+                        }
+                    ),
+                )
+                self._prune_search_metadata(cache_dir)
+                now = self._clock()
+                public_items = []
+                for candidate in candidates:
+                    token = secrets.token_urlsafe(32)
+                    self._tokens[token] = _ImportGrant(
+                        candidate=candidate,
+                        provider_id=provider_id,
+                        query_hash=query_hash,
+                        query=normalized_query,
+                        expires_at=now + self._token_ttl_s,
+                    )
+                    public_items.append({**candidate.public_dict(), "import_token": token})
+                while len(self._tokens) > MAX_IMPORT_TOKENS:
+                    self._tokens.popitem(last=False)
+                return {"provider_id": provider_id, "page": 1, "items": public_items}
             try:
                 normalized_query = normalize_query(query)
                 search_url = (
@@ -884,6 +1154,7 @@ class AssetProviderService:
                     candidate=candidate,
                     provider_id=provider_id,
                     query_hash=query_hash,
+                    query=normalized_query,
                     expires_at=now + self._token_ttl_s,
                 )
                 public_items.append({**candidate.public_dict(), "import_token": token})
@@ -892,7 +1163,7 @@ class AssetProviderService:
             return {"provider_id": provider_id, "page": page, "items": public_items}
 
     def import_candidate(
-        self, import_token: str, visual_validator: VisualValidator
+        self, import_token: str, visual_validator: VisualValidator | None = None
     ) -> dict[str, Any]:
         with self._lock:
             self._clean_expired_tokens()
@@ -909,12 +1180,13 @@ class AssetProviderService:
                 or (
                     candidate.mime_type not in _MIME_EXTENSION
                     and candidate.mime_type != SVG_MIME
+                    and candidate.mime_type != FONT_MIME
                 )
             ):
                 raise _error("import token was not found", 404, "import_token_not_found")
-            if not callable(visual_validator):
+            if not isinstance(candidate, FontAssetCandidate) and not callable(visual_validator):
                 raise _error("visual validator is required", 400, "malformed_request")
-            if (
+            if not isinstance(candidate, FontAssetCandidate) and (
                 candidate.width > MAX_DIMENSION
                 or candidate.height > MAX_DIMENSION
                 or candidate.width * candidate.height > MAX_PIXELS
@@ -923,6 +1195,11 @@ class AssetProviderService:
 
             root = self._root()
             self._require_consent(root, provider_id)
+            if isinstance(candidate, FontAssetCandidate):
+                self._require_font_available()
+                return self._import_font_candidate(
+                    root, provider_id, candidate, grant.query, grant.query_hash
+                )
             if isinstance(candidate, SvgAssetCandidate):
                 self._require_svg_available()
                 return self._import_svg_candidate(root, provider_id, candidate, grant.query_hash)
@@ -1073,6 +1350,262 @@ class AssetProviderService:
                 "url": f"/{relative.as_posix()}",
                 "idempotent": False,
             }
+
+    def _import_font_candidate(
+        self,
+        root: Path,
+        provider_id: str,
+        candidate: FontAssetCandidate,
+        query: str,
+        query_hash: str,
+    ) -> dict[str, Any]:
+        """Download and validate private font/license bytes, then publish atomically."""
+        if hashlib.sha256(query.encode("utf-8")).hexdigest() != query_hash:
+            raise _error("font import grant is invalid", 404, "import_token_not_found")
+        try:
+            current = asset_registry.current_font_provider_item(
+                root,
+                provider_id=provider_id,
+                candidate_id=candidate.candidate_id,
+                query=query,
+                download_url=candidate.download_url,
+            )
+        except asset_registry.AssetRegistryError as exc:
+            raise _error("font provider state is invalid", 409, "registry_conflict") from exc
+        if current is not None:
+            try:
+                asset_registry.resolve_project_font(
+                    root,
+                    current["asset_id"],
+                    required_text=asset_registry.project_required_font_text(root),
+                )
+            except asset_registry.AssetRegistryError as exc:
+                raise _error("font does not cover current project text", 422, "policy_rejected") from exc
+            return {
+                "item": current,
+                "source": current["path"],
+                "url": f"/{current['path']}",
+                "idempotent": True,
+            }
+
+        required_text = asset_registry.project_required_font_text(root)
+        stage_id = uuid.uuid4().hex
+        font_stage_rel = Path("working/source_artifacts/fonts") / f".{stage_id}.font.part"
+        license_stage_rel = Path("working/source_artifacts/fonts") / f".{stage_id}.license.part"
+        font_stage = self._safe_directory(root, font_stage_rel.parent) / font_stage_rel.name
+        license_stage = self._safe_directory(root, license_stage_rel.parent) / license_stage_rel.name
+        validated_result: Any = None
+        normalized_license = ""
+        normalized_license_sha = ""
+        created_paths: list[Path] = []
+        publication_snapshot: dict[str, bytes | None] | None = None
+
+        def rollback() -> None:
+            errors: list[str] = []
+            for path in reversed(created_paths):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    errors.append(str(exc))
+            if publication_snapshot is not None:
+                try:
+                    asset_registry.restore_publication(root, publication_snapshot)
+                except asset_registry.AssetRegistryError as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise _error("font import rollback failed", 409, "registry_rollback_failed")
+
+        def validate_license(path: Path) -> None:
+            nonlocal normalized_license, normalized_license_sha
+            normalized_license, normalized_license_sha = asset_registry.validate_font_license_text(
+                path.read_bytes(), candidate.license_spdx
+            )
+
+        def validate_font(path: Path) -> None:
+            nonlocal validated_result
+            if self._font_validator is None or self._font_capability_identity is None:
+                raise ValueError("font validator unavailable")
+            raw = path.read_bytes()
+            result = self._font_validator(
+                raw,
+                required_text,
+                license_spdx=candidate.license_spdx,
+                declared_mime=candidate.mime_type,
+            )
+            snapshot = asset_registry._font_validation_snapshot(result)
+            receipt = snapshot["receipt"]
+            capability = self._font_capability_identity
+            if (
+                receipt.get("fonttools_version") != capability["fonttools_version"]
+                or receipt.get("validator_version") != capability["validator_version"]
+                or receipt.get("policy_version") != capability["policy_version"]
+                or receipt.get("limits_sha256") != capability["limits_sha256"]
+                or receipt.get("license_spdx") != candidate.license_spdx
+                or receipt.get("declared_mime_verified") is not True
+            ):
+                raise ValueError("font validator identity mismatch")
+            if provider_id == "fontsource" and (
+                result.family != candidate.family
+                or result.style != candidate.style
+                or result.weight != candidate.weight
+            ):
+                raise ValueError("font metadata does not match Fontsource candidate")
+            validated_result = result
+
+        try:
+            self._download(
+                candidate.license_download_url,
+                license_stage,
+                root,
+                allowed_hosts=_IMPORT_HOSTS[provider_id],
+                max_bytes=FONT_LICENSE_MAX_BYTES,
+                validator=validate_license,
+            )
+            if not license_stage.is_file() or license_stage.is_symlink() or not normalized_license:
+                raise _error("font license download did not produce text", 502, "provider_failure")
+            self._download(
+                candidate.download_url,
+                font_stage,
+                root,
+                allowed_hosts=_IMPORT_HOSTS[provider_id],
+                max_bytes=FONT_MAX_BYTES,
+                validator=validate_font,
+            )
+            if not font_stage.is_file() or font_stage.is_symlink() or validated_result is None:
+                raise _error("font download did not produce validated data", 502, "provider_failure")
+            font_raw = font_stage.read_bytes()
+            license_raw = license_stage.read_bytes()
+            font_sha = hashlib.sha256(font_raw).hexdigest()
+            license_sha = hashlib.sha256(license_raw).hexdigest()
+            if font_sha != validated_result.sha256:
+                raise _error("font validator hash does not match download", 422, "policy_rejected")
+            if provider_id == "google-fonts":
+                expected_blob_sha, separator, _name = candidate.candidate_id.partition(":")
+                actual_blob_sha = hashlib.sha1(
+                    f"blob {len(font_raw)}\0".encode("ascii") + font_raw,
+                    usedforsecurity=False,
+                ).hexdigest()
+                if separator != ":" or actual_blob_sha != expected_blob_sha:
+                    raise _error(
+                        "Google Fonts blob does not match repository listing",
+                        422,
+                        "policy_rejected",
+                    )
+            font_rel = Path("assets/fonts") / f"{font_sha}.{validated_result.container}"
+            license_rel = Path("licenses") / f"{license_sha}.txt"
+            candidate_hash = hashlib.sha256(candidate.candidate_id.encode("utf-8")).hexdigest()[:16]
+            asset_id = f"font-{provider_id}-{candidate_hash}-{font_sha[:16]}"
+            verified_at = _utc_now()
+            item = {
+                "asset_id": asset_id,
+                "path": font_rel.as_posix(),
+                "sha256": font_sha,
+                "origin": "provider",
+                "provider_id": provider_id,
+                "source_url": candidate.landing_url,
+                "license": {
+                    "spdx": candidate.license_spdx,
+                    "evidence_url": candidate.license_download_url,
+                    "attribution_required": candidate.attribution_required,
+                    "attribution_text": f"{validated_result.family} — {candidate.license_spdx}",
+                    "verified_at": verified_at,
+                },
+                "review_status": "approved",
+            }
+            candidate_metadata = {
+                "family": candidate.family,
+                "style": candidate.style,
+                "weight": candidate.weight,
+                "subset": candidate.subset,
+                "unicode_range": candidate.unicode_range,
+                "version": candidate.version,
+                "source_url": candidate.landing_url,
+            }
+            publication_snapshot = asset_registry.snapshot_publication(root)
+            for relative, payload in ((license_rel, license_raw), (font_rel, font_raw)):
+                target = root / relative
+                if target.exists() or target.is_symlink():
+                    if target.is_symlink() or not target.is_file() or target.read_bytes() != payload:
+                        raise _error("font content-addressed path conflicts", 409, "registry_conflict")
+                else:
+                    try:
+                        self._atomic_write(root, relative, payload)
+                    except Exception:
+                        if target.is_file() and not target.is_symlink() and target.read_bytes() == payload:
+                            created_paths.append(target)
+                        raise
+                    else:
+                        created_paths.append(target)
+            receipt_path = (
+                root
+                / asset_registry.PROVIDER_RECEIPTS_REL
+                / (hashlib.sha256(asset_id.encode("utf-8")).hexdigest() + ".json")
+            )
+            receipt_preexisted = receipt_path.exists() or receipt_path.is_symlink()
+            try:
+                receipt = asset_registry.save_font_provider_receipt(
+                    root,
+                    item,
+                    candidate_id=candidate.candidate_id,
+                    query=query,
+                    download_url=candidate.download_url,
+                    license_download_url=candidate.license_download_url,
+                    candidate_metadata=candidate_metadata,
+                    font_result=validated_result,
+                    license_path=license_rel.as_posix(),
+                    license_sha256=license_sha,
+                    license_normalized_sha256=normalized_license_sha,
+                    license_size=len(license_raw),
+                    capability_identity=dict(self._font_capability_identity or {}),
+                )
+            except Exception:
+                if (
+                    not receipt_preexisted
+                    and receipt_path.is_file()
+                    and not receipt_path.is_symlink()
+                ):
+                    created_paths.append(receipt_path)
+                raise
+            if receipt_preexisted:
+                raise asset_registry.AssetRegistryError(
+                    "font receipt publication replaced preexisting evidence"
+                )
+            created_paths.append(receipt_path)
+            if not isinstance(receipt, dict) or not receipt_path.is_file() or receipt_path.is_symlink():
+                raise asset_registry.AssetRegistryError("font receipt publication failed")
+            asset_registry.upsert_item(root, item)
+            return {
+                "item": item,
+                "source": font_rel.as_posix(),
+                "url": f"/{font_rel.as_posix()}",
+                "idempotent": False,
+            }
+        except AssetProviderError:
+            if publication_snapshot is not None:
+                rollback()
+            raise
+        except DownloadValidationError as exc:
+            if publication_snapshot is not None:
+                rollback()
+            raise _error("font or license failed security policy", 422, "policy_rejected") from exc
+        except DownloadError as exc:
+            if publication_snapshot is not None:
+                rollback()
+            raise _error("font provider download failed", 502, "provider_failure") from exc
+        except (asset_registry.AssetRegistryError, OSError) as exc:
+            if publication_snapshot is not None:
+                rollback()
+            raise _error("font registry transaction failed", 409, "registry_conflict") from exc
+        except Exception as exc:
+            if publication_snapshot is not None:
+                rollback()
+            raise _error("font import failed security policy", 422, "policy_rejected") from exc
+        finally:
+            for path in (font_stage, license_stage):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _import_svg_candidate(
         self, root: Path, provider_id: str, candidate: SvgAssetCandidate, query_hash: str

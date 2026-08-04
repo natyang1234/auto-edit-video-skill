@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -898,14 +899,38 @@ def referenced_render_inputs(
     for item in visual_plan.get("items", []):
         if item.get("selected_asset"):
             add(str(item["selected_asset"]), "visual-plan-asset")
-    try:
-        from render_editor_timeline import font_path
-
-        font_file = font_path()
-        if project_dir.resolve() in font_file.resolve().parents:
-            add(font_file.resolve().relative_to(project_dir.resolve()).as_posix(), "font")
-    except (ValueError, OSError):
-        pass
+    # Project fonts are receipt-bound render inputs, never manual-assertion
+    # assets. Resolve each selected id strictly so stale/tampered receipts
+    # cannot be smuggled through the rights gate by a matching family name.
+    selected_font_ids: set[str] = set()
+    defaults = state.get("caption_defaults")
+    if isinstance(defaults, dict) and defaults.get("font_asset_id"):
+        selected_font_ids.add(str(defaults["font_asset_id"]))
+    for overlay in state.get("overlays", []):
+        style = overlay.get("style") if isinstance(overlay, dict) and isinstance(overlay.get("style"), dict) else {}
+        if style.get("font_asset_id"):
+            selected_font_ids.add(str(style["font_asset_id"]))
+    for asset_id in sorted(selected_font_ids):
+        try:
+            binding = asset_registry.resolve_project_font(project_dir, asset_id)
+            path = str(binding.get("path") or "")
+            sha256 = str(binding.get("sha256") or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                raise asset_registry.AssetRegistryError("font resolver returned no SHA-256")
+            inputs[path] = {
+                "path": path,
+                "kind": "font",
+                "asset_id": asset_id,
+                "sha256": sha256,
+                "requires_assertion": False,
+                "license_status": "provider-approved",
+            }
+        except asset_registry.AssetRegistryError:
+            inputs[f"font:{asset_id}"] = {
+                "path": f"font:{asset_id}", "kind": "font", "asset_id": asset_id,
+                "sha256": "", "requires_assertion": True,
+                "license_status": "provider-provenance-invalid",
+            }
     return sorted(inputs.values(), key=lambda item: item["path"])
 
 
@@ -2244,6 +2269,13 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     editing_brief = state.get("editing_brief", "")
     if not isinstance(editing_brief, str) or len(editing_brief) > 2000:
         errors.append("editing_brief must be a string of at most 2000 characters")
+    caption_defaults = state.get("caption_defaults")
+    if caption_defaults is not None and not isinstance(caption_defaults, dict):
+        errors.append("caption_defaults must be an object")
+    elif isinstance(caption_defaults, dict) and caption_defaults.get("font_asset_id") is not None:
+        font_asset_id = caption_defaults["font_asset_id"]
+        if not isinstance(font_asset_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", font_asset_id):
+            errors.append("caption_defaults font_asset_id is invalid")
     overlays = state.get("overlays")
     if not isinstance(overlays, list):
         errors.append("overlays must be an array")
@@ -2378,6 +2410,11 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
         ):
             errors.append(f"overlay {overlay_id or index} z_index is invalid")
         style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+        if style.get("font_asset_id") is not None and (
+            not isinstance(style["font_asset_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", style["font_asset_id"])
+        ):
+            errors.append(f"overlay {overlay_id or index} style font_asset_id is invalid")
         style_bounds = {
             "font_size": (8, 500),
             "stroke_width": (0, 50),
@@ -2682,7 +2719,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             with self.server.project_lock:
                 state = read_json(project / STATE_REL, {}) or {}
             expected = caption_compositor.caption_content_revision(
-                state, state.get("canvas") or {}, 1.0
+                state, state.get("canvas") or {}, 1.0, project
             )
             if isinstance(plan, dict) and plan.get("caption_revision") == expected:
                 ready = True
@@ -2715,42 +2752,56 @@ class EditorHandler(BaseHTTPRequestHandler):
 
     def handle_font_info(self, project: Path) -> None:
         import caption_compositor
-
         plan = read_json(project / "working/caption_render_plan.json", None)
         receipt = plan.get("receipt", {}) if isinstance(plan, dict) else {}
+        with self.server.project_lock:
+            state = read_json(project / STATE_REL, {}) or {}
+        try:
+            fonts = asset_registry.list_project_fonts(project)
+        except asset_registry.AssetRegistryError:
+            # A broken registry must not turn into a selectable-looking list.
+            fonts = []
+        selected_id = ""
+        defaults = state.get("caption_defaults")
+        if isinstance(defaults, dict):
+            selected_id = str(defaults.get("font_asset_id") or "")
+        public_fonts = [
+            {
+                key: item.get(key)
+                for key in (
+                    "asset_id", "family", "style", "weight", "coverage", "scripts",
+                    "license", "license_spdx", "provider_id", "sha256", "availability",
+                )
+            }
+            for item in fonts
+        ]
+        selected = next((item for item in public_fonts if str(item.get("asset_id")) == selected_id), None)
         try:
             from render_editor_timeline import font_path
-
             resolved = str(font_path())
         except ValueError:
             resolved = ""
-        font_details: dict[str, Any] = {}
-        if resolved and caption_compositor.compositor_available():
-            try:
-                modules = caption_compositor._load_coretext()
-                ct_module = modules[0]
-                base_font = caption_compositor._make_base_font(
-                    ct_module, 24.0, Path(resolved)
-                )
-                font_details = {
-                    "postscript_name": str(ct_module.CTFontCopyPostScriptName(base_font)),
-                    "family": str(ct_module.CTFontCopyFamilyName(base_font)),
-                    "sha256": caption_compositor.font_digest(Path(resolved)),
-                    "source": "project" if str(self.server.project_dir) in resolved else "system",
-                    "license": "unverified",
-                }
-            except Exception:  # noqa: BLE001 - informational endpoint
-                font_details = {}
         self.send_json(
             {
                 "ok": True,
                 "engine": caption_compositor.engine_descriptor(),
-                "project_font": resolved,
-                "project_font_details": font_details,
+                # This endpoint deliberately exposes only manifest metadata,
+                # never provider download URLs, receipt internals, or paths.
+                "fonts": public_fonts,
+                "selected": selected,
+                "selection_status": (
+                    "verified" if selected is not None else ("unavailable" if selected_id else "legacy")
+                ),
+                "legacy": {
+                    "current": Path(resolved).name if resolved else "",
+                    "status": "unverified-legacy",
+                },
                 "sanctioned_fallbacks": sorted(
                     caption_compositor.SANCTIONED_FALLBACK_PS_NAMES
                 ),
-                "receipt_fonts": receipt.get("fonts", {}),
+                "caption_font_asset_ids": sorted(
+                    str(asset_id) for asset_id in (receipt.get("fonts", {}) or {})
+                ),
                 "disallowed_fallbacks": receipt.get("disallowed_fallbacks", []),
             }
         )
@@ -2793,7 +2844,7 @@ class EditorHandler(BaseHTTPRequestHandler):
 
     CAPTION_STYLE_KEYS = {
         "color", "font_size", "stroke_color", "stroke_width", "box", "box_color",
-        "max_width", "animation", "font_weight", "font_family", "emphasis_color",
+        "max_width", "animation", "font_weight", "font_family", "font_asset_id", "emphasis_color",
     }
 
     def handle_caption_apply_style(self) -> None:
@@ -3572,6 +3623,57 @@ class EditorHandler(BaseHTTPRequestHandler):
                     break
                 remaining -= len(chunk)
 
+    def handle_project_font_bytes(self, project: Path, asset_id: str) -> None:
+        """Serve only a freshly verified local font; no range or path input."""
+        handle = None
+        try:
+            binding = asset_registry.resolve_project_font(project, asset_id)
+            path = project_entry_path(project, str(binding.get("path") or ""))
+            if path.suffix.lower() not in {".ttf", ".otf"}:
+                raise asset_registry.AssetRegistryError("font type is invalid")
+            expected_sha256 = binding.get("sha256")
+            if not isinstance(expected_sha256, str) or re.fullmatch(
+                r"[0-9a-f]{64}", expected_sha256
+            ) is None:
+                raise asset_registry.AssetRegistryError("font hash is invalid")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise OSError("font path is not a regular file")
+                handle = os.fdopen(descriptor, "rb")
+                descriptor = -1
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                if digest.hexdigest() != expected_sha256:
+                    raise asset_registry.AssetRegistryError("font bytes changed after resolve")
+                handle.seek(0)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        except (asset_registry.AssetRegistryError, OSError, ValueError):
+            if handle is not None:
+                handle.close()
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header(
+                "Content-Type", "font/ttf" if path.suffix.lower() == ".ttf" else "font/otf"
+            )
+            self.send_header("Content-Length", str(file_stat.st_size))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                shutil.copyfileobj(handle, self.wfile)
+        finally:
+            handle.close()
+
     def route(self) -> tuple[str, dict[str, list[str]]]:
         parsed = urllib.parse.urlparse(self.path)
         return parsed.path, urllib.parse.parse_qs(parsed.query)
@@ -3770,11 +3872,44 @@ class EditorHandler(BaseHTTPRequestHandler):
                 return
             self.serve_file(source, allow_range=True)
             return
+        font_match = re.fullmatch(r"/api/fonts/([A-Za-z0-9_-]{1,80})/bytes", path)
+        if font_match:
+            self.handle_project_font_bytes(project, font_match.group(1))
+            return
         if path.startswith("/assets/"):
-            relative = urllib.parse.unquote(path.removeprefix("/"))
+            encoded_relative = path.removeprefix("/")
+            if re.search(r"%(?![0-9A-Fa-f]{2})", encoded_relative):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            try:
+                relative = urllib.parse.unquote_to_bytes(encoded_relative).decode("utf-8")
+            except UnicodeDecodeError:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            route_parts = relative.split("/")
+            if any(part in {"", ".", ".."} for part in route_parts):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            route_parts_folded = tuple(part.casefold() for part in route_parts)
+            route_suffix = Path(relative).suffix.casefold()
+            if (
+                route_parts_folded[:2] == ("assets", "fonts")
+                or route_suffix in {".ttf", ".otf"}
+            ):
+                # Project fonts are hostile structured binaries.  The only
+                # browser exposure path is /api/fonts/<asset_id>/bytes, which
+                # resolves receipt-bound bytes and physically revalidates the
+                # font on every request.  Generic assets must not create a
+                # second, MIME-guess-based path around that boundary.
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
             try:
                 asset = scoped_project_path(project, relative, "assets")
             except ValueError:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            canonical_parts = asset.relative_to(project.resolve()).parts
+            if tuple(part.casefold() for part in canonical_parts[:2]) == ("assets", "fonts"):
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             if asset.suffix.lower() in {".svg", ".svgz", ".xml"}:

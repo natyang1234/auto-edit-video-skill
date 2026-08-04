@@ -94,7 +94,63 @@ def source_has_audible_signal(source: Path, start: float, duration: float) -> bo
         return False
 
 
-def font_path() -> Path:
+def project_font_binding(
+    project_dir: Path | None,
+    state: dict[str, Any] | None = None,
+    font_asset_id: str | None = None,
+    required_text: str = "",
+) -> dict[str, Any] | None:
+    """Resolve a selected project font at the renderer trust boundary.
+
+    A family is presentation metadata only.  When an asset id is selected we
+    ask the provenance registry for the exact receipt-bound bytes and never
+    fall back to ``fc-match`` or a local family lookup.
+    """
+    if font_asset_id is not None and not isinstance(font_asset_id, str):
+        raise ValueError("font_asset_id is invalid")
+    selected = str(font_asset_id or "").strip()
+    if not selected and isinstance(state, dict):
+        defaults = state.get("caption_defaults")
+        if isinstance(defaults, dict):
+            candidate = defaults.get("font_asset_id")
+            if candidate is not None and not isinstance(candidate, str):
+                raise ValueError("font_asset_id is invalid")
+            selected = str(candidate or "").strip()
+    if not selected:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", selected):
+        raise ValueError("font_asset_id is invalid")
+    if project_dir is None:
+        raise ValueError("selected project font requires project_dir")
+    import asset_registry
+
+    try:
+        binding = asset_registry.resolve_project_font(
+            Path(project_dir), selected, required_text=required_text,
+        )
+    except asset_registry.AssetRegistryError as exc:
+        raise ValueError(f"project font {selected} is unavailable: {exc}") from exc
+    if not isinstance(binding, dict) or not isinstance(binding.get("path"), str):
+        raise ValueError(f"project font {selected} returned an invalid binding")
+    path = (Path(project_dir) / binding["path"]).resolve()
+    if Path(project_dir).resolve() not in path.parents or not path.is_file():
+        raise ValueError(f"project font {selected} path is unsafe")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get("sha256") or "")):
+        raise ValueError(f"project font {selected} has no verified SHA-256")
+    return {**binding, "path": path, "verified": True}
+
+
+def font_path(
+    project_dir: Path | None = None,
+    state: dict[str, Any] | None = None,
+    font_asset_id: str | None = None,
+    required_text: str = "",
+) -> Path:
+    binding = project_font_binding(project_dir, state, font_asset_id, required_text)
+    if binding is not None:
+        return Path(binding["path"])
+    # Legacy/system behavior deliberately remains available only when no
+    # project asset id was selected. It is never represented as verified.
     override = str(os.environ.get("AUTO_EDIT_FONT", "")).strip()
     if override:
         candidate = Path(override).expanduser()
@@ -655,7 +711,6 @@ def build_render_command(
             f"[{visual_input_index if visual_input_index is not None else 0}:v]{base_filter}[v0]"
         ]
     current = "v0"
-    font = font_path()
     for index, overlay in enumerate(overlays, start=1):
         output_label = f"v{index}"
         kind = overlay.get("type")
@@ -671,6 +726,13 @@ def build_render_command(
             safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(overlay.get("id", index)))
             text_file = render_text_dir / f"{safe_id}.txt"
             text_file.write_text(text, encoding="utf-8")
+            overlay_style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+            font = font_path(
+                project_dir,
+                state,
+                str(overlay_style.get("font_asset_id") or "") or None,
+                str(overlay.get("text") or ""),
+            )
             filters.append(
                 text_filter(
                     current,
@@ -1081,7 +1143,12 @@ def render_cover(
         f"crop={width}:{height},setsar=1[v0]"
     ]
     if title.strip():
-        filters.append(text_filter("v0", "v1", overlay, width, height, 1.0, font_path(), text_file))
+        filters.append(
+            text_filter(
+                "v0", "v1", overlay, width, height, 1.0,
+                font_path(project_dir, state, required_text=title), text_file,
+            )
+        )
         final_label = "v1"
     else:
         final_label = "v0"

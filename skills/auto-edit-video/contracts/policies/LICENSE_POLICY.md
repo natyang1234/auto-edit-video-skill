@@ -2,7 +2,7 @@
 
 ## Allowlist（可進 final）
 CC0-1.0、CC-BY-4.0（須 attribution）、CC-BY-SA-4.0（須 attribution＋同條款標示）、
-OFL-1.1（字型）、Apache-2.0、MIT、ISC、Unlicense、`internal-original`（自產）、
+OFL-1.1（字型）、Apache-2.0、Ubuntu-font-1.0（字型）、MIT、ISC、Unlicense、`internal-original`（自產）、
 `user-owned`（rights assertion 核可）。
 
 ## 拒絕
@@ -23,6 +23,19 @@ CC-BY-NC／ND 系列、未知授權、來源不可考、以及來源條款禁 AI
    license evidence 是固定 provider ID→SPDX→official GitHub repo→pinned ref→LICENSE path；並有
    server 匯入流程產生、與 registry item/hash 一致的 consistency evidence；單獨新增或修改
    `assets/provenance.json` 不足以自動核可。
+7. Google Fonts／Fontsource 字型只接受 project-private `assets/fonts/<sha256>.ttf|.otf`，
+   並須有 server 產生的 strict v3 receipt，同時綁定 pinned commit／strict semver candidate、
+   font bytes、實際下載且通過 SPDX text fingerprint 的 `licenses/<sha256>.txt`、validator identity
+   與 import-time glyph coverage。Final resolve 必須重算所有實體 hash、重驗 license text 與當前
+   project render text coverage；missing／舊版／手造 receipt 一律 fail closed。
+8. 字型授權正文不是 marker check：`contracts/licenses/OFL-1.1.txt`、
+   `contracts/licenses/Apache-2.0.txt` 與 `contracts/licenses/Ubuntu-font-1.0.txt` 是
+   reviewable canonical template，下載內容只允許完整正文，
+   或 bounded、明確格式的 copyright／Reserved Font Name header 加完整正文；任何截斷、增刪條款或
+   cross-SPDX 內容都拒絕。Apache template 是 `https://www.apache.org/licenses/LICENSE-2.0.txt`
+   的 exact 官方正文（SHA-256 `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`）。
+   Ubuntu template 取自 Canonical legal page 所連結的官方
+   `assets.ubuntu.com` plain-text UFL 1.0；不得用 marker、padding 或推測文字放行。
 
 ## Project filesystem 信任邊界
 

@@ -25,6 +25,8 @@ import contract_registry
 CAPTIONS_REL = Path("working/captions")
 RENDER_PLAN_REL = Path("working/caption_render_plan.json")
 SANCTIONED_FALLBACK_PS_NAMES = {"AppleColorEmoji"}
+# Compatibility name for pre-project-font plans/tests. New glyph runs use the
+# actual selected asset id and never emit this placeholder.
 PROJECT_FONT_ASSET_ID = "font-project-default"
 EMOJI_FONT_ASSET_ID = "font-system-emoji"
 
@@ -62,10 +64,38 @@ def engine_descriptor() -> dict[str, str]:
     }
 
 
-def _font_file(project_dir: Path) -> Path:
-    """Project font resolution — same chain the drawtext route uses."""
-    from render_editor_timeline import font_path  # lazy: avoids import cycle
+def _font_binding(
+    project_dir: Path,
+    state: dict[str, Any],
+    overlay: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the exact selected bytes used by this caption raster."""
+    from render_editor_timeline import project_font_binding  # lazy: import cycle
 
+    style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+    binding = project_font_binding(
+        project_dir, state, str(style.get("font_asset_id") or "") or None,
+        str(overlay.get("text") or ""),
+    )
+    if binding is not None:
+        return binding
+    from render_editor_timeline import font_path
+
+    path = font_path()
+    return {
+        "asset_id": "font-legacy-system",
+        "path": path,
+        "sha256": font_digest(path),
+        "legacy": True,
+        "verified": False,
+    }
+
+
+def _font_file(project_dir: Path, state: dict[str, Any] | None = None, overlay: dict[str, Any] | None = None) -> Path:
+    """Compatibility helper; project-aware calls retain exact binding truth."""
+    if state is not None and overlay is not None:
+        return Path(_font_binding(project_dir, state, overlay)["path"])
+    from render_editor_timeline import font_path
     return font_path()
 
 
@@ -132,7 +162,8 @@ def render_caption_png(
     font_size = max(14.0, float(style.get("font_size", 52)) * render_scale)
     max_width = max(20.0, min(96.0, float(style.get("max_width", 84))))
     frame_width = canvas_width * render_scale * (max_width / 100.0)
-    font_file = _font_file(project_dir)
+    font_binding = _font_binding(project_dir, state, overlay)
+    font_file = Path(font_binding["path"])
     base_font = _make_base_font(ct, font_size, font_file)
 
     attributed = foundation.NSMutableAttributedString.alloc().initWithString_(text)
@@ -279,7 +310,7 @@ def render_caption_png(
             run_ps = str(ct.CTFontCopyPostScriptName(run_font)) if run_font else "unknown"
             run_range = ct.CTRunGetStringRange(run)
             if run_ps in project_ps_names:
-                asset_id = PROJECT_FONT_ASSET_ID
+                asset_id = str(font_binding["asset_id"])
             elif run_ps in SANCTIONED_FALLBACK_PS_NAMES:
                 asset_id = EMOJI_FONT_ASSET_ID
             else:
@@ -324,6 +355,7 @@ def render_caption_png(
         },
         "x_padding": padding,
         "x_disallowed_fallbacks": sorted(set(disallowed_fallbacks)),
+        "x_font_binding": font_binding,
     }
 
 
@@ -339,11 +371,24 @@ def caption_overlays(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def caption_content_revision(state: dict[str, Any], canvas: dict[str, Any], render_scale: float) -> str:
-    try:
-        font_identity = font_digest(_font_file(None))
-    except (OSError, ValueError):
-        font_identity = "unresolved"
+def caption_content_revision(
+    state: dict[str, Any], canvas: dict[str, Any], render_scale: float, project_dir: Path | None = None,
+) -> str:
+    font_identity: dict[str, Any] = {}
+    if project_dir is not None:
+        for overlay in caption_overlays(state):
+            try:
+                binding = _font_binding(project_dir, state, overlay)
+                font_identity[str(overlay.get("id"))] = {
+                    "asset_id": binding.get("asset_id"), "sha256": binding.get("sha256"),
+                }
+            except (OSError, ValueError):
+                font_identity[str(overlay.get("id"))] = "unresolved"
+    else:
+        try:
+            font_identity["legacy"] = font_digest(_font_file(None))
+        except (OSError, ValueError):
+            font_identity["legacy"] = "unresolved"
     pack_identity: dict[str, Any] = {}
     for overlay in caption_overlays(state):
         try:
@@ -382,7 +427,7 @@ def build_render_plan(
     if not compositor_available():
         raise RuntimeError("caption compositor is not available on this host")
     canvas = state.get("canvas") or {}
-    content_revision = caption_content_revision(state, canvas, render_scale)
+    content_revision = caption_content_revision(state, canvas, render_scale, project_dir)
     plan_path = project_dir / RENDER_PLAN_REL
     if plan_path.is_file():
         try:
@@ -401,9 +446,15 @@ def build_render_plan(
         for overlay in caption_overlays(state)
     ]
     disallowed = sorted({name for item in items for name in item.pop("x_disallowed_fallbacks")})
+    font_receipts: dict[str, dict[str, Any]] = {}
     for item in items:
         item.pop("x_padding", None)
-    font_file = _font_file(project_dir)
+        binding = item.pop("x_font_binding", {})
+        asset_id = str(binding.get("asset_id") or "font-legacy-system")
+        path = binding.get("path")
+        font_receipts[asset_id] = {
+            "path": str(path), "sha256": str(binding.get("sha256") or ""),
+        }
     plan = {
         "schema_version": 1,
         "caption_revision": content_revision,
@@ -413,10 +464,7 @@ def build_render_plan(
             "shaping_engine": "macos-coretext",
             "shaping_engine_version": engine_descriptor()["version"],
             "fonts": {
-                PROJECT_FONT_ASSET_ID: {
-                    "path": str(font_file),
-                    "sha256": font_digest(font_file),
-                },
+                **font_receipts,
                 EMOJI_FONT_ASSET_ID: {"path": "system:Apple Color Emoji", "sha256": ""},
             },
             "disallowed_fallbacks": disallowed,
@@ -490,4 +538,3 @@ def selected_pack(state: dict[str, Any], overlay: dict[str, Any]):
         raise ValueError(f"unknown style pack: {pack_id}")
     scope = "pack-highlight" if (selection.get("per_highlight") or {}).get(highlight) else "pack-project"
     return pack, f"{scope}:{pack_id}"
-

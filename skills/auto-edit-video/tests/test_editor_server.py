@@ -94,6 +94,27 @@ class FakeAssetProviderService:
 
 
 class CaptionEffectModelTests(unittest.TestCase):
+    def test_font_asset_id_requires_a_safe_string_and_changes_revision(self) -> None:
+        state = {
+            "schema_version": 2,
+            "caption_defaults": {"font_asset_id": "font-google-fonts-0123456789abcdef-0123456789abcdef"},
+            "overlays": [{"id": "caption-1", "type": "caption", "style": {}}],
+        }
+        before = editor_state_revision(state)
+        state["caption_defaults"]["font_asset_id"] = "font-google-fonts-fedcba9876543210-fedcba9876543210"
+        self.assertNotEqual(before, editor_state_revision(state))
+
+        invalid_default = {**state, "caption_defaults": {"font_asset_id": True}}
+        self.assertIn("caption_defaults font_asset_id is invalid", validate_editor_state(invalid_default, 1.0))
+        invalid_overlay = {
+            **state,
+            "overlays": [{"id": "caption-1", "type": "caption", "style": {"font_asset_id": 7}}],
+        }
+        self.assertIn(
+            "overlay caption-1 style font_asset_id is invalid",
+            validate_editor_state(invalid_overlay, 1.0),
+        )
+
     def test_semantic_review_metadata_does_not_change_render_revision(self) -> None:
         state = {
             "schema_version": 1,
@@ -343,6 +364,32 @@ class EditorServerTests(unittest.TestCase):
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def test_fonts_endpoint_projects_only_safe_metadata(self) -> None:
+        asset_id = "font-google-fonts-0123456789abcdef-0123456789abcdef"
+        resolved = {
+            "asset_id": asset_id,
+            "family": "Example Sans",
+            "style": "Regular",
+            "weight": 400,
+            "coverage": {"unicode_coverage_count": 42},
+            "scripts": ["Latin"],
+            "license_spdx": "OFL-1.1",
+            "provider_id": "google-fonts",
+            "sha256": "a" * 64,
+            "path": "assets/fonts/private.ttf",
+            "receipt": {"download_url": "https://private.invalid/secret"},
+            "validation": {"required_text": "secret"},
+        }
+        with patch.object(editor_server.asset_registry, "list_project_fonts", return_value=[resolved]):
+            status, _headers, body = self.request("GET", "/api/fonts")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["fonts"][0]["asset_id"], asset_id)
+        self.assertEqual(payload["selected"], None)
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for forbidden in ("private.ttf", "private.invalid", "download_url", "required_text", "receipt", "validation"):
+            self.assertNotIn(forbidden, serialized)
 
     def request(
         self,
@@ -745,6 +792,125 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, body = self.request("GET", "/assets/safe.%50%4E%47")
         self.assertEqual(status, 200)
         self.assertEqual(body, png.read_bytes())
+
+    def test_generic_assets_route_never_serves_project_font_bytes(self) -> None:
+        hostile = b"NOT-A-FONT hostile bytes probe"
+        fonts = self.project / "assets/fonts"
+        fonts.mkdir()
+        (fonts / "unregistered.ttf").write_bytes(hostile)
+        (fonts / "nested").mkdir()
+        (fonts / "nested/preview.png").write_bytes(hostile)
+        (self.project / "assets/font-alias").symlink_to(fonts, target_is_directory=True)
+        imported = self.project / "assets/imported"
+        imported.mkdir()
+        (imported / "renamed.OTF").write_bytes(hostile)
+
+        blocked = (
+            "/assets/fonts/unregistered.ttf",
+            "/assets/FONTS/unregistered.ttf",
+            "/assets/%66onts/unregistered.ttf",
+            "/assets/fonts%2Funregistered.ttf",
+            "/assets/fonts/unregistered.%74%74%66",
+            "/assets/fonts/nested/preview.png",
+            "/assets/./fonts/nested/preview.png",
+            "/assets/x/../fonts/nested/preview.png",
+            "/assets/%2e/fonts/nested/preview.png",
+            "/assets/x/%2e%2e/fonts/nested/preview.png",
+            "/assets//fonts/nested/preview.png",
+            "/assets/fonts//nested/preview.png",
+            "/assets/fonts%2F%2Fnested/preview.png",
+            "/assets/%/fonts/nested/preview.png",
+            "/assets/%FF/fonts/nested/preview.png",
+            "/assets/font-alias/nested/preview.png",
+            "/assets/imported/renamed.OTF",
+            "/assets/imported/renamed.%4f%54%46",
+        )
+        for route in blocked:
+            with self.subTest(route=route):
+                status, _headers, body = self.request("GET", route)
+                self.assertEqual(status, 403)
+                self.assertNotIn(hostile, body)
+
+        status, _headers, body = self.request("GET", "/api/fonts/fake/bytes")
+        self.assertEqual(status, 404)
+        self.assertNotIn(hostile, body)
+
+    def test_project_font_bytes_route_is_fixed_mime_nosniff_and_no_range(self) -> None:
+        asset_id = "font-google-fonts-0123456789abcdef-0123456789abcdef"
+        font = self.project / "assets/fonts/verified.ttf"
+        font.parent.mkdir()
+        payload = b"verified receipt-bound font bytes"
+        font.write_bytes(payload)
+        binding = {
+            "asset_id": asset_id,
+            "path": "assets/fonts/verified.ttf",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+        with patch.object(
+            editor_server.asset_registry,
+            "resolve_project_font",
+            return_value=binding,
+        ) as resolve:
+            status, headers, body = self.request(
+                "GET",
+                f"/api/fonts/{asset_id}/bytes",
+                headers={"Range": "bytes=2-5"},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, payload)
+        self.assertEqual(headers["Content-Type"], "font/ttf")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIsNone(headers.get("Accept-Ranges"))
+        self.assertIsNone(headers.get("Content-Range"))
+        resolve.assert_called_once_with(self.project.resolve(), asset_id)
+
+        with patch.object(
+            editor_server.asset_registry,
+            "resolve_project_font",
+            side_effect=editor_server.asset_registry.AssetRegistryError("tampered"),
+        ):
+            status, _headers, body = self.request(
+                "GET", f"/api/fonts/{asset_id}/bytes"
+            )
+        self.assertEqual(status, 404)
+        self.assertNotIn(payload, body)
+
+        outside = Path(self._tmp.name) / "outside.ttf"
+        outside.write_bytes(payload)
+        symlink = self.project / "assets/fonts/symlink.ttf"
+        symlink.symlink_to(outside)
+        with patch.object(
+            editor_server.asset_registry,
+            "resolve_project_font",
+            return_value={
+                "asset_id": asset_id,
+                "path": "assets/fonts/symlink.ttf",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        ):
+            status, _headers, body = self.request(
+                "GET", f"/api/fonts/{asset_id}/bytes"
+            )
+        self.assertEqual(status, 404)
+        self.assertNotIn(payload, body)
+
+        with patch.object(
+            editor_server.asset_registry,
+            "resolve_project_font",
+            return_value={
+                "asset_id": asset_id,
+                "path": "assets/fonts/missing.ttf",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        ):
+            status, _headers, body = self.request(
+                "GET", f"/api/fonts/{asset_id}/bytes"
+            )
+        self.assertEqual(status, 404)
+        self.assertNotIn(payload, body)
 
     def test_source_symlink_outside_project_is_rejected(self) -> None:
         outside = Path(self._tmp.name) / "outside.mp4"

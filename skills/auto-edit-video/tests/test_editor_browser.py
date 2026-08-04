@@ -722,6 +722,145 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             self.assertEqual(console_errors, [])
             browser.close()
 
+    def test_project_font_selection_preview_failure_and_font_provider_metadata(self) -> None:
+        """Font selection is ID-bound, preview-safe, and never DOM-injects metadata."""
+        host, port = self.server.server_address
+        first = "font-google-fonts-0123456789abcdef-0123456789abcdef"
+        second = "font-google-fonts-fedcba9876543210-fedcba9876543210"
+        font_requests: list[str] = []
+        saved: list[dict[str, object]] = []
+        fonts_calls = 0
+        font_payload = {
+            "ok": True,
+            "engine": {"status": "present", "version": "test"},
+            "fonts": [
+                {"asset_id": first, "family": "Same <script> Family", "style": "Regular", "weight": 400, "coverage": {"count": 10}, "scripts": ["Latin"], "license_spdx": "OFL-1.1", "provider_id": "google-fonts", "sha256": "a" * 64, "availability": "verified"},
+                {"asset_id": second, "family": "Same <script> Family", "style": "Bold", "weight": 700, "coverage": {"count": 20}, "scripts": ["Latin", "Han"], "license_spdx": "OFL-1.1", "provider_id": "google-fonts", "sha256": "b" * 64, "availability": "verified"},
+            ],
+            "selected": None,
+            "selection_status": "legacy",
+            "legacy": {"current": "Legacy.ttf", "status": "unverified-legacy"},
+            "sanctioned_fallbacks": [],
+            "caption_font_asset_ids": [],
+            "disallowed_fallbacks": [],
+        }
+        provider_payload = {"ok": True, "providers": [{"id": "google-fonts", "label": "Google Fonts", "kind": "font", "consent_required": False, "consented": True, "available": True, "network_disclosure": "metadata only"}]}
+        font_result = {"import_token": "font-token", "kind": "font", "title": "<img src=x onerror=alert(1)>", "family": "<script>alert(1)</script>", "license_spdx": "OFL-1.1", "coverage": "Latin、Han", "mime_type": "font/ttf"}
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+
+            def fonts_route(route: object) -> None:
+                nonlocal fonts_calls
+                fonts_calls += 1
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(font_payload, ensure_ascii=False))
+
+            def bytes_route(route: object) -> None:
+                font_requests.append(route.request.url)
+                if second in route.request.url:
+                    route.fulfill(status=404, content_type="text/plain", body="missing")
+                else:
+                    route.fulfill(status=200, content_type="font/ttf", body=(Path("/System/Library/Fonts/Symbol.ttf").read_bytes()))
+
+            def state_route(route: object) -> None:
+                payload = route.request.post_data_json
+                saved.append(payload)
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "updated_at": "now", "revision": "c" * 64, "invalidated_gates": [], "approval_revisions": {}}))
+
+            page.route("**/api/fonts", fonts_route)
+            page.route("**/api/fonts/*/bytes", bytes_route)
+            page.route("**/api/captions/status", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "engine": {"status": "not_configured"}})))
+            page.route("**/api/editor-state", state_route)
+            page.route("**/api/providers/status", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps(provider_payload)))
+            page.route("**/api/assets/search", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "items": [font_result]})))
+            page.route("**/api/assets/import-provider", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "asset_id": second})))
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            page.locator("#layer-form:not([hidden])").wait_for()
+            self.assertEqual(page.locator("#font-family").input_value(), "__legacy__")
+
+            page.locator("#font-family").select_option(first)
+            self.assertEqual(page.locator("#font-family").input_value(), first)
+            page.wait_for_timeout(850)
+            self.assertTrue(saved)
+            first_style = next(item for item in saved[-1]["overlays"] if item["id"] == "caption-0001")["style"]
+            self.assertEqual(first_style["font_asset_id"], first)
+            self.assertEqual(first_style["font_family"], "Same <script> Family")
+            self.assertEqual(first_style["font_weight"], 400)
+            page.locator("#preview-video").evaluate(
+                "el => { el.currentTime = 1; el.dispatchEvent(new Event('timeupdate')); }"
+            )
+            page.wait_for_timeout(700)
+            self.assertTrue(any(first in url for url in font_requests))
+            preview_font = page.locator('.preview-overlay[data-overlay-id="caption-0001"]').evaluate("el => getComputedStyle(el).getPropertyValue('--overlay-font')")
+            self.assertIn(first, preview_font)
+            self.assertNotIn("assets/", preview_font)
+            self.assertNotIn("receipt", preview_font)
+
+            page.locator("#font-family").select_option(second)
+            page.wait_for_timeout(850)
+            self.assertTrue(any(second in url for url in font_requests))
+            self.assertIn("瀏覽器預覽字型載入失敗", page.locator("#font-panel").inner_text())
+            self.assertTrue(saved)
+            style = next(item for item in saved[-1]["overlays"] if item["id"] == "caption-0001")["style"]
+            self.assertEqual(style["font_asset_id"], second)
+            self.assertEqual(style["font_family"], "Same <script> Family")
+            self.assertEqual(style["font_weight"], 700)
+
+            page.locator("#desk-assets summary").click()
+            page.locator("#desk-provider-select").wait_for()
+            page.locator("#desk-provider-query").fill("safe font")
+            page.locator("#desk-provider-search").click()
+            row = page.locator("#desk-provider-results .provider-result-row").first
+            row.wait_for()
+            self.assertEqual(row.get_attribute("data-kind"), "font")
+            self.assertEqual(row.locator("img,object,embed,script").count(), 0)
+            self.assertIn("<script>", row.inner_text())
+            row.get_by_role("button", name="匯入").click()
+            page.get_by_role("button", name="已匯入").wait_for()
+            self.assertGreaterEqual(fonts_calls, 2, "font import refreshes verified font manifest")
+            browser.close()
+
+    def test_unavailable_font_manifest_preserves_existing_binding_on_unrelated_edit(self) -> None:
+        host, port = self.server.server_address
+        asset_id = "font-google-fonts-0123456789abcdef-0123456789abcdef"
+        saved: list[dict[str, object]] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+
+            def project_route(route: object) -> None:
+                response = route.fetch()
+                payload = response.json()
+                caption = next(item for item in payload["state"]["overlays"] if item["id"] == "caption-0001")
+                caption.setdefault("style", {})["font_asset_id"] = asset_id
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(payload, ensure_ascii=False))
+
+            def state_route(route: object) -> None:
+                saved.append(route.request.post_data_json)
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "updated_at": "now", "revision": "d" * 64, "invalidated_gates": [], "approval_revisions": {}}))
+
+            page.route("**/api/project", project_route)
+            page.route("**/api/fonts", lambda route: route.fulfill(status=503, content_type="application/json", body=json.dumps({"error": "unavailable"})))
+            page.route("**/api/editor-state", state_route)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            page.locator("#layer-form:not([hidden])").wait_for()
+            self.assertTrue(page.locator("#font-family").input_value().startswith("__unavailable__:"))
+            page.locator("#font-size").fill("63")
+            page.wait_for_timeout(850)
+            self.assertTrue(saved)
+            style = next(item for item in saved[-1]["overlays"] if item["id"] == "caption-0001")["style"]
+            self.assertEqual(style["font_asset_id"], asset_id)
+            page.locator("#preview-video").evaluate(
+                "el => { el.currentTime = 1; el.dispatchEvent(new Event('timeupdate')); }"
+            )
+            preview_font = page.locator('.preview-overlay[data-overlay-id="caption-0001"]').evaluate(
+                "el => getComputedStyle(el).getPropertyValue('--overlay-font')"
+            )
+            self.assertIn(f"ProjectFont-{asset_id}", preview_font)
+            self.assertNotIn("PingFang", preview_font)
+            self.assertIn("字型清單載入失敗", page.locator("#font-panel").inner_text())
+            browser.close()
+
 
 if __name__ == "__main__":
     unittest.main()
