@@ -173,6 +173,8 @@ def freeze_content_analysis(
     analysis = dict(draft)
     analysis["schema_version"] = 1
     analysis["source_sha256"] = str(manifest.get("source", {}).get("sha256") or "")
+    analysis["evidence_map_revision"] = evidence_map["revision"]
+    analysis["transcript_revision"] = evidence_map["transcript_revision"]
     analysis.setdefault(
         "engine",
         {"id": engine_id, "kind": "agent", "model": engine_id, "version": "1"},
@@ -199,6 +201,39 @@ def freeze_content_analysis(
                     "extends past the source duration"
                 )
     _write_json(project_dir / CONTENT_REL, analysis)
+    return analysis
+
+
+def load_frozen_analysis(project_dir: Path, evidence_map: dict[str, Any]) -> dict[str, Any]:
+    """Load content_analysis.json and reject any post-freeze tampering.
+
+    Verifies (a) the stored canonical revision matches the recomputed hash,
+    and (b) the frozen artifact is bound to the CURRENT evidence map and
+    transcript revisions — editing thesis/ranges/truth map after freeze, or
+    swapping the transcript underneath, both fail closed.
+    """
+    analysis = _read_json(project_dir / CONTENT_REL)
+    if analysis.get("frozen") is not True:
+        raise NarrativeError("content analysis is not frozen; run freeze-content-analysis")
+    stored_revision = analysis.get("revision")
+    recomputed = contract_registry.canonical_hash(
+        {key: value for key, value in analysis.items() if key != "revision"}
+    )
+    if stored_revision != recomputed:
+        raise NarrativeError(
+            "content_analysis.json was modified after freezing; re-run "
+            "freeze-content-analysis on an honest draft"
+        )
+    if analysis.get("evidence_map_revision") != evidence_map.get("revision"):
+        raise NarrativeError(
+            "frozen analysis is bound to a different evidence map revision; "
+            "re-run build-evidence-index and freeze again"
+        )
+    if analysis.get("transcript_revision") != evidence_map.get("transcript_revision"):
+        raise NarrativeError(
+            "frozen analysis is bound to a different transcript revision; "
+            "re-freeze against the current transcript"
+        )
     return analysis
 
 
@@ -253,10 +288,8 @@ def _formula_eligible(formula: dict[str, Any], features: dict[str, float]) -> bo
 
 
 def route_formulas(project_dir: Path) -> dict[str, Any]:
-    analysis = _read_json(project_dir / CONTENT_REL)
-    if analysis.get("frozen") is not True:
-        raise NarrativeError("content analysis is not frozen; run freeze-content-analysis")
     evidence_map = verify_evidence_map(project_dir)
+    analysis = load_frozen_analysis(project_dir, evidence_map)
     policy = load_policy()
     policy_hash = contract_registry.canonical_hash(policy)
     evidence_by_id = {item["id"]: item for item in evidence_map["items"]}
@@ -343,9 +376,10 @@ PURPOSES = ("hook", "context", "method", "proof", "payoff", "cta")
 
 def build_narrative_plan(project_dir: Path) -> dict[str, Any]:
     structure = _read_json(project_dir / PLAN_REL)
-    analysis = _read_json(project_dir / CONTENT_REL)
     manifest = _read_json(project_dir / "project.json")
     transcript = _read_json(project_dir / TRANSCRIPT_REL)
+    evidence_map = verify_evidence_map(project_dir)
+    analysis = load_frozen_analysis(project_dir, evidence_map)
     selected_id = structure["selected"]["idea_id"]
     candidate = next(
         (c for c in analysis.get("idea_candidates", []) if c["id"] == selected_id),
@@ -424,15 +458,40 @@ def reanchor(
     """
     plan = _read_json(project_dir / NARRATIVE_REL)
     structure = _read_json(project_dir / PLAN_REL)
-    analysis = _read_json(project_dir / CONTENT_REL)
     evidence_map = verify_evidence_map(project_dir)
+    analysis = load_frozen_analysis(project_dir, evidence_map)
     words = rough_cut_transcript.get("words") or []
-    haystack = normalized_literal(
-        "".join(str(word.get("text", "")) for word in words)
-    )
-    if not haystack:
+    tokens = [
+        normalized_literal(str(word.get("text", "")))
+        for word in words
+        if normalized_literal(str(word.get("text", "")))
+    ]
+    if not tokens:
         status = "failed"
     else:
+        joined = "".join(tokens)
+        # Token-boundary map: a literal only anchors when its normalized text
+        # starts AND ends on token boundaries — substring hits that stitch
+        # across unrelated tokens do not count (Codex review, containment
+        # false positives).
+        boundaries = set()
+        cursor = 0
+        for token in tokens:
+            boundaries.add(cursor)
+            cursor += len(token)
+        boundaries.add(cursor)
+
+        def literal_anchored(literal: str) -> bool:
+            needle = normalized_literal(literal)
+            if not needle:
+                return False
+            start = joined.find(needle)
+            while start != -1:
+                if start in boundaries and (start + len(needle)) in boundaries:
+                    return True
+                start = joined.find(needle, start + 1)
+            return False
+
         selected_id = structure["selected"]["idea_id"]
         candidate = next(
             (c for c in analysis.get("idea_candidates", []) if c["id"] == selected_id),
@@ -442,8 +501,7 @@ def reanchor(
         missing = [
             eid
             for eid in candidate.get("evidence_ids", [])
-            if normalized_literal(evidence_by_id.get(eid, {}).get("literal", ""))
-            not in haystack
+            if not literal_anchored(evidence_by_id.get(eid, {}).get("literal", ""))
         ]
         status = "anchored" if not missing else "stale"
     plan["reanchor"] = {

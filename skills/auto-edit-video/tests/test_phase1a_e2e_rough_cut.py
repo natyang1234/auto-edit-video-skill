@@ -211,8 +211,8 @@ class Phase1aRoughCutE2ETests(unittest.TestCase):
         self.assertEqual(probe.returncode, 0, probe.stderr)
         duration = float(probe.stdout.strip())
         # Should be approximately 2 seconds (±1 frame ~= ±0.03s)
-        self.assertAlmostEqual(duration, 2.0, delta=0.15,
-                               msg="Rough cut duration should equal sum of segments")
+        self.assertAlmostEqual(duration, 2.0, delta=1.0 / 30.0 + 0.01,
+                               msg="Rough cut duration should equal sum of segments ±1 frame")
 
         # Criterion 3: Subtitle overlay positioning (basic check)
         # Verify captions are present in the state (they should be auto-generated from transcript)
@@ -278,7 +278,7 @@ class Phase1aRoughCutE2ETests(unittest.TestCase):
             capture_output=True, text=True,
         )
         duration = float(probe.stdout.strip())
-        self.assertAlmostEqual(duration, 2.0, delta=0.15)
+        self.assertAlmostEqual(duration, 2.0, delta=1.0 / 30.0 + 0.01)
 
         # Criterion 5: Offline workflow verification
         # All operations above should use only local data

@@ -98,98 +98,27 @@ def _load_platform_presets() -> dict[str, dict[str, Any]]:
 
 PLATFORM_PRESETS: dict[str, dict[str, Any]] = _load_platform_presets()
 
-DIRECTOR_PRESETS: dict[str, dict[str, Any]] = {
-    "teacher-punch": {
-        "label": "專業教學",
-        "description": "先講結論、拆解步驟，以高對比重點字協助理解。",
-        "caption": {
-            "font_family": "PingFang TC",
-            "font_size": 58,
-            "font_weight": 800,
-            "color": "#f7f2e8",
-            "emphasis_color": "#ffd447",
-            "stroke_color": "#17130f",
-            "stroke_width": 5,
-            "x": 50,
-            "y": 76,
-            "max_width": 86,
-            "animation": "pop",
-        },
-        "visual_density": "balanced",
-    },
-    "editorial-clean": {
-        "label": "編輯精簡",
-        "description": "小而準的字幕、克制字卡，保留人物與畫面呼吸。",
-        "caption": {
-            "font_family": "Avenir Next",
-            "font_size": 44,
-            "font_weight": 700,
-            "color": "#f6f0e5",
-            "emphasis_color": "#e94f37",
-            "stroke_color": "#211d19",
-            "stroke_width": 3,
-            "x": 50,
-            "y": 82,
-            "max_width": 82,
-            "animation": "fade",
-        },
-        "visual_density": "sparse",
-    },
-    "documentary": {
-        "label": "八卦時事",
-        "description": "快速交代背景與衝突，用暖色重點帶出討論焦點。",
-        "caption": {
-            "font_family": "Songti TC",
-            "font_size": 48,
-            "font_weight": 700,
-            "color": "#f2eadb",
-            "emphasis_color": "#d99a52",
-            "stroke_color": "#262019",
-            "stroke_width": 3,
-            "x": 50,
-            "y": 80,
-            "max_width": 78,
-            "animation": "fade",
-        },
-        "visual_density": "sparse",
-    },
-    "high-energy": {
-        "label": "爆款短影音",
-        "description": "強 Hook、大字、快進場，適合密集節奏與高張力片段。",
-        "caption": {
-            "font_family": "PingFang TC",
-            "font_size": 68,
-            "font_weight": 900,
-            "color": "#fff5e6",
-            "emphasis_color": "#ffb000",
-            "stroke_color": "#17110d",
-            "stroke_width": 6,
-            "x": 50,
-            "y": 72,
-            "max_width": 90,
-            "animation": "slide-up",
-        },
-        "visual_density": "dense",
-    },
-    "minimal": {
-        "label": "POV 藏鏡人",
-        "description": "低干擾字幕與沉浸節奏，讓第一視角與現場感主導。",
-        "caption": {
-            "font_family": "Avenir Next",
-            "font_size": 40,
-            "font_weight": 600,
-            "color": "#f7f3ec",
-            "emphasis_color": "#f7f3ec",
-            "stroke_color": "#221e1a",
-            "stroke_width": 2,
-            "x": 50,
-            "y": 86,
-            "max_width": 76,
-            "animation": "none",
-        },
-        "visual_density": "sparse",
-    },
-}
+def _load_director_presets() -> dict[str, dict[str, Any]]:
+    """Director presets load from the versioned registry (runtime SSOT,
+    symmetric with _load_platform_presets); missing/invalid fails closed."""
+    import contract_registry
+
+    registry_path = SKILL_DIR / "contracts/instances/director_mode__registry.json"
+    try:
+        payload = contract_registry.load_artifact_text(
+            registry_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"director mode registry unreadable: {exc}") from exc
+    errors = contract_registry.validate_artifact("director_mode", payload)
+    if errors:
+        raise RuntimeError(
+            "director mode registry failed contract validation: " + "; ".join(errors)
+        )
+    return {mode["id"]: dict(mode["constraints"]) for mode in payload["modes"]}
+
+
+DIRECTOR_PRESETS: dict[str, dict[str, Any]] = _load_director_presets()
 
 
 def now_utc() -> str:
@@ -520,12 +449,17 @@ def effect_span_final_errors(
     if not spans_present:
         return []
     if clip is not None and state.get("visual_quality_mode") == "designed":
+        # Same clip-scoped role resolution the renderer uses to pick the
+        # designed route (visual_quality.overlays_for_clip) — global roles
+        # from other highlights must not unlock this clip's approval.
+        from visual_quality import DESIGN_ROLES, overlays_for_clip
+
         roles = {
             str(item.get("design_role"))
-            for item in state.get("overlays", [])
-            if isinstance(item, dict) and item.get("design_role")
+            for item in overlays_for_clip(state, clip)
+            if item.get("design_role")
         }
-        if {"hook", "concept", "rule", "memory", "recap"}.issubset(roles):
+        if set(DESIGN_ROLES).issubset(roles):
             return []
     return [
         "per-character effect spans are not rendered by the current final route; "

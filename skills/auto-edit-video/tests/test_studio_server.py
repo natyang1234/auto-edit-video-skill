@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,7 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from auto_edit import validate_manifest  # noqa: E402
+import studio_server  # noqa: E402
 from studio_server import StudioServer  # noqa: E402
 
 
@@ -515,3 +517,36 @@ class FolderImportTests(StudioHarness):
         )
         self.assertEqual(status, 422, payload)
         self.assertEqual(payload.get("error_code"), "no_video")
+
+    def test_finalize_failure_releases_import_lock(self) -> None:
+        files = [{"path": "main.mp4", "size_bytes": len(self.source_bytes)}]
+        status, payload = self.create_folder_session(files)
+        self.assertEqual(status, 201, payload)
+        session = payload["session"]
+        status, _headers, raw = self.request(
+            "PUT",
+            session["upload_url_template"] + "main.mp4",
+            self.source_bytes,
+            {"Content-Type": "application/octet-stream", **self.folder_headers()},
+        )
+        self.assertEqual(status, 200, raw)
+
+        real_run = studio_server.subprocess.run
+
+        def failing_run(command, *args, **kwargs):
+            if any("ingest-folder" in str(part) for part in command):
+                return subprocess.CompletedProcess(command, 1, "", "boom")
+            return real_run(command, *args, **kwargs)
+
+        with unittest.mock.patch.object(studio_server.subprocess, "run", failing_run):
+            status, payload = self.json_response(
+                "POST", str(session["finalize_url"]), None, self.folder_headers()
+            )
+        self.assertEqual(status, 500, payload)
+        self.assertFalse(
+            (self.projects_root / f".folder-creating-{session['id']}").exists(),
+            "failed finalize must clean its staging dir",
+        )
+        # The lock must be free: a fresh session is accepted immediately.
+        status, payload = self.create_folder_session(files)
+        self.assertEqual(status, 201, payload)

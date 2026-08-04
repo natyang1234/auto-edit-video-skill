@@ -329,10 +329,19 @@
   "revision": {
    "type": "string",
    "pattern": "^[0-9a-f]{64}$"
+  },
+  "evidence_map_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
+  },
+  "transcript_revision": {
+   "type": "string",
+   "pattern": "^[0-9a-f]{64}$"
   }
  },
  "required": [
   "engine",
+  "evidence_map_revision",
   "frozen",
   "generated_at",
   "idea_candidates",
@@ -340,6 +349,7 @@
   "revision",
   "schema_version",
   "source_sha256",
+  "transcript_revision",
   "truth_map"
  ],
  "additionalProperties": false

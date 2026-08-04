@@ -50,16 +50,29 @@ def ffprobe_path() -> str:
     return str(candidate) if candidate.is_file() else "ffprobe"
 
 
-@functools.lru_cache(maxsize=1)
-def ffmpeg_version() -> str:
+@functools.lru_cache(maxsize=4)
+def _tool_identity(executable: str) -> str:
+    """version + build-config digest — cache keys must see build changes."""
     try:
-        head = subprocess.run(
-            [ffmpeg_path(), "-version"], capture_output=True, text=True, check=True
-        ).stdout.splitlines()[0]
-    except (OSError, subprocess.CalledProcessError, IndexError):
+        output = subprocess.run(
+            [executable, "-version"], capture_output=True, text=True, check=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
         return "unknown"
-    match = re.search(r"ffmpeg version (\S+)", head)
-    return match.group(1) if match else "unknown"
+    head = output.splitlines()[0] if output else "unknown"
+    match = re.search(r"version (\S+)", head)
+    version = match.group(1) if match else "unknown"
+    import hashlib
+
+    return f"{version}+build-{hashlib.sha256(output.encode('utf-8')).hexdigest()[:12]}"
+
+
+def ffmpeg_version() -> str:
+    return _tool_identity(ffmpeg_path())
+
+
+def ffprobe_version() -> str:
+    return _tool_identity(ffprobe_path())
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -231,7 +244,7 @@ def extract_frame(source: Path, timestamp: float, destination: Path) -> None:
             f"scale='if(gt(iw,ih),{OCR_SCALE_LONG_SIDE},-2)':'if(gt(iw,ih),-2,{OCR_SCALE_LONG_SIDE})'",
             str(destination),
         ],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=OCR_FRAME_TIMEOUT_S,
     )
     if result.returncode != 0 or not destination.is_file():
         raise ValueError(f"frame extraction failed at {timestamp:.3f}s")
@@ -290,7 +303,13 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
     ff_version = ffmpeg_version()
     stats: dict[str, str] = {}
 
-    def run_stage(stage: str, params: dict[str, Any], compute: Callable[[], Any], upstream: str = "") -> Any:
+    def run_stage(
+        stage: str,
+        params: dict[str, Any],
+        compute: Callable[[], Any],
+        upstream: str = "",
+        engine: dict[str, str] | None = None,
+    ) -> Any:
         payload, hit = stage_cached(
             project_dir,
             stage,
@@ -298,7 +317,7 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
                 "source_sha256": source_sha,
                 "stage": stage,
                 "params": params,
-                "engine": {"ffmpeg": ff_version},
+                "engine": engine if engine is not None else {"ffmpeg": ff_version},
                 "upstream": upstream,
             },
             compute,
@@ -306,7 +325,12 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
         stats[stage] = "hit" if hit else "computed"
         return payload
 
-    probe = run_stage("probe", {"tool": "ffprobe"}, lambda: probe_source(source))
+    probe = run_stage(
+        "probe",
+        {"tool": "ffprobe"},
+        lambda: probe_source(source),
+        engine={"ffprobe": ffprobe_version()},
+    )
     duration_s = float(probe["duration_s"])
     loudness = run_stage("loudness", {"filter": "ebur128"}, lambda: measure_loudness(source))
     silences = run_stage(
@@ -320,6 +344,24 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
         lambda: detect_shots(source, duration_s),
         upstream=contract_registry.canonical_hash(probe),
     )
+    asr_engine = transcript_engine(project_dir)
+    transcript_path = project_dir / "working/transcript_words.json"
+    transcript_state = {
+        "status": asr_engine["status"],
+        "transcript_sha256": (
+            contract_registry.canonical_hash(
+                json.loads(transcript_path.read_text(encoding="utf-8"))
+            )
+            if asr_engine["status"] == "present"
+            else None
+        ),
+    }
+    run_stage(
+        "asr",
+        {"artifact": "working/transcript_words.json"},
+        lambda: transcript_state,
+        engine=asr_engine,
+    )
     ocr_engine = vision_ocr.vision_engine()
     sampling_params = {
         "interval_s": OCR_SAMPLE_INTERVAL_S,
@@ -329,6 +371,9 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
         "scale_long_side": OCR_SCALE_LONG_SIDE,
         "timeout_s": OCR_FRAME_TIMEOUT_S,
         "engine": ocr_engine,
+        "recognition_languages": ["zh-Hant", "en-US"],
+        "recognition_level": "accurate",
+        "language_correction": False,
     }
     if ocr_engine["status"] == "present":
         shot_starts = [shot["start"] for shot in shots]
@@ -350,7 +395,7 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
         "source_sha256": source_sha,
         "engines": {
             "ffprobe": {"name": "ffprobe", "version": ff_version, "status": "present"},
-            "asr": transcript_engine(project_dir),
+            "asr": asr_engine,
             "ocr": ocr_engine,
             "shot_detector": {
                 "name": "ffmpeg-scene",

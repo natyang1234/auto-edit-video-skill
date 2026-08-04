@@ -1546,6 +1546,33 @@ def cmd_plan_narrative(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reanchor_narrative(args: argparse.Namespace) -> int:
+    """Re-anchor evidence against a rough-cut re-transcription.
+
+    Workflow: render the rough cut, transcribe it (e.g. transcribe-local on
+    the output, or an external whisper run), then pass that word-timed
+    transcript here; the plan's reanchor status becomes anchored/stale/failed.
+    """
+    try:
+        import narrative_engine
+    except ImportError as exc:
+        return die(f"cannot load narrative engine: {exc}")
+    try:
+        transcript = read_json(Path(args.transcript).expanduser())
+        plan = narrative_engine.reanchor(
+            Path(args.project_dir).expanduser().resolve(), transcript
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    print(
+        json.dumps(
+            {"ok": True, "reanchor": plan["reanchor"], "plan_hash": plan["plan_hash"]},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_analyze_video(args: argparse.Namespace) -> int:
     """Whole-video technical analysis with stage-level checkpoint cache."""
     try:
@@ -1591,7 +1618,11 @@ def cmd_ingest_folder(args: argparse.Namespace) -> int:
     files = sorted(
         path
         for path in folder.rglob("*")
-        if path.is_file() and not path.name.startswith(".") and not path.is_symlink()
+        if path.is_file()
+        and not path.is_symlink()
+        and not any(
+            part.startswith(".") for part in path.relative_to(folder).parts
+        )
     )
     if not files:
         return die("the folder contains no importable files")
@@ -1655,15 +1686,47 @@ def cmd_ingest_folder(args: argparse.Namespace) -> int:
     project_dir = project_dir.expanduser().absolute()
     imported_dir = project_dir / "assets/imported"
     copied = 0
+    provenance_items: list[dict[str, Any]] = []
     for entry in entries:
         if entry["role"] in {"main_video", "ignored"}:
             continue
         source_path = folder / entry["path"]
-        destination = imported_dir / f"{entry['sha256'][:8]}-{source_path.name}"
+        # 16-hex content prefix keeps names readable while making a
+        # case-insensitive-filesystem collision imply identical content
+        # (which is then a legitimate dedupe, not silent loss).
+        destination = imported_dir / f"{entry['sha256'][:16]}-{source_path.name}"
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             shutil.copy2(source_path, destination)
             copied += 1
+        provenance_items.append(
+            {
+                "asset_id": f"asset-{entry['sha256'][:16]}",
+                "path": destination.relative_to(project_dir).as_posix(),
+                "sha256": entry["sha256"],
+                "origin": "folder-import",
+                "provider_id": None,
+                "source_url": None,
+                "license": {
+                    "spdx": "user-owned-pending",
+                    "attribution_required": False,
+                    "attribution_text": "",
+                    "verified_at": now_utc(),
+                },
+                "review_status": "pending",
+            }
+        )
+    seen_assets: set[str] = set()
+    provenance_items = [
+        item
+        for item in provenance_items
+        if not (item["asset_id"] in seen_assets or seen_assets.add(item["asset_id"]))
+    ]
+    provenance = {"schema_version": 1, "items": provenance_items}
+    errors = contract_registry.validate_artifact("asset_provenance", provenance)
+    if errors:
+        return die("asset provenance failed contract validation: " + "; ".join(errors))
+    write_json(project_dir / "working/asset_provenance.json", provenance)
     inventory = {
         "schema_version": 1,
         "project_id": manifest["project_id"],
@@ -4165,6 +4228,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan_narrative.add_argument("--project-dir", required=True)
     plan_narrative.set_defaults(func=cmd_plan_narrative)
+
+    reanchor = sub.add_parser(
+        "reanchor-narrative",
+        help="Re-anchor evidence literals against a rough-cut re-transcription",
+    )
+    reanchor.add_argument("--project-dir", required=True)
+    reanchor.add_argument("--transcript", required=True,
+                          help="word-timed transcript JSON of the rendered rough cut")
+    reanchor.set_defaults(func=cmd_reanchor_narrative)
 
     narrative = sub.add_parser(
         "apply-narrative-plan",

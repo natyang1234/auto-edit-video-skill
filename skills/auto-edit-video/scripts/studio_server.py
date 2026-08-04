@@ -722,6 +722,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         last_modified = file_meta.get("last_modified_ms")
         if last_modified is not None and (isinstance(last_modified, bool) or not isinstance(last_modified, int)):
             raise StudioRequestError(422, "invalid_metadata", "last_modified_ms must be an integer")
+        self.release_stale_folder_session()
         import_id = f"imp_{secrets.token_hex(16)}"
         created = now_utc()
         session = {
@@ -774,6 +775,33 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise StudioRequestError(422, "invalid_path", f"folder path is invalid: {raw!r}")
         return Path(path).as_posix()
 
+    FOLDER_SESSION_STALE_S = 1800
+
+    def release_stale_folder_session(self) -> None:
+        """A folder session abandoned mid-upload must not deadlock imports."""
+        with self.server.import_lock:
+            active = self.server.active_upload_id
+            if not active:
+                return
+            session = self.server.imports.get(active)
+            if not session or session.get("kind") != "folder":
+                return
+            if session.get("state") not in {"open", "uploading", "aborted"}:
+                return
+            try:
+                updated = datetime.fromisoformat(
+                    str(session.get("updated_at", "")).replace("Z", "+00:00")
+                )
+            except ValueError:
+                return
+            age = (datetime.now(timezone.utc) - updated).total_seconds()
+            if session.get("state") == "aborted" or age > self.FOLDER_SESSION_STALE_S:
+                session["state"] = "expired"
+                staging = Path(str(session.get("staging_dir", "")))
+                if staging.is_dir() and not staging.is_symlink():
+                    shutil.rmtree(staging, ignore_errors=True)
+                self.server.active_upload_id = None
+
     def handle_create_folder_import(self) -> None:
         body = self.read_folder_json_body()
         if not isinstance(body, dict) or not isinstance(body.get("files"), list):
@@ -821,6 +849,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         source_language = str((body.get("settings") or {}).get("source_language", "auto"))
         if source_language not in SOURCE_LANGUAGES:
             raise StudioRequestError(422, "invalid_settings", "source language is unsupported")
+        self.release_stale_folder_session()
         session_id = f"fol_{secrets.token_hex(16)}"
         staging = self.server.projects_root / f".folder-creating-{session_id}"
         created = now_utc()
@@ -913,12 +942,34 @@ class StudioHandler(BaseHTTPRequestHandler):
         missing = [path for path, item in session["files"].items() if not item["received"]]
         if missing:
             raise StudioRequestError(409, "incomplete_upload", f"{len(missing)} files not uploaded yet")
+        try:
+            self._folder_finalize_locked(session, session_id)
+        finally:
+            if session.get("state") != "ready":
+                # Any failure must release the import lock and clean up, or
+                # every later import 409s forever (Codex review blocker).
+                session["state"] = "aborted"
+                session["updated_at"] = now_utc()
+                staging = Path(str(session.get("staging_dir", "")))
+                if staging.is_dir() and not staging.is_symlink():
+                    shutil.rmtree(staging, ignore_errors=True)
+                partial = session.pop("_partial_project", None)
+                if partial:
+                    partial_path = Path(partial)
+                    if partial_path.is_dir() and not partial_path.is_symlink():
+                        shutil.rmtree(partial_path, ignore_errors=True)
+                with self.server.import_lock:
+                    if self.server.active_upload_id == session_id:
+                        self.server.active_upload_id = None
+
+    def _folder_finalize_locked(self, session: dict[str, Any], session_id: str) -> None:
         session["state"] = "importing"
         session["updated_at"] = now_utc()
         staging = Path(session["staging_dir"])
         project_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dt%H%M%Sz').lower()}-" \
             f"{safe_project_slug(session['project_name'])}-{secrets.token_hex(2)}"
         final_project = self.server.projects_root / project_id
+        session["_partial_project"] = str(final_project)
         command = [
             sys.executable,
             str(AUTO_EDIT_SCRIPT),
@@ -976,6 +1027,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             message = "資料夾已匯入；正在排程本機分析"
         except OSError:
             message = "資料夾已匯入；本機自動處理尚未啟動"
+        session.pop("_partial_project", None)
         session.update(
             {
                 "state": "ready",

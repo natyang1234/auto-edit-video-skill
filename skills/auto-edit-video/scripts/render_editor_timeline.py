@@ -514,8 +514,12 @@ def build_render_command(
 
     output.parent.mkdir(parents=True, exist_ok=True)
     has_audio_stream = manifest.get("source", {}).get("has_audio") is not False
+    # Probe the covered SOURCE span; with reorder the first/last segment give
+    # a negative span, so use min/max over all segments (Codex review).
+    probe_start = min(start for start, _end in segments)
+    probe_span = max(end for _start, end in segments) - probe_start
     normalize_audio = has_audio_stream and source_has_audible_signal(
-        source, segments[0][0], segments[-1][1] - segments[0][0]
+        source, probe_start, probe_span
     )
     if multi_segment:
         if has_audio_stream:
@@ -538,9 +542,15 @@ def build_render_command(
                 filters.append("[acat]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
             else:
                 filters.append("[acat]anull[aout]")
+        else:
+            # Sourceless audio: emit a silent bed of exactly the post-cut
+            # duration so every variant has a uniform stream layout (plan B2).
+            filters.append(
+                f"anullsrc=r=48000:cl=stereo,atrim=0:{duration:.6f},"
+                "asetpts=PTS-STARTPTS[aout]"
+            )
         command.extend(["-filter_complex", ";".join(filters), "-map", f"[{current}]"])
-        if has_audio_stream:
-            command.extend(["-map", "[aout]"])
+        command.extend(["-map", "[aout]"])
     else:
         command.extend(
             [
