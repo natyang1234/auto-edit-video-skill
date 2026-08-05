@@ -39,6 +39,12 @@ class QaPolicy:
     max_black_ratio: float = 0.35
     allow_missing_audio: bool = False
     min_integrated_lufs: float = -45.0
+    # A clip too short for R128 is judged on sample peak instead, which is a
+    # different quantity: real speech here measures around -16 LUFS with
+    # peaks near -2 dBFS. Sharing the LUFS number meant tightening the
+    # loudness gate silently tightened the peak gate too, and a peak
+    # threshold at speech level rejects ordinary quiet talking.
+    min_short_clip_peak_dbfs: float = -45.0
     # Full scale itself is clipping: material limited to exactly 0.0 dBTP has
     # been squashed against the ceiling. Delivery targets sit well below.
     max_true_peak_dbfs: float = -0.1
@@ -102,6 +108,7 @@ class QaPolicy:
                 "allow_missing_audio",
                 "allow_silent_delivery",
                 "min_integrated_lufs",
+                "min_short_clip_peak_dbfs",
                 "max_silent_ratio",
                 "max_silent_run_ratio",
                 "max_silent_run_seconds",
@@ -128,6 +135,7 @@ class QaPolicy:
             "max_black_segment_seconds",
             "max_black_ratio",
             "min_integrated_lufs",
+            "min_short_clip_peak_dbfs",
             "max_true_peak_dbfs",
             "max_silent_ratio",
             "max_silent_run_ratio",
@@ -646,7 +654,7 @@ def inspect(
             # Too short for R128; judge level on the sample peak so brief
             # clips are neither falsely failed nor waved through.
             peak = peak_level_dbfs(video)
-            if peak is None or peak < policy.min_integrated_lufs:
+            if peak is None or peak < policy.min_short_clip_peak_dbfs:
                 failures.append(
                     "clip is too short to measure loudness and its peak level is silent"
                 )
