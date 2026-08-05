@@ -22,6 +22,14 @@ MAX_DECORATED_SHARE = 0.5
 # Numbers are only a chart when there are enough of them to compare.
 CHART_MIN_DATUMS = 3
 LIST_MIN_ITEMS = 3
+# How long each kind of card stays on screen, regardless of how long the
+# segment it belongs to runs. A hook lands fast; a chart needs reading time.
+CARD_DWELL_SECONDS = {
+    "title": 3.0,
+    "stat": 4.0,
+    "chart": 5.5,
+    "dynamic_list": 5.5,
+}
 # Enumeration in speech, in the languages this tool is used in.
 LIST_MARKERS = re.compile(
     r"(第[一二三四五六七八九十]+|首先|其次|再來|最後|然後|另外"
@@ -225,12 +233,21 @@ def plan_visuals(
                 layer["review_status"] = "pending"
                 layers.append(layer)
 
+        # A card summarises its whole segment but must not sit there for the
+        # whole segment: on a single-take clip that means one box parked over
+        # the speaker's face for the entire video. Evidence still comes from
+        # the full window above; only the time on screen is bounded.
+        display_end = end
+        dwell = CARD_DWELL_SECONDS.get(beat)
+        if dwell is not None:
+            display_end = min(end, start + dwell)
+
         plan_items.append(
             {
                 "id": item_id,
                 "highlight_id": highlight_id,
                 "start": round(start, 3),
-                "end": round(end, 3),
+                "end": round(display_end, 3),
                 "beat": beat,
                 "structured_layer_id": layer_id,
                 "selected_asset": None,

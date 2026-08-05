@@ -143,6 +143,30 @@ class VisualDirectorTests(unittest.TestCase):
         again = vd.plan_visuals(segments(2), found)
         self.assertEqual(first, again)
 
+    def test_a_card_does_not_sit_there_for_the_whole_take(self) -> None:
+        # One 17s single-take segment is the state every project starts in.
+        # The card used to inherit that span and park over the speaker's face.
+        one_long_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.233}]
+        result = vd.plan_visuals(
+            one_long_take, [evidence("quote", "今晚別宅在家", 0.2, 2.6, "aa11")]
+        )
+        item = result["visual_plan"]["items"][0]
+        self.assertEqual(item["beat"], "title")
+        self.assertLessEqual(
+            item["end"] - item["start"],
+            vd.CARD_DWELL_SECONDS["title"],
+            "a title card must not run the length of its segment",
+        )
+        self.assertEqual(vd.validate(result), [])
+
+    def test_a_short_segment_is_never_stretched_to_the_dwell(self) -> None:
+        brief = [{"id": "h0", "source_start": 0.0, "source_end": 1.2}]
+        result = vd.plan_visuals(
+            brief, [evidence("quote", "跟我走", 0.1, 1.0, "bb22")]
+        )
+        item = result["visual_plan"]["items"][0]
+        self.assertEqual(item["end"], 1.2, "the cap shortens; it never extends")
+
     def test_every_plan_satisfies_the_contracts(self) -> None:
         result = vd.plan_visuals(
             segments(4),
