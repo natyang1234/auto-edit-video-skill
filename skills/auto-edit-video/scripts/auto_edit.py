@@ -2291,13 +2291,17 @@ def readable_caption_segments(
     # Where the recogniser itself ended a segment is a boundary worth
     # keeping: some engines return phrase-level segments without punctuation,
     # and splitting those again on length alone cuts mid-phrase.
-    segment_ends = {
-        round(float(segment["end"]), 3)
-        for segment in segments
-        if isinstance(segment, dict) and segment.get("end") is not None
-    }
+    #
+    # Which segment a word belongs to is recorded on the word. Deciding it by
+    # comparing timestamps instead means any word that happens to end on the
+    # same rounded second as some segment elsewhere in the video ends a line
+    # — on an eight-minute lesson that fired 442 times and left captions one
+    # character long.
+    def segment_of(word: dict[str, Any]) -> str:
+        return str(word.get("segment_id") or "")
+
     for word in words:
-        if current and round(float(current[-1]["end"]), 3) in segment_ends:
+        if current and segment_of(current[-1]) and segment_of(current[-1]) != segment_of(word):
             flush()
         if current:
             gap = float(word["start"]) - float(current[-1]["end"])

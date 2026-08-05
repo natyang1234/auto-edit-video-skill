@@ -105,6 +105,63 @@ class AutofitTests(unittest.TestCase):
         lines, _ = cc.fit_caption_text("今晚別宅\n在家跟我", self.measure_at, 10.0, 100.0)
         self.assertEqual(lines, ["今晚別宅", "在家跟我"])
 
+class CaptionSegmentTests(unittest.TestCase):
+    """Which words share a caption line."""
+
+    @staticmethod
+    def split(segments, words):
+        sys.path.insert(0, str(SKILL_DIR / "scripts"))
+        from auto_edit import readable_caption_segments
+
+        return readable_caption_segments(segments, words)
+
+    @staticmethod
+    def words(*items) -> list[dict]:
+        return [
+            {"id": f"word-{index:04d}", "text": text, "start": start, "end": end,
+             "segment_id": segment}
+            for index, (text, start, end, segment) in enumerate(items, start=1)
+        ]
+
+    def test_a_line_ends_where_the_recogniser_ended_its_segment(self) -> None:
+        segments = [{"start": 0.0, "end": 2.0, "text": "今晚別宅在家"},
+                    {"start": 2.0, "end": 4.0, "text": "跟我走"}]
+        words = self.words(
+            ("今晚", 0.0, 1.0, "segment-0001"),
+            ("別宅在家", 1.0, 2.0, "segment-0001"),
+            ("跟我走", 2.0, 4.0, "segment-0002"),
+        )
+        self.assertEqual(
+            [item["text"] for item in self.split(segments, words)],
+            ["今晚別宅在家", "跟我走"],
+        )
+
+    def test_a_word_ending_on_another_segments_timestamp_does_not_end_a_line(self) -> None:
+        # Deciding boundaries by comparing timestamps means any word that
+        # happens to end on the same rounded second as a segment elsewhere
+        # in the video ends a line. On a real lesson that fired hundreds of
+        # times and left captions one character long.
+        segments = [{"start": 0.0, "end": 4.0, "text": "今晚別宅在家跟我走"},
+                    {"start": 4.0, "end": 8.0, "text": "忠孝復興四號出口"}]
+        words = self.words(
+            ("今晚", 0.0, 1.0, "segment-0001"),
+            # This one ends exactly when segment one ends, but belongs to it.
+            ("別宅在家", 1.0, 4.0, "segment-0001"),
+            ("跟我走", 4.0, 4.4, "segment-0001"),
+            ("忠孝復興", 4.4, 8.0, "segment-0002"),
+        )
+        lines = [item["text"] for item in self.split(segments, words)]
+        self.assertEqual(lines, ["今晚別宅在家跟我走", "忠孝復興"])
+
+    def test_words_without_a_segment_id_still_split_on_gaps(self) -> None:
+        # Older transcripts predate the field; length and silence still apply.
+        words = [
+            {"id": "word-1", "text": "今晚別宅在家", "start": 0.0, "end": 1.0},
+            {"id": "word-2", "text": "跟我走", "start": 3.0, "end": 4.0},
+        ]
+        lines = [item["text"] for item in self.split([], words)]
+        self.assertEqual(len(lines), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
