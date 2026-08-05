@@ -156,7 +156,7 @@ python3 "$SKILL/scripts/auto_edit.py" import-whisper \
   --manifest /absolute/path/project/project.json \
   --whisper-json /absolute/path/whisper.json \
   --srt /absolute/path/whisper.srt \
-  --model base
+  --model large-v3
 
 python3 "$SKILL/scripts/auto_edit.py" semantic-calibrate \
   --manifest /absolute/path/project/project.json \

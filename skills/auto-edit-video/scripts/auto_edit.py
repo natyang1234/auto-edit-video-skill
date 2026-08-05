@@ -803,7 +803,14 @@ def transcription_initial_prompt(source_language: str, glossary: list[str]) -> s
     if not chinese_or_auto and not glossary:
         return None
     if chinese_or_auto:
-        prompt = "中英逐字稿。英文請保留拼寫，不要中文音譯。"
+        # The prompt steers spelling and vocabulary, so declaring the variant
+        # here prevents mis-hearings the project would otherwise have to
+        # detect and repair afterwards. zh-TW asks for Taiwanese wording;
+        # anything else only asks for verbatim Chinese-English handling.
+        if source_language in {"zh-TW", "zh-en"}:
+            prompt = "繁體中文，台灣用語。中英逐字稿。英文請保留拼寫，不要中文音譯。"
+        else:
+            prompt = "中英逐字稿。英文請保留拼寫，不要中文音譯。"
         glossary_prefix = "英文詞彙："
     else:
         prompt = "Verbatim transcript. Preserve original spelling."
@@ -4289,7 +4296,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the installed local Whisper CLI and import timed transcript artifacts",
     )
     transcribe.add_argument("--manifest", required=True)
-    transcribe.add_argument("--model", default="base")
+    # Measured on a 17s Mandarin ad: base heard a brand name as an unrelated
+    # phrase and a department store as a function word, while large-v3 got
+    # both. Deliveries carry these words on screen, so accuracy wins over the
+    # minute or two the larger model costs; pass --model for a faster run.
+    transcribe.add_argument("--model", default="large-v3")
     transcribe.add_argument("--timeout", type=int, default=21600)
     transcribe.set_defaults(func=cmd_transcribe_local)
 
