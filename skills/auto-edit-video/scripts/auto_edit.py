@@ -343,7 +343,11 @@ def resolve_output_target(
         if not math.isfinite(target_duration) or target_duration <= 0:
             raise ValueError("target duration must be a positive finite number")
         target = round(float(target_duration), 3)
-        tolerance = round(max(2.0, min(15.0, target * 0.10)), 3)
+        # "About thirty seconds" is a length to aim for, not a length to
+        # hit: at ten percent a thirty-second target refuses anything under
+        # twenty-seven, and a good forty-second point gets thrown away for
+        # being the wrong length. Aim for the target, accept what reads.
+        tolerance = round(max(5.0, min(30.0, target * 0.45)), 3)
         return {
             **common,
             "duration_profile": "custom",
@@ -3907,6 +3911,34 @@ def materialise_clip(
     return state
 
 
+def framing_for(requested: str, manifest: dict[str, Any]) -> str:
+    """contain or cover, deciding for the caller when asked to.
+
+    Filling a vertical frame from landscape footage means throwing away more
+    than half the width, and on a lesson that width is the blackboard.
+    Keeping the whole picture with bars loses nothing; the bars also give
+    the captions somewhere to sit that is not on top of the speaker.
+    """
+    if requested in {"contain", "cover"}:
+        return requested
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    target = manifest.get("output_target") if isinstance(manifest.get("output_target"), dict) else {}
+    try:
+        source_ratio = float(source.get("width") or 0) / float(source.get("height") or 0)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return "cover"
+    from editor_server import PLATFORM_PRESETS  # lazy: import cycle
+
+    preset = PLATFORM_PRESETS.get(str(target.get("platform") or "")) or {}
+    try:
+        target_ratio = float(preset["width"]) / float(preset["height"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        # Unknown platform: assume the vertical frame these are cut for.
+        target_ratio = 9 / 16
+    # Wider than the frame it is going into: cropping would discard content.
+    return "contain" if source_ratio > target_ratio * 1.15 else "cover"
+
+
 def cmd_cut(args: argparse.Namespace) -> int:
     """One command: a long video in, finished clips out."""
     import subprocess as _subprocess
@@ -3989,6 +4021,12 @@ def cmd_cut(args: argparse.Namespace) -> int:
     if not highlights:
         return die("nothing in this video came out as a clip worth cutting")
 
+    chosen_framing = framing_for(args.framing, manifest)
+    _step(
+        "keeping the whole picture with bars"
+        if chosen_framing == "contain"
+        else "filling the frame and following the speaker"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     renderer = str(Path(__file__).with_name("render_editor_timeline.py"))
     made: list[dict[str, Any]] = []
@@ -4005,7 +4043,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
         try:
             materialise_clip(
                 project_dir, manifest, highlight,
-                fit="cover", cards=not args.no_cards,
+                fit=chosen_framing, cards=not args.no_cards,
             )
         except ValueError as exc:
             problems.append(f"{title}: {exc}")
@@ -4736,7 +4774,7 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument("--out", required=True, help="where the clips go")
     cut.add_argument("--project-dir", default="", help="defaults to <out>/.project")
     cut.add_argument("--clips", type=int, default=3, help="how many clips to cut")
-    cut.add_argument("--seconds", type=float, default=None, help="roughly how long each")
+    cut.add_argument("--seconds", type=float, default=30.0, help="roughly how long each")
     cut.add_argument("--language", default="zh-TW")
     cut.add_argument("--model", default="auto")
     cut.add_argument("--platform", choices=PLATFORMS, default="instagram-reels")
@@ -4747,6 +4785,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cut.add_argument("--brief", default="", help="what you want out of it")
     cut.add_argument("--translate", default="", help="add a second caption line, e.g. en")
+    cut.add_argument(
+        "--framing", choices=("auto", "contain", "cover"), default="auto",
+        help="auto keeps the whole picture when the source is wider than the target",
+    )
     cut.add_argument("--quality", choices=("preview", "final"), default="preview")
     cut.add_argument("--timeout", type=int, default=900)
     cut.add_argument(
