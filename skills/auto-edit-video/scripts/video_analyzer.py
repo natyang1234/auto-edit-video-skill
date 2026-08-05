@@ -42,6 +42,7 @@ BURNED_IN_MAX_EVIDENCE = 12
 BURNED_IN_SAMPLE_COUNT = 12    # detection samples on its own schedule
 BURNED_IN_MIN_DISTINCT_TEXTS = 3   # a caption row says something new
 BURNED_IN_MIN_DISTINCT_SHARE = 0.5  # ...on at least half the hits
+BURNED_IN_RULE_VERSION = "burned-in-v2-distinct-text"
 
 
 def ffmpeg_path() -> str:
@@ -515,7 +516,18 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
         "ocr_spans": ocr_spans,
         "burned_in_captions": run_stage(
             "burned_in_captions",
-            {"samples": BURNED_IN_SAMPLE_COUNT, "band_top": BURNED_IN_BAND_TOP},
+            {
+                # The rule version belongs in the key: changing how the
+                # verdict is reached must not be served from a cache keyed
+                # only on how the frames were sampled.
+                "rule": BURNED_IN_RULE_VERSION,
+                "samples": BURNED_IN_SAMPLE_COUNT,
+                "band_top": BURNED_IN_BAND_TOP,
+                "max_off_center": BURNED_IN_MAX_OFF_CENTER,
+                "max_spread": BURNED_IN_MAX_BAND_SPREAD,
+                "min_distinct": BURNED_IN_MIN_DISTINCT_TEXTS,
+                "min_distinct_share": BURNED_IN_MIN_DISTINCT_SHARE,
+            },
             lambda: detect_burned_in_captions(source, duration_s),
             engine=vision_ocr.vision_engine(),
         ),
