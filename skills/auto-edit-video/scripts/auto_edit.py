@@ -3911,15 +3911,33 @@ def cmd_cut(args: argparse.Namespace) -> int:
     """One command: a long video in, finished clips out."""
     import subprocess as _subprocess
 
-    source = Path(args.input).expanduser().resolve()
-    if not source.is_file():
+    folder = Path(args.folder).expanduser().resolve() if args.folder else None
+    source = Path(args.input).expanduser().resolve() if args.input else None
+    if folder is None and source is None:
+        return die("give it something to cut: --input a video, or --folder a folder")
+    if folder is not None and not folder.is_dir():
+        return die(f"no such folder: {folder}")
+    if source is not None and not source.is_file():
         return die(f"no such video: {source}")
     out_dir = Path(args.out).expanduser().resolve()
     project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir \
         else out_dir / ".project"
     manifest_path = project_dir / "project.json"
 
-    if not manifest_path.is_file():
+    if not manifest_path.is_file() and folder is not None:
+        # A folder brings its own pictures and B-roll, and says which file is
+        # the talking. Handing the picked video to init instead would throw
+        # the rest of the folder away.
+        _step("reading the folder")
+        ingest_argv = [
+            "--folder", str(folder), "--project-dir", str(project_dir),
+            "--source-language", args.language,
+        ]
+        if args.main:
+            ingest_argv += ["--main", args.main]
+        if cmd_ingest_folder(_args_for("ingest-folder", *ingest_argv)):
+            return 2
+    elif not manifest_path.is_file():
         _step("preparing the project")
         init_argv = [
             "--input", str(source), "--project-dir", str(project_dir),
@@ -4712,7 +4730,9 @@ def build_parser() -> argparse.ArgumentParser:
         "cut",
         help="One command: a long video in, finished clips out",
     )
-    cut.add_argument("--input", required=True, help="the video to cut")
+    cut.add_argument("--input", default="", help="the video to cut")
+    cut.add_argument("--folder", default="", help="a folder to cut from, with its assets")
+    cut.add_argument("--main", default="", help="which file in the folder is the video")
     cut.add_argument("--out", required=True, help="where the clips go")
     cut.add_argument("--project-dir", default="", help="defaults to <out>/.project")
     cut.add_argument("--clips", type=int, default=3, help="how many clips to cut")
