@@ -90,6 +90,79 @@ class StructuredCardTests(unittest.TestCase):
             self.assertEqual(png.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             self.assertEqual(item["compiler_version"], scc.COMPILER_VERSION)
 
+    def test_every_pack_component_renders_and_differs(self) -> None:
+        # The pack declares how each component looks; a component that draws
+        # the same pixels as another is not being honoured.
+        cases = [
+            ("title", "prompt-card", {"title": "資料會說話", "kicker": "PROMPT"}),
+            ("title", "kinetic-title", {"title": "資料會說話"}),
+            ("title", "title-lockup", {"title": "資料會說話"}),
+            ("stat", "hero-stat", {"value": "87%", "label": "完成率"}),
+            ("stat", "progress", {"value": "87%", "label": "完成率", "ratio": 0.87}),
+            ("chart", "dashboard",
+             {"chart_kind": "bar", "datums": [{"label": "一", "value": 3}]}),
+            ("dynamic_list", "dynamic-list", {"items": [{"text": "甲"}, {"text": "乙"}]}),
+            ("dynamic_list", "warning-checklist",
+             {"items": [{"text": "甲"}, {"text": "乙", "severity": "warning"}]}),
+            ("dynamic_list", "carousel-grid",
+             {"items": [{"text": "甲"}, {"text": "乙"}, {"text": "丙"}, {"text": "丁"}]}),
+            ("dynamic_list", "calendar-reveal",
+             {"items": [{"text": "8/1"}, {"text": "8/2"}, {"text": "8/3"}, {"text": "8/4"}]}),
+        ]
+        digests: dict[str, str] = {}
+        for layer_type, component_id, payload in cases:
+            with self.subTest(component_id):
+                layer = {
+                    "id": f"layer-{component_id}",
+                    "type": layer_type,
+                    "component_id": component_id,
+                    "payload": payload,
+                }
+                _path, digest, width, height = scc.render_card(
+                    self.project, layer, self.pack, self.state["canvas"], 1.0
+                )
+                self.assertGreater(width, 0)
+                self.assertGreater(height, 0)
+                digests[component_id] = digest
+        for group in (
+            ("prompt-card", "kinetic-title", "title-lockup"),
+            ("hero-stat", "progress"),
+            ("dynamic-list", "warning-checklist", "carousel-grid", "calendar-reveal"),
+        ):
+            rendered = {digests[name] for name in group}
+            self.assertEqual(
+                len(rendered), len(group), f"{group} must not render identically"
+            )
+
+    def test_component_must_be_able_to_render_the_item(self) -> None:
+        # The type says what the data is; a component that cannot draw that
+        # payload is a configuration error, not a fallback.
+        for layer_type, component_id in (
+            ("title", "progress"),
+            ("stat", "kinetic-title"),
+            ("chart", "dynamic-list"),
+            ("title", "no-such-component"),
+        ):
+            with self.subTest(f"{layer_type}/{component_id}"):
+                with self.assertRaises(ValueError):
+                    scc.resolve_component(self.pack, layer_type, component_id)
+        # Absent means the type's default, which every type must have.
+        for layer_type in ("title", "stat", "chart", "dynamic_list"):
+            self.assertIn(
+                scc.resolve_component(self.pack, layer_type, None)["kind"],
+                scc.COMPONENTS_BY_TYPE[layer_type],
+            )
+
+    def test_progress_component_requires_a_ratio(self) -> None:
+        layer = {
+            "id": "layer-progress",
+            "type": "stat",
+            "component_id": "progress",
+            "payload": {"value": "87%", "label": "完成率"},
+        }
+        with self.assertRaises(ValueError):
+            scc.render_card(self.project, layer, self.pack, self.state["canvas"], 1.0)
+
     def test_cache_is_stable_and_payload_change_rerenders(self) -> None:
         layers = make_layers()
         first = scc.build_structured_artifacts(self.project, self.state, layers, self.pack)

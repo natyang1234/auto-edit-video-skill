@@ -128,6 +128,57 @@ def _finish_card(foundation, quartz, context, project_dir: Path, layer_id: str) 
     )
 
 
+# What data an item carries decides its type; which component renders it
+# decides how it looks. A component only fits the types whose payload it can
+# actually draw.
+COMPONENTS_BY_TYPE = {
+    "title": ("prompt_card", "kinetic_title", "title_lockup"),
+    "stat": ("hero_stat", "progress"),
+    "chart": ("dashboard",),
+    "dynamic_list": ("dynamic_list", "warning_checklist", "carousel_grid", "calendar_reveal"),
+}
+DEFAULT_COMPONENT = {
+    "title": "prompt_card",
+    "stat": "hero_stat",
+    "chart": "dashboard",
+    "dynamic_list": "dynamic_list",
+}
+
+
+def resolve_component(pack: dict[str, Any], layer_type: str, component_id: str | None) -> dict[str, Any]:
+    """The pack component that renders this item, or an error if it cannot."""
+    components = {str(item.get("id")): item for item in pack.get("components", [])}
+    allowed = COMPONENTS_BY_TYPE.get(layer_type, ())
+    if not component_id:
+        wanted = DEFAULT_COMPONENT.get(layer_type)
+        chosen = next(
+            (item for item in components.values() if item.get("kind") == wanted), None
+        )
+        if chosen is not None:
+            return chosen
+        if components:
+            raise ValueError(f"style pack has no default component for {layer_type!r}")
+        # A pack that declares no components at all predates them (the "none"
+        # selection passes one). Render as before rather than refusing.
+        return {"id": f"builtin-{wanted}", "kind": wanted, "layout": "left-stack"}
+    chosen = components.get(component_id)
+    if chosen is None:
+        raise ValueError(f"style pack has no component {component_id!r}")
+    if chosen.get("kind") not in allowed:
+        raise ValueError(
+            f"component {component_id!r} ({chosen.get('kind')}) cannot render a "
+            f"{layer_type!r} item"
+        )
+    return chosen
+
+
+def _layout_origin(layout: str, card_width: float, text_width: float, pad: float) -> float:
+    """Where a line starts, from the component's declared layout."""
+    if layout in {"center", "full-bleed"}:
+        return max(pad, (card_width - text_width) / 2)
+    return pad
+
+
 def render_card(
     project_dir: Path,
     layer: dict[str, Any],
@@ -141,6 +192,8 @@ def render_card(
     ct, foundation, quartz = modules
     payload = layer.get("payload") or {}
     layer_type = layer.get("type")
+    component = resolve_component(pack, str(layer_type), layer.get("component_id"))
+    layout = str(component.get("layout") or "left-stack")
     scale = render_scale
     canvas_width = int(canvas.get("width", 1080)) * scale
     card_width = int(canvas_width * 0.84)
@@ -168,7 +221,16 @@ def render_card(
             _draw_line(ct, quartz, context, kicker, pad, cursor)
             cursor -= 8 * scale
         cursor -= title_size
-        _draw_line(ct, quartz, context, title, pad, cursor)
+        _draw_line(
+            ct, quartz, context, title,
+            _layout_origin(layout, card_width, _line_width(ct, title), pad), cursor,
+        )
+        if component.get("kind") == "title_lockup":
+            # A lower third reads as a band, so it carries a rule under the text.
+            quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, accent))
+            quartz.CGContextFillRect(
+                context, quartz.CGRectMake(pad, cursor - 10 * scale, card_width - pad * 2, 2 * scale)
+            )
         if subtitle_text:
             subtitle, _ = _fit_text(foundation, ct, quartz, subtitle_text, 18 * scale,
                                     muted, card_width - pad * 2, scale)
@@ -184,7 +246,22 @@ def render_card(
         height = int(pad * 2 + value_size * 1.2 + 30 * scale + (20 * scale if source_text else 0))
         context = _begin_card(quartz, card_width, height, panel)
         cursor = height - pad - value_size
-        _draw_line(ct, quartz, context, value, pad, cursor)
+        _draw_line(
+            ct, quartz, context, value,
+            _layout_origin(layout, card_width, _line_width(ct, value), pad), cursor,
+        )
+        if component.get("kind") == "progress":
+            ratio = payload.get("ratio")
+            if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+                raise ValueError("progress component requires a numeric payload ratio")
+            filled = max(0.0, min(1.0, float(ratio)))
+            track = card_width - pad * 2
+            quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, muted))
+            quartz.CGContextFillRect(context, quartz.CGRectMake(pad, pad, track, 6 * scale))
+            quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, accent))
+            quartz.CGContextFillRect(
+                context, quartz.CGRectMake(pad, pad, track * filled, 6 * scale)
+            )
         cursor -= 26 * scale
         _draw_line(ct, quartz, context, label, pad, cursor)
         if source_text:
@@ -236,16 +313,32 @@ def render_card(
     elif layer_type == "dynamic_list":
         entries = payload.get("items") or []
         row = int(30 * scale)
-        height = pad * 2 + row * len(entries)
+        wrapped = 2 if component.get("kind") in {"carousel_grid", "calendar_reveal"} else 1
+        rows = (len(entries) + wrapped - 1) // wrapped
+        height = pad * 2 + row * max(rows, 1)
         context = _begin_card(quartz, card_width, height, panel)
+        kind = component.get("kind")
+        columns = 2 if kind in {"carousel_grid", "calendar_reveal"} else 1
+        column_width = (card_width - pad * 2) / columns
         for index, entry in enumerate(entries):
+            if kind == "warning_checklist":
+                prefix = "⚠ " if entry.get("severity") == "warning" else "✓ "
+            elif columns > 1:
+                prefix = ""
+            else:
+                prefix = f"{index + 1}. "
             line, _ = _fit_text(
                 foundation, ct, quartz,
-                f"{index + 1}. {entry.get('text', '')}",
-                18 * scale, ink, card_width - pad * 2, scale,
+                f"{prefix}{entry.get('text', '')}",
+                18 * scale, ink, column_width - pad * 0.5, scale,
             )
-            _draw_line(ct, quartz, context, line, pad,
-                       height - pad - row * index - 20 * scale)
+            column, position = divmod(index, max(1, (len(entries) + columns - 1) // columns)) \
+                if columns > 1 else (0, index)
+            _draw_line(
+                ct, quartz, context, line,
+                pad + column * column_width,
+                height - pad - row * position - 20 * scale,
+            )
     else:
         raise ValueError(f"unsupported structured layer type: {layer_type}")
     return _finish_card(foundation, quartz, context, project_dir, str(layer.get("id")))
