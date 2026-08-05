@@ -609,6 +609,10 @@ def build_render_command(
     if visual_source is not None:
         visual_input_index = 1
         command.extend(["-i", str(visual_source)])
+    # Decided before any overlay is read, because it changes which of them
+    # are drawn as well as which layer bundle is used.
+    planned_cards = card_plan_bundle(project_dir)
+    card_plan_adopted = planned_cards is not None
     overlays: list[dict[str, Any]] = []
     for source_overlay in state.get("overlays", []):
         if not isinstance(source_overlay, dict) or not source_overlay.get("visible", True):
@@ -619,6 +623,12 @@ def build_render_command(
             continue
         if visual_source is not None and source_overlay.get("design_role"):
             # design-role cards are baked by the graphic package
+            continue
+        if card_plan_adopted and source_overlay.get("design_role"):
+            # The card plan answers "which cards" on its own. These were put
+            # here by the highlight-deck and legacy overlay paths, which the
+            # plan replaces; drawing both puts two cards on screen at once —
+            # the very thing the plan's contract refuses to hold.
             continue
         if (
             visual_source is not None
@@ -648,11 +658,10 @@ def build_render_command(
     # A card plan, once a project has one, is the whole answer to "which
     # cards". Cards used to arrive down three unrelated paths; letting the
     # plan and one of those paths both contribute would restore exactly the
-    # drift the plan exists to remove.
-    layers_bundle, visual_plan_v2 = card_plan_bundle(project_dir) or (
-        layers_bundle,
-        visual_plan_v2,
-    )
+    # drift the plan exists to remove. The design-role overlays those other
+    # paths left in the editor state are skipped above on the same flag.
+    if planned_cards is not None:
+        layers_bundle, visual_plan_v2 = planned_cards
     if layers_bundle.get("items"):
         import structured_card_compositor
 
@@ -1215,6 +1224,19 @@ def card_plan_bundle(
     path = project_dir / card_plan.CARD_PLAN_REL
     if not path.is_file():
         return None
+    # load() recovers to an empty plan so a caller can start adding cards to
+    # a damaged file. Here that recovery would be indistinguishable from a
+    # deliberately empty plan, and the author would silently get no cards.
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"card plan at {path} could not be read: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError(
+            f"card plan at {path} is schema_version "
+            f"{raw.get('schema_version') if isinstance(raw, dict) else '?'}, "
+            "which this renderer does not understand"
+        )
     plan = card_plan.load(project_dir, "")
     if not plan.get("items"):
         return {"schema_version": 1, "items": []}, {

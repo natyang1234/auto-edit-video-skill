@@ -29,7 +29,8 @@ ORIGIN_RANK = {"manual": 0, "model": 1, "director": 2}
 # that a plan written for a newer renderer still validates, but rendering one
 # fails loudly rather than dropping it silently.
 DRAWABLE_KINDS = ("title", "stat", "chart", "dynamic_list")
-MIN_CARD_SECONDS = 0.6
+# The threshold lives in the contract so every producer meets the same one.
+MIN_CARD_SECONDS = contract_registry.CARD_MIN_SECONDS
 
 
 def card_id(*parts: Any) -> str:

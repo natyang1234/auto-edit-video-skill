@@ -253,5 +253,46 @@ class CardMergeTests(unittest.TestCase):
         self.assertEqual(model["payload"]["value"], "new model")
 
 
+class PlanIsTheOnlySourceTests(unittest.TestCase):
+    """Adopting a plan has to silence the other card paths, not just one."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="card-plan-only-")
+        self.project = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        (self.project / "working").mkdir(parents=True, exist_ok=True)
+        sys.path.insert(0, str(SKILL_DIR / "scripts"))
+        import render_editor_timeline
+        self.renderer = render_editor_timeline
+
+    def test_no_plan_file_means_the_old_paths_still_decide(self) -> None:
+        self.assertIsNone(self.renderer.card_plan_bundle(self.project))
+
+    def test_an_unreadable_plan_is_an_error_not_an_empty_one(self) -> None:
+        # Recovering to "no cards" here is indistinguishable from a plan the
+        # author deliberately emptied, and they would get neither their cards
+        # nor a word about it.
+        (self.project / "working/card_plan.json").write_text("{ not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.renderer.card_plan_bundle(self.project)
+
+    def test_a_plan_from_a_newer_schema_is_an_error(self) -> None:
+        (self.project / "working/card_plan.json").write_text(
+            '{"schema_version": 9, "items": []}', encoding="utf-8"
+        )
+        with self.assertRaises(ValueError):
+            self.renderer.card_plan_bundle(self.project)
+
+    def test_an_empty_plan_yields_an_empty_bundle_not_none(self) -> None:
+        # None means "no plan, use the old paths"; an empty plan means
+        # "the author wants no cards". They are different answers.
+        card_plan.save(self.project, card_plan.empty_plan("c" * 64))
+        bundle = self.renderer.card_plan_bundle(self.project)
+        self.assertIsNotNone(bundle)
+        layers, visual_plan = bundle
+        self.assertEqual(layers["items"], [])
+        self.assertEqual(visual_plan["items"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

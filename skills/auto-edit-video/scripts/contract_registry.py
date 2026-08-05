@@ -634,6 +634,9 @@ def semantic_rights_assertion(assertion) -> list[str]:
     return errors
 
 
+CARD_MIN_SECONDS = 0.6
+
+
 def semantic_card_plan(artifact) -> list[str]:
     """Rules the shape cannot express: real spans, unique ids, one card at a time.
 
@@ -662,6 +665,14 @@ def semantic_card_plan(artifact) -> list[str]:
         if end <= start:
             errors.append(f"card {identifier} ends at or before it starts")
             continue
+        if end - start < CARD_MIN_SECONDS:
+            # Enforced here rather than at the one CLI that happens to add
+            # cards today, so every producer meets it — a flash too brief to
+            # read is a defect however it got proposed.
+            errors.append(
+                f"card {identifier} is on screen for {end - start:.2f}s, "
+                f"under the {CARD_MIN_SECONDS}s it takes to read one"
+            )
         if not item.get("payload"):
             errors.append(f"card {identifier} has an empty payload")
         spans.append((start, end, identifier))
