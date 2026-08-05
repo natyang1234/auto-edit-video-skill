@@ -3796,6 +3796,51 @@ def sync_plans_to_editor(project_dir: Path, duration_s: float) -> int:
     return len(generated)
 
 
+def cmd_add_card(args: argparse.Namespace) -> int:
+    """Place one card by hand. It outranks anything a model proposes."""
+    import card_plan
+
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    project_dir = manifest_path.parent
+    try:
+        manifest = read_json(manifest_path)
+    except ValueError as exc:
+        return die(str(exc))
+    payload: dict[str, Any] = {}
+    if args.title:
+        payload["title"] = args.title
+    if args.subtitle:
+        payload["subtitle"] = args.subtitle
+    if args.kicker:
+        payload["kicker"] = args.kicker
+    if args.value:
+        payload["value"] = args.value
+        payload.setdefault("label", args.title or args.value)
+    if not payload:
+        return die("a card needs at least --title or --value")
+    try:
+        plan, notes = card_plan.add(
+            project_dir,
+            str(manifest.get("source", {}).get("sha256") or ""),
+            start=float(args.at),
+            end=float(args.at) + float(args.seconds),
+            kind=args.kind,
+            payload=payload,
+            note=args.note or "",
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    emit(
+        {
+            "ok": True,
+            "cards": len(plan["items"]),
+            "plan": str(project_dir / card_plan.CARD_PLAN_REL),
+            "notes": notes,
+        }
+    )
+    return 0
+
+
 def cmd_plan_overlays(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).expanduser().resolve()
     project_dir = manifest_path.parent
@@ -4465,6 +4510,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--manifest", required=True)
     analyze.set_defaults(func=cmd_analyze_edits)
+
+    cards = sub.add_parser(
+        "add-card",
+        help="Place a card at a moment by hand; it outranks proposed cards",
+    )
+    cards.add_argument("--manifest", required=True)
+    cards.add_argument("--at", type=float, required=True, help="source seconds")
+    cards.add_argument("--seconds", type=float, default=3.0, help="time on screen")
+    cards.add_argument(
+        "--kind", choices=("title", "stat", "chart", "dynamic_list"), default="title"
+    )
+    cards.add_argument("--title", default="")
+    cards.add_argument("--subtitle", default="")
+    cards.add_argument("--kicker", default="")
+    cards.add_argument("--value", default="", help="the figure, for a stat card")
+    cards.add_argument("--note", default="", help="why this card is here")
+    cards.set_defaults(func=cmd_add_card)
 
     plans = sub.add_parser(
         "plan-overlays",

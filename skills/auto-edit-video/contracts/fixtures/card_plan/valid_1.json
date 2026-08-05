@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "items": [
+    {
+      "id": "card-8f2a1c",
+      "start": 8.0,
+      "end": 11.0,
+      "kind": "note",
+      "payload": {"title": "採訪自己", "meta": "21:47", "icon": "🎙"},
+      "origin": "manual",
+      "editorial": true,
+      "evidence_ids": [],
+      "note": "nat 手動指定"
+    },
+    {
+      "id": "card-3b91de",
+      "start": 20.0,
+      "end": 23.5,
+      "kind": "chip",
+      "payload": {"text": "🥐 → 🎙 → 這支 Reel"},
+      "origin": "model",
+      "editorial": true
+    }
+  ],
+  "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

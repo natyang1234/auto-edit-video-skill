@@ -645,6 +645,14 @@ def build_render_command(
     from editor_server import load_layer_bundle
 
     layers_bundle, visual_plan_v2 = load_layer_bundle(project_dir)
+    # A card plan, once a project has one, is the whole answer to "which
+    # cards". Cards used to arrive down three unrelated paths; letting the
+    # plan and one of those paths both contribute would restore exactly the
+    # drift the plan exists to remove.
+    layers_bundle, visual_plan_v2 = card_plan_bundle(project_dir) or (
+        layers_bundle,
+        visual_plan_v2,
+    )
     if layers_bundle.get("items"):
         import structured_card_compositor
 
@@ -1191,6 +1199,31 @@ def finalize_variant_delivery_receipt(
 
 
 DEFAULT_CARD_Y = 46.0
+
+
+def card_plan_bundle(
+    project_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The card plan expressed as a layer bundle, or None if there is no plan.
+
+    A plan that exists but cannot be drawn is an error, not a silent fall
+    back to whatever the old paths would have produced: the author asked for
+    those cards and would otherwise get different ones with no warning.
+    """
+    import card_plan
+
+    path = project_dir / card_plan.CARD_PLAN_REL
+    if not path.is_file():
+        return None
+    plan = card_plan.load(project_dir, "")
+    if not plan.get("items"):
+        return {"schema_version": 1, "items": []}, {
+            "schema_version": 1,
+            "revision": plan.get("revision", ""),
+            "highlight_plan_revision": plan.get("revision", ""),
+            "items": [],
+        }
+    return card_plan.to_layer_bundle(plan)
 
 
 def caption_top_fraction(state: dict[str, Any]) -> float:

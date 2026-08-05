@@ -634,7 +634,48 @@ def semantic_rights_assertion(assertion) -> list[str]:
     return errors
 
 
+def semantic_card_plan(artifact) -> list[str]:
+    """Rules the shape cannot express: real spans, unique ids, one card at a time.
+
+    Two cards live at once only ever means a layout collision on screen, so
+    the plan refuses to hold one rather than leaving the renderer to discover
+    it. Manual entries are merged before validation, so a clash here is a
+    clash the author can still see and fix.
+    """
+    errors: list[str] = []
+    items = artifact.get("items")
+    if not isinstance(items, list):
+        return ["card plan items must be an array"]
+    seen: set[str] = set()
+    spans: list[tuple[float, float, str]] = []
+    for index, item in enumerate(items):
+        identifier = str(item.get("id", index))
+        if identifier in seen:
+            errors.append(f"card {identifier} is listed twice")
+        seen.add(identifier)
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end"))
+        except (TypeError, ValueError):
+            errors.append(f"card {identifier} timing must be numeric")
+            continue
+        if end <= start:
+            errors.append(f"card {identifier} ends at or before it starts")
+            continue
+        if not item.get("payload"):
+            errors.append(f"card {identifier} has an empty payload")
+        spans.append((start, end, identifier))
+    spans.sort()
+    for (start, end, identifier), (next_start, _, next_id) in zip(spans, spans[1:]):
+        if next_start < end - 0.001:
+            errors.append(
+                f"cards {identifier} and {next_id} are on screen at the same time"
+            )
+    return errors
+
+
 SEMANTIC_VALIDATORS = {
+    "card_plan": semantic_card_plan,
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
     "master_timeline": semantic_master_timeline,
     "approval_receipt": semantic_approval_receipt,
