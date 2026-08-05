@@ -2107,7 +2107,12 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
     ]
     keyword_state = {"highlights": highlights, "overlays": []}
     overlays: list[dict[str, Any]] = []
-    for index, segment in enumerate(transcript.get("segments", []), start=1):
+    # Whisper returns as few as one segment for a whole clip, which as a
+    # caption is an unreadable wall of text. The transcript carries a reading
+    # split alongside it; the sync path already prefers it and this one must
+    # agree, or the first caption a project gets depends on which code made it.
+    caption_source = transcript.get("caption_segments") or transcript.get("segments", [])
+    for index, segment in enumerate(caption_source, start=1):
         text = str(segment.get("text", "")).strip()
         if not text:
             continue

@@ -573,3 +573,31 @@ class ContextualSemanticCalibrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScriptConversionGuardTests(unittest.TestCase):
+    """A model may not quietly restyle the project into another script."""
+
+    def test_a_simplified_rewrite_is_not_a_correction(self) -> None:
+        from contextual_semantic_calibration import _is_script_conversion
+
+        # Observed from a local run: the model reported a Traditional spelling
+        # as a typo and offered the Simplified form at 0.95 confidence.
+        self.assertTrue(_is_script_conversion("復興 4 號", "复兴 4 号"))
+        self.assertTrue(_is_script_conversion("開啟", "开启"))
+
+    def test_a_real_mishearing_still_gets_through(self) -> None:
+        from contextual_semantic_calibration import _is_script_conversion
+
+        for source, replacement in (
+            ("別摘在家", "別宅在家"),
+            ("中校復興", "捷運復興"),
+            ("台灣", "臺灣"),
+        ):
+            with self.subTest(f"{source}->{replacement}"):
+                self.assertFalse(_is_script_conversion(source, replacement))
+
+    def test_an_unchanged_patch_is_not_treated_as_conversion(self) -> None:
+        from contextual_semantic_calibration import _is_script_conversion
+
+        self.assertFalse(_is_script_conversion("復興", "復興"))

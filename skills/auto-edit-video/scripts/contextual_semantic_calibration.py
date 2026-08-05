@@ -60,6 +60,26 @@ def _latin_only_phrase(value: str) -> bool:
     return bool(LATIN_RE.search(value)) and HAN_RE.search(value) is None
 
 
+def _is_script_conversion(source: str, replacement: str) -> bool:
+    """Whether a proposal only rewrites the source in the other script.
+
+    Models trained on mainland text routinely report Traditional spellings as
+    typos and offer the Simplified form with high confidence. The project has
+    already declared which script it is written in, so a change that survives
+    converting back is an orthography edit wearing a correction's clothes.
+    """
+    if source == replacement:
+        return False
+    try:
+        from traditional_chinese import to_taiwan_traditional
+    except ImportError:
+        return False
+    try:
+        return to_taiwan_traditional(replacement) == source
+    except Exception:
+        return False
+
+
 def _patch_has_unchanged_edges(source: str, replacement: str) -> bool:
     """Detect a model wrapping a small change in unchanged sentence context."""
 
@@ -615,6 +635,8 @@ def validate_contextual_proposals(
             reject_reason = "patch_is_sentence_rewrite"
         elif NUMBER_RE.findall(source) != NUMBER_RE.findall(replacement):
             reject_reason = "numbers_changed"
+        elif _is_script_conversion(source, replacement):
+            reject_reason = "script_converted_not_corrected"
         elif not _ascii_change_allowed(source, replacement, glossary):
             reject_reason = "latin_terms_changed_without_glossary"
         elif confidence is None or verifier_confidence is None:

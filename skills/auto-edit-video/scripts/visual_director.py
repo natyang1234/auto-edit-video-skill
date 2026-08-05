@@ -29,6 +29,14 @@ LIST_MARKERS = re.compile(
     re.IGNORECASE,
 )
 NUMBER_VALUE = re.compile(r"-?\d+(?:\.\d+)?")
+# Speech is full of numbers that are not measurements: exit 4, the second
+# floor, half past six. A figure earns a card when it is a quantity — a
+# percentage, a decimal, a unit, or something large enough to be counted.
+MEASUREMENT = re.compile(r"(%|％|\d+\.\d|\d{3,}|\d+\s*(?:倍|萬|億|千|百分|分鐘|小時|天|年|人|次|元|美元|kg|km|MB|GB))")
+
+
+def is_measurement(literal: str) -> bool:
+    return bool(MEASUREMENT.search(str(literal)))
 
 
 def _identifier(prefix: str, *parts: Any) -> str:
@@ -124,7 +132,11 @@ def _list_payload(layer_id: str, quotes: list[dict[str, Any]]) -> dict[str, Any]
 
 def _classify(found: list[dict[str, Any]], is_opening: bool) -> str:
     """What this segment is carrying, or PLAIN_BEAT when it is carrying prose."""
-    numbers = [item for item in found if item.get("kind") == "number"]
+    numbers = [
+        item
+        for item in found
+        if item.get("kind") == "number" and is_measurement(item.get("literal", ""))
+    ]
     quotes = [item for item in found if item.get("kind") == "quote"]
     if len(numbers) >= CHART_MIN_DATUMS:
         return "chart"
@@ -151,13 +163,19 @@ def plan_visuals(
     """
     plan_items: list[dict[str, Any]] = []
     layers: list[dict[str, Any]] = []
-    budget = int(len(segments) * max_decorated_share)
+    # At least one card is allowed, or a timeline that is still one long
+    # take could never carry anything.
+    budget = max(1, int(len(segments) * max_decorated_share)) if segments else 0
     decorated = 0
     previous_decorated = False
 
     for index, segment in enumerate(segments):
-        start = float(segment.get("start", 0.0))
-        end = float(segment.get("end", 0.0))
+        # Timeline segments carry source_start/source_end; callers holding a
+        # plain window use start/end.
+        start = float(segment.get("source_start", segment.get("start", 0.0)))
+        end = float(segment.get("source_end", segment.get("end", 0.0)))
+        if end <= start:
+            continue
         highlight_id = str(segment.get("id") or "")
         if not re.fullmatch(r"highlight-[0-9a-f]{8,}", highlight_id):
             highlight_id = _identifier("highlight", segment.get("id"), start, end)
@@ -174,7 +192,11 @@ def plan_visuals(
         evidence_ids: list[str] = []
         if beat != PLAIN_BEAT:
             layer_id = _identifier("structured-layer", item_id, beat)
-            numbers = [item for item in found if item.get("kind") == "number"]
+            numbers = [
+                item
+                for item in found
+                if item.get("kind") == "number" and is_measurement(item.get("literal", ""))
+            ]
             quotes = [item for item in found if item.get("kind") == "quote"]
             if beat == "chart":
                 layer = _chart_payload(layer_id, numbers)

@@ -23,8 +23,13 @@ def evidence(kind: str, literal: str, start: float, end: float, tag: str) -> dic
 
 
 def segments(count: int, length: float = 4.0) -> list[dict]:
+    # The field names the editor stores, not a shape invented for the test.
     return [
-        {"id": f"h{index}", "start": index * length, "end": (index + 1) * length}
+        {
+            "id": f"h{index}",
+            "source_start": index * length,
+            "source_end": (index + 1) * length,
+        }
         for index in range(count)
     ]
 
@@ -56,9 +61,9 @@ class VisualDirectorTests(unittest.TestCase):
         result = vd.plan_visuals(
             segments(2),
             [
-                evidence("number", "12", 4.2, 4.4, "aa11"),
-                evidence("number", "34", 5.2, 5.4, "bb22"),
-                evidence("number", "56", 6.2, 6.4, "cc33"),
+                evidence("number", "12%", 4.2, 4.4, "aa11"),
+                evidence("number", "34%", 5.2, 5.4, "bb22"),
+                evidence("number", "56%", 6.2, 6.4, "cc33"),
             ],
         )
         self.assertEqual(self.beats(result)[1], "chart")
@@ -85,9 +90,9 @@ class VisualDirectorTests(unittest.TestCase):
         result = vd.plan_visuals(
             segments(3),
             [
-                evidence("number", "10", 0.5, 0.9, "aa11"),
-                evidence("number", "20", 4.5, 4.9, "bb22"),
-                evidence("number", "30", 8.5, 8.9, "cc33"),
+                evidence("number", "10%", 0.5, 0.9, "aa11"),
+                evidence("number", "20%", 4.5, 4.9, "bb22"),
+                evidence("number", "30%", 8.5, 8.9, "cc33"),
             ],
         )
         beats = self.beats(result)
@@ -100,12 +105,37 @@ class VisualDirectorTests(unittest.TestCase):
     def test_cards_stay_a_minority_of_the_cut(self) -> None:
         many = segments(10)
         found = [
-            evidence("number", str(index * 10), index * 4 + 0.5, index * 4 + 0.9, f"{index:04d}")
+            evidence("number", f"{index * 10}%", index * 4 + 0.5, index * 4 + 0.9, f"{index:04d}")
             for index in range(10)
         ]
         result = vd.plan_visuals(many, found)
         decorated = [beat for beat in self.beats(result) if beat != "keep_aroll"]
         self.assertLessEqual(len(decorated), 5)
+
+    def test_a_segment_without_a_usable_window_is_skipped(self) -> None:
+        result = vd.plan_visuals(
+            [{"id": "h0"}, {"id": "h1", "source_start": 0.0, "source_end": 4.0}], []
+        )
+        self.assertEqual(len(result["visual_plan"]["items"]), 1)
+        self.assertEqual(vd.validate(result), [])
+
+    def test_a_number_that_is_not_a_measurement_gets_no_card(self) -> None:
+        # "exit 4" and "the second floor" are numbers, not statistics.
+        for literal in ("4", "二樓", "8"):
+            with self.subTest(literal):
+                result = vd.plan_visuals(
+                    segments(2), [evidence("number", literal, 5.0, 5.4, "aa11")]
+                )
+                self.assertEqual(self.beats(result)[1], "keep_aroll")
+
+    def test_a_single_take_can_still_carry_one_card(self) -> None:
+        # A timeline that has not been cut into highlights is one segment;
+        # a budget proportional to segment count would allow it nothing.
+        result = vd.plan_visuals(
+            segments(1, length=17.0), [evidence("number", "87%", 5.0, 5.4, "aa11")]
+        )
+        self.assertEqual(self.beats(result), ["stat"])
+        self.assertEqual(vd.validate(result), [])
 
     def test_the_same_input_plans_the_same_video(self) -> None:
         found = [evidence("number", "87%", 5.0, 5.5, "ab12")]
