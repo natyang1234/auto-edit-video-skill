@@ -2283,7 +2283,17 @@ def readable_caption_segments(
         )
         current.clear()
 
+    # Where the recogniser itself ended a segment is a boundary worth
+    # keeping: some engines return phrase-level segments without punctuation,
+    # and splitting those again on length alone cuts mid-phrase.
+    segment_ends = {
+        round(float(segment["end"]), 3)
+        for segment in segments
+        if isinstance(segment, dict) and segment.get("end") is not None
+    }
     for word in words:
+        if current and round(float(current[-1]["end"]), 3) in segment_ends:
+            flush()
         if current:
             gap = float(word["start"]) - float(current[-1]["end"])
             candidate = current + [word]
@@ -2459,7 +2469,10 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
     caption_segments = readable_caption_segments(segments, flat_words)
     transcript = {
         "schema_version": SCHEMA_VERSION,
-        "engine": "openai-whisper",
+        # Provenance follows the engine that produced this, not the format it
+        # was written in: a wrong label here is how a transcript gets trusted
+        # for the wrong reasons later.
+        "engine": str(data.get("engine") or "openai-whisper"),
         "language": data.get("language"),
         "duration_s": round(duration_s, 3),
         "text": str(data.get("text", "")).strip(),
@@ -3203,6 +3216,54 @@ def project_staged_source(manifest_path: Path, manifest: dict[str, Any]) -> Path
     return source
 
 
+def transcribe_with_breeze(
+    manifest_path: Path, source: Path, args: argparse.Namespace
+) -> int | None:
+    """Transcribe with the Taiwan-tuned recogniser, or None to fall back.
+
+    General checkpoints mishear Taiwanese place names, brands and homophones,
+    and those words end up on screen. Returning None when the runtime is
+    absent keeps a project transcribable on a machine that has not installed
+    it, rather than failing outright.
+    """
+    import breeze_asr
+
+    ok, reason = breeze_asr.available()
+    if not ok:
+        if args.model == "breeze":
+            die(f"Breeze was requested but is unavailable: {reason}")
+            return 1
+        return None
+    run_dir = manifest_path.parent / "working/whisper-local" / uuid.uuid4().hex
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        payload = breeze_asr.transcribe(source)
+    except Exception as exc:  # the runtime is a separate process; it can fail many ways
+        manifest = read_json(manifest_path)
+        manifest.setdefault("stages", {})["transcribe"] = "failed"
+        manifest["transcription"] = {
+            "engine": "breeze-asr-25",
+            "model": breeze_asr.MODEL_REPO,
+            "status": "failed",
+            "error_code": "breeze_failed",
+            "updated_at": now_utc(),
+        }
+        write_json(manifest_path, manifest)
+        return die(f"Breeze transcription failed: {exc}")
+    transcript_json = run_dir / f"{source.stem}.json"
+    write_json(transcript_json, payload)
+    try:
+        imported = import_whisper_artifacts(
+            manifest_path, transcript_json, srt_path=None, model=breeze_asr.MODEL_REPO
+        )
+    except ValueError as exc:
+        return die(str(exc))
+    imported["local"] = True
+    imported["engine"] = "breeze-asr-25"
+    emit(imported)
+    return 0
+
+
 def cmd_transcribe_local(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).expanduser().resolve()
     try:
@@ -3210,6 +3271,15 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
         source = project_staged_source(manifest_path, manifest)
     except ValueError as exc:
         return die(str(exc))
+    language = str(manifest.get("subtitles", {}).get("source_language", "auto"))
+    if language in {"zh-TW", "zh-en"} and args.model in {"auto", "breeze"}:
+        result = transcribe_with_breeze(manifest_path, source, args)
+        if result is not None:
+            return result
+    if args.model in {"auto", "breeze"}:
+        # Either this is not a Taiwanese project or the tuned runtime is not
+        # installed; whisper needs an actual size to load.
+        args.model = "large-v3"
     whisper = os.environ.get("WHISPER_BIN", "").strip() or shutil.which("whisper")
     if not whisper:
         return die("local Whisper CLI is not installed")
@@ -4296,11 +4366,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the installed local Whisper CLI and import timed transcript artifacts",
     )
     transcribe.add_argument("--manifest", required=True)
-    # Measured on a 17s Mandarin ad: base heard a brand name as an unrelated
-    # phrase and a department store as a function word, while large-v3 got
-    # both. Deliveries carry these words on screen, so accuracy wins over the
-    # minute or two the larger model costs; pass --model for a faster run.
-    transcribe.add_argument("--model", default="large-v3")
+    # auto picks the Taiwan-tuned recogniser for zh-TW and zh-en projects and
+    # Whisper otherwise. Measured on a 17s Mandarin ad: base heard the brand
+    # name as an unrelated phrase, large-v3 fixed that but still missed a
+    # metro station and read "book a table" as "positioning"; the Taiwan-tuned
+    # model got all of them. Name a Whisper size here to force one.
+    transcribe.add_argument("--model", default="auto")
     transcribe.add_argument("--timeout", type=int, default=21600)
     transcribe.set_defaults(func=cmd_transcribe_local)
 
