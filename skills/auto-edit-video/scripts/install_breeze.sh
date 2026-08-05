@@ -16,6 +16,13 @@ command -v uv >/dev/null 2>&1 || {
 }
 
 mkdir -p "$(dirname "$ENV_DIR")"
+if [ -L "$ENV_DIR" ]; then
+  # uv would follow the link and build the environment wherever it points,
+  # leaving this path still borrowed from somewhere that may not persist.
+  echo "$ENV_DIR is a symlink to $(readlink "$ENV_DIR")." >&2
+  echo "Remove it first so the runtime installs here for real." >&2
+  exit 1
+fi
 uv venv "$ENV_DIR"
 uv pip install --python "$ENV_DIR/bin/python" mlx-whisper
 

@@ -92,21 +92,39 @@ def derive_evidence_items(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
 
     sentence_words: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal sentence_words
+        if not sentence_words:
+            return
+        add(
+            "quote",
+            "".join(str(w.get("text", "")) for w in sentence_words),
+            float(sentence_words[0]["start"]),
+            float(sentence_words[-1]["end"]),
+        )
+        sentence_words = []
+
     for word in words:
         text = str(word.get("text", ""))
         if not text.strip():
             continue
+        # The recogniser's own segmentation is a sentence boundary too.
+        # Recognisers that emit no punctuation — Breeze among them — would
+        # otherwise yield one quote holding the entire transcript, and every
+        # card built from it reads as a run-on cut off mid-word.
+        segment_id = word.get("segment_id")
+        if (
+            sentence_words
+            and segment_id is not None
+            and segment_id != sentence_words[-1].get("segment_id")
+        ):
+            flush()
         sentence_words.append(word)
         if NUMBER_TOKEN.search(text):
             add("number", text, float(word["start"]), float(word["end"]))
         if SENTENCE_BREAK.search(text):
-            add(
-                "quote",
-                "".join(str(w.get("text", "")) for w in sentence_words),
-                float(sentence_words[0]["start"]),
-                float(sentence_words[-1]["end"]),
-            )
-            sentence_words = []
+            flush()
     if sentence_words:
         add(
             "quote",

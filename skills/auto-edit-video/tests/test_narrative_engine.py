@@ -95,6 +95,30 @@ class NarrativeEngineTests(unittest.TestCase):
         self.assertEqual(number["literal"], "87%")
         self.assertEqual(contract_registry.validate_artifact("evidence_map", first), [])
 
+    def test_an_unpunctuated_transcript_still_yields_one_quote_per_line(self) -> None:
+        # Breeze — the recogniser zh-TW projects use — emits no punctuation.
+        # Sentence-break-only splitting turned the whole clip into one quote,
+        # and every card built from it read as a run-on cut off mid-word.
+        words = [
+            {"id": "word-1", "text": "今晚", "start": 0.0, "end": 0.9,
+             "segment_id": "segment-0001"},
+            {"id": "word-2", "text": "別宅在家", "start": 0.9, "end": 2.0,
+             "segment_id": "segment-0001"},
+            {"id": "word-3", "text": "忠孝復興", "start": 3.9, "end": 4.8,
+             "segment_id": "segment-0002"},
+            {"id": "word-4", "text": "四號出口", "start": 4.8, "end": 5.9,
+             "segment_id": "segment-0002"},
+        ]
+        quotes = [
+            item
+            for item in narrative_engine.derive_evidence_items(words)
+            if item["kind"] == "quote"
+        ]
+        self.assertEqual(
+            [item["literal"] for item in quotes],
+            ["今晚別宅在家", "忠孝復興四號出口"],
+        )
+
     def test_tampered_evidence_map_is_rejected(self) -> None:
         evidence_map = self.build_index()
         evidence_map["items"][0]["literal"] = "留存是 99.9%（捏造）"
