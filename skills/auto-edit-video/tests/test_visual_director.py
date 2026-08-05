@@ -159,6 +159,31 @@ class VisualDirectorTests(unittest.TestCase):
         )
         self.assertEqual(vd.validate(result), [])
 
+    def test_an_editorial_title_replaces_the_transcript_extract(self) -> None:
+        # The card path through the director had to learn this separately
+        # from the highlight design cards; the two disagreed until it did.
+        one_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.0}]
+        found = [evidence("quote", "今晚別宅在家跟我走", 0.2, 2.6, "aa11")]
+        plain = vd.plan_visuals(one_take, found)
+        named = vd.plan_visuals(one_take, found, editorial_title="台北今晚約會路線")
+        self.assertEqual(
+            plain["structured_layers"]["items"][0]["payload"]["title"],
+            "今晚別宅在家跟我走",
+        )
+        self.assertEqual(
+            named["structured_layers"]["items"][0]["payload"]["title"],
+            "台北今晚約會路線",
+        )
+
+    def test_a_blank_editorial_title_falls_back_to_the_transcript(self) -> None:
+        one_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.0}]
+        found = [evidence("quote", "今晚別宅在家跟我走", 0.2, 2.6, "aa11")]
+        result = vd.plan_visuals(one_take, found, editorial_title="   ")
+        self.assertEqual(
+            result["structured_layers"]["items"][0]["payload"]["title"],
+            "今晚別宅在家跟我走",
+        )
+
     def test_a_short_segment_is_never_stretched_to_the_dwell(self) -> None:
         brief = [{"id": "h0", "source_start": 0.0, "source_end": 1.2}]
         result = vd.plan_visuals(

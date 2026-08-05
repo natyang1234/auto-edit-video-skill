@@ -71,12 +71,17 @@ def _label_for(literal: str) -> str:
     return cleaned[:18] if cleaned else "—"
 
 
-def _title_payload(layer_id: str, quotes: list[dict[str, Any]]) -> dict[str, Any]:
+def _title_payload(
+    layer_id: str, quotes: list[dict[str, Any]], editorial_title: str = ""
+) -> dict[str, Any]:
+    # An editorial title says what the cut is about; the first quote only says
+    # how it happens to open. Same preference as the highlight design cards.
+    headline = editorial_title.strip()[:40] or _label_for(quotes[0]["literal"])[:40]
     return {
         "id": layer_id,
         "type": "title",
         "payload": {
-            "title": _label_for(quotes[0]["literal"])[:40],
+            "title": headline,
             # The opening card names what the piece is about, which is the
             # hook rather than a section marker or a pulled quote.
             "title_kind": "full-screen-hook",
@@ -162,6 +167,7 @@ def plan_visuals(
     segments: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
     max_decorated_share: float = MAX_DECORATED_SHARE,
+    editorial_title: str = "",
 ) -> dict[str, Any]:
     """Decide a beat for every segment, and build the cards those beats need.
 
@@ -222,7 +228,7 @@ def plan_visuals(
                 layer = _list_payload(layer_id, enumerated)
                 evidence_ids = [entry["evidence_id"] for entry in layer["payload"]["items"]]
             else:
-                layer = _title_payload(layer_id, quotes)
+                layer = _title_payload(layer_id, quotes, editorial_title)
                 evidence_ids = []
             if layer_id is not None:
                 layer["visual_plan_item_id"] = item_id

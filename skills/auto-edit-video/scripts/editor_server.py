@@ -2103,6 +2103,22 @@ def upgrade_editor_state_layout_effects(project_dir: Path, state: dict[str, Any]
 BURNED_IN_SETTING_VALUES = ("auto", "yes", "no")
 
 
+def active_editorial_title(state: dict[str, Any]) -> str:
+    """The editorial name of the cut being worked on, if a model wrote one."""
+    active_id = str(state.get("active_highlight_id") or "")
+    for item in state.get("highlights", []):
+        if not isinstance(item, dict):
+            continue
+        if active_id and str(item.get("id") or "") != active_id:
+            continue
+        editorial = item.get("editorial")
+        if isinstance(editorial, dict) and editorial.get("is_editorial_copy"):
+            return str(editorial.get("title") or "")
+        if active_id:
+            break
+    return ""
+
+
 def caption_render_decision(
     project_dir: Path, manifest: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -4698,7 +4714,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not isinstance(segments, list) or not segments:
             self.send_json({"ok": False, "error": "the timeline has no segments"}, status=422)
             return
-        planned = visual_director.plan_visuals(segments, evidence["items"])
+        planned = visual_director.plan_visuals(
+            segments, evidence["items"], editorial_title=active_editorial_title(state)
+        )
         errors = visual_director.validate(planned)
         if errors:
             self.send_json({"ok": False, "error": "; ".join(errors[:5])}, status=422)
