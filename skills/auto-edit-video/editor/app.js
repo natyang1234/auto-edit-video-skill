@@ -3157,6 +3157,7 @@ async function deskLoadProviders() {
   if (!select || deskProviderStatusLoaded) {
     deskRenderProviderDisclosure();
     deskWireGenerateImage();
+    deskWireAutoVisuals();
     return;
   }
   if (status) status.textContent = "正在載入開放素材來源…";
@@ -3631,6 +3632,40 @@ function deskWireGenerateImage() {
       }
     } catch (error) {
       if (status) status.textContent = `生成失敗：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+
+function deskWireAutoVisuals() {
+  const button = document.getElementById("desk-auto-button");
+  const status = document.getElementById("desk-auto-status");
+  if (!button) return;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    if (status) status.textContent = "排版中…";
+    try {
+      const payload = await request("/api/auto-visuals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (payload && payload.ok === false) throw new Error(payload.error || "排版失敗");
+      const beats = payload.beats || {};
+      const decorated = Object.entries(beats)
+        .filter(([beat]) => beat !== "keep_aroll")
+        .map(([beat, count]) => `${beat} ${count}`)
+        .join("、");
+      if (status) {
+        status.textContent = decorated
+          ? `排好了：${decorated}，其餘維持原畫面。`
+          : "逐字稿沒有可用的數字或列舉，全部維持原畫面。";
+      }
+      if (typeof refreshProject === "function") await refreshProject();
+    } catch (error) {
+      if (status) status.textContent = `排版失敗：${error.message}`;
     } finally {
       button.disabled = false;
     }

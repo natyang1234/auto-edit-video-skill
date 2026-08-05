@@ -57,6 +57,7 @@ from template_catalog import (
 
 
 import generated_images
+import visual_director
 import qa_video
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -4399,6 +4400,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/assets/import-provider":
             self.handle_provider_import()
             return
+        if path == "/api/auto-visuals":
+            self.handle_auto_visuals()
+            return
         if path == "/api/generate-image":
             self.handle_generate_image()
             return
@@ -4597,6 +4601,38 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "approval_revisions": revisions,
             }
         )
+
+    def handle_auto_visuals(self) -> None:
+        """Lay out every cut's visuals from what the transcript says."""
+        project_dir = self.server.project_dir
+        state = read_json(project_dir / STATE_REL, {}) or {}
+        evidence = read_json(project_dir / "working/evidence_map.json", None)
+        if not isinstance(evidence, dict) or not evidence.get("items"):
+            self.send_json(
+                {"ok": False, "error": "no evidence index yet; build it from the transcript first"},
+                status=422,
+            )
+            return
+        segments = state.get("segments")
+        if not isinstance(segments, list) or not segments:
+            self.send_json({"ok": False, "error": "the timeline has no segments"}, status=422)
+            return
+        planned = visual_director.plan_visuals(segments, evidence["items"])
+        errors = visual_director.validate(planned)
+        if errors:
+            self.send_json({"ok": False, "error": "; ".join(errors[:5])}, status=422)
+            return
+        try:
+            publish_layer_bundle(
+                project_dir, planned["structured_layers"], planned["visual_plan"]
+            )
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=422)
+            return
+        beats: dict[str, int] = {}
+        for item in planned["visual_plan"]["items"]:
+            beats[item["beat"]] = beats.get(item["beat"], 0) + 1
+        self.send_json({"ok": True, "beats": beats, "layers": len(planned["structured_layers"]["items"])})
 
     def handle_generate_image(self) -> None:
         """Make a picture for one beat, or hand back the one it already has."""
