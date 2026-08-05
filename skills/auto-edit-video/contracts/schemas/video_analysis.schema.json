@@ -227,6 +227,69 @@
     "additionalProperties": false
    }
   },
+  "burned_in_captions": {
+   "type": "object",
+   "properties": {
+    "status": {
+     "type": "string",
+     "enum": [
+      "detected",
+      "absent",
+      "not_configured"
+     ]
+    },
+    "frames_sampled": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "frames_with_band_text": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "band_center_y": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "band_spread": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "evidence": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "start": {
+        "type": "number",
+        "minimum": 0
+       },
+       "text": {
+        "type": "string"
+       },
+       "center_y": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "center_y",
+       "start",
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    }
+   },
+   "required": [
+    "frames_sampled",
+    "frames_with_band_text",
+    "status"
+   ],
+   "additionalProperties": false
+  },
   "revision": {
    "type": "string",
    "pattern": "^[0-9a-f]{64}$"

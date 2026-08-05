@@ -2075,6 +2075,49 @@ def upgrade_editor_state_layout_effects(project_dir: Path, state: dict[str, Any]
     return changed
 
 
+BURNED_IN_SETTING_VALUES = ("auto", "yes", "no")
+
+
+def caption_render_decision(
+    project_dir: Path, manifest: dict[str, Any]
+) -> tuple[bool, str]:
+    """Should this project draw its own captions? Returns (render, reason).
+
+    Footage that already carries burned-in subtitles gets a second, usually
+    worse, transcript stacked on top of a correct one. The analysis stage
+    reports what it saw; the project setting always wins over it.
+    """
+    subtitles = manifest.get("subtitles")
+    setting = "auto"
+    if isinstance(subtitles, dict):
+        setting = str(subtitles.get("source_has_burned_in") or "auto").lower()
+    if setting not in BURNED_IN_SETTING_VALUES:
+        setting = "auto"
+    if setting == "yes":
+        return False, "project declares the source is already subtitled"
+    if setting == "no":
+        return True, "project declares the source carries no subtitles"
+
+    analysis_path = project_dir / "working/video_analysis.json"
+    try:
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True, "no analysis yet; assuming the source is unsubtitled"
+    detection = analysis.get("burned_in_captions")
+    if not isinstance(detection, dict):
+        return True, "analysis predates burned-in detection"
+    status = str(detection.get("status") or "")
+    if status == "detected":
+        hits = detection.get("frames_with_band_text")
+        sampled = detection.get("frames_sampled")
+        return False, (
+            f"source already shows subtitles in {hits}/{sampled} sampled frames"
+        )
+    if status == "not_configured":
+        return True, "OCR unavailable; cannot tell, so captions stay on"
+    return True, "no burned-in subtitles found in the source"
+
+
 def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     transcript = read_json(project_dir / "working/transcript_words.json", {}) or {}
     highlight_plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
@@ -2112,6 +2155,9 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
     # split alongside it; the sync path already prefers it and this one must
     # agree, or the first caption a project gets depends on which code made it.
     caption_source = transcript.get("caption_segments") or transcript.get("segments", [])
+    render_captions, caption_reason = caption_render_decision(project_dir, manifest)
+    if not render_captions:
+        caption_source = []
     for index, segment in enumerate(caption_source, start=1):
         text = str(segment.get("text", "")).strip()
         if not text:
@@ -2177,6 +2223,10 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         "updated_at": now_utc(),
         "project_id": manifest.get("project_id"),
         "source_sha256": manifest.get("source", {}).get("sha256"),
+        "caption_generation": {
+            "enabled": render_captions,
+            "reason": caption_reason,
+        },
         "segments": default_source_segments(manifest),
         "variants": [],
         "rights": {"asserted": False, "assertion_revision": None},

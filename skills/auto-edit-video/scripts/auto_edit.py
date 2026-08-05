@@ -1291,6 +1291,7 @@ def initialize_project(
     contextual_semantic_calibration: bool = False,
     semantic_model: str = "qwen2.5:7b",
     subtitle_mode: str = "source",
+    source_has_burned_in: str = "auto",
     target_language: str | None = None,
     platform: str = "auto",
     duration_profile: str = "full",
@@ -1391,6 +1392,8 @@ def initialize_project(
         },
         "subtitles": {
             "mode": subtitle_mode,
+            # auto = believe the analysis stage; yes/no override it.
+            "source_has_burned_in": source_has_burned_in,
             "source_language": source_language,
             "target_language": target_language,
             "glossary": glossary,
@@ -1865,6 +1868,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             contextual_semantic_calibration=args.contextual_semantic_calibration,
             semantic_model=args.semantic_model,
             subtitle_mode=args.subtitle_mode,
+            source_has_burned_in=args.source_has_burned_in,
             target_language=args.target_language,
             platform=args.platform,
             duration_profile=args.duration_profile,
@@ -2515,11 +2519,15 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
         from editor_server import (
             DIRECTOR_PRESETS,
             caption_effect_spans,
+            caption_render_decision,
             editor_state_revision,
             effect_keywords_for_caption,
         )
     except ImportError as exc:
         raise ValueError(f"cannot load editor transcript bridge: {exc}") from exc
+    # Same decision as the bootstrap path, made by the same function: a
+    # project that skips captions must not have them reappear on re-sync.
+    render_captions, caption_reason = caption_render_decision(project_dir, manifest)
     director_id = str(state.get("director_style") or "teacher-punch")
     director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
     caption_style = dict(state.get("caption_defaults") or director["caption"])
@@ -2556,6 +2564,12 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
     ]
     captions: list[dict[str, Any]] = []
     source_segments = transcript.get("caption_segments") or transcript.get("segments", [])
+    if not render_captions:
+        source_segments = []
+    state["caption_generation"] = {
+        "enabled": render_captions,
+        "reason": caption_reason,
+    }
     for index, segment in enumerate(source_segments, start=1):
         text = str(segment.get("text", "")).strip()
         if not text:
@@ -4243,6 +4257,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--semantic-model", default="qwen2.5:7b")
     init.add_argument("--subtitle-mode", choices=SUBTITLE_MODES, default="source")
+    init.add_argument(
+        "--source-has-burned-in", choices=("auto", "yes", "no"), default="auto",
+        help="does the footage already carry subtitles? auto = let analysis decide",
+    )
     init.add_argument("--target-language")
     init.add_argument("--platform", choices=PLATFORMS, default="auto")
     init.add_argument("--duration-profile", choices=DURATION_PROFILES, default="full")

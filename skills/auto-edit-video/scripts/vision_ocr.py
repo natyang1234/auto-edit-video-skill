@@ -68,8 +68,22 @@ def _recognize_sync(image_path: Path, languages: tuple[str, ...]) -> list[dict]:
             continue
         best = candidate[0]
         text = str(best.string()).strip()
-        if text:
-            lines.append({"text": text, "confidence": float(best.confidence())})
+        if not text:
+            continue
+        # Vision normalises boxes to [0,1] with the origin at bottom-left.
+        box = observation.boundingBox()
+        lines.append(
+            {
+                "text": text,
+                "confidence": float(best.confidence()),
+                "box": {
+                    "x": float(box.origin.x),
+                    "y": float(box.origin.y),
+                    "width": float(box.size.width),
+                    "height": float(box.size.height),
+                },
+            }
+        )
     return lines
 
 

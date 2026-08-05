@@ -32,6 +32,14 @@ OCR_MAX_PER_MINUTE = 30
 OCR_SCALE_LONG_SIDE = 960
 OCR_FRAME_TIMEOUT_S = 10.0
 OCR_SPAN_LENGTH_S = 2.0
+# Burned-in subtitle detection, in Vision's normalised bottom-left space.
+BURNED_IN_BAND_TOP = 0.30       # caption rows live in the bottom 30%
+BURNED_IN_MAX_OFF_CENTER = 0.22  # and stay near the horizontal centre
+BURNED_IN_MIN_FRAME_SHARE = 0.5  # present in at least half the samples
+BURNED_IN_MIN_FRAMES = 3         # never conclude from one or two frames
+BURNED_IN_MAX_BAND_SPREAD = 0.05  # anchored height, unlike scenery text
+BURNED_IN_MAX_EVIDENCE = 12
+BURNED_IN_SAMPLE_COUNT = 12    # detection samples on its own schedule
 
 
 def ffmpeg_path() -> str:
@@ -276,6 +284,89 @@ def run_ocr(
     return spans
 
 
+def burned_in_verdict(frames: dict[float, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Pure verdict over {timestamp: OCR lines with boxes}.
+
+    A subtitle is text that sits low, sits centred, and sits at the SAME
+    height every time; shop signs and menu boards drift as the camera moves,
+    so the tight vertical clustering is what separates them.
+    """
+    if not frames:
+        return {"status": "not_configured", "frames_sampled": 0, "frames_with_band_text": 0}
+
+    evidence: list[dict[str, Any]] = []
+    for timestamp in sorted(frames):
+        best: dict[str, Any] | None = None
+        for line in frames[timestamp]:
+            box = line.get("box")
+            if not isinstance(box, dict):
+                continue
+            center_y = float(box["y"]) + float(box["height"]) / 2.0
+            center_x = float(box["x"]) + float(box["width"]) / 2.0
+            if center_y > BURNED_IN_BAND_TOP:
+                continue
+            if abs(center_x - 0.5) > BURNED_IN_MAX_OFF_CENTER:
+                continue
+            # Lowest qualifying line is the caption row.
+            if best is None or center_y < best["center_y"]:
+                best = {
+                    "start": round(float(timestamp), 3),
+                    "text": str(line["text"]),
+                    "center_y": round(center_y, 5),
+                }
+        if best is not None:
+            evidence.append(best)
+
+    sampled = len(frames)
+    hits = len(evidence)
+    result: dict[str, Any] = {
+        "status": "absent",
+        "frames_sampled": sampled,
+        "frames_with_band_text": hits,
+        "band_center_y": None,
+        "band_spread": None,
+        "evidence": evidence[:BURNED_IN_MAX_EVIDENCE],
+    }
+    if hits < BURNED_IN_MIN_FRAMES or hits < sampled * BURNED_IN_MIN_FRAME_SHARE:
+        return result
+
+    centers = [item["center_y"] for item in evidence]
+    mean = sum(centers) / len(centers)
+    spread = (sum((value - mean) ** 2 for value in centers) / len(centers)) ** 0.5
+    result["band_center_y"] = round(mean, 5)
+    result["band_spread"] = round(spread, 5)
+    if spread <= BURNED_IN_MAX_BAND_SPREAD:
+        result["status"] = "detected"
+    return result
+
+
+def detect_burned_in_captions(source: Path, duration_s: float) -> dict[str, Any]:
+    """Sample the clip on its own schedule and rule on burned-in subtitles.
+
+    Deliberately does NOT reuse the OCR stage's frames: that stage samples on
+    shot boundaries, which on a short single-shot clip yields two frames —
+    too few to tell an anchored caption row from a coincidence.
+    """
+    if duration_s <= 0:
+        return {"status": "not_configured", "frames_sampled": 0, "frames_with_band_text": 0}
+    count = BURNED_IN_SAMPLE_COUNT
+    # Evenly spaced, inset from both ends so titles/end cards do not dominate.
+    timestamps = [
+        round(duration_s * (index + 0.5) / count, 3) for index in range(count)
+    ]
+    frames: dict[float, list[dict[str, Any]]] = {}
+    with tempfile.TemporaryDirectory(prefix="auto-edit-burnin-") as scratch:
+        for timestamp in timestamps:
+            frame = Path(scratch) / f"burnin-{timestamp:.3f}.png"
+            try:
+                extract_frame(source, timestamp, frame)
+                lines = vision_ocr.recognize_text(frame, timeout_s=OCR_FRAME_TIMEOUT_S)
+            except Exception:
+                continue
+            frames[timestamp] = lines
+    return burned_in_verdict(frames)
+
+
 def transcript_engine(project_dir: Path) -> dict[str, str]:
     words_path = project_dir / "working/transcript_words.json"
     if not words_path.is_file():
@@ -411,6 +502,12 @@ def analyze(project_dir: Path) -> tuple[dict[str, Any], dict[str, str]]:
         "silences": silences,
         "shots": shots,
         "ocr_spans": ocr_spans,
+        "burned_in_captions": run_stage(
+            "burned_in_captions",
+            {"samples": BURNED_IN_SAMPLE_COUNT, "band_top": BURNED_IN_BAND_TOP},
+            lambda: detect_burned_in_captions(source, duration_s),
+            engine=vision_ocr.vision_engine(),
+        ),
     }
     analysis["revision"] = contract_registry.canonical_hash(analysis)
     errors = contract_registry.validate_artifact("video_analysis", analysis)
