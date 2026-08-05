@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+import text_joining
 from datetime import datetime, timezone
 from typing import Any
 
@@ -141,25 +142,8 @@ def clean_text(value: str) -> str:
 
 
 def join_transcript_parts(parts: list[str]) -> str:
-    result = ""
-    no_space_before = set("，。！？、,.!?：:；;％%）)]}〉》」』…")
-    no_space_after = set("（([{〈《「『")
-    for raw_part in parts:
-        part = str(raw_part).strip()
-        if not part:
-            continue
-        if not result:
-            result = part
-            continue
-        previous = result[-1]
-        current = part[0]
-        if current in no_space_before or previous in no_space_after:
-            result += part
-        elif previous.isascii() or current.isascii():
-            result += " " + part
-        else:
-            result += part
-    return result.strip()
+    """Transcript text for these parts, by the shared spacing rule."""
+    return text_joining.join_tokens(parts)
 
 
 def transcript_title_excerpt(text: str, max_chars: int = 36) -> str:

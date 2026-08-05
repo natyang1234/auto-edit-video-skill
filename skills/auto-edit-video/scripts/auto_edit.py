@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 import uuid
+
+import text_joining
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -2244,25 +2246,8 @@ def caption_display_units(text: str) -> int:
 
 
 def join_caption_words(words: list[dict[str, Any]]) -> str:
-    result = ""
-    no_space_before = set("，。！？、,.!?：:；;％%）)]}〉》」』…")
-    no_space_after = set("（([{〈《「『")
-    for word in words:
-        token = str(word.get("text", "")).strip()
-        if not token:
-            continue
-        if not result:
-            result = token
-            continue
-        previous = result[-1]
-        current = token[0]
-        if current in no_space_before or previous in no_space_after:
-            result += token
-        elif previous.isascii() or current.isascii():
-            result += " " + token
-        else:
-            result += token
-    return result.strip()
+    """Caption text for these words, by the shared spacing rule."""
+    return text_joining.join_tokens(word.get("text", "") for word in words)
 
 
 def readable_caption_segments(
@@ -3994,7 +3979,9 @@ def cmd_cut(args: argparse.Namespace) -> int:
     for highlight in highlights:
         editorial = highlight.get("editorial") or {}
         title = str(editorial.get("title") or highlight.get("title") or "clip")
-        name = re.sub(r"[^\w一-鿿 ]+", "_", title).strip()[:40] or "clip"
+        # An editorial title is already short; a transcript extract is a
+        # sentence, and a sentence makes an unusable filename.
+        name = re.sub(r"[^\w一-鿿 ]+", "_", title).strip()[:24].strip() or "clip"
         output = out_dir / f"{int(highlight.get('rank', 0)):02d}_{name}.mp4"
         _step(f"cutting 「{title}」")
         try:
@@ -4021,7 +4008,24 @@ def cmd_cut(args: argparse.Namespace) -> int:
         if result.returncode != 0:
             problems.append(f"{title}: {(result.stderr or '').strip()[-200:]}")
             continue
-        made.append({"title": title, "file": str(output),
+        # Every clip goes through the delivery gate. Handing back a black or
+        # silent file because nobody thought to check is the failure this
+        # gate exists for, and until now `cut` was the one path that skipped
+        # it — QA was something a person remembered to run afterwards.
+        verdict = _subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("qa_video.py")),
+             "--video", str(output),
+             "--report", str(project_dir / f"qa/{output.stem}.json")],
+            check=False, capture_output=True, text=True,
+        )
+        status = "unknown"
+        try:
+            status = str(json.loads(verdict.stdout or "{}").get("status") or "unknown")
+        except ValueError:
+            pass
+        if status != "pass":
+            problems.append(f"{title}: delivery QA said {status}")
+        made.append({"title": title, "file": str(output), "qa": status,
                      "seconds": round(float(highlight["end"]) - float(highlight["start"]), 2)})
 
     emit({

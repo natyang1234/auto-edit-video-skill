@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import text_joining
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -497,8 +498,9 @@ def _timed_source_span(
     ]
     if not words:
         return None
-    no_space_before = set("，。！？、,.!?：:；;％%）)]}〉》」』…")
-    no_space_after = set("（([{〈《「『")
+    # This searches for text the caption and highlight paths produced, so it
+    # has to space tokens exactly as they did — hence the shared rule rather
+    # than a third copy of the punctuation sets.
     chunks: list[str] = []
     combined = ""
     for word in words:
@@ -506,16 +508,9 @@ def _timed_source_span(
         if not token:
             chunks.append("")
             continue
-        prefix = ""
-        if combined:
-            previous = combined[-1]
-            current = token[0]
-            if (
-                current not in no_space_before
-                and previous not in no_space_after
-                and (previous.isascii() or current.isascii())
-            ):
-                prefix = " "
+        prefix = (
+            " " if combined and text_joining.needs_space(combined[-1], token[0]) else ""
+        )
         chunk = prefix + token
         chunks.append(chunk)
         combined += chunk

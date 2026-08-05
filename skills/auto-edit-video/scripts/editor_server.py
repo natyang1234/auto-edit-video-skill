@@ -2112,19 +2112,36 @@ def caption_translations(project_dir: Path) -> dict[str, str]:
     return caption_translator.by_caption_text(project_dir)
 
 
+CARD_TITLE_MAX_CHARS = 40
+
+
+def highlight_card_title(highlight: dict[str, Any]) -> str:
+    """What this cut's card is called. One answer, for every card path.
+
+    Two paths build title cards, and each used to work out the fallback for
+    itself: one ended at a quote from the transcript, the other at the
+    highlight's own title, and they truncated at different lengths — so the
+    same cut was named two different things depending on which path drew it.
+    """
+    if not isinstance(highlight, dict):
+        return ""
+    editorial = highlight.get("editorial")
+    if isinstance(editorial, dict) and editorial.get("is_editorial_copy"):
+        title = str(editorial.get("title") or "").strip()
+        if title:
+            return title[:CARD_TITLE_MAX_CHARS]
+    return str(highlight.get("title") or "").strip()[:CARD_TITLE_MAX_CHARS]
+
+
 def active_editorial_title(state: dict[str, Any]) -> str:
-    """The editorial name of the cut being worked on, if a model wrote one."""
+    """The name of the cut being worked on, by the shared rule."""
     active_id = str(state.get("active_highlight_id") or "")
     for item in state.get("highlights", []):
         if not isinstance(item, dict):
             continue
         if active_id and str(item.get("id") or "") != active_id:
             continue
-        editorial = item.get("editorial")
-        if isinstance(editorial, dict) and editorial.get("is_editorial_copy"):
-            return str(editorial.get("title") or "")
-        if active_id:
-            break
+        return highlight_card_title(item)
     return ""
 
 
