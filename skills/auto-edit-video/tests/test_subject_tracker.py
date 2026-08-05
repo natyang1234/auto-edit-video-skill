@@ -108,5 +108,42 @@ def _numbers_after_commas(expression: str) -> list[str]:
     return re.findall(r"(?<=,)(\d+)(?=[,)]|$)", expression)
 
 
+class CardPlacementTests(unittest.TestCase):
+    """Put the card where the speaker is not."""
+
+    CARD = 0.06      # a hook card is about six percent of the frame
+    CAPTIONS = 0.70  # captions start here
+
+    def place(self, head_top):
+        return tracker.card_y_percent(
+            head_top, card_height_fraction=self.CARD,
+            caption_top=self.CAPTIONS, default=46.0,
+        )
+
+    def test_room_above_the_head_is_used(self) -> None:
+        y, reason = self.place(0.21)
+        self.assertEqual(reason, "above_subject")
+        self.assertLess(y / 100 + self.CARD / 2, 0.21, "must clear the head")
+
+    def test_a_head_near_the_top_pushes_the_card_below_them(self) -> None:
+        y, reason = self.place(0.02)
+        self.assertEqual(reason, "above_captions")
+        self.assertLess(y / 100 + self.CARD / 2, self.CAPTIONS, "must clear captions")
+        self.assertGreater(y / 100, 0.02, "must clear the subject")
+
+    def test_no_detection_keeps_the_fixed_position_and_says_so(self) -> None:
+        # A caller that cannot tell a deliberate placement from an
+        # unchanged default will report a collision as a layout choice.
+        self.assertEqual(self.place(None), (46.0, "no_subject_found"))
+
+    def test_a_card_taller_than_every_gap_falls_back(self) -> None:
+        # Subject high in frame, captions high too: nowhere for a card this
+        # tall to sit without landing on one of them.
+        y, reason = tracker.card_y_percent(
+            0.05, card_height_fraction=0.30, caption_top=0.30, default=46.0
+        )
+        self.assertEqual((y, reason), (46.0, "no_clear_band"))
+
+
 if __name__ == "__main__":
     unittest.main()

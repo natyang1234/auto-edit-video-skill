@@ -182,6 +182,65 @@ def crop_x_expression(
     return expression
 
 
+def subject_head_top(source: Path, start: float, end: float, *, fps: float = 1.0) -> float | None:
+    """Highest point the subject reaches, as a fraction from the top.
+
+    A standing speaker fills the frame from the head down, so the only
+    reliably empty region is above them. This returns where that region
+    ends — the topmost head position across the cut, not the average, so a
+    card placed above it stays clear even at the subject's tallest moment.
+    """
+    from video_analyzer import extract_frame  # local: import cycle
+
+    span = max(0.0, end - start)
+    if span <= 0:
+        return None
+    count = min(MAX_SAMPLES, max(2, int(span * fps)))
+    tops: list[float] = []
+    with tempfile.TemporaryDirectory(prefix="auto-edit-head-") as scratch:
+        for index in range(count):
+            frame = Path(scratch) / f"h{index:04d}.png"
+            try:
+                extract_frame(source, start + span * (index + 0.5) / count, frame)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                continue
+            boxes = _detect(frame)
+            if not boxes:
+                continue
+            primary = max(boxes, key=lambda box: box["width"] * box["height"])
+            # Vision measures from the bottom; screen coordinates run down.
+            tops.append(1.0 - (primary["y"] + primary["height"]))
+    if not tops:
+        return None
+    return round(min(tops), 5)
+
+
+def card_y_percent(
+    head_top: float | None,
+    *,
+    card_height_fraction: float,
+    caption_top: float,
+    default: float,
+) -> tuple[float, str]:
+    """Where the card's centre sits, as a percentage from the top.
+
+    Returns the default and a reason when there is nowhere better; a caller
+    that cannot tell "placed deliberately" from "left where it was" will
+    report a collision as a layout choice.
+    """
+    if head_top is None:
+        return default, "no_subject_found"
+    margin = card_height_fraction * 0.35
+    # Centre the card in the clear band above the head, if it fits there.
+    if head_top >= card_height_fraction + margin * 2:
+        return round(max(margin, (head_top - card_height_fraction) / 2) * 100 + card_height_fraction * 50, 2), "above_subject"
+    # Otherwise sit between the subject and the captions, still clear of both.
+    below = caption_top - card_height_fraction - margin
+    if below > head_top:
+        return round(below * 100, 2), "above_captions"
+    return default, "no_clear_band"
+
+
 def tracked_crop_x(
     source: Path,
     start: float,

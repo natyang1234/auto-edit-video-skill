@@ -683,6 +683,10 @@ def build_render_command(
                 for window_start, window_end in windows:
                     if layer_ref and layer_ref in artifact_by_layer:
                         artifact = artifact_by_layer[layer_ref]
+                        card_y = card_y_for_window(
+                            source, plan_item, artifact, height,
+                            caption_top_fraction(state),
+                        )
                         overlays.append(
                             {
                                 "id": plan_item.get("id"),
@@ -707,7 +711,7 @@ def build_render_command(
                                         ),
                                     ) if artifact.get("width") else 84.0,
                                     "x": 50,
-                                    "y": 46,
+                                    "y": card_y,
                                     # The style pack says how this component
                                     # should arrive; every card fading in
                                     # regardless was the pack going unread.
@@ -1184,6 +1188,64 @@ def finalize_variant_delivery_receipt(
     delivery_dir = project_dir / VARIANT_DELIVERY_REL
     delivery_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(delivery_dir / f"{variant_id}.json", receipt)
+
+
+DEFAULT_CARD_Y = 46.0
+
+
+def caption_top_fraction(state: dict[str, Any]) -> float:
+    """Where the caption band starts, as a fraction from the top."""
+    defaults = state.get("caption_defaults")
+    y = 76.0
+    if isinstance(defaults, dict):
+        try:
+            y = float(defaults.get("y", y))
+        except (TypeError, ValueError):
+            pass
+    # Captions are anchored by their centre and can wrap to a second line.
+    return max(0.0, min(1.0, (y - 8.0) / 100.0))
+
+
+def card_y_for_window(
+    source: Path,
+    plan_item: dict[str, Any],
+    artifact: dict[str, Any],
+    canvas_height: int,
+    caption_top: float,
+) -> float:
+    """Put the card where the speaker is not.
+
+    A fixed mid-frame position lands on whoever is talking. The tracker
+    already knows where they are, so ask it, and keep the fixed position for
+    every case where it cannot answer.
+    """
+    try:
+        import subject_tracker
+    except ImportError:
+        return DEFAULT_CARD_Y
+    card_height = float(artifact.get("height") or 0.0)
+    if card_height <= 0 or canvas_height <= 0:
+        return DEFAULT_CARD_Y
+    try:
+        head_top = subject_tracker.subject_head_top(
+            source,
+            float(plan_item.get("start", 0.0)),
+            float(plan_item.get("end", 0.0)),
+        )
+        placement, reason = subject_tracker.card_y_percent(
+            head_top,
+            card_height_fraction=card_height / canvas_height,
+            caption_top=caption_top,
+            default=DEFAULT_CARD_Y,
+        )
+    except Exception:
+        return DEFAULT_CARD_Y
+    print(
+        json.dumps({"card_placement": {"y": placement, "reason": reason}},
+                   ensure_ascii=False),
+        file=sys.stderr,
+    )
+    return placement
 
 
 def tracked_or_centered_crop_x(
