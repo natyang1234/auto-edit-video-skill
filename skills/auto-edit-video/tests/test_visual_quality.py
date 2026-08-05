@@ -406,3 +406,47 @@ class GraphicPackageTemplateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DesignOverlayTextTests(unittest.TestCase):
+    """Five cards in a highlight should not all quote the same sentence."""
+
+    def transcript(self) -> dict:
+        return {
+            # What whisper returns for a short clip: one segment holding
+            # everything, plus the reading split derived from word timings.
+            "segments": [{"id": "s1", "start": 0.0, "end": 17.0, "text": "甲乙丙丁戊己庚辛壬癸"}],
+            "caption_segments": [
+                {"id": "c1", "start": 0.0, "end": 4.0, "text": "第一句話"},
+                {"id": "c2", "start": 4.0, "end": 9.0, "text": "第二句話"},
+                {"id": "c3", "start": 9.0, "end": 13.0, "text": "第三句話"},
+                {"id": "c4", "start": 13.0, "end": 17.0, "text": "第四句話"},
+            ],
+        }
+
+    def test_cards_sample_the_reading_split_not_one_long_segment(self) -> None:
+        import visual_quality
+
+        overlays = visual_quality.build_highlight_design_overlays(
+            self.transcript(),
+            {"id": "h1", "start": 0.0, "end": 17.0, "title": ""},
+            {"font_size": 42},
+            "teacher-punch",
+        )
+        texts = [overlay["text"] for overlay in overlays]
+        self.assertGreater(len(set(texts)), 1, f"every card quoted the same text: {texts}")
+        for text in texts:
+            self.assertNotIn("甲乙丙", text, "cards fell back to the unsplit segment")
+
+    def test_a_transcript_without_a_split_still_works(self) -> None:
+        import visual_quality
+
+        transcript = self.transcript()
+        del transcript["caption_segments"]
+        overlays = visual_quality.build_highlight_design_overlays(
+            transcript,
+            {"id": "h1", "start": 0.0, "end": 17.0, "title": ""},
+            {"font_size": 42},
+            "teacher-punch",
+        )
+        self.assertTrue(overlays)

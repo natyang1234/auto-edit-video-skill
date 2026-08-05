@@ -65,9 +65,13 @@ def _overlapping_segments(
     highlight: dict[str, Any],
 ) -> list[dict[str, Any]]:
     clip_start, clip_end = _highlight_bounds(highlight)
+    # The reading split, when the transcript carries one: whisper may return a
+    # single segment for a whole clip, and sampling five cards out of it gives
+    # five copies of the same truncated wall of text.
+    source = transcript.get("caption_segments") or transcript.get("segments", [])
     return [
         item
-        for item in transcript.get("segments", [])
+        for item in source
         if isinstance(item, dict)
         and str(item.get("text", "")).strip()
         and _finite_number(item.get("end")) > clip_start
