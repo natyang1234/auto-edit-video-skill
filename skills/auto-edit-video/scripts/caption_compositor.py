@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,95 @@ def _cg_color(quartz, hex_color: str, alpha: float = 1.0):
     return quartz.CGColorCreateGenericRGB(red, green, blue, alpha)
 
 
+_LATIN = re.compile(r"[0-9A-Za-z@#$%&'’\-.]")
+# Punctuation that must not start a line, and punctuation that must not end one.
+_NO_LINE_START = "，,。.、！!？?：:；;）)」』】》〉…”’%％"
+_NO_LINE_END = "（(「『【《〈“‘"
+# A line holding only a couple of characters reads as a mistake, not a line.
+MIN_TAIL_CHARS = 3
+# Shrinking a little beats wrapping badly, but only a little.
+MIN_AUTOFIT_SCALE = 0.82
+AUTOFIT_STEP = 0.04
+
+
+def _breakable(text: str, index: int) -> bool:
+    """Can a line end just before ``index``?"""
+    if index <= 0 or index >= len(text):
+        return False
+    before, after = text[index - 1], text[index]
+    if after in _NO_LINE_START or before in _NO_LINE_END:
+        return False
+    if before == " ":
+        return True
+    # Never split a Latin word or a number down the middle; Chinese may break
+    # between any two characters, which is why the framesetter alone leaves
+    # words like 小門就是 cut in half.
+    if _LATIN.match(before) and _LATIN.match(after):
+        return False
+    return True
+
+
+def wrap_lines(text: str, measure, max_width: float) -> list[str] | None:
+    """Break one line into balanced lines, or None if it cannot be done well.
+
+    Greedy filling packs the first line and leaves the remainder stranded —
+    that is where the single dangling character comes from. This balances
+    the lines instead, and refuses a break that would strand one.
+    """
+    if measure(text) <= max_width:
+        return [text]
+    positions = [index for index in range(1, len(text)) if _breakable(text, index)]
+    if not positions:
+        return None
+
+    best: tuple[float, list[str]] | None = None
+    for split in positions:
+        head, tail = text[:split].rstrip(), text[split:].lstrip()
+        if not head or not tail:
+            continue
+        if len(head) < MIN_TAIL_CHARS or len(tail) < MIN_TAIL_CHARS:
+            continue
+        head_width, tail_width = measure(head), measure(tail)
+        if head_width > max_width:
+            continue
+        if tail_width > max_width:
+            rest = wrap_lines(tail, measure, max_width)
+            if rest is None:
+                continue
+            score = abs(head_width - max_width) + 1000 * len(rest)
+            candidate = [head, *rest]
+        else:
+            score = abs(head_width - tail_width)
+            candidate = [head, tail]
+        if best is None or score < best[0]:
+            best = (score, candidate)
+    return best[1] if best else None
+
+
+def fit_caption_text(text: str, measure_at, font_size: float, max_width: float):
+    """(lines, font size). Shrink a little before accepting a second line.
+
+    A caption that drops one point to stay on one line reads better than one
+    that keeps its size and wraps with two characters left over.
+    """
+    paragraphs = text.split("\n")
+    size = font_size
+    while size >= font_size * MIN_AUTOFIT_SCALE:
+        measure = measure_at(size)
+        if all(measure(part) <= max_width for part in paragraphs):
+            return paragraphs, size
+        size *= 1.0 - AUTOFIT_STEP
+
+    measure = measure_at(font_size)
+    wrapped: list[str] = []
+    for part in paragraphs:
+        lines = wrap_lines(part, measure, max_width)
+        # Nothing splits well: leave it to the framesetter rather than
+        # forcing a break somewhere worse.
+        wrapped.extend(lines if lines is not None else [part])
+    return wrapped, font_size
+
+
 def render_caption_png(
     project_dir: Path,
     overlay: dict[str, Any],
@@ -176,6 +266,36 @@ def render_caption_png(
     frame_width = canvas_width * render_scale * (max_width / 100.0)
     font_binding = _font_binding(project_dir, state, overlay)
     font_file = Path(font_binding["path"])
+
+    def measure_at(size: float):
+        probe_font = _make_base_font(ct, size, font_file)
+
+        def measure(value: str) -> float:
+            if not value:
+                return 0.0
+            probe = foundation.NSMutableAttributedString.alloc().initWithString_(value)
+            probe.addAttributes_range_(
+                {ct.kCTFontAttributeName: probe_font},
+                foundation.NSMakeRange(0, probe.length()),
+            )
+            line = ct.CTLineCreateWithAttributedString(probe)
+            width, _a, _d, _l = ct.CTLineGetTypographicBounds(line, None, None, None)
+            return float(width)
+
+        return measure
+
+    # Decide the breaks here rather than letting the framesetter fill greedily:
+    # it packs the first line and strands whatever is left, which is how a
+    # caption ends up with one character on a line of its own.
+    lines, font_size = fit_caption_text(text, measure_at, font_size, frame_width)
+    text = "\n".join(lines)
+    if translation_range is not None and translation:
+        # The breaks moved the text, so the range has to be found again.
+        marker = "\n".join(
+            wrap_lines(translation, measure_at(font_size), frame_width) or [translation]
+        )
+        offset = text.rfind(marker)
+        translation_range = (offset, offset + len(marker)) if offset >= 0 else None
     base_font = _make_base_font(ct, font_size, font_file)
 
     stroke_width = float(style.get("stroke_width", 3)) * render_scale
