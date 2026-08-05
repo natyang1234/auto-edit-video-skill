@@ -591,9 +591,14 @@ def build_render_command(
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x171512,setsar=1,setpts=PTS-STARTPTS"
         )
     else:
+        crop_x = "(iw-ow)/2"
+        if not multi_segment and state.get("subject_tracking", True):
+            crop_x = tracked_or_centered_crop_x(
+                source, manifest, clip_start, clip_end, width, height
+            )
         base_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},setsar=1,setpts=PTS-STARTPTS"
+            f"crop={width}:{height}:{crop_x}:(ih-oh)/2,setsar=1,setpts=PTS-STARTPTS"
         )
 
     command = [ffmpeg_path(), "-y"]
@@ -1167,6 +1172,54 @@ def finalize_variant_delivery_receipt(
     delivery_dir = project_dir / VARIANT_DELIVERY_REL
     delivery_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(delivery_dir / f"{variant_id}.json", receipt)
+
+
+def tracked_or_centered_crop_x(
+    source: Path,
+    manifest: dict[str, Any],
+    clip_start: float,
+    clip_end: float,
+    width: int,
+    height: int,
+) -> str:
+    """Where the crop window sits over time — following the subject if found.
+
+    Falls back to centring for every reason it can fail: no source
+    dimensions, no subject, tracking unavailable. A vertical crop that
+    guesses centre is the old behaviour, not a broken render.
+    """
+    try:
+        import subject_tracker
+    except ImportError:
+        return "(iw-ow)/2"
+    source_info = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    try:
+        src_w = float(source_info.get("width") or 0.0)
+        src_h = float(source_info.get("height") or 0.0)
+    except (TypeError, ValueError):
+        return "(iw-ow)/2"
+    if src_w <= 0 or src_h <= 0:
+        return "(iw-ow)/2"
+    # cover scales by whichever axis needs the most, then crops the excess.
+    scale = max(width / src_w, height / src_h)
+    scaled_width = src_w * scale
+    try:
+        expression, report = subject_tracker.tracked_crop_x(
+            source, clip_start, clip_end,
+            scaled_width=scaled_width, window_width=float(width),
+        )
+    except Exception:
+        # Tracking is an enhancement; never let it cost the render.
+        return "(iw-ow)/2"
+    if expression is None:
+        return "(iw-ow)/2"
+    print(
+        json.dumps({"subject_tracking": report}, ensure_ascii=False),
+        file=sys.stderr,
+    )
+    # Commas separate filters in a filtergraph, so every comma inside an
+    # expression has to be escaped or the graph splits mid-argument.
+    return expression.replace(",", "\\,")
 
 
 def render_cover(
