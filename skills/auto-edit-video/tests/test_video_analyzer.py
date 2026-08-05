@@ -41,6 +41,59 @@ class SamplingTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+class BurnedInVerdictTests(unittest.TestCase):
+    """Position alone cannot tell a caption row from station furniture."""
+
+    @staticmethod
+    def frames(texts: list[str], center_y: float = 0.16) -> dict:
+        # One qualifying line per sampled frame, all in the caption band.
+        return {
+            float(index) * 4.0: [
+                {
+                    "text": text,
+                    "box": {"x": 0.25, "y": center_y - 0.02, "width": 0.5, "height": 0.04},
+                }
+            ]
+            for index, text in enumerate(texts)
+        }
+
+    def test_a_changing_caption_row_is_detected(self) -> None:
+        verdict = video_analyzer.burned_in_verdict(
+            self.frames(
+                ["今晚別宅在家", "忠孝復興四號出口", "旁邊巷子", "上二樓", "跟我進來", "訂位"]
+            )
+        )
+        self.assertEqual(verdict["status"], "detected")
+
+    def test_a_station_watermark_is_not_a_caption_row(self) -> None:
+        # A phone-number banner sits low, sits centred and never moves — the
+        # only thing that separates it from subtitles is that it never
+        # changes. Calling it a caption row silently drops every subtitle.
+        verdict = video_analyzer.burned_in_verdict(self.frames(["加倍"] * 12))
+        self.assertEqual(verdict["status"], "absent")
+        self.assertEqual(verdict["distinct_texts"], 1)
+
+    def test_a_watermark_with_ocr_noise_is_still_not_a_caption_row(self) -> None:
+        # Real OCR reads the same banner slightly differently frame to frame.
+        noisy = ["加倍", "加", "成效加倍", "加倍"] * 3
+        verdict = video_analyzer.burned_in_verdict(self.frames(noisy))
+        self.assertEqual(verdict["status"], "absent")
+
+    def test_scenery_text_that_drifts_is_not_a_caption_row(self) -> None:
+        frames = {}
+        for index, text in enumerate(["多采", "DOWNTOWN", "營業中", "多采", "招牌", "小門"]):
+            offset = 0.10 + index * 0.03  # the camera moves; the sign moves
+            frames[float(index) * 4.0] = [
+                {"text": text,
+                 "box": {"x": 0.3, "y": offset, "width": 0.4, "height": 0.04}}
+            ]
+        self.assertEqual(video_analyzer.burned_in_verdict(frames)["status"], "absent")
+
+    def test_no_boxes_at_all_is_not_a_conclusion(self) -> None:
+        verdict = video_analyzer.burned_in_verdict({})
+        self.assertEqual(verdict["status"], "not_configured")
+
+
 class AnalyzeVideoTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

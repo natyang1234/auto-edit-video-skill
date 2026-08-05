@@ -40,6 +40,8 @@ BURNED_IN_MIN_FRAMES = 3         # never conclude from one or two frames
 BURNED_IN_MAX_BAND_SPREAD = 0.05  # anchored height, unlike scenery text
 BURNED_IN_MAX_EVIDENCE = 12
 BURNED_IN_SAMPLE_COUNT = 12    # detection samples on its own schedule
+BURNED_IN_MIN_DISTINCT_TEXTS = 3   # a caption row says something new
+BURNED_IN_MIN_DISTINCT_SHARE = 0.5  # ...on at least half the hits
 
 
 def ffmpeg_path() -> str:
@@ -333,10 +335,19 @@ def burned_in_verdict(frames: dict[float, list[dict[str, Any]]]) -> dict[str, An
     centers = [item["center_y"] for item in evidence]
     mean = sum(centers) / len(centers)
     spread = (sum((value - mean) ** 2 for value in centers) / len(centers)) ** 0.5
+    distinct = {item["text"] for item in evidence}
     result["band_center_y"] = round(mean, 5)
     result["band_spread"] = round(spread, 5)
-    if spread <= BURNED_IN_MAX_BAND_SPREAD:
-        result["status"] = "detected"
+    result["distinct_texts"] = len(distinct)
+    if spread > BURNED_IN_MAX_BAND_SPREAD:
+        return result
+    # A station logo or a phone-number banner also sits low, sits centred and
+    # never moves — position alone cannot tell it from a caption row. What
+    # separates them is that subtitles say something different each time.
+    if len(distinct) < max(BURNED_IN_MIN_DISTINCT_TEXTS, hits * BURNED_IN_MIN_DISTINCT_SHARE):
+        result["status"] = "absent"
+        return result
+    result["status"] = "detected"
     return result
 
 
