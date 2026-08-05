@@ -662,6 +662,13 @@ def build_render_command(
     # paths left in the editor state are skipped above on the same flag.
     if planned_cards is not None:
         layers_bundle, visual_plan_v2 = planned_cards
+    # Composing the cards and placing the plan's beats are separate jobs, and
+    # nesting the second inside the first meant a plan of nothing but
+    # pictures was skipped whole: no picture drawn, no error, a render that
+    # reported success. Cards are composed only when there are cards; every
+    # plan item is placed either way.
+    artifact_by_layer: dict[str, Any] = {}
+    resolved_pack: dict[str, Any] = {"id": "none", "tokens": {}}
     if layers_bundle.get("items"):
         import structured_card_compositor
 
@@ -675,11 +682,6 @@ def build_render_command(
             selection = state.get("style_pack") or {}
             if selection.get("project_default") or selection.get("per_highlight"):
                 resolved_pack = structured_card_compositor.load_default_pack()
-            else:
-                # No pack selected: cards render with the compositor's own
-                # fallback tokens; an empty pack keeps the hash distinct so
-                # selecting a pack later verifiably re-renders.
-                resolved_pack = {"id": "none", "tokens": {}}
             artifacts_index = structured_card_compositor.build_structured_artifacts(
                 project_dir, state, layers_bundle, resolved_pack, render_scale,
             )
@@ -689,69 +691,69 @@ def build_render_command(
                 for item in artifacts_index.get("items", [])
                 if item.get("canvas") == key
             }
-            for plan_item in visual_plan_v2.get("items", []):
-                layer_ref = plan_item.get("structured_layer_id")
-                asset_ref = plan_item.get("selected_asset")
-                windows = map_source_range_to_post_cut(
-                    segments,
-                    float(plan_item.get("start", 0.0)),
-                    float(plan_item.get("end", 0.0)),
+    for plan_item in visual_plan_v2.get("items", []):
+        layer_ref = plan_item.get("structured_layer_id")
+        asset_ref = plan_item.get("selected_asset")
+        windows = map_source_range_to_post_cut(
+            segments,
+            float(plan_item.get("start", 0.0)),
+            float(plan_item.get("end", 0.0)),
+        )
+        for window_start, window_end in windows:
+            if layer_ref and layer_ref in artifact_by_layer:
+                artifact = artifact_by_layer[layer_ref]
+                card_y = card_y_for_window(
+                    source, plan_item, artifact, height,
+                    caption_top_fraction(state),
                 )
-                for window_start, window_end in windows:
-                    if layer_ref and layer_ref in artifact_by_layer:
-                        artifact = artifact_by_layer[layer_ref]
-                        card_y = card_y_for_window(
-                            source, plan_item, artifact, height,
-                            caption_top_fraction(state),
-                        )
-                        overlays.append(
-                            {
-                                "id": plan_item.get("id"),
-                                "type": "image",
-                                "source": artifact["artifact_id"],
-                                "start": window_start,
-                                "end": window_end,
-                                "visible": True,
-                                "z_index": 5,
-                                "style": {
-                                    # The card was composed at this canvas, so
-                                    # draw it at the size it was drawn. Forcing
-                                    # every card to one width re-stretched a
-                                    # card that had just been fitted to its
-                                    # text, and upscaled its glyph edges.
-                                    "width": max(
-                                        5.0,
-                                        min(
-                                            100.0,
-                                            float(artifact.get("width") or 0)
-                                            / max(width, 1) * 100.0,
-                                        ),
-                                    ) if artifact.get("width") else 84.0,
-                                    "x": 50,
-                                    "y": card_y,
-                                    # The style pack says how this component
-                                    # should arrive; every card fading in
-                                    # regardless was the pack going unread.
-                                    "animation": motion_for_layer(
-                                        resolved_pack, layers_bundle, layer_ref
-                                    ),
-                                },
-                            }
-                        )
-                    elif asset_ref:
-                        overlays.append(
-                            {
-                                "id": plan_item.get("id"),
-                                "type": "image",
-                                "source": str(asset_ref),
-                                "start": window_start,
-                                "end": window_end,
-                                "visible": True,
-                                "z_index": 4,
-                                "style": {"width": 60.0, "x": 50, "y": 42,
-                                          "animation": "fade"},
-                            }
-                        )
+                overlays.append(
+                    {
+                        "id": plan_item.get("id"),
+                        "type": "image",
+                        "source": artifact["artifact_id"],
+                        "start": window_start,
+                        "end": window_end,
+                        "visible": True,
+                        "z_index": 5,
+                        "style": {
+                            # The card was composed at this canvas, so
+                            # draw it at the size it was drawn. Forcing
+                            # every card to one width re-stretched a
+                            # card that had just been fitted to its
+                            # text, and upscaled its glyph edges.
+                            "width": max(
+                                5.0,
+                                min(
+                                    100.0,
+                                    float(artifact.get("width") or 0)
+                                    / max(width, 1) * 100.0,
+                                ),
+                            ) if artifact.get("width") else 84.0,
+                            "x": 50,
+                            "y": card_y,
+                            # The style pack says how this component
+                            # should arrive; every card fading in
+                            # regardless was the pack going unread.
+                            "animation": motion_for_layer(
+                                resolved_pack, layers_bundle, layer_ref
+                            ),
+                        },
+                    }
+                )
+            elif asset_ref:
+                overlays.append(
+                    {
+                        "id": plan_item.get("id"),
+                        "type": "image",
+                        "source": str(asset_ref),
+                        "start": window_start,
+                        "end": window_end,
+                        "visible": True,
+                        "z_index": 4,
+                        "style": {"width": 60.0, "x": 50, "y": 42,
+                                  "animation": "fade"},
+                    }
+                )
 
     if any(is_plain_caption(overlay) for overlay in overlays):
         import caption_compositor
