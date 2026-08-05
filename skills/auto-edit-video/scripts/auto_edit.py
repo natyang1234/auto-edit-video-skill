@@ -12,6 +12,7 @@ import math
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2638,6 +2639,7 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
             "start": item["start"],
             "end": item["end"],
             "title": str(item["title"]),
+            "editorial": item.get("editorial"),
             "review_status": str(item["review_status"]),
             "score": item["score"],
             "source": "working/highlight_plan.json",
@@ -3383,6 +3385,55 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
     return 0
 
 
+def apply_editorial_selection(
+    plan: dict[str, Any],
+    transcript: dict[str, Any],
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Replace scored windows with a model's cuts, or keep the scored ones.
+
+    A model that is unreachable, slow, or talking nonsense must not cost the
+    project its highlights: the deterministic plan is already built and stays
+    exactly as it was, with the reason recorded in the plan's warnings.
+    """
+    import editorial_planner
+
+    bounds = (plan.get("configuration") or {}).get("duration_bounds_s") or {}
+    try:
+        items, warnings = editorial_planner.plan_editorial_highlights(
+            transcript,
+            duration_s=float(manifest.get("source", {}).get("duration_s", 0.0)),
+            count=int(args.count),
+            min_duration=float(bounds.get("min") or 8.0),
+            max_duration=float(bounds.get("max") or 90.0),
+            brief=str(getattr(args, "brief", "") or ""),
+            provider=tuple(shlex.split(args.editorial_provider))
+            if getattr(args, "editorial_provider", "")
+            else editorial_planner.DEFAULT_PROVIDER,
+            timeout_s=int(getattr(args, "editorial_timeout", editorial_planner.DEFAULT_TIMEOUT_S)),
+        )
+    except (editorial_planner.EditorialUnavailable, ValueError) as exc:
+        plan.setdefault("warnings", []).append(
+            f"editorial selection unavailable, kept the scored plan: {exc}"
+        )
+        return plan
+    plan["items"] = items
+    plan["generator"] = editorial_planner.GENERATOR
+    plan["status"] = "needs_review" if items else plan.get("status", "needs_transcript")
+    plan.setdefault("warnings", []).extend(warnings)
+    plan["plan_revision"] = highlight_planner_hash(plan)
+    return plan
+
+
+def highlight_planner_hash(plan: dict[str, Any]) -> str:
+    from highlight_planner import canonical_hash
+
+    return canonical_hash(
+        {key: value for key, value in plan.items() if key not in {"generated_at", "plan_revision"}}
+    )
+
+
 def cmd_plan_highlights(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).expanduser().resolve()
     project_dir = manifest_path.parent
@@ -3405,6 +3456,8 @@ def cmd_plan_highlights(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         return die(str(exc))
+    if getattr(args, "editorial", False):
+        plan = apply_editorial_selection(plan, transcript, manifest, args)
     errors = validate_highlight_plan(
         plan,
         float(manifest.get("source", {}).get("duration_s", 0.0)),
@@ -4432,6 +4485,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     highlights.add_argument("--count", type=int, default=10)
     highlights.add_argument("--brief", default="")
+    highlights.add_argument(
+        "--editorial", action="store_true",
+        help="let a model choose and name the cuts; falls back to the scored plan",
+    )
+    highlights.add_argument(
+        "--editorial-provider", default="",
+        help="command that answers the selection prompt (default: openclaw agent-7)",
+    )
+    highlights.add_argument("--editorial-timeout", type=int, default=600)
     highlights.set_defaults(func=cmd_plan_highlights)
 
     voices = sub.add_parser("voices", help="List Rumi/Fish and Edge voice options")

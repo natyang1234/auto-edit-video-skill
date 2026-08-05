@@ -143,7 +143,15 @@ def build_highlight_design_overlays(
     if duration <= 0:
         return []
     segments = _overlapping_segments(transcript, highlight)
-    title = _trim_text(highlight.get("title"), 48)
+    # An editorial title says what the cut is about; the transcript extract
+    # only says what its first seconds happened to contain. Prefer the
+    # editorial wording when a model wrote one, and never quote it.
+    editorial = highlight.get("editorial")
+    title = ""
+    if isinstance(editorial, dict) and editorial.get("is_editorial_copy"):
+        title = _trim_text(editorial.get("title"), 48)
+    if not title:
+        title = _trim_text(highlight.get("title"), 48)
     if not title:
         title = _sample_segment_text(segments, 0.0, "本段精華")
     sample_fractions = {

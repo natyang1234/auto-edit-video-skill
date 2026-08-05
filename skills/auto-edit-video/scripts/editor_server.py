@@ -2141,6 +2141,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
             "start": item.get("start"),
             "end": item.get("end"),
             "title": str(item.get("title", "")),
+            "editorial": item.get("editorial"),
             "review_status": str(item.get("review_status", "pending")),
             "score": item.get("score"),
             "source": "working/highlight_plan.json",
