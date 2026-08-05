@@ -691,6 +691,7 @@ def build_render_command(
                 for item in artifacts_index.get("items", [])
                 if item.get("canvas") == key
             }
+    dropped_beats: list[str] = []
     for plan_item in visual_plan_v2.get("items", []):
         layer_ref = plan_item.get("structured_layer_id")
         asset_ref = plan_item.get("selected_asset")
@@ -699,6 +700,7 @@ def build_render_command(
             float(plan_item.get("start", 0.0)),
             float(plan_item.get("end", 0.0)),
         )
+        placed_before = len(overlays)
         for window_start, window_end in windows:
             if layer_ref and layer_ref in artifact_by_layer:
                 artifact = artifact_by_layer[layer_ref]
@@ -754,6 +756,27 @@ def build_render_command(
                                   "animation": "fade"},
                     }
                 )
+
+        # A beat whose window fell inside removed material legitimately
+        # draws nothing. A beat with a window that still drew nothing was
+        # dropped, and a dropped beat looks exactly like a plan that never
+        # asked for it — which is how a picture went missing twice tonight
+        # from a render that reported success.
+        if windows and len(overlays) == placed_before:
+            reason = (
+                f"no composed card for layer {layer_ref}"
+                if layer_ref
+                else "the beat names neither a card nor an asset"
+            )
+            dropped_beats.append(
+                f"{plan_item.get('beat', '?')} at "
+                f"{float(plan_item.get('start', 0.0)):.2f}s ({reason})"
+            )
+    if dropped_beats:
+        raise ValueError(
+            "the plan asked for visuals that did not reach the frame: "
+            + "; ".join(dropped_beats[:5])
+        )
 
     if any(is_plain_caption(overlay) for overlay in overlays):
         import caption_compositor

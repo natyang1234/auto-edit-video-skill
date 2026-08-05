@@ -86,5 +86,35 @@ class AssetOnlyPlanTests(unittest.TestCase):
             })
 
 
+class DroppedBeatTests(unittest.TestCase):
+    """A beat with time on screen that drew nothing is an error, not a shrug."""
+
+    SEGMENTS = [(0.0, 5.0), (10.0, 15.0)]
+
+    def test_a_beat_inside_removed_material_legitimately_draws_nothing(self) -> None:
+        # It was cut out. Raising here would make every trimmed project fail.
+        self.assertEqual(
+            renderer.map_source_range_to_post_cut(self.SEGMENTS, 6.0, 8.0), []
+        )
+
+    def test_a_beat_inside_kept_material_has_a_window(self) -> None:
+        self.assertEqual(
+            renderer.map_source_range_to_post_cut(self.SEGMENTS, 1.0, 3.0),
+            [(1.0, 3.0)],
+        )
+
+    def test_a_beat_spanning_a_removed_stretch_keeps_both_sides(self) -> None:
+        windows = renderer.map_source_range_to_post_cut(self.SEGMENTS, 4.0, 11.0)
+        self.assertEqual(len(windows), 2)
+
+    def test_the_guard_names_the_beat_and_why(self) -> None:
+        # The message has to say which beat and what was missing; "something
+        # went wrong" costs another render to find out.
+        import inspect
+        source = inspect.getsource(renderer.build_render_command)
+        self.assertIn("did not reach the frame", source)
+        self.assertIn("no composed card for layer", source)
+
+
 if __name__ == "__main__":
     unittest.main()
