@@ -38,9 +38,13 @@ LIST_MARKERS = re.compile(
 )
 NUMBER_VALUE = re.compile(r"-?\d+(?:\.\d+)?")
 # Speech is full of numbers that are not measurements: exit 4, the second
-# floor, half past six. A figure earns a card when it is a quantity — a
-# percentage, a decimal, a unit, or something large enough to be counted.
-MEASUREMENT = re.compile(r"(%|％|\d+\.\d|\d{3,}|\d+\s*(?:倍|萬|億|千|百分|分鐘|小時|天|年|人|次|元|美元|kg|km|MB|GB))")
+# floor, half past six, "whether you play with 2000 dogs or one". A figure
+# earns a card when it says how much of something there is — a percentage, a
+# decimal, or a unit. Size alone does not qualify it: a big round number is
+# just as often hyperbole, and a stat card asserts it was a measurement.
+MEASUREMENT = re.compile(
+    r"(%|％|\d+\.\d|\d+\s*(?:倍|萬|億|千|百分|分鐘|小時|天|年|人|次|元|美元|kg|km|MB|GB))"
+)
 
 
 def is_measurement(literal: str) -> bool:

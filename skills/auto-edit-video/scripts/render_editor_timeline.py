@@ -693,7 +693,19 @@ def build_render_command(
                                 "visible": True,
                                 "z_index": 5,
                                 "style": {
-                                    "width": 84.0,
+                                    # The card was composed at this canvas, so
+                                    # draw it at the size it was drawn. Forcing
+                                    # every card to one width re-stretched a
+                                    # card that had just been fitted to its
+                                    # text, and upscaled its glyph edges.
+                                    "width": max(
+                                        5.0,
+                                        min(
+                                            100.0,
+                                            float(artifact.get("width") or 0)
+                                            / max(width, 1) * 100.0,
+                                        ),
+                                    ) if artifact.get("width") else 84.0,
                                     "x": 50,
                                     "y": 46,
                                     # The style pack says how this component

@@ -159,6 +159,22 @@ class VisualDirectorTests(unittest.TestCase):
         )
         self.assertEqual(vd.validate(result), [])
 
+    def test_a_big_round_number_used_rhetorically_is_not_a_stat(self) -> None:
+        # "whether you play with 2000 dogs or one dog" — the figure is
+        # hyperbole. A stat card would assert somebody measured it.
+        result = vd.plan_visuals(
+            segments(1),
+            [evidence("number", "2000", 1.0, 1.4, "aa11"),
+             evidence("quote", "你不管跟 2000 隻還是一隻狗玩", 0.5, 3.0, "bb22")],
+        )
+        self.assertNotIn("stat", self.beats(result))
+
+    def test_a_figure_with_a_unit_is_still_a_stat(self) -> None:
+        result = vd.plan_visuals(
+            segments(1), [evidence("number", "2000 人", 1.0, 1.4, "cc33")]
+        )
+        self.assertEqual(self.beats(result), ["stat"])
+
     def test_an_editorial_title_replaces_the_transcript_extract(self) -> None:
         # The card path through the director had to learn this separately
         # from the highlight design cards; the two disagreed until it did.

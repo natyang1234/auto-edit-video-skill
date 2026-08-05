@@ -212,3 +212,45 @@ class StructuredCardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HookCardShapeTests(unittest.TestCase):
+    """A full-screen hook is not a lower-third band."""
+
+    def setUp(self) -> None:
+        if not scc.compositor_available():
+            self.skipTest("CoreText compositor unavailable")
+        self.pack = scc.load_default_pack()
+        self.project = Path(tempfile.mkdtemp())
+
+    def card(self, title: str, title_kind: str) -> tuple[int, int]:
+        _rel, _digest, width, height = scc.render_card(
+            self.project,
+            {
+                "id": f"structured-layer-{abs(hash(title_kind)) % 10**12:012x}",
+                "type": "title",
+                "payload": {"title": title, "title_kind": title_kind},
+            },
+            self.pack,
+            {"width": 1080, "height": 1920},
+            0.5,
+        )
+        return width, height
+
+    def test_a_hook_card_is_sized_to_its_words(self) -> None:
+        # The width used to be a fixed share of the canvas, so a six-word
+        # title sat in a slab built for a sentence, with its text in the
+        # left corner and the rest empty.
+        short, _ = self.card("台北今晚約會路線", "full-screen-hook")
+        canvas_share = int(1080 * 0.5 * 0.84)
+        self.assertLess(short, canvas_share)
+
+    def test_a_longer_hook_still_stops_at_the_canvas_share(self) -> None:
+        wide, _ = self.card(
+            "今晚別宅在家跟我走忠孝復興四號出口旁邊巷子右手邊小門", "full-screen-hook"
+        )
+        self.assertLessEqual(wide, int(1080 * 0.5 * 0.84))
+
+    def test_a_lower_third_keeps_the_band_width(self) -> None:
+        band, _ = self.card("台北今晚約會路線", "lower-third")
+        self.assertEqual(band, int(1080 * 0.5 * 0.84))

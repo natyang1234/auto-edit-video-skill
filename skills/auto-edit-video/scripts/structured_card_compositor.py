@@ -210,6 +210,17 @@ def render_card(
         )
         kicker_text = str(payload.get("kicker") or "")
         subtitle_text = str(payload.get("subtitle") or "")
+        # A hook fills the screen and is read as a statement; a lower third is
+        # a band along the bottom. The payload has said which since the
+        # director started emitting these, and only the pack's default was
+        # being consulted — so a hook was drawn as a band with its text pushed
+        # into the left corner of a slab sized for a sentence it did not have.
+        if str(payload.get("title_kind") or "") == "full-screen-hook":
+            layout = "center"
+            if not kicker_text and not subtitle_text:
+                card_width = int(
+                    min(card_width, _line_width(ct, title) + pad * 2)
+                )
         height = int(pad * 2 + title_size * 1.4 + (22 * scale if kicker_text else 0)
                      + (26 * scale if subtitle_text else 0))
         context = _begin_card(quartz, card_width, height, panel)
@@ -390,7 +401,7 @@ def build_structured_artifacts(
         ):
             items.append(cached)
             continue
-        rel_path, digest, _w, _h = render_card(
+        rel_path, digest, card_width, card_height = render_card(
             project_dir, layer, pack, canvas, render_scale
         )
         items.append(
@@ -405,6 +416,11 @@ def build_structured_artifacts(
                 "artifact_hash": digest,
                 "layer_id": str(layer.get("id")),
                 "canvas": key,
+                # The size it was actually drawn at. Without it the renderer
+                # has to assume one, and a card fitted to its text gets
+                # stretched back out to that assumption.
+                "width": int(card_width),
+                "height": int(card_height),
             }
         )
     # keep other-canvas entries (variants render per canvas)
