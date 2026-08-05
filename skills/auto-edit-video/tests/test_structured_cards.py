@@ -254,3 +254,59 @@ class HookCardShapeTests(unittest.TestCase):
     def test_a_lower_third_keeps_the_band_width(self) -> None:
         band, _ = self.card("台北今晚約會路線", "lower-third")
         self.assertEqual(band, int(1080 * 0.5 * 0.84))
+
+
+class ReferenceStyleCardTests(unittest.TestCase):
+    """The three looks the reference footage uses."""
+
+    def setUp(self) -> None:
+        if not scc.compositor_available():
+            self.skipTest("CoreText compositor unavailable")
+        self.pack = scc.load_default_pack()
+        self.project = Path(tempfile.mkdtemp())
+
+    def card(self, kind: str, payload: dict) -> tuple[int, int]:
+        _rel, _digest, width, height = scc.render_card(
+            self.project,
+            {"id": f"structured-layer-{kind}0001", "type": kind, "payload": payload},
+            self.pack,
+            {"width": 1080, "height": 1920},
+            0.5,
+        )
+        return width, height
+
+    def test_a_note_card_draws_icon_title_and_meta(self) -> None:
+        width, height = self.card(
+            "note", {"icon": "🎙", "title": "採訪自己", "meta": "21:47"}
+        )
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
+
+    def test_a_note_with_a_waveform_is_taller_than_one_without(self) -> None:
+        plain = self.card("note", {"title": "採訪自己"})[1]
+        recorded = self.card("note", {"title": "採訪自己", "waveform": True})[1]
+        self.assertGreater(recorded, plain)
+
+    def test_a_chip_is_sized_to_its_line(self) -> None:
+        # A chip stretched to a fixed width stops reading as a chip.
+        short = self.card("chip", {"text": "這間"})[0]
+        long = self.card("chip", {"text": "🥐 → 🎙 → 這支 Reel 很長很長"})[0]
+        self.assertLess(short, long)
+        self.assertLess(long, int(1080 * 0.5 * 0.84))
+
+    def test_a_statement_leaves_room_for_its_number(self) -> None:
+        without = self.card("statement", {"text": "批量發布安排"})[0]
+        with_lead = self.card("statement", {"lead": "03", "text": "批量發布安排"})[0]
+        self.assertGreater(with_lead, without)
+
+    def test_a_chip_with_no_text_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            self.card("chip", {})
+
+    def test_a_statement_with_no_text_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            self.card("statement", {"lead": "03"})
+
+    def test_a_component_cannot_render_a_type_it_does_not_fit(self) -> None:
+        with self.assertRaises(ValueError):
+            scc.resolve_component(self.pack, "chip", "hero-stat")

@@ -8,7 +8,11 @@
    "panel": "#161B22",
    "ink": "#E6EDF3",
    "accent": "#E5484D",
-   "amber": "#F5A623"
+   "amber": "#F5A623",
+   "surface": "#FBF7F0",
+   "surface_ink": "#2A2622",
+   "surface_muted": "#8C8378",
+   "surface_accent": "#D2571E"
   },
   "typography": {
    "title": "font-noto-sans-tc-bold",
@@ -153,6 +157,48 @@
    "layout": "center",
    "motion": {
     "preset": "flip",
+    "enter": "fade",
+    "exit": "fade",
+    "duration_range": [
+     0.3,
+     1.5
+    ]
+   }
+  },
+  {
+   "id": "note-card",
+   "kind": "note_card",
+   "layout": "left-stack",
+   "motion": {
+    "preset": "slide-up",
+    "enter": "fade",
+    "exit": "fade",
+    "duration_range": [
+     0.3,
+     1.5
+    ]
+   }
+  },
+  {
+   "id": "chip",
+   "kind": "chip",
+   "layout": "center",
+   "motion": {
+    "preset": "pop-in",
+    "enter": "fade",
+    "exit": "fade",
+    "duration_range": [
+     0.2,
+     1.0
+    ]
+   }
+  },
+  {
+   "id": "statement-card",
+   "kind": "statement_card",
+   "layout": "center",
+   "motion": {
+    "preset": "slide-up",
     "enter": "fade",
     "exit": "fade",
     "duration_range": [

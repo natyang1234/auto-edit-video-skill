@@ -136,12 +136,18 @@ COMPONENTS_BY_TYPE = {
     "stat": ("hero_stat", "progress"),
     "chart": ("dashboard",),
     "dynamic_list": ("dynamic_list", "warning_checklist", "carousel_grid", "calendar_reveal"),
+    "note": ("note_card",),
+    "chip": ("chip",),
+    "statement": ("statement_card",),
 }
 DEFAULT_COMPONENT = {
     "title": "prompt_card",
     "stat": "hero_stat",
     "chart": "dashboard",
     "dynamic_list": "dynamic_list",
+    "note": "note_card",
+    "chip": "chip",
+    "statement": "statement_card",
 }
 
 
@@ -350,6 +356,124 @@ def render_card(
                 pad + column * column_width,
                 height - pad - row * position - 20 * scale,
             )
+    elif layer_type == "note":
+        # A small widget quoting something the speaker referred to: an icon,
+        # what it is, and when. Light surface — the footage these sit on is
+        # daylight and classrooms, where a dark slab reads as a hole.
+        surface = _pack_token(pack, "palette", "surface", "#FBF7F0")
+        surface_ink = _pack_token(pack, "palette", "surface_ink", "#2A2622")
+        surface_muted = _pack_token(pack, "palette", "surface_muted", "#8C8378")
+        accent_ink = _pack_token(pack, "palette", "surface_accent", "#D2571E")
+        icon = str(payload.get("icon") or "").strip()
+        head = f"{icon} {payload.get('title') or ''}".strip()
+        meta_text = str(payload.get("meta") or "").strip()
+        title, title_size = _fit_text(
+            foundation, ct, quartz, head, 26 * scale, surface_ink,
+            card_width - pad * 3, scale,
+        )
+        meta = None
+        if meta_text:
+            meta, _ = _fit_text(
+                foundation, ct, quartz, meta_text, 22 * scale, accent_ink,
+                card_width / 3, scale,
+            )
+        body_text = str(payload.get("body") or "").strip()
+        body = None
+        if body_text:
+            body, _ = _fit_text(
+                foundation, ct, quartz, body_text, 18 * scale, surface_muted,
+                card_width - pad * 2, scale,
+            )
+        wave = bool(payload.get("waveform"))
+        height = int(
+            pad * 2 + title_size * 1.4
+            + (30 * scale if wave else 0)
+            + (26 * scale if body else 0)
+        )
+        context = _begin_card(quartz, card_width, height, surface)
+        cursor = height - pad - title_size
+        _draw_line(ct, quartz, context, title, pad, cursor)
+        if meta is not None:
+            _draw_line(
+                ct, quartz, context, meta,
+                card_width - pad - _line_width(ct, meta), cursor,
+            )
+        if wave:
+            # A recording is legible as one from its waveform; the shape is
+            # decoration, so it is drawn, not sampled from audio that this
+            # card may not even refer to.
+            cursor -= 24 * scale
+            quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, accent_ink))
+            bar = max(2.0, 3 * scale)
+            gap = bar * 1.9
+            count = int((card_width - pad * 2) / gap)
+            for index in range(count):
+                # Speech is uneven; bars of one height read as a progress
+                # bar, not a recording. Two out-of-step cycles give the
+                # irregularity without depending on any audio.
+                swing = abs(((index * 5) % 13) - 6) / 6.0
+                ripple = abs(((index * 3) % 7) - 3) / 3.0
+                tall = 3 + 15 * (0.35 + 0.65 * swing) * (0.55 + 0.45 * ripple)
+                bar_height = tall * scale
+                quartz.CGContextFillRect(
+                    context,
+                    quartz.CGRectMake(
+                        pad + index * gap, cursor + (18 * scale - bar_height) / 2,
+                        bar, bar_height,
+                    ),
+                )
+        if body is not None:
+            cursor -= 26 * scale
+            _draw_line(ct, quartz, context, body, pad, cursor)
+    elif layer_type == "chip":
+        # One short line, sized to itself. A chip that stretches to a fixed
+        # width stops reading as a chip.
+        accent = _pack_token(pack, "palette", "surface_accent", "#D2571E")
+        chip_ink = _pack_token(pack, "palette", "surface", "#FBF7F0")
+        text_value = str(payload.get("text") or "").strip()
+        if not text_value:
+            raise ValueError("a chip card needs text")
+        line, line_size = _fit_text(
+            foundation, ct, quartz, text_value, 26 * scale, chip_ink,
+            card_width - pad * 2, scale,
+        )
+        chip_pad = int(18 * scale)
+        card_width = int(min(card_width, _line_width(ct, line) + chip_pad * 2))
+        height = int(line_size * 1.9)
+        context = _begin_card(quartz, card_width, height, accent)
+        _draw_line(
+            ct, quartz, context, line,
+            (card_width - _line_width(ct, line)) / 2, (height - line_size) / 2 + line_size * 0.18,
+        )
+    elif layer_type == "statement":
+        # A number the piece is counting off, and what that step is.
+        surface = _pack_token(pack, "palette", "surface", "#FBF7F0")
+        surface_ink = _pack_token(pack, "palette", "surface_ink", "#2A2622")
+        accent_ink = _pack_token(pack, "palette", "surface_accent", "#D2571E")
+        lead_text = str(payload.get("lead") or "").strip()
+        text_value = str(payload.get("text") or "").strip()
+        if not text_value:
+            raise ValueError("a statement card needs text")
+        lead = None
+        if lead_text:
+            lead, _ = _fit_text(
+                foundation, ct, quartz, lead_text, 46 * scale, accent_ink,
+                card_width / 3, scale,
+            )
+        lead_width = (_line_width(ct, lead) + 14 * scale) if lead is not None else 0.0
+        body, body_size = _fit_text(
+            foundation, ct, quartz, text_value, 34 * scale, surface_ink,
+            card_width - pad * 2 - lead_width, scale,
+        )
+        content = lead_width + _line_width(ct, body)
+        card_width = int(min(card_width, content + pad * 2))
+        height = int(pad * 1.6 + body_size * 1.5)
+        context = _begin_card(quartz, card_width, height, surface)
+        origin = max(pad, (card_width - content) / 2)
+        baseline = (height - body_size) / 2 + body_size * 0.18
+        if lead is not None:
+            _draw_line(ct, quartz, context, lead, origin, baseline)
+        _draw_line(ct, quartz, context, body, origin + lead_width, baseline)
     else:
         raise ValueError(f"unsupported structured layer type: {layer_type}")
     return _finish_card(foundation, quartz, context, project_dir, str(layer.get("id")))

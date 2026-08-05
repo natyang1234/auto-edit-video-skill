@@ -1,79 +1,82 @@
 {
-  "$id": "auto-edit-video/contracts/structured_layer",
-  "title": "structured_layer",
-  "x_schema_version": 1,
-  "type": "object",
-  "properties": {
-    "schema_version": {
-      "const": 1
-    },
-    "items": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^structured-layer-[0-9a-f]{8,}$"
-          },
-          "visual_plan_item_id": {
-            "type": "string",
-            "pattern": "^visual-beat-[0-9a-f]{8,}$"
-          },
-          "type": {
-            "type": "string",
-            "enum": [
-              "title",
-              "stat",
-              "chart",
-              "dynamic_list"
-            ]
-          },
-          "revision": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "evidence_revision": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          },
-          "payload": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": true
-          },
-          "review_status": {
-            "type": "string",
-            "enum": [
-              "pending",
-              "approved",
-              "rejected"
-            ]
-          },
-          "component_id": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64,
-            "description": "Which style-pack component renders this item. Optional: the type's default component is used when absent. The type says what the data is; the component says how it looks."
-          }
-        },
-        "required": [
-          "evidence_revision",
-          "id",
-          "payload",
-          "review_status",
-          "revision",
-          "type",
-          "visual_plan_item_id"
-        ],
-        "additionalProperties": false
-      }
-    }
+ "$id": "auto-edit-video/contracts/structured_layer",
+ "title": "structured_layer",
+ "x_schema_version": 1,
+ "type": "object",
+ "properties": {
+  "schema_version": {
+   "const": 1
   },
-  "required": [
-    "items",
-    "schema_version"
-  ],
-  "additionalProperties": false
+  "items": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^structured-layer-[0-9a-f]{8,}$"
+     },
+     "visual_plan_item_id": {
+      "type": "string",
+      "pattern": "^visual-beat-[0-9a-f]{8,}$"
+     },
+     "type": {
+      "type": "string",
+      "enum": [
+       "title",
+       "stat",
+       "chart",
+       "dynamic_list",
+       "note",
+       "chip",
+       "statement"
+      ]
+     },
+     "revision": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "evidence_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "payload": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": true
+     },
+     "review_status": {
+      "type": "string",
+      "enum": [
+       "pending",
+       "approved",
+       "rejected"
+      ]
+     },
+     "component_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Which style-pack component renders this item. Optional: the type's default component is used when absent. The type says what the data is; the component says how it looks."
+     }
+    },
+    "required": [
+     "evidence_revision",
+     "id",
+     "payload",
+     "review_status",
+     "revision",
+     "type",
+     "visual_plan_item_id"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ "required": [
+  "items",
+  "schema_version"
+ ],
+ "additionalProperties": false
 }

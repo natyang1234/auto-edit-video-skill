@@ -65,7 +65,10 @@
        "title_lockup",
        "carousel_grid",
        "progress",
-       "calendar_reveal"
+       "calendar_reveal",
+       "note_card",
+       "chip",
+       "statement_card"
       ]
      },
      "layout": {

@@ -3807,6 +3807,12 @@ def cmd_add_card(args: argparse.Namespace) -> int:
     except ValueError as exc:
         return die(str(exc))
     payload: dict[str, Any] = {}
+    for name in ("icon", "meta", "body", "text", "lead"):
+        value = getattr(args, name, "")
+        if value:
+            payload[name] = value
+    if getattr(args, "waveform", False):
+        payload["waveform"] = True
     if args.title:
         payload["title"] = args.title
     if args.subtitle:
@@ -3817,7 +3823,7 @@ def cmd_add_card(args: argparse.Namespace) -> int:
         payload["value"] = args.value
         payload.setdefault("label", args.title or args.value)
     if not payload:
-        return die("a card needs at least --title or --value")
+        return die("a card needs content: --title, --value or --text")
     try:
         plan, notes = card_plan.add(
             project_dir,
@@ -4519,12 +4525,22 @@ def build_parser() -> argparse.ArgumentParser:
     cards.add_argument("--at", type=float, required=True, help="source seconds")
     cards.add_argument("--seconds", type=float, default=3.0, help="time on screen")
     cards.add_argument(
-        "--kind", choices=("title", "stat", "chart", "dynamic_list"), default="title"
+        "--kind",
+        choices=("title", "stat", "note", "chip", "statement"),
+        default="title",
     )
     cards.add_argument("--title", default="")
     cards.add_argument("--subtitle", default="")
     cards.add_argument("--kicker", default="")
     cards.add_argument("--value", default="", help="the figure, for a stat card")
+    cards.add_argument("--icon", default="", help="emoji shown before a note's title")
+    cards.add_argument("--meta", default="", help="the small right-hand label on a note")
+    cards.add_argument("--body", default="", help="a second line under a note's title")
+    cards.add_argument(
+        "--waveform", action="store_true", help="draw a recording strip on a note"
+    )
+    cards.add_argument("--text", default="", help="the line on a chip or statement")
+    cards.add_argument("--lead", default="", help="the figure a statement counts off")
     cards.add_argument("--note", default="", help="why this card is here")
     cards.set_defaults(func=cmd_add_card)
 
