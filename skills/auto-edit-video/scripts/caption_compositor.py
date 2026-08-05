@@ -29,6 +29,10 @@ SANCTIONED_FALLBACK_PS_NAMES = {"AppleColorEmoji"}
 # actual selected asset id and never emit this placeholder.
 PROJECT_FONT_ASSET_ID = "font-project-default"
 EMOJI_FONT_ASSET_ID = "font-system-emoji"
+# A translation is support, not a second headline.
+TRANSLATION_SCALE = 0.62
+# ...and it carries a lighter outline in proportion.
+TRANSLATION_STROKE = 0.55
 
 _CORETEXT = None
 
@@ -158,6 +162,14 @@ def render_caption_png(
     text = str(overlay.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         raise ValueError("caption text is empty")
+    # A translation rides under the spoken line, in the same frame so the
+    # two share one set of line-breaking rules. Effect spans index the
+    # spoken text, so it has to stay at the front and keep its offsets.
+    translation = str(overlay.get("translation") or "").strip()
+    translation_range: tuple[int, int] | None = None
+    if translation:
+        translation_range = (len(text) + 1, len(text) + 1 + len(translation))
+        text = f"{text}\n{translation}"
     canvas_width = int(canvas.get("width", 1080))
     font_size = max(14.0, float(style.get("font_size", 52)) * render_scale)
     max_width = max(20.0, min(96.0, float(style.get("max_width", 84))))
@@ -194,6 +206,30 @@ def render_caption_png(
         else:
             attrs[ct.kCTForegroundColorAttributeName] = fill_color
         built.addAttributes_range_(attrs, built_range)
+
+        if translation_range is not None:
+            # Smaller and quieter: it supports the spoken line rather than
+            # competing with it. It keeps the same outline, because it sits
+            # on the same moving picture and needs the same legibility.
+            start, end = translation_range
+            sub = {
+                ct.kCTFontAttributeName: ct.CTFontCreateCopyWithAttributes(
+                    base_font, font_size * TRANSLATION_SCALE, None, None
+                )
+            }
+            if pass_kind == "fill":
+                sub[ct.kCTForegroundColorAttributeName] = _cg_color(
+                    quartz, str(style.get("translation_color") or "#DCD6CA")
+                )
+            else:
+                # Stroke width is a share of each run's own size, so the same
+                # share on a smaller line reads as equally bold — two
+                # headlines instead of a line and its support.
+                sub[ct.kCTStrokeWidthAttributeName] = (
+                    stroke_width * 2.0 * TRANSLATION_STROKE
+                    / (font_size * TRANSLATION_SCALE) * 100.0
+                )
+            built.addAttributes_range_(sub, foundation.NSMakeRange(start, end - start))
 
         nonlocal max_span_scale
         for span in overlay.get("effect_spans") or []:

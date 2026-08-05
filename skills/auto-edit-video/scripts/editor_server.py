@@ -2103,6 +2103,15 @@ def upgrade_editor_state_layout_effects(project_dir: Path, state: dict[str, Any]
 BURNED_IN_SETTING_VALUES = ("auto", "yes", "no")
 
 
+def caption_translations(project_dir: Path) -> dict[str, str]:
+    """Spoken line -> second-line translation, empty when none was made."""
+    try:
+        import caption_translator
+    except ImportError:
+        return {}
+    return caption_translator.by_caption_text(project_dir)
+
+
 def active_editorial_title(state: dict[str, Any]) -> str:
     """The editorial name of the cut being worked on, if a model wrote one."""
     active_id = str(state.get("active_highlight_id") or "")
@@ -2198,6 +2207,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
     # agree, or the first caption a project gets depends on which code made it.
     caption_source = transcript.get("caption_segments") or transcript.get("segments", [])
     render_captions, caption_reason = caption_render_decision(project_dir, manifest)
+    translations = caption_translations(project_dir)
     if not render_captions:
         caption_source = []
     for index, segment in enumerate(caption_source, start=1):
@@ -2229,6 +2239,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
                 "style": dict(caption_style),
                 "source": "working/transcript_words.json",
                 "provenance": "local-whisper draft; requires transcript review",
+                **({"translation": translations[text]} if text in translations else {}),
             }
         )
     design_overlays: list[dict[str, Any]] = []

@@ -2529,6 +2529,10 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
     # Same decision as the bootstrap path, made by the same function: a
     # project that skips captions must not have them reappear on re-sync.
     render_captions, caption_reason = caption_render_decision(project_dir, manifest)
+    # Both places that build caption overlays attach translations, or the
+    # second line appears and disappears depending on which one ran last.
+    from editor_server import caption_translations
+    translations = caption_translations(project_dir)
     director_id = str(state.get("director_style") or "teacher-punch")
     director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
     caption_style = dict(state.get("caption_defaults") or director["caption"])
@@ -2602,6 +2606,7 @@ def sync_transcript_to_editor(project_dir: Path) -> int:
                 "style": dict(caption_style),
                 "source": "working/transcript_words.json",
                 "provenance": "local-whisper draft; requires transcript review",
+                **({"translation": translations[text]} if text in translations else {}),
                 "semantic_review": (
                     {
                         "status": "pending",
