@@ -39,6 +39,13 @@ DEFAULT_TIMEOUT_S = 600
 MAX_TRANSCRIPT_CHARS = 60000
 MAX_TITLE_CHARS = 24
 MIN_HOOK_CHARS = 4
+MIN_KEYWORDS = 3
+MAX_KEYWORDS = 6
+# A keyword is a term, not a clause. Long enough to mean something, short
+# enough that emphasising it does not just recolour the whole line.
+MIN_KEYWORD_CHARS = 2
+MAX_KEYWORD_CHARS = 8
+MAX_LATIN_KEYWORD_CHARS = 20
 # A hook is quoted speech; allow for punctuation and spacing drift between the
 # model's echo and the transcript, but nothing more.
 _NOISE = re.compile(r"[\s，,。.、！!？?：:；;「」『』\"'（）()\-—…]+")
@@ -97,9 +104,13 @@ def build_prompt(
 - title：你自己下的短標題，{MAX_TITLE_CHARS} 字以內，講這段在講什麼，不要照抄原句
 - hook：這段開頭的**逐字稿原句**，必須一字不差出現在你選的時間範圍內
 - reason：為什麼這段值得單獨發
+- keywords：這段字幕裡該highlight的關鍵詞 {MIN_KEYWORDS}–{MAX_KEYWORDS} 個。
+  每個都必須**一字不差出現在這段的逐字稿裡**，而且要是完整的詞
+  （例如「虛主詞」「不定詞」「單數」「cigar」），不要切一半、不要整句、不要虛詞
 
 只回傳 JSON array，不要 markdown、不要說明文字：
-[{{"title":"短標題","start":0.0,"end":30.0,"hook":"開頭原句","reason":"入選理由"}}]"""
+[{{"title":"短標題","start":0.0,"end":30.0,"hook":"開頭原句","reason":"入選理由",\
+"keywords":["關鍵詞1","關鍵詞2","關鍵詞3"]}}]"""
 
 
 def parse_json_payload(text: str) -> list[dict[str, Any]]:
@@ -199,6 +210,53 @@ def _reply_from_envelope(envelope: Any) -> str | None:
     return None
 
 
+_CJK = re.compile(r"[㐀-鿿]")
+
+
+def keyword_length_ok(term: str) -> bool:
+    """Is this a term rather than a clause?
+
+    Eight CJK characters is a sentence fragment; nine Latin letters is still
+    one word ("cigarette"). Measuring both on one ruler either lets Chinese
+    clauses through or throws English words away.
+    """
+    if len(term) < MIN_KEYWORD_CHARS:
+        return False
+    if _CJK.search(term):
+        return len(term) <= MAX_KEYWORD_CHARS
+    return len(term) <= MAX_LATIN_KEYWORD_CHARS and len(term.split()) <= 2
+
+
+def ground_keywords(raw: Any, spoken: str) -> tuple[list[str], list[str]]:
+    """Keep the keywords the cut actually says; report the ones it does not.
+
+    Emphasis is the one place a wrong word is worse than no word: it points
+    the eye at something and asserts it matters. A term the speaker never
+    said would be highlighted in someone else's sentence.
+    """
+    if not isinstance(raw, list):
+        return [], []
+    kept: list[str] = []
+    dropped: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        term = str(value or "").strip()
+        if not term or not keyword_length_ok(term):
+            if term:
+                dropped.append(term)
+            continue
+        if term.casefold() in seen:
+            continue
+        if term not in spoken:
+            dropped.append(term)
+            continue
+        seen.add(term.casefold())
+        kept.append(term)
+        if len(kept) >= MAX_KEYWORDS:
+            break
+    return kept, dropped
+
+
 def snap_to_clauses(
     clauses: list[dict[str, Any]], start: float, end: float
 ) -> list[dict[str, Any]]:
@@ -269,6 +327,12 @@ def ground_proposals(
             warnings.append(f"dropped {label!r}: title is empty")
             continue
 
+        keywords, dropped = ground_keywords(proposal.get("keywords"), spoken)
+        if dropped:
+            warnings.append(
+                f"{label!r}: ignored keywords not spoken in the cut: {dropped[:5]}"
+            )
+
         snapped_start = round(float(window[0]["start"]), 3)
         snapped_end = round(float(window[-1]["end"]), 3)
         grounded.append(
@@ -281,6 +345,7 @@ def ground_proposals(
                     "title": title,
                     "hook": hook,
                     "reason": str(proposal["reason"]).strip()[:400],
+                    "keywords": keywords,
                     "is_editorial_copy": True,
                     "generator": GENERATOR,
                 },

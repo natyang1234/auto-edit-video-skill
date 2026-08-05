@@ -99,6 +99,54 @@ class GroundingTests(unittest.TestCase):
         self.assertTrue(any("kept the first 1" in w for w in warnings))
 
 
+class KeywordGroundingTests(unittest.TestCase):
+    SPOKEN = "所以呢雪茄叫做 cigar 它是大隻的小隻的叫做香菸 cigarette 都一樣不好"
+
+    def ground(self, terms: list) -> tuple[list[str], list[str]]:
+        return ep.ground_keywords(terms, self.SPOKEN)
+
+    def test_terms_the_cut_says_are_kept_in_order(self) -> None:
+        kept, dropped = self.ground(["雪茄", "cigar", "香菸"])
+        self.assertEqual(kept, ["雪茄", "cigar", "香菸"])
+        self.assertEqual(dropped, [])
+
+    def test_a_term_the_cut_never_says_is_dropped(self) -> None:
+        # Emphasis points the eye and asserts the word matters. Highlighting
+        # a word the speaker never said is worse than highlighting nothing.
+        kept, dropped = self.ground(["cigar", "電子菸"])
+        self.assertEqual(kept, ["cigar"])
+        self.assertEqual(dropped, ["電子菸"])
+
+    def test_a_whole_clause_is_not_a_keyword(self) -> None:
+        kept, dropped = self.ground(["它是大隻的小隻的叫做"])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped, ["它是大隻的小隻的叫做"])
+
+    def test_an_english_word_is_not_measured_by_the_chinese_ruler(self) -> None:
+        # "cigarette" is nine characters and one word. Eight CJK characters
+        # is a sentence fragment. One length limit cannot serve both.
+        kept, _ = self.ground(["cigarette"])
+        self.assertEqual(kept, ["cigarette"])
+
+    def test_case_duplicates_collapse(self) -> None:
+        kept, _ = self.ground(["cigar", "CIGAR"])
+        self.assertEqual(kept, ["cigar"])
+
+    def test_the_count_is_capped(self) -> None:
+        kept, _ = self.ground(["雪茄", "cigar", "香菸", "cigarette", "大隻", "小隻", "一樣"])
+        self.assertLessEqual(len(kept), ep.MAX_KEYWORDS)
+
+    def test_missing_keywords_are_not_an_error(self) -> None:
+        self.assertEqual(ep.ground_keywords(None, self.SPOKEN), ([], []))
+
+    def test_grounded_cuts_carry_their_keywords(self) -> None:
+        kept, _ = ep.ground_proposals(
+            [proposal(keywords=["虛主詞", "不存在的詞", "單數"])],
+            LESSON, duration_s=30.0, min_duration=8.0, max_duration=60.0, count=8,
+        )
+        self.assertEqual(kept[0]["editorial"]["keywords"], ["單數"])
+
+
 class PlanItemTests(unittest.TestCase):
     def test_the_item_title_stays_an_exact_transcript_extract(self) -> None:
         # The highlight-plan contract requires it; the editorial wording is

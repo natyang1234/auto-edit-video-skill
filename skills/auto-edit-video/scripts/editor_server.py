@@ -1896,6 +1896,9 @@ def artifact_plan_overlays(
     return overlays
 
 
+MAX_CAPTION_EMPHASIS_SPANS = 3
+
+
 def extract_effect_keywords(values: list[Any]) -> list[str]:
     """Extract reusable exact-match terms from reviewed highlight/card copy."""
     keywords: set[str] = set()
@@ -1943,6 +1946,21 @@ def effect_keywords_for_caption(state: dict[str, Any], start: float, end: float)
         and float(item.get("end", 0.0)) > start
         and float(item.get("start", 0.0)) < end
     ]
+    # A model that read the cut named its key terms and every one of them was
+    # checked against what is spoken there. Those beat enumerating substrings
+    # of a title, which yields fragments like a word cut in half.
+    editorial_terms: list[str] = []
+    for item in matching:
+        editorial = item.get("editorial")
+        if isinstance(editorial, dict) and editorial.get("is_editorial_copy"):
+            editorial_terms.extend(
+                str(term) for term in (editorial.get("keywords") or []) if str(term).strip()
+            )
+    if editorial_terms:
+        return sorted(
+            dict.fromkeys(editorial_terms),
+            key=lambda term: (-len(term), term.casefold()),
+        )
     highlight_ids = {str(item.get("id") or "") for item in matching}
     sources: list[Any] = [item.get("title") for item in matching]
     for overlay in state.get("overlays", []):
@@ -1961,6 +1979,7 @@ def caption_effect_spans(
     end: float,
     color: str,
     keywords: list[str] | None = None,
+    max_spans: int = MAX_CAPTION_EMPHASIS_SPANS,
 ) -> list[dict[str, Any]]:
     """Map transcript-grounded emphasis proposals onto exact caption character ranges."""
     spans: list[dict[str, Any]] = []
@@ -1998,7 +2017,7 @@ def caption_effect_spans(
             }
         )
     for keyword_index, phrase in enumerate(keywords or [], start=1):
-        if len(spans) >= 2:
+        if len(spans) >= max_spans:
             break
         matched_phrase = phrase
         offset = text.find(matched_phrase)
@@ -2015,7 +2034,11 @@ def caption_effect_spans(
         if any(offset < used_end and span_end > used_start for used_start, used_end in occupied):
             continue
         occupied.append((offset, span_end))
-        effect = "pop" if len(spans) % 2 == 0 else "highlight"
+        # Every keyword gets the same treatment. Alternating in a backdrop
+        # marker meant the second term kept the base text colour, so however
+        # many terms a line carried, exactly one of them ever read as
+        # emphasised.
+        effect = "pop"
         spans.append(
             {
                 "id": f"keyword-fx-{keyword_index:04d}",
@@ -2031,11 +2054,13 @@ def caption_effect_spans(
             }
         )
     spans.sort(key=lambda item: (item["start_char"], item["end_char"]))
-    for index, span in enumerate(spans):
-        effect = "pop" if index % 2 == 0 else "highlight"
+    for span in spans:
+        # Reading order used to decide the effect, so on any line the second
+        # term became a backdrop marker that keeps the base text colour: two
+        # keywords went in and one came out looking emphasised.
         if span.get("source") != "working/emphasis_plan.json":
-            span["style"]["effect"] = effect
-            span["style"]["font_scale"] = 1.18 if effect == "pop" else 1.08
+            span["style"]["effect"] = "pop"
+            span["style"]["font_scale"] = 1.18
     return spans
 
 

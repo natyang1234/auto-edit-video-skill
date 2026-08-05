@@ -35,6 +35,7 @@ from editor_server import (  # noqa: E402
     caption_effect_spans,
     editor_state_revision,
     extract_effect_keywords,
+    MAX_CAPTION_EMPHASIS_SPANS,
     gate_revision,
     migrate_editor_state_v1_to_v2,
     render_download_errors,
@@ -159,8 +160,11 @@ class CaptionEffectModelTests(unittest.TestCase):
             keywords,
         )
         self.assertEqual([item["text"] for item in spans], ["It", "to V"])
-        self.assertEqual({item["style"]["effect"] for item in spans}, {"pop", "highlight"})
-        self.assertLessEqual(len(spans), 2)
+        # Every keyword has to read as emphasised. Alternating the effect by
+        # reading order meant the second term became a backdrop marker that
+        # keeps the base text colour, so a line with two keywords showed one.
+        self.assertEqual({item["style"]["effect"] for item in spans}, {"pop"})
+        self.assertLessEqual(len(spans), MAX_CAPTION_EMPHASIS_SPANS)
 
     def test_keyword_matching_keeps_natural_chinese_de_in_caption_range(self) -> None:
         spans = caption_effect_spans(
