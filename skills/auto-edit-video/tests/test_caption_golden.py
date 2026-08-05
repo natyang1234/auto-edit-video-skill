@@ -168,7 +168,10 @@ class CaptionGoldenTests(unittest.TestCase):
                     "style": {
                         "font_size": 40,
                         "color": "#F7F2E8",
-                        "stroke_width": 0,
+                        # Ship-realistic outline. A centred stroke eats inward,
+                        # so anything above 0 is where fill survival is decided.
+                        "stroke_width": 5,
+                        "stroke_color": "#17130F",
                         "x": 50,
                         "y": 50,
                         "animation": "fade",

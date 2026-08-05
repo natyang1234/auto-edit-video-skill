@@ -166,52 +166,66 @@ def render_caption_png(
     font_file = Path(font_binding["path"])
     base_font = _make_base_font(ct, font_size, font_file)
 
-    attributed = foundation.NSMutableAttributedString.alloc().initWithString_(text)
-    full_range = foundation.NSMakeRange(0, attributed.length())
     stroke_width = float(style.get("stroke_width", 3)) * render_scale
-    base_attrs = {
-        ct.kCTFontAttributeName: base_font,
-        ct.kCTForegroundColorAttributeName: _cg_color(
-            quartz, str(style.get("color") or "#F7F2E8")
-        ),
-    }
-    if stroke_width > 0:
-        # Negative stroke = fill + stroke; width is relative % of font size.
-        base_attrs[ct.kCTStrokeWidthAttributeName] = -(stroke_width / font_size * 100.0)
-        base_attrs[ct.kCTStrokeColorAttributeName] = _cg_color(
-            quartz, str(style.get("stroke_color") or "#17130F")
-        )
-    attributed.addAttributes_range_(base_attrs, full_range)
+    stroke_color = _cg_color(quartz, str(style.get("stroke_color") or "#17130F"))
+    fill_color = _cg_color(quartz, str(style.get("color") or "#F7F2E8"))
 
     max_span_scale = 1.0
-    for span in overlay.get("effect_spans") or []:
-        span_style = span.get("style") or {}
-        start = int(span.get("start_char", 0))
-        end = int(span.get("end_char", 0))
-        if end <= start or end > attributed.length():
-            continue
-        span_range = foundation.NSMakeRange(start, end - start)
-        scale = max(0.5, min(3.0, float(span_style.get("font_scale", 1.0))))
-        max_span_scale = max(max_span_scale, scale)
-        effect_kind = str(span_style.get("effect") or "pop")
-        if effect_kind == "highlight":
-            # Highlight = backdrop marker: keep the base text colour and
-            # paint a translucent pill behind the span (drawn below).
-            span_attrs = {}
+
+    def build_attributed(pass_kind: str):
+        """One attributed string per drawing pass.
+
+        CoreText centres a stroke on the glyph outline, so a stroke wide
+        enough to read against video eats inward until it swallows the fill
+        of thin CJK strokes entirely.  Draw the outline first at double
+        width, then lay the fill over its inner half: what survives is a
+        true outside-only outline.
+        """
+        built = foundation.NSMutableAttributedString.alloc().initWithString_(text)
+        built_range = foundation.NSMakeRange(0, built.length())
+        attrs = {ct.kCTFontAttributeName: base_font}
+        if pass_kind == "stroke":
+            # Positive stroke width = stroke only, no fill.
+            attrs[ct.kCTStrokeWidthAttributeName] = (
+                stroke_width * 2.0 / font_size * 100.0
+            )
+            attrs[ct.kCTStrokeColorAttributeName] = stroke_color
+            attrs[ct.kCTForegroundColorAttributeName] = stroke_color
         else:
-            span_attrs = {
-                ct.kCTForegroundColorAttributeName: _cg_color(
+            attrs[ct.kCTForegroundColorAttributeName] = fill_color
+        built.addAttributes_range_(attrs, built_range)
+
+        nonlocal max_span_scale
+        for span in overlay.get("effect_spans") or []:
+            span_style = span.get("style") or {}
+            start = int(span.get("start_char", 0))
+            end = int(span.get("end_char", 0))
+            if end <= start or end > built.length():
+                continue
+            span_range = foundation.NSMakeRange(start, end - start)
+            scale = max(0.5, min(3.0, float(span_style.get("font_scale", 1.0))))
+            max_span_scale = max(max_span_scale, scale)
+            effect_kind = str(span_style.get("effect") or "pop")
+            span_attrs: dict[Any, Any] = {}
+            if pass_kind == "fill" and effect_kind != "highlight":
+                # Highlight = backdrop marker: keep the base text colour and
+                # paint a translucent pill behind the span (drawn below).
+                span_attrs[ct.kCTForegroundColorAttributeName] = _cg_color(
                     quartz, str(span_style.get("color") or "#FF5533")
                 )
-            }
-        if scale != 1.0:
-            span_attrs[ct.kCTFontAttributeName] = ct.CTFontCreateCopyWithAttributes(
-                base_font, font_size * scale, None, None
-            )
-        if span_style.get("effect") == "underline":
-            span_attrs[ct.kCTUnderlineStyleAttributeName] = ct.kCTUnderlineStyleSingle
-        attributed.addAttributes_range_(span_attrs, span_range)
+            if scale != 1.0:
+                span_attrs[ct.kCTFontAttributeName] = ct.CTFontCreateCopyWithAttributes(
+                    base_font, font_size * scale, None, None
+                )
+            if pass_kind == "fill" and span_style.get("effect") == "underline":
+                span_attrs[ct.kCTUnderlineStyleAttributeName] = ct.kCTUnderlineStyleSingle
+            if span_attrs:
+                built.addAttributes_range_(span_attrs, span_range)
+        return built
 
+    # Layout is identical across passes: stroke width does not change glyph
+    # advances, so the fill lands exactly on top of its own outline.
+    attributed = build_attributed("fill")
     framesetter = ct.CTFramesetterCreateWithAttributedString(attributed)
     constraint = quartz.CGSizeMake(frame_width, 100000.0)
     fitted, _ = ct.CTFramesetterSuggestFrameSizeWithConstraints(
@@ -284,6 +298,14 @@ def render_caption_png(
                     ),
                 )
 
+    if stroke_width > 0:
+        stroke_frame = ct.CTFramesetterCreateFrame(
+            ct.CTFramesetterCreateWithAttributedString(build_attributed("stroke")),
+            foundation.NSMakeRange(0, 0),
+            path,
+            None,
+        )
+        ct.CTFrameDraw(stroke_frame, context)
     ct.CTFrameDraw(frame, context)
 
     # Glyph-run font accounting (plan v2 B2): map every run back to a
