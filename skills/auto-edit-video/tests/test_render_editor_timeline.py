@@ -58,3 +58,61 @@ class ProjectFontResolverTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "unavailable"):
                 font_path(self.project, {"caption_defaults": {"font_asset_id": asset_id}})
+
+
+class CardMotionTests(unittest.TestCase):
+    """Cards arrive the way their component says they should."""
+
+    def setUp(self) -> None:
+        import structured_card_compositor
+
+        self.pack = structured_card_compositor.load_default_pack()
+        self.layers = {
+            "items": [
+                {"id": "L-progress", "type": "stat", "component_id": "progress"},
+                {"id": "L-carousel", "type": "dynamic_list", "component_id": "carousel-grid"},
+                {"id": "L-lockup", "type": "title", "component_id": "title-lockup"},
+            ]
+        }
+
+    def test_each_component_gets_the_motion_its_pack_declares(self) -> None:
+        from render_editor_timeline import motion_for_layer
+
+        self.assertEqual(motion_for_layer(self.pack, self.layers, "L-progress"), "slide-in")
+        self.assertEqual(motion_for_layer(self.pack, self.layers, "L-carousel"), "pan")
+        self.assertEqual(motion_for_layer(self.pack, self.layers, "L-lockup"), "slide-up")
+
+    def test_an_unknown_layer_still_renders(self) -> None:
+        from render_editor_timeline import motion_for_layer
+
+        self.assertEqual(motion_for_layer(self.pack, self.layers, "nope"), "fade")
+
+    def test_content_animations_are_approximated_and_marked_as_such(self) -> None:
+        # Digits counting up or a page turning cannot be done by moving a
+        # finished image; those take the nearest entrance and are not claimed
+        # to be faithful.
+        from render_editor_timeline import resolve_motion
+
+        for preset in ("count-up", "word-cascade", "staggered-reveal", "flip", "fill"):
+            with self.subTest(preset):
+                animation, faithful = resolve_motion(preset)
+                self.assertIn(animation, {"fade", "pop", "slide-in", "slide-up", "pan"})
+                self.assertFalse(faithful)
+        for preset in ("slide-in", "slide-up", "pan", "check-pop"):
+            with self.subTest(preset):
+                self.assertTrue(resolve_motion(preset)[1])
+
+    def test_horizontal_motion_reaches_the_filter(self) -> None:
+        from render_editor_timeline import image_filter
+
+        overlay = {
+            "id": "o1",
+            "type": "image",
+            "source": "card.png",
+            "start": 1.0,
+            "end": 4.0,
+            "style": {"width": 84.0, "x": 50, "y": 46, "animation": "slide-in"},
+        }
+        built = image_filter("in", "out", "asset", overlay, 1080, 1920)
+        self.assertIn("overlay=x=", built)
+        self.assertIn("if(lt(t,", built.split("overlay=x=")[1][:80])

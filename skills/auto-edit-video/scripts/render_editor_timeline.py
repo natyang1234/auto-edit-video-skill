@@ -209,6 +209,51 @@ def wrap_overlay_text(text: str, width: int, style: dict[str, Any], render_scale
     return "\n".join(textwrap.wrap(compact, width=max(chars, 8), break_long_words=False))
 
 
+# What each style-pack preset asks for, expressed as motion this pipeline can
+# apply to a finished card. Presets that animate a card's *contents* — digits
+# counting, words arriving one by one, a page turning — cannot be done by
+# moving a finished image, so they take the closest entrance instead and say
+# so in the render receipt rather than pretending.
+MOTION_PRESETS = {
+    "slide-in": ("slide-in", True),
+    "slide-up": ("slide-up", True),
+    "fade-up": ("slide-up", True),
+    "pan": ("pan", True),
+    "check-pop": ("pop", True),
+    "fade": ("fade", True),
+    "count-up": ("pop", False),
+    "word-cascade": ("fade", False),
+    "staggered-reveal": ("fade", False),
+    "fill": ("slide-in", False),
+    "flip": ("pop", False),
+}
+MOTION_ANIMATIONS = {"fade", "pop", "slide-up", "slide-in", "pan"}
+
+
+def motion_for_layer(pack: dict[str, Any], layers: dict[str, Any], layer_id: str) -> str:
+    """The animation this card's component asks for."""
+    import structured_card_compositor
+
+    layer = next(
+        (item for item in layers.get("items", []) if item.get("id") == layer_id), None
+    )
+    if layer is None:
+        return "fade"
+    try:
+        component = structured_card_compositor.resolve_component(
+            pack, str(layer.get("type")), layer.get("component_id")
+        )
+    except ValueError:
+        return "fade"
+    preset = (component.get("motion") or {}).get("preset")
+    return resolve_motion(preset)[0]
+
+
+def resolve_motion(preset: str | None) -> tuple[str, bool]:
+    """The animation to apply, and whether it is what the preset asked for."""
+    return MOTION_PRESETS.get(str(preset or ""), ("fade", False))
+
+
 def motion_values(
     style: dict[str, Any],
     start: float,
@@ -218,7 +263,7 @@ def motion_values(
 ) -> tuple[str, str | None]:
     """Return FFmpeg y/alpha expressions matching the live editor motions."""
     animation = str(style.get("animation", "none"))
-    if animation not in {"fade", "pop", "slide-up"}:
+    if animation not in MOTION_ANIMATIONS:
         return base_y, None
     duration = max(0.01, end - start)
     fade_duration = min(0.18, max(0.01, duration * 0.22))
@@ -232,6 +277,9 @@ def motion_values(
         return base_y, alpha
     motion_duration = min(0.22, max(0.01, duration * 0.28))
     motion_end = start + motion_duration
+    if animation in {"slide-in", "pan"}:
+        # Horizontal motion; the vertical position holds.
+        return base_y, alpha
     motion_offset = offset if animation == "slide-up" else offset * 0.35
     y = (
         f"if(lt(t,{motion_end:.3f}),({base_y})+"
@@ -307,6 +355,18 @@ def image_filter(
     end = max(start + 0.01, float(overlay.get("end", start + 0.01)))
     y, _alpha = motion_values(style, start, end, base_y, max(12.0, height * 0.04))
     duration = max(0.01, end - start)
+    animation_name = str(style.get("animation", "none"))
+    if animation_name == "slide-in":
+        travel = max(24.0, width * 0.05)
+        enter = min(0.28, max(0.05, duration * 0.3))
+        x = (
+            f"if(lt(t,{start + enter:.3f}),({x})-"
+            f"({start + enter:.3f}-t)/{enter:.3f}*{travel:.3f},({x}))"
+        )
+    elif animation_name == "pan":
+        # A slow drift across the whole hold, which is what a carousel does.
+        drift = max(16.0, width * 0.03)
+        x = f"({x})+({drift:.3f}*min(1,max(0,(t-{start:.3f})/{duration:.3f}))-{drift / 2:.3f})"
     fade_duration = min(0.18, max(0.01, duration * 0.22))
     animation = str(style.get("animation", "none"))
     scaled = f"{output_label}_asset"
@@ -314,7 +374,7 @@ def image_filter(
         f"[{asset_label}]scale={asset_width}:-2,format=rgba,"
         f"setpts=PTS-STARTPTS+{start:.3f}/TB"
     )
-    if animation in {"fade", "pop", "slide-up"}:
+    if animation in MOTION_ANIMATIONS:
         asset_filters += (
             f",fade=t=in:st={start:.3f}:d={fade_duration:.3f}:alpha=1"
             f",fade=t=out:st={max(start, end - fade_duration):.3f}:"
@@ -631,7 +691,12 @@ def build_render_command(
                                     "width": 84.0,
                                     "x": 50,
                                     "y": 46,
-                                    "animation": "fade",
+                                    # The style pack says how this component
+                                    # should arrive; every card fading in
+                                    # regardless was the pack going unread.
+                                    "animation": motion_for_layer(
+                                        resolved_pack, layers_bundle, layer_ref
+                                    ),
                                 },
                             }
                         )
