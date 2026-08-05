@@ -38,7 +38,9 @@
        "dynamic_list",
        "note",
        "chip",
-       "statement"
+       "statement",
+       "broll",
+       "image"
       ]
      },
      "payload": {

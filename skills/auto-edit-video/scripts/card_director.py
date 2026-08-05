@@ -38,7 +38,18 @@ KIND_GUIDE = """- note：講到某個東西／工具／紀錄時，用小卡把�
 - stat：講到一個帶單位的量值時。payload：{"value":"30 分鐘","label":"在說什麼"}"""
 
 
-def build_prompt(view: str, *, duration_s: float, budget: int) -> str:
+def build_prompt(
+    view: str, *, duration_s: float, budget: int, assets: dict[str, str] | None = None
+) -> str:
+    asset_block = ""
+    if assets:
+        listed = "\n".join(f"  - {name}" for name in assets)
+        asset_block = f"""
+- image：這個專案的資料夾裡帶了這些圖，講到相關的東西時可以直接放上畫面。
+  只能用下面列出來的檔名，不可以自己編：
+{listed}
+  payload：{{"asset":"上面其中一個檔名"}}
+"""
     return f"""你是短影音美術。這是一支影片的逐字稿，附時間碼：
 
 {view}
@@ -47,7 +58,7 @@ def build_prompt(view: str, *, duration_s: float, budget: int) -> str:
 卡是用來把講到的東西具象化，不是把字幕再寫一次。寧可少給也不要每句都配。
 
 可用的卡種類：
-{KIND_GUIDE}
+{KIND_GUIDE}{asset_block}
 
 每一筆要有：
 - at：卡出現的秒數（0–{duration_s:.3f}）
@@ -64,12 +75,55 @@ def build_prompt(view: str, *, duration_s: float, budget: int) -> str:
 "quote":"我就把自己錄起來","reason":"把抽象動作變成看得見的東西"}}]"""
 
 
+def project_assets(project_dir) -> dict[str, str]:
+    """{name the model sees: path the renderer opens}.
+
+    Two different paths describe the same picture. The inventory records
+    where it sat in the author's folder; ingest copies it into the project
+    under a content-addressed name, and that copy is the one the renderer
+    can open. Handing the model the folder path produced a plan pointing at
+    a file that is not there — and the renderer drew nothing, silently.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(project_dir)
+    inventory = root / "working/folder_inventory.json"
+    provenance = root / "working/asset_provenance.json"
+    if not inventory.is_file() or not provenance.is_file():
+        return {}
+    try:
+        files = json.loads(inventory.read_text(encoding="utf-8"))
+        owned = json.loads(provenance.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+    landed = {
+        str(item.get("sha256")): str(item.get("path"))
+        for item in owned.get("items", [])
+        if item.get("sha256") and item.get("path")
+    }
+    main_video = str(files.get("main_video_path") or "")
+    assets: dict[str, str] = {}
+    for entry in files.get("files", []):
+        name = str(entry.get("path") or "")
+        # The footage being cut is not something to cut away to.
+        if not name or name == main_video:
+            continue
+        if str(entry.get("kind")) not in {"image", "gif", "video"}:
+            continue
+        path = landed.get(str(entry.get("sha256")))
+        if path and (root / path).is_file():
+            assets[name] = path
+    return assets
+
+
 def ground_cards(
     proposals: list[dict[str, Any]],
     clauses: list[dict[str, Any]],
     *,
     duration_s: float,
     budget: int,
+    available_assets: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Keep the cards the video actually supports; say why the rest went."""
     notes: list[str] = []
@@ -90,13 +144,24 @@ def ground_cards(
             continue
 
         kind = str(proposal.get("kind") or "")
-        if kind not in card_plan.DRAWABLE_KINDS:
+        if kind not in card_plan.DRAWABLE_KINDS and kind not in card_plan.ASSET_KINDS:
             notes.append(f"dropped {label}: {kind!r} is not a card this can draw")
             continue
         payload = proposal.get("payload")
         if not isinstance(payload, dict) or not payload:
             notes.append(f"dropped {label}: no payload")
             continue
+        if kind in card_plan.ASSET_KINDS:
+            # The model can only show a picture the project actually has,
+            # and it names it the way the author does. Translate that to the
+            # copy the renderer can open — passing the folder name straight
+            # through pointed at a file that is not in the project.
+            asset = str(payload.get("asset") or "").strip()
+            landed = (available_assets or {}).get(asset)
+            if not landed:
+                notes.append(f"dropped {label}: {asset!r} is not in this project")
+                continue
+            payload = dict(payload, asset=landed, name=asset)
 
         spoken = "".join(
             str(clause.get("text", ""))
@@ -148,6 +213,7 @@ def propose_cards(
     transcript: dict[str, Any],
     *,
     duration_s: float,
+    assets: dict[str, str] | None = None,
     provider: tuple[str, ...] = editorial_planner.DEFAULT_PROVIDER,
     timeout_s: int = editorial_planner.DEFAULT_TIMEOUT_S,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -162,6 +228,7 @@ def propose_cards(
         editorial_planner.transcript_view(transcript),
         duration_s=duration_s,
         budget=budget,
+        assets=assets,
     )
     proposals = editorial_planner.parse_json_payload(
         editorial_planner.call_provider(prompt, provider=provider, timeout_s=timeout_s)
@@ -169,7 +236,8 @@ def propose_cards(
     if not proposals:
         raise EditorialUnavailable("the model proposed no cards")
     cards, notes = ground_cards(
-        proposals, clauses, duration_s=duration_s, budget=budget
+        proposals, clauses, duration_s=duration_s, budget=budget,
+        available_assets=assets,
     )
     if not cards:
         raise EditorialUnavailable(
@@ -199,6 +267,7 @@ def main() -> int:
         cards, notes = propose_cards(
             transcript,
             duration_s=float(source.get("duration_s") or 0.0),
+            assets=project_assets(project_dir),
             provider=tuple(shlex.split(args.provider))
             if args.provider
             else editorial_planner.DEFAULT_PROVIDER,

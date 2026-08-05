@@ -31,6 +31,9 @@ ORIGIN_RANK = {"manual": 0, "model": 1, "director": 2}
 DRAWABLE_KINDS = (
     "title", "stat", "chart", "dynamic_list", "note", "chip", "statement",
 )
+# Kinds whose content is a file already in the project rather than something
+# the compositor draws.
+ASSET_KINDS = ("broll", "image")
 # The threshold lives in the contract so every producer meets the same one.
 MIN_CARD_SECONDS = contract_registry.CARD_MIN_SECONDS
 
@@ -203,6 +206,32 @@ def to_layer_bundle(
     items: list[dict[str, Any]] = []
     for index, card in enumerate(plan.get("items", [])):
         kind = str(card.get("kind"))
+        if kind in ASSET_KINDS:
+            # A picture from the folder, shown as itself. There is no layer to
+            # compose: the file is the content, so the plan points at it and
+            # the renderer draws it.
+            asset = str((card.get("payload") or {}).get("asset") or "").strip()
+            if not asset:
+                raise ValueError(f"card {card.get('id')} names no asset to show")
+            items.append(
+                {
+                    "id": "visual-beat-" + contract_registry.canonical_hash(
+                        [card["id"], index]
+                    )[:12],
+                    "highlight_id": highlight_id or (
+                        "highlight-" + contract_registry.canonical_hash([card["id"]])[:12]
+                    ),
+                    "start": float(card["start"]),
+                    "end": float(card["end"]),
+                    "beat": kind,
+                    "structured_layer_id": None,
+                    "selected_asset": asset,
+                    "conceptual_only": False,
+                    "evidence_ids": list(card.get("evidence_ids") or []),
+                    "review_status": "pending",
+                }
+            )
+            continue
         if kind not in DRAWABLE_KINDS:
             raise ValueError(
                 f"card {card.get('id')} is a {kind!r} card, which this renderer "

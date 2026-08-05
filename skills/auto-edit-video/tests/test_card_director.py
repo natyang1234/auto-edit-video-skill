@@ -116,5 +116,139 @@ class BudgetTests(unittest.TestCase):
         self.assertLessEqual(director.card_budget(6000.0), director.MAX_CARDS)
 
 
+class AssetCardTests(unittest.TestCase):
+    """A picture card can only show a picture the project owns."""
+
+    # {what the author calls it: what the renderer opens}
+    ASSETS = {
+        "店門口.png": "assets/imported/aaaa-店門口.png",
+        "招牌.jpg": "assets/imported/bbbb-招牌.jpg",
+    }
+
+    def ground(self, *items: dict):
+        return director.ground_cards(
+            list(items), SPOKEN, duration_s=24.0, budget=8,
+            available_assets=self.ASSETS,
+        )
+
+    def test_a_picture_the_project_has_is_kept(self) -> None:
+        cards, _ = self.ground(proposal(kind="image", payload={"asset": "店門口.png"}))
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["kind"], "image")
+
+    def test_the_plan_points_at_the_copy_the_renderer_can_open(self) -> None:
+        # The model names the picture the way the author does; ingest copied
+        # it under a content-addressed name. Passing the author's name
+        # straight through left the plan pointing at a file that is not in
+        # the project, and the renderer drew nothing without complaining.
+        cards, _ = self.ground(proposal(kind="image", payload={"asset": "店門口.png"}))
+        self.assertEqual(cards[0]["payload"]["asset"], self.ASSETS["店門口.png"])
+        self.assertEqual(cards[0]["payload"]["name"], "店門口.png")
+
+    def test_a_filename_the_model_invented_is_dropped(self) -> None:
+        # It would render as a missing file at best, and as somebody else's
+        # picture at worst.
+        cards, notes = self.ground(
+            proposal(kind="image", payload={"asset": "我編的.png"})
+        )
+        self.assertEqual(cards, [])
+        self.assertTrue(any("not in this project" in note for note in notes))
+
+    def test_a_picture_card_with_no_asset_named_is_dropped(self) -> None:
+        cards, notes = self.ground(proposal(kind="image", payload={"title": "沒說是哪張"}))
+        self.assertEqual(cards, [])
+        self.assertTrue(any("not in this project" in note for note in notes))
+
+    def test_a_picture_still_has_to_quote_the_moment(self) -> None:
+        # Same bargain as every other card: the wording may be chosen, the
+        # moment may not be invented.
+        cards, notes = self.ground(
+            proposal(kind="image", payload={"asset": "店門口.png"},
+                     quote="這句話沒有人說過")
+        )
+        self.assertEqual(cards, [])
+        self.assertTrue(any("nothing like that is said" in note for note in notes))
+
+    def test_with_no_assets_a_picture_card_cannot_be_placed(self) -> None:
+        cards, _ = director.ground_cards(
+            [proposal(kind="image", payload={"asset": "店門口.png"})],
+            SPOKEN, duration_s=24.0, budget=8, available_assets={},
+        )
+        self.assertEqual(cards, [])
+
+
+class ProjectAssetTests(unittest.TestCase):
+    """Reading the folder inventory as it is actually written."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.project = Path(tempfile.mkdtemp())
+        (self.project / "working").mkdir(parents=True)
+        (self.project / "assets/imported").mkdir(parents=True)
+
+    def write(self, files: list[dict], main: str = "", landed: list[dict] | None = None) -> None:
+        import json
+        (self.project / "working/folder_inventory.json").write_text(
+            json.dumps({"files": files, "main_video_path": main}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (self.project / "working/asset_provenance.json").write_text(
+            json.dumps({"items": landed or []}, ensure_ascii=False), encoding="utf-8"
+        )
+        for item in landed or []:
+            (self.project / item["path"]).write_bytes(b"x")
+
+    def test_pictures_are_read_from_the_key_the_inventory_uses(self) -> None:
+        # It is "files". Reading "items" — the name most artifacts here use —
+        # returned nothing and silently offered the model no pictures at all,
+        # which looks identical to a folder that had none.
+        self.write(
+            [
+                {"path": "店門口.png", "kind": "image", "sha256": "aa"},
+                {"path": "說明.pdf", "kind": "document", "sha256": "bb"},
+            ],
+            landed=[{"sha256": "aa", "path": "assets/imported/aa-店門口.png"}],
+        )
+        self.assertEqual(
+            director.project_assets(self.project),
+            {"店門口.png": "assets/imported/aa-店門口.png"},
+        )
+
+    def test_the_footage_being_cut_is_not_offered_as_a_cutaway(self) -> None:
+        self.write(
+            [
+                {"path": "original.mp4", "kind": "video", "sha256": "aa"},
+                {"path": "廚房.mp4", "kind": "video", "sha256": "bb"},
+            ],
+            main="original.mp4",
+            landed=[
+                {"sha256": "aa", "path": "assets/imported/aa-original.mp4"},
+                {"sha256": "bb", "path": "assets/imported/bb-廚房.mp4"},
+            ],
+        )
+        self.assertEqual(
+            director.project_assets(self.project),
+            {"廚房.mp4": "assets/imported/bb-廚房.mp4"},
+        )
+
+    def test_a_picture_the_project_did_not_keep_is_not_offered(self) -> None:
+        # Inventoried but never copied in: naming it would plan a card
+        # around a file the renderer cannot open.
+        self.write([{"path": "店門口.png", "kind": "image", "sha256": "aa"}], landed=[])
+        self.assertEqual(director.project_assets(self.project), {})
+
+    def test_no_inventory_means_no_pictures_rather_than_an_error(self) -> None:
+        self.assertEqual(director.project_assets(self.project), {})
+
+    def test_an_unreadable_inventory_means_no_pictures(self) -> None:
+        (self.project / "working/folder_inventory.json").write_text(
+            "{ not json", encoding="utf-8"
+        )
+        (self.project / "working/asset_provenance.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        self.assertEqual(director.project_assets(self.project), {})
+
+
 if __name__ == "__main__":
     unittest.main()
