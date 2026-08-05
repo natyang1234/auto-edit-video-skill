@@ -413,6 +413,37 @@ def render_receipt_index(project_dir: Path) -> tuple[set[str], set[str]]:
     return final_paths, preview_paths
 
 
+def verified_receipt_file(
+    project_dir: Path,
+    relative: str,
+    declared_sha256: str,
+    scope: str,
+    label: str,
+) -> tuple[Path | None, str]:
+    """Resolve one file a delivery receipt vouches for. Returns (path, error).
+
+    Single, batch and variant deliveries each wrote out this same sequence —
+    refuse a symlink, confine to the scope, require the file, require the
+    digest — and had already drifted: one caught OSError from resolution and
+    the other two did not. Nothing reaches that difference today, but three
+    hand-written copies of a delivery gate is how a fourth one ends up
+    missing a step that matters.
+    """
+    if not relative or not re.fullmatch(r"[0-9a-f]{64}", declared_sha256 or ""):
+        return None, f"{label} contract is incomplete"
+    try:
+        if (project_dir / Path(relative)).is_symlink():
+            raise ValueError("must not be a symlink")
+        path = scoped_project_path(project_dir, relative, scope)
+    except (ValueError, OSError):
+        return None, f"{label} escapes its project scope"
+    if not path.is_file():
+        return None, f"{label} is missing"
+    if file_sha256(path) != declared_sha256:
+        return None, f"{label} changed after verification"
+    return path, ""
+
+
 def _variant_report_errors(
     project_dir: Path,
     receipt: dict[str, Any],
@@ -425,19 +456,16 @@ def _variant_report_errors(
     missing, tampered, failing, or generated before the enforced QaPolicy —
     otherwise pre-policy (black/silent) variant finals stay downloadable.
     """
-    report_rel = str(receipt.get("report") or "")
-    declared = str(receipt.get("report_sha256") or "")
-    if not report_rel or not re.fullmatch(r"[0-9a-f]{64}", declared):
-        return [f"variant {variant_id} QA report is missing or does not match its receipt"]
-    try:
-        # Same fence as single/batch: reject a symlinked report outright and
-        # resolve intermediate symlinks, confining the report to qa/.
-        if (project_dir / Path(report_rel)).is_symlink():
-            raise ValueError("QA report must not be a symlink")
-        report_path = scoped_project_path(project_dir, report_rel, "qa")
-    except (ValueError, OSError):
-        return [f"variant {variant_id} QA report is missing or does not match its receipt"]
-    if not report_path.is_file() or file_sha256(report_path) != declared:
+    report_path, failure = verified_receipt_file(
+        project_dir,
+        str(receipt.get("report") or ""),
+        str(receipt.get("report_sha256") or ""),
+        "qa",
+        f"variant {variant_id} QA report",
+    )
+    if failure:
+        # The variant slot answers with one message whatever went wrong, so
+        # a caller cannot probe the project by reading the difference.
         return [f"variant {variant_id} QA report is missing or does not match its receipt"]
     report = read_json(report_path, None)
     if not isinstance(report, dict) or report.get("status") != "pass":
@@ -1357,19 +1385,11 @@ def single_delivery_qa_errors(
         if not relative or not re.fullmatch(r"[0-9a-f]{64}", declared):
             errors.append(f"delivery QA {path_key} contract is incomplete")
             continue
-        try:
-            entry = project_dir / Path(relative)
-            if entry.is_symlink():
-                raise ValueError(f"{path_key} must not be a symlink")
-            path = scoped_project_path(project_dir, relative, scope)
-        except ValueError:
-            errors.append(f"delivery QA {path_key} escapes its project scope")
-            continue
-        if not path.is_file():
-            errors.append(f"delivery QA {path_key} is missing")
-            continue
-        if file_sha256(path) != declared:
-            errors.append(f"delivery QA {path_key} changed after verification")
+        path, failure = verified_receipt_file(
+            project_dir, relative, declared, scope, f"delivery QA {path_key}"
+        )
+        if failure:
+            errors.append(failure)
             continue
         resolved[path_key] = path
 
@@ -1497,19 +1517,12 @@ def batch_delivery_qa_errors(
             if not relative or not re.fullmatch(r"[0-9a-f]{64}", declared):
                 errors.append(f"batch item {clip_id or index} {path_key} contract is incomplete")
                 continue
-            try:
-                entry = project_dir / Path(relative)
-                if entry.is_symlink():
-                    raise ValueError(f"{path_key} must not be a symlink")
-                path = scoped_project_path(project_dir, relative, scope)
-            except ValueError:
-                errors.append(f"batch item {clip_id or index} {path_key} escapes its project scope")
-                continue
-            if not path.is_file():
-                errors.append(f"batch item {clip_id or index} {path_key} is missing")
-                continue
-            if file_sha256(path) != declared:
-                errors.append(f"batch item {clip_id or index} {path_key} changed after verification")
+            path, failure = verified_receipt_file(
+                project_dir, relative, declared, scope,
+                f"batch item {clip_id or index} {path_key}",
+            )
+            if failure:
+                errors.append(failure)
                 continue
             resolved[path_key] = path
 
