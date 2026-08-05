@@ -3156,6 +3156,7 @@ async function deskLoadProviders() {
   const { select, status } = deskProviderElements();
   if (!select || deskProviderStatusLoaded) {
     deskRenderProviderDisclosure();
+    deskWireGenerateImage();
     return;
   }
   if (status) status.textContent = "正在載入開放素材來源…";
@@ -3592,3 +3593,46 @@ function bindProductionDesk() {
 }
 
 bindProductionDesk();
+
+
+function deskWireGenerateImage() {
+  const button = document.getElementById("desk-generate-button");
+  const beatInput = document.getElementById("desk-generate-beat");
+  const promptInput = document.getElementById("desk-generate-prompt");
+  const status = document.getElementById("desk-generate-status");
+  const preview = document.getElementById("desk-generate-preview");
+  if (!button || !beatInput || !promptInput) return;
+
+  button.addEventListener("click", async () => {
+    const beatId = beatInput.value.trim();
+    const prompt = promptInput.value.trim();
+    if (!beatId || !prompt) {
+      if (status) status.textContent = "要填段落 ID 和想要的畫面。";
+      return;
+    }
+    button.disabled = true;
+    if (status) status.textContent = "生成中，第一次大約 40 秒…";
+    try {
+      const payload = await request("/api/generate-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ beat_id: beatId, prompt }),
+      });
+      if (payload && payload.ok === false) throw new Error(payload.error || "生成失敗");
+      const image = payload.image || {};
+      if (status) {
+        status.textContent = image.reused
+          ? "這一段已經有圖了，沿用既有的。"
+          : "生成完成，已存進專案素材。";
+      }
+      if (preview && image.path) {
+        preview.src = `/${image.path}?v=${encodeURIComponent(image.sha256 || "")}`;
+        preview.hidden = false;
+      }
+    } catch (error) {
+      if (status) status.textContent = `生成失敗：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}

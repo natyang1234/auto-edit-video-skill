@@ -56,6 +56,7 @@ from template_catalog import (
 )
 
 
+import generated_images
 import qa_video
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -4398,6 +4399,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/assets/import-provider":
             self.handle_provider_import()
             return
+        if path == "/api/generate-image":
+            self.handle_generate_image()
+            return
         if path == "/api/copy-draft":
             self.handle_copy_draft()
             return
@@ -4593,6 +4597,28 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "approval_revisions": revisions,
             }
         )
+
+    def handle_generate_image(self) -> None:
+        """Make a picture for one beat, or hand back the one it already has."""
+        payload = self.read_json_body()
+        if payload is None:
+            return
+        beat_id = str(payload.get("beat_id") or "").strip()
+        prompt = str(payload.get("prompt") or "").strip()
+        if not beat_id or not prompt:
+            self.send_json({"ok": False, "error": "beat_id and prompt are required"}, status=422)
+            return
+        try:
+            result = generated_images.generate_image(
+                self.server.project_dir, beat_id, prompt
+            )
+        except Exception as exc:  # the bridge drives a browser; it can fail in many ways
+            self.send_json({"ok": False, "error": str(exc)[-400:]}, status=502)
+            return
+        if not result.get("ok") and not result.get("reused"):
+            self.send_json({"ok": False, "error": result.get("reason", "generation failed")}, status=502)
+            return
+        self.send_json({"ok": True, "image": result})
 
     def handle_approval(self) -> None:
         try:

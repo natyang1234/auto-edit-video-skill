@@ -481,6 +481,26 @@
           </details>
           <details id="desk-assets">
             <summary>素材庫與指派</summary>
+            <section class="provider-panel" aria-labelledby="desk-generate-heading">
+              <div class="provider-panel-heading">
+                <div>
+                  <p class="eyebrow">GENERATED IMAGE</p>
+                  <h3 id="desk-generate-heading">生成圖片</h3>
+                </div>
+                <span class="local-chip">用本機瀏覽器生成</span>
+              </div>
+              <label class="field" for="desk-generate-beat">
+                <span>用在哪一段</span>
+                <input id="desk-generate-beat" type="text" placeholder="段落 ID，例如 beat-3" />
+              </label>
+              <label class="field" for="desk-generate-prompt">
+                <span>想要什麼畫面</span>
+                <input id="desk-generate-prompt" type="text" placeholder="深藍底、扁平向量的資料圖卡" />
+              </label>
+              <button class="button button-secondary full-width" id="desk-generate-button" type="button">生成圖片</button>
+              <p class="provider-status" id="desk-generate-status">同一段落只會生一次，改了描述才會重生。</p>
+              <img id="desk-generate-preview" alt="" hidden />
+            </section>
             <section class="provider-panel" aria-labelledby="desk-provider-heading">
               <div class="provider-panel-heading">
                 <div>
