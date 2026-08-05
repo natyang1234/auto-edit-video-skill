@@ -284,15 +284,30 @@ def render_caption_png(
 
         return measure
 
+    # Emphasised words are drawn larger than the rest, so measuring at the
+    # base size reports a line narrower than it will be and the framesetter
+    # breaks it again — putting back the stranded character these breaks
+    # exist to avoid. Budget for the widest span in the caption.
+    emphasis_scale = 1.0
+    for span in overlay.get("effect_spans") or []:
+        try:
+            emphasis_scale = max(
+                emphasis_scale,
+                float((span.get("style") or {}).get("font_scale", 1.0)),
+            )
+        except (TypeError, ValueError):
+            continue
+    wrap_width = frame_width / max(1.0, emphasis_scale)
+
     # Decide the breaks here rather than letting the framesetter fill greedily:
     # it packs the first line and strands whatever is left, which is how a
     # caption ends up with one character on a line of its own.
-    lines, font_size = fit_caption_text(text, measure_at, font_size, frame_width)
+    lines, font_size = fit_caption_text(text, measure_at, font_size, wrap_width)
     text = "\n".join(lines)
     if translation_range is not None and translation:
         # The breaks moved the text, so the range has to be found again.
         marker = "\n".join(
-            wrap_lines(translation, measure_at(font_size), frame_width) or [translation]
+            wrap_lines(translation, measure_at(font_size), wrap_width) or [translation]
         )
         offset = text.rfind(marker)
         translation_range = (offset, offset + len(marker)) if offset >= 0 else None

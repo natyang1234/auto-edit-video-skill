@@ -3852,6 +3852,184 @@ def cmd_add_card(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _step(label: str) -> None:
+    """Progress goes to stderr so stdout stays one JSON document."""
+    print(f"… {label}", file=sys.stderr, flush=True)
+
+
+def _args_for(command: str, *argv: str) -> argparse.Namespace:
+    """Build a sub-command's arguments through its own parser.
+
+    Hand-assembling a Namespace means restating every default the parser
+    already declares, and missing one shows up as an AttributeError deep
+    inside the command. Let argparse fill them.
+    """
+    return build_parser().parse_args([command, *argv])
+
+
+def materialise_clip(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    highlight: dict[str, Any],
+    *,
+    fit: str,
+    cards: bool,
+) -> dict[str, Any]:
+    """Editor state for one highlight, with its visuals planned.
+
+    Every step here already exists as a function used by the interactive
+    editor; this calls those rather than restating them, because the one
+    thing this codebase reliably gets wrong is the same decision written
+    twice.
+    """
+    import visual_director
+    from editor_server import (
+        active_editorial_title,
+        default_editor_state,
+        publish_layer_bundle,
+        read_json,
+    )
+    from video_analyzer import atomic_write_json
+
+    state = default_editor_state(project_dir, manifest)
+    base = state["segments"][0]
+    state["segments"] = [
+        dict(base, source_start=float(highlight["start"]), source_end=float(highlight["end"]))
+    ]
+    state["canvas"]["fit"] = fit
+    state["active_highlight_id"] = str(highlight["id"])
+    atomic_write_json(project_dir / "working/editor_state.json", state)
+
+    if cards:
+        evidence = read_json(project_dir / "working/evidence_map.json", None)
+        if isinstance(evidence, dict) and evidence.get("items"):
+            planned = visual_director.plan_visuals(
+                state["segments"],
+                evidence["items"],
+                editorial_title=active_editorial_title(state),
+            )
+            errors = visual_director.validate(planned)
+            if errors:
+                raise ValueError("; ".join(errors[:3]))
+            publish_layer_bundle(
+                project_dir, planned["structured_layers"], planned["visual_plan"]
+            )
+    return state
+
+
+def cmd_cut(args: argparse.Namespace) -> int:
+    """One command: a long video in, finished clips out."""
+    import subprocess as _subprocess
+
+    source = Path(args.input).expanduser().resolve()
+    if not source.is_file():
+        return die(f"no such video: {source}")
+    out_dir = Path(args.out).expanduser().resolve()
+    project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir \
+        else out_dir / ".project"
+    manifest_path = project_dir / "project.json"
+
+    if not manifest_path.is_file():
+        _step("preparing the project")
+        init_argv = [
+            "--input", str(source), "--project-dir", str(project_dir),
+            "--source-language", args.language, "--platform", args.platform,
+            "--source-has-burned-in", args.burned_in,
+        ]
+        if args.seconds:
+            init_argv += ["--target-duration", str(args.seconds)]
+        code = cmd_init(_args_for("init", *init_argv))
+        if code:
+            return code
+
+    _step("looking at the picture and the sound")
+    if cmd_analyze_video(_args_for("analyze-video", "--project-dir", str(project_dir))):
+        return 2
+    _step("listening to what is said")
+    if cmd_transcribe_local(_args_for(
+        "transcribe-local", "--manifest", str(manifest_path), "--model", args.model
+    )):
+        return 2
+    _step("indexing what can be quoted")
+    if cmd_build_evidence_index(
+        _args_for("build-evidence-index", "--project-dir", str(project_dir))
+    ):
+        return 2
+
+    _step(f"choosing {args.clips} moment(s) worth cutting")
+    highlight_argv = [
+        "--manifest", str(manifest_path), "--director", args.director,
+        "--count", str(args.clips), "--brief", args.brief,
+        "--editorial-timeout", str(args.timeout),
+    ]
+    if not args.no_editorial:
+        highlight_argv.append("--editorial")
+    if cmd_plan_highlights(_args_for("plan-highlights", *highlight_argv)):
+        return 2
+
+    if args.translate:
+        _step(f"translating the captions into {args.translate}")
+        _subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("caption_translator.py")),
+             "--project-dir", str(project_dir), "--language", args.translate],
+            check=False, capture_output=True,
+        )
+
+    manifest = read_json(manifest_path)
+    plan = read_json(project_dir / "working/highlight_plan.json")
+    highlights = plan.get("items", [])
+    if not highlights:
+        return die("nothing in this video came out as a clip worth cutting")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    renderer = str(Path(__file__).with_name("render_editor_timeline.py"))
+    made: list[dict[str, Any]] = []
+    problems: list[str] = []
+
+    for highlight in highlights:
+        editorial = highlight.get("editorial") or {}
+        title = str(editorial.get("title") or highlight.get("title") or "clip")
+        name = re.sub(r"[^\w一-鿿 ]+", "_", title).strip()[:40] or "clip"
+        output = out_dir / f"{int(highlight.get('rank', 0)):02d}_{name}.mp4"
+        _step(f"cutting 「{title}」")
+        try:
+            materialise_clip(
+                project_dir, manifest, highlight,
+                fit="cover", cards=not args.no_cards,
+            )
+        except ValueError as exc:
+            problems.append(f"{title}: {exc}")
+            continue
+        if args.cards_from_model:
+            _subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("card_director.py")),
+                 "--project-dir", str(project_dir)],
+                check=False, capture_output=True,
+            )
+        # A stale artifact index would reuse cards drawn for the previous clip.
+        (project_dir / "working/structured_layer_artifacts.json").unlink(missing_ok=True)
+        result = _subprocess.run(
+            [sys.executable, renderer, "--project-dir", str(project_dir),
+             "--output", str(output), "--quality", args.quality],
+            check=False, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            problems.append(f"{title}: {(result.stderr or '').strip()[-200:]}")
+            continue
+        made.append({"title": title, "file": str(output),
+                     "seconds": round(float(highlight["end"]) - float(highlight["start"]), 2)})
+
+    emit({
+        "ok": bool(made),
+        "clips": made,
+        "out": str(out_dir),
+        "project": str(project_dir),
+        "problems": problems,
+    })
+    return 0 if made else 2
+
+
 def cmd_plan_overlays(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).expanduser().resolve()
     project_dir = manifest_path.parent
@@ -4521,6 +4699,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--manifest", required=True)
     analyze.set_defaults(func=cmd_analyze_edits)
+
+    cut = sub.add_parser(
+        "cut",
+        help="One command: a long video in, finished clips out",
+    )
+    cut.add_argument("--input", required=True, help="the video to cut")
+    cut.add_argument("--out", required=True, help="where the clips go")
+    cut.add_argument("--project-dir", default="", help="defaults to <out>/.project")
+    cut.add_argument("--clips", type=int, default=3, help="how many clips to cut")
+    cut.add_argument("--seconds", type=float, default=None, help="roughly how long each")
+    cut.add_argument("--language", default="zh-TW")
+    cut.add_argument("--model", default="auto")
+    cut.add_argument("--platform", choices=PLATFORMS, default="instagram-reels")
+    cut.add_argument(
+        "--director",
+        choices=("teacher-punch", "high-energy", "documentary", "minimal", "editorial-clean"),
+        default="high-energy",
+    )
+    cut.add_argument("--brief", default="", help="what you want out of it")
+    cut.add_argument("--translate", default="", help="add a second caption line, e.g. en")
+    cut.add_argument("--quality", choices=("preview", "final"), default="preview")
+    cut.add_argument("--timeout", type=int, default=900)
+    cut.add_argument(
+        "--cards-from-model", action="store_true",
+        help="also let a model propose cards through the clip",
+    )
+    cut.add_argument("--no-cards", action="store_true", help="no cards at all")
+    cut.add_argument(
+        "--no-editorial", action="store_true",
+        help="pick moments by score instead of asking a model",
+    )
+    cut.add_argument(
+        "--burned-in", choices=("auto", "yes", "no"), default="auto",
+        help="does the footage already carry subtitles?",
+    )
+    cut.set_defaults(func=cmd_cut)
 
     cards = sub.add_parser(
         "add-card",
