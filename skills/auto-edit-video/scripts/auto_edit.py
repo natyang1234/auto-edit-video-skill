@@ -479,7 +479,8 @@ def probe_media(path: Path) -> dict[str, Any]:
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration:stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+                "format=duration:stream=index,codec_type,codec_name,width,height,"
+                "r_frame_rate,sample_rate,channels:stream_side_data=rotation",
                 "-of",
                 "json",
                 str(path),
@@ -504,10 +505,23 @@ def probe_media(path: Path) -> dict[str, Any]:
         raise ValueError("input must contain a valid video stream")
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("source video duration must be positive and finite")
+    # Phones store the sensor frame and a rotation to display it by; every
+    # decision downstream is about the displayed picture. Reporting the
+    # sensor's 1920x1080 for a portrait phone clip made the framing rule read
+    # it as wide, and handed the QA gate a letterbox exclusion for bars that
+    # do not exist — so two thirds of a portrait delivery went unjudged.
+    width, height = int(video["width"]), int(video["height"])
+    for side_data in video.get("side_data_list") or []:
+        try:
+            rotation = int(float(side_data.get("rotation", 0)))
+        except (TypeError, ValueError):
+            continue
+        if rotation % 180 != 0:
+            width, height = height, width
     return {
         "duration_s": duration,
-        "width": video.get("width"),
-        "height": video.get("height"),
+        "width": width,
+        "height": height,
         "fps": parse_rate(video.get("r_frame_rate")),
         "video_codec": video.get("codec_name"),
         "stream_count": len(streams),
@@ -4402,8 +4416,15 @@ def cmd_cut(args: argparse.Namespace) -> int:
             pass
         if status != "pass":
             problems.append(f"{title}: delivery QA said {status}")
+        # The delivered file's length, not the selection's: trimming pauses
+        # shortens the clip after the highlight span was chosen, and a report
+        # that repeats the span says 17.8s about a 14.3s file.
+        try:
+            delivered = round(float(probe_media(output).get("duration_s")), 2)
+        except (ValueError, RuntimeError):
+            delivered = round(float(highlight["end"]) - float(highlight["start"]), 2)
         made.append({"title": title, "file": str(output), "qa": status,
-                     "seconds": round(float(highlight["end"]) - float(highlight["start"]), 2)})
+                     "seconds": delivered})
 
     emit({
         "ok": bool(made),

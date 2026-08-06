@@ -489,3 +489,62 @@ class PauseTrimmingTests(unittest.TestCase):
             ["cut", "--input", "a.mp4", "--out", "o"]
         )
         self.assertFalse(args.keep_pauses)
+
+
+class RotatedSourceTests(unittest.TestCase):
+    """A phone stores the sensor frame and a rotation to display it by.
+
+    Reporting the sensor's 1920x1080 for a portrait phone clip made the
+    framing rule read it as wide — and handed the QA gate a letterbox
+    exclusion for bars that do not exist, so two thirds of a portrait
+    delivery went unjudged. Found on the first real phone video this tool
+    was given.
+    """
+
+    def probe(self, rotation) -> dict:
+        import shutil
+        import subprocess
+        import tempfile
+
+        if not shutil.which("ffmpeg"):
+            self.skipTest("needs ffmpeg")
+        tmp = tempfile.TemporaryDirectory(prefix="auto-edit-rotate-")
+        self.addCleanup(tmp.cleanup)
+        flat = Path(tmp.name) / "flat.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error",
+             "-f", "lavfi", "-i", "color=c=red:s=320x180:d=1",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+             "-shortest", "-pix_fmt", "yuv420p", str(flat)],
+            check=True, capture_output=True,
+        )
+        if not rotation:
+            return auto_edit.probe_media(flat)
+        # A display matrix, the way a phone writes one — a rotate metadata
+        # tag is a different thing and probe rightly ignores it.
+        path = Path(tmp.name) / "clip.mov"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error",
+             "-display_rotation", str(rotation), "-i", str(flat),
+             "-c", "copy", str(path)],
+            check=True, capture_output=True,
+        )
+        return auto_edit.probe_media(path)
+
+    def test_a_sideways_rotation_swaps_the_reported_dimensions(self) -> None:
+        media = self.probe(90)
+        self.assertEqual((media["width"], media["height"]), (180, 320))
+
+    def test_no_rotation_reports_the_frame_as_stored(self) -> None:
+        media = self.probe(0)
+        self.assertEqual((media["width"], media["height"]), (320, 180))
+
+    def test_upside_down_does_not_swap(self) -> None:
+        media = self.probe(180)
+        self.assertEqual((media["width"], media["height"]), (320, 180))
+
+    def test_the_framing_rule_sees_the_displayed_shape(self) -> None:
+        # The consequence that matters: a portrait phone clip fills a
+        # portrait canvas instead of being letterboxed as if it were wide.
+        portrait = self.probe(90)
+        self.assertEqual(auto_edit.framing_for("auto", {"source": portrait}), "cover")
