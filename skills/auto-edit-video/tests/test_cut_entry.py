@@ -343,3 +343,74 @@ class GlossaryReachesTheProjectTests(unittest.TestCase):
     def test_an_oversized_term_is_refused_rather_than_truncated(self) -> None:
         with self.assertRaises(ValueError):
             auto_edit.normalize_transcription_glossary(["x" * 81])
+
+
+class SavedTermsTests(unittest.TestCase):
+    """A term list is only useful if it is kept.
+
+    The same brand names and the same mis-hearings come back on every
+    project; retyping them on each run is the same as not having them.
+    """
+
+    def write(self, payload) -> Path:
+        import json
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory(prefix="auto-edit-terms-")
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "terms.json"
+        path.write_text(
+            payload if isinstance(payload, str)
+            else __import__("json").dumps(payload, ensure_ascii=False),
+            "utf-8",
+        )
+        return path
+
+    def test_a_kept_list_is_read(self) -> None:
+        path = self.write({"glossary": ["D-Town"], "fix": ["句型=巨型"]})
+        self.assertEqual(auto_edit.saved_terms(path), (["D-Town"], ["句型=巨型"]))
+
+    def test_no_file_means_nothing_kept(self) -> None:
+        self.assertEqual(auto_edit.saved_terms(Path("/no/such/terms.json")), ([], []))
+
+    def test_a_file_that_cannot_be_read_stops_rather_than_being_skipped(self) -> None:
+        # Silently ignoring a list someone wrote is how a mis-heard word
+        # reaches a card anyway, with the run reporting success.
+        for payload in ("{not json", {"glossary": "D-Town"}, {"fix": [1, 2]}, "[]"):
+            with self.subTest(payload):
+                with self.assertRaises(ValueError):
+                    auto_edit.saved_terms(self.write(payload))
+
+    def test_missing_keys_are_allowed(self) -> None:
+        self.assertEqual(auto_edit.saved_terms(self.write({})), ([], []))
+
+    def test_the_kept_rules_survive_normalising(self) -> None:
+        # What is stored has to be what the two normalisers accept, or the
+        # file is a list of terms that quietly never apply.
+        path = self.write({
+            "glossary": ["D-Town", "cigar"],
+            "fix": ["句型=巨型", "be 動詞=b動詞|b 動詞"],
+        })
+        glossary, fix = auto_edit.saved_terms(path)
+        self.assertEqual(
+            auto_edit.normalize_transcription_glossary(glossary), ["D-Town", "cigar"]
+        )
+        rules = auto_edit.normalize_transcription_calibrations(fix)
+        self.assertEqual(rules[0], {"canonical": "句型", "aliases": ["巨型"]})
+        self.assertEqual(rules[1]["aliases"], ["b動詞", "b 動詞"])
+
+    def test_a_correction_with_context_spares_the_same_word_elsewhere(self) -> None:
+        # 為了 is heard as "weight", but "to lose weight" is correct. The
+        # rule carries the words around it so only the wrong one is rewritten.
+        data = {"segments": [{"words": [
+            {"word": "它叫做", "start": 0.0, "end": 0.5},
+            {"word": " weight", "start": 0.5, "end": 1.0},
+            {"word": "為了要減肥to lose", "start": 1.0, "end": 2.0},
+            {"word": " weight", "start": 2.0, "end": 2.5},
+        ]}]}
+        auto_edit.apply_transcription_calibrations(
+            data, auto_edit.normalize_transcription_calibrations(["叫做 為了=叫做 weight"])
+        )
+        joined = "".join(word["word"] for word in data["segments"][0]["words"])
+        self.assertIn("叫做 為了", joined)
+        self.assertIn("lose weight", joined)

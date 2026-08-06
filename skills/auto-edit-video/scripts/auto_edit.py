@@ -4011,6 +4011,37 @@ def framing_for(requested: str, manifest: dict[str, Any]) -> str:
     return "contain" if source_ratio > target_ratio * 1.15 else "cover"
 
 
+# Terms worth keeping between projects: the same brand names and the same
+# mis-hearings come back every time, and retyping them on every run is the
+# same as not having them.
+TERMS_FILE = HOME / ".auto-edit/terms.json"
+
+
+def saved_terms(path: Path = TERMS_FILE) -> tuple[list[str], list[str]]:
+    """The kept glossary and corrections, as (glossary, fix) raw entries.
+
+    A missing file means nothing was kept. A file that is there but cannot be
+    read is an error, not an empty list: silently ignoring a term list the
+    user wrote is exactly how a mis-heard word reaches a card anyway.
+    """
+    if not path.is_file():
+        return [], []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path} is not readable JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must hold an object with 'glossary' and 'fix'")
+    glossary = payload.get("glossary", [])
+    fix = payload.get("fix", [])
+    for name, value in (("glossary", glossary), ("fix", fix)):
+        if not isinstance(value, list) or any(
+            not isinstance(entry, str) for entry in value
+        ):
+            raise ValueError(f"{path}: '{name}' must be a list of strings")
+    return list(glossary), list(fix)
+
+
 def cut_target_seconds(requested: float, source_duration: float) -> float | None:
     """The length to aim each clip at, or None to leave length alone.
 
@@ -4126,10 +4157,14 @@ def cmd_cut(args: argparse.Namespace) -> int:
     # the one command this tool is driven by there was no way to supply any —
     # and a mis-heard word now reaches a card, where it is far more visible
     # than in a caption.
-    if args.glossary or args.fix:
+    try:
+        kept_glossary, kept_fix = saved_terms()
+    except ValueError as exc:
+        return die(str(exc))
+    if kept_glossary or kept_fix or args.glossary or args.fix:
         try:
-            terms = normalize_transcription_glossary(args.glossary)
-            fixes = normalize_transcription_calibrations(args.fix)
+            terms = normalize_transcription_glossary(kept_glossary + args.glossary)
+            fixes = normalize_transcription_calibrations(kept_fix + args.fix)
         except ValueError as exc:
             return die(str(exc))
         manifest = read_json(manifest_path)
@@ -4142,9 +4177,15 @@ def cmd_cut(args: argparse.Namespace) -> int:
             subtitles["calibrations"] = fixes
         manifest["updated_at"] = now_utc()
         write_json(manifest_path, manifest)
+        aliases = sum(len(rule["aliases"]) for rule in fixes)
+        source = (
+            f" ({TERMS_FILE.name} + command line)"
+            if (kept_glossary or kept_fix) and (args.glossary or args.fix)
+            else f" (from {TERMS_FILE.name})" if kept_glossary or kept_fix else ""
+        )
         _step(
             f"keeping the spelling of {len(terms)} term(s) and correcting "
-            f"{sum(len(rule['aliases']) for rule in fixes)} mis-hearing(s)"
+            f"{aliases} mis-hearing(s){source}"
         )
 
     _step("looking at the picture and the sound")
