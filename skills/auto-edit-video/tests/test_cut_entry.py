@@ -65,3 +65,76 @@ class EntryPointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeliveryGateCallTests(unittest.TestCase):
+    """The gate call is checkable without spending a render on it.
+
+    It was not, and a call built with the wrong helper signature reached a
+    real run with the whole suite green: nothing in the tests got as far as
+    the line, because getting there meant transcribing and rendering first.
+    """
+
+    def project(self, canvas: dict | None) -> Path:
+        import json
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory(prefix="auto-edit-gate-call-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "working").mkdir(parents=True)
+        if canvas is not None:
+            (root / "working/editor_state.json").write_text(
+                json.dumps({"schema_version": 1, "canvas": canvas}), "utf-8"
+            )
+        return root
+
+    def test_the_call_is_built_at_all(self) -> None:
+        command = auto_edit.clip_qa_command(
+            self.project(None), {}, Path("/out/clip.mp4")
+        )
+        self.assertIn("--video", command)
+        self.assertIn("/out/clip.mp4", command)
+
+    def test_a_letterboxed_clip_tells_the_gate_where_the_picture_is(self) -> None:
+        command = auto_edit.clip_qa_command(
+            self.project({"width": 1080, "height": 1920, "fit": "contain"}),
+            {"source": {"width": 1920, "height": 1080}},
+            Path("/out/clip.mp4"),
+        )
+        self.assertIn("--content-rect", command)
+
+    def test_a_cropped_clip_claims_no_geometry(self) -> None:
+        command = auto_edit.clip_qa_command(
+            self.project({"width": 1080, "height": 1920, "fit": "cover"}),
+            {"source": {"width": 1920, "height": 1080}},
+            Path("/out/clip.mp4"),
+        )
+        self.assertNotIn("--content-rect", command)
+
+    def test_a_project_with_no_state_yet_still_produces_a_call(self) -> None:
+        # Not a crash: the gate runs on whatever the render produced even if
+        # the state was never written.
+        command = auto_edit.clip_qa_command(
+            self.project(None),
+            {"source": {"width": 1920, "height": 1080}},
+            Path("/out/clip.mp4"),
+        )
+        self.assertNotIn("--content-rect", command)
+
+    def test_the_gate_accepts_everything_the_call_passes(self) -> None:
+        # The two sides are separate programs; an argument added on one side
+        # and unknown on the other fails only at run time.
+        import qa_video
+
+        parser = qa_video.build_parser()
+        command = auto_edit.clip_qa_command(
+            self.project({"width": 1080, "height": 1920, "fit": "contain"}),
+            {"source": {"width": 1920, "height": 1080}},
+            Path("/out/clip.mp4"),
+        )
+        parsed = parser.parse_args(command[2:])
+        self.assertTrue(parsed.content_rect)
+        self.assertEqual(
+            qa_video.parse_content_rect(parsed.content_rect)[3], 0.316406
+        )

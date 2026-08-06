@@ -3939,6 +3939,32 @@ def framing_for(requested: str, manifest: dict[str, Any]) -> str:
     return "contain" if source_ratio > target_ratio * 1.15 else "cover"
 
 
+def clip_qa_command(
+    project_dir: Path, manifest: dict[str, Any], output: Path
+) -> list[str]:
+    """The delivery gate call for one finished clip.
+
+    Built here rather than inline so it can be checked without rendering a
+    video first: the arguments are the part that drifts, and the render that
+    surrounds them takes minutes, which is how a broken call reached a real
+    run with the suite green.
+    """
+    import qa_video as _qa
+
+    state_path = project_dir / "working/editor_state.json"
+    clip_state = read_json(state_path) if state_path.is_file() else {}
+    return [
+        sys.executable,
+        str(Path(__file__).with_name("qa_video.py")),
+        "--video", str(output),
+        "--report", str(project_dir / f"qa/{output.stem}.json"),
+        # Landscape sources are delivered whole, inside letterbox bars that
+        # are dark by construction. The gate is told where the picture is, or
+        # it condemns any clip whose own picture is dark.
+        *_qa.qa_policy_args(clip_state, manifest),
+    ]
+
+
 def cmd_cut(args: argparse.Namespace) -> int:
     """One command: a long video in, finished clips out."""
     import subprocess as _subprocess
@@ -4068,19 +4094,8 @@ def cmd_cut(args: argparse.Namespace) -> int:
         # silent file because nobody thought to check is the failure this
         # gate exists for, and until now `cut` was the one path that skipped
         # it — QA was something a person remembered to run afterwards.
-        # Landscape sources are delivered whole, inside letterbox bars. Those
-        # bars are dark by construction, so the gate is told where the picture
-        # actually is; judging the padded frame condemns any clip whose own
-        # picture is dark.
-        import qa_video as _qa
         verdict = _subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("qa_video.py")),
-             "--video", str(output),
-             "--report", str(project_dir / f"qa/{output.stem}.json"),
-             *_qa.qa_policy_args(
-                 read_json(project_dir / "working/editor_state.json", {}) or {},
-                 manifest,
-             )],
+            clip_qa_command(project_dir, manifest, output),
             check=False, capture_output=True, text=True,
         )
         status = "unknown"
