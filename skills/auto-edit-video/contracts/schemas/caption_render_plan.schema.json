@@ -1,168 +1,174 @@
 {
- "$id": "auto-edit-video/contracts/caption_render_plan",
- "title": "caption_render_plan",
- "x_schema_version": 1,
- "type": "object",
- "properties": {
-  "schema_version": {
-   "const": 1
-  },
-  "caption_revision": {
-   "type": "string",
-   "pattern": "^[0-9a-f]{64}$"
-  },
-  "grapheme_contract": {
-   "const": "grapheme_cluster_v1"
-  },
-  "items": {
-   "type": "array",
-   "items": {
-    "type": "object",
-    "properties": {
-     "caption_item_id": {
+  "$id": "auto-edit-video/contracts/caption_render_plan",
+  "title": "caption_render_plan",
+  "x_schema_version": 1,
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "caption_revision": {
       "type": "string",
-      "minLength": 1
-     },
-     "clusters": {
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "grapheme_contract": {
+      "const": "grapheme_cluster_v1"
+    },
+    "items": {
       "type": "array",
       "items": {
-       "type": "array",
-       "items": {
-        "type": "integer",
-        "minimum": 0
-       },
-       "minItems": 2,
-       "maxItems": 2
-      }
-     },
-     "glyph_runs": {
-      "type": "array",
-      "items": {
-       "type": "object",
-       "properties": {
-        "font_asset_id": {
-         "type": "string",
-         "minLength": 1
+        "type": "object",
+        "properties": {
+          "caption_item_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "clusters": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "glyph_runs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "font_asset_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "cluster_start": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cluster_end": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "cluster_end",
+                "cluster_start",
+                "font_asset_id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "artifact": {
+            "type": "object",
+            "properties": {
+              "rgba_path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "width": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "height": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "padding": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Transparent margin on each side, for stroke and emphasis growth. The ink is this much narrower than width, which is what a check about covering or being covered has to measure."
+              }
+            },
+            "required": [
+              "artifact_hash",
+              "height",
+              "padding",
+              "rgba_path",
+              "width"
+            ],
+            "additionalProperties": false
+          },
+          "style_sources": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
         },
-        "cluster_start": {
-         "type": "integer",
-         "minimum": 0
-        },
-        "cluster_end": {
-         "type": "integer",
-         "minimum": 0
-        }
-       },
-       "required": [
-        "cluster_end",
-        "cluster_start",
-        "font_asset_id"
-       ],
-       "additionalProperties": false
+        "required": [
+          "artifact",
+          "caption_item_id",
+          "clusters",
+          "glyph_runs"
+        ],
+        "additionalProperties": false
       }
-     },
-     "artifact": {
+    },
+    "receipt": {
       "type": "object",
       "properties": {
-       "rgba_path": {
-        "type": "string",
-        "minLength": 1
-       },
-       "artifact_hash": {
-        "type": "string",
-        "pattern": "^[0-9a-f]{64}$"
-       },
-       "width": {
-        "type": "integer",
-        "minimum": 1
-       },
-       "height": {
-        "type": "integer",
-        "minimum": 1
-       }
+        "shaping_engine": {
+          "type": "string",
+          "minLength": 1
+        },
+        "shaping_engine_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fonts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "sha256"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "disallowed_fallbacks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       },
       "required": [
-       "artifact_hash",
-       "height",
-       "rgba_path",
-       "width"
+        "disallowed_fallbacks",
+        "fonts",
+        "shaping_engine",
+        "shaping_engine_version"
       ],
       "additionalProperties": false
-     },
-     "style_sources": {
-      "type": "object",
-      "additionalProperties": {
-       "type": "string"
-      }
-     }
     },
-    "required": [
-     "artifact",
-     "caption_item_id",
-     "clusters",
-     "glyph_runs"
-    ],
-    "additionalProperties": false
-   }
-  },
-  "receipt": {
-   "type": "object",
-   "properties": {
-    "shaping_engine": {
-     "type": "string",
-     "minLength": 1
-    },
-    "shaping_engine_version": {
-     "type": "string",
-     "minLength": 1
-    },
-    "fonts": {
-     "type": "object",
-     "additionalProperties": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-       "path",
-       "sha256"
-      ],
-      "properties": {
-       "path": {
-        "type": "string",
-        "minLength": 1
-       },
-       "sha256": {
-        "type": "string"
-       }
-      }
-     }
-    },
-    "disallowed_fallbacks": {
-     "type": "array",
-     "items": {
-      "type": "string"
-     }
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
-   },
-   "required": [
-    "disallowed_fallbacks",
-    "fonts",
-    "shaping_engine",
-    "shaping_engine_version"
-   ],
-   "additionalProperties": false
   },
-  "revision": {
-   "type": "string",
-   "pattern": "^[0-9a-f]{64}$"
-  }
- },
- "required": [
-  "caption_revision",
-  "grapheme_contract",
-  "items",
-  "receipt",
-  "revision",
-  "schema_version"
- ],
- "additionalProperties": false
+  "required": [
+    "caption_revision",
+    "grapheme_contract",
+    "items",
+    "receipt",
+    "revision",
+    "schema_version"
+  ],
+  "additionalProperties": false
 }

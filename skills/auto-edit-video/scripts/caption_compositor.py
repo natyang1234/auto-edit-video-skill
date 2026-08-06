@@ -545,6 +545,11 @@ def render_caption_png(
             "artifact_hash": artifact_hash,
             "width": width,
             "height": height,
+            # The ink is narrower than the raster by this much on each side.
+            # Without it, a check on where the caption sits measures the
+            # transparent margin and reports text that is comfortably inside
+            # a boundary as crossing it.
+            "padding": padding,
         },
         "x_padding": padding,
         "x_disallowed_fallbacks": sorted(set(disallowed_fallbacks)),

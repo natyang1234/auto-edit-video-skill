@@ -160,6 +160,26 @@ class WhatStopsARenderTests(unittest.TestCase):
         self.assertEqual(vc.blocking(report), [])
 
 
+class InkNotRasterTests(unittest.TestCase):
+    """A caption's raster is wider than its words.
+
+    The compositor wraps text to 84% of the frame, which is exactly what
+    Instagram Reels leaves clear, then pads the raster for the stroke. The
+    first version of this check measured the raster and reported a caption
+    whose words sit inside the margin as crossing it — a warning about
+    transparent pixels, on every caption of every delivery.
+    """
+
+    def test_the_padded_raster_would_have_been_reported(self) -> None:
+        raster = placed("caption", y=0.72, width=0.874, height=0.058)
+        self.assertTrue(vc.find_safe_area_intrusions([raster], REELS_SAFE))
+
+    def test_the_ink_inside_it_is_not(self) -> None:
+        # The same caption measured without its 9px margin, at 540 wide.
+        ink = placed("caption", y=0.72, width=0.874 - 18 / 540, height=0.058)
+        self.assertEqual(vc.find_safe_area_intrusions([ink], REELS_SAFE), [])
+
+
 class MeasuredDeliveriesTests(unittest.TestCase):
     """Two real cuts, so the blocking rule cannot quietly reject good work."""
 
@@ -172,7 +192,7 @@ class MeasuredDeliveriesTests(unittest.TestCase):
                    start=0.0, end=3.0),
             placed("caption-0001", y=0.720, width=0.500, height=0.058,
                    start=0.0, end=3.2),
-            placed("caption-0003", y=0.720, width=0.874, height=0.058,
+            placed("caption-0003", y=0.720, width=0.874 - 18 / 540, height=0.058,
                    start=6.54, end=10.80),
         ]
         report = vc.review(shipped, REELS_SAFE)

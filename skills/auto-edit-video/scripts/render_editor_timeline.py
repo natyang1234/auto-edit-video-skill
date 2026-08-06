@@ -462,10 +462,18 @@ def placements_of(
             # asset's own proportions, which is what ffmpeg's -2 computes.
             scaled_width = float(style.get("width", 0)) / 100.0
             if scaled_width > 0:
-                entry["width"] = scaled_width
-                entry["height"] = (
-                    scaled_width * width * (drawn_height / drawn_width) / height
-                )
+                drawn_scale = scaled_width * width / drawn_width
+                # A caption's raster is wider than its text by a transparent
+                # margin. Measuring the raster reports a caption whose words
+                # sit inside a boundary as crossing it.
+                try:
+                    padding = max(0.0, float(drawn.get("padding") or 0)) * 2
+                except (TypeError, ValueError):
+                    padding = 0.0
+                ink_width = max(1.0, drawn_width - padding)
+                ink_height = max(1.0, drawn_height - padding)
+                entry["width"] = ink_width * drawn_scale / width
+                entry["height"] = ink_height * drawn_scale / height
         placements.append(entry)
     return placements
 
@@ -501,7 +509,14 @@ def captionized_overlays(
                 "end": overlay.get("end"),
                 "visible": True,
                 "z_index": overlay.get("z_index", 0),
-                "drawn": {"width": artifact["width"], "height": artifact["height"]},
+                # The raster carries a transparent margin for the stroke; the
+                # ink is that much narrower, and the ink is what a viewer
+                # sees covered or clipped.
+                "drawn": {
+                    "width": artifact["width"],
+                    "height": artifact["height"],
+                    "padding": artifact.get("padding", 0),
+                },
                 "style": {
                     "width": max(5.0, min(100.0, artifact["width"] / max(width, 1) * 100.0)),
                     "x": float(style.get("x", 50)),
