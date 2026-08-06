@@ -222,5 +222,109 @@ class VisualDirectorTests(unittest.TestCase):
         self.assertEqual(vd.validate(result), [])
 
 
+class MoreKindsOfCardTests(unittest.TestCase):
+    """Four more card kinds, each built only out of words that were said.
+
+    A quote or a question is the line itself. A comparison or a definition
+    has two halves, so each pattern requires the connective that separates
+    them: the split is found in the sentence, never guessed. Without one the
+    segment keeps its picture.
+    """
+
+    def plan(self, literal: str, count: int = 2) -> dict:
+        return vd.plan_visuals(
+            segments(count), [evidence("quote", literal, 5.0, 6.0, "aa11")]
+        )
+
+    def beat_of(self, literal: str) -> str:
+        return [item["beat"] for item in self.plan(literal)["visual_plan"]["items"]][1]
+
+    def payload_of(self, literal: str) -> dict:
+        return self.plan(literal)["structured_layers"]["items"][0]["payload"]
+
+    def test_a_definition_becomes_a_term_card(self) -> None:
+        self.assertEqual(self.beat_of("所謂的虛主詞就是代替不定詞片語"), "term")
+        payload = self.payload_of("所謂的虛主詞就是代替不定詞片語")
+        self.assertEqual(payload["term"], "虛主詞")
+        self.assertEqual(payload["meaning"], "代替不定詞片語")
+
+    def test_a_naming_sentence_is_read_the_right_way_round(self) -> None:
+        # "這個東西叫做虛主詞" names the thing second.
+        payload = self.payload_of("這個東西叫做虛主詞")
+        self.assertEqual(payload["term"], "虛主詞")
+        self.assertEqual(payload["meaning"], "這個東西")
+
+    def test_a_contrast_becomes_a_comparison_card(self) -> None:
+        for literal, left, right in (
+            ("不是抽菸而是抽雪茄", "抽菸", "抽雪茄"),
+            ("雪茄跟香菸的差別", "雪茄", "香菸"),
+        ):
+            with self.subTest(literal):
+                self.assertEqual(self.beat_of(literal), "comparison")
+                payload = self.payload_of(literal)
+                self.assertEqual((payload["left"], payload["right"]), (left, right))
+
+    def test_both_halves_are_words_the_sentence_contains(self) -> None:
+        literal = "不是抽菸而是抽雪茄"
+        payload = self.payload_of(literal)
+        for half in (payload["left"], payload["right"]):
+            self.assertIn(half, literal, "a card half nobody said is a fabrication")
+
+    def test_a_question_becomes_a_question_card(self) -> None:
+        self.assertEqual(self.beat_of("為什麼大家都做錯"), "question")
+        self.assertEqual(
+            self.payload_of("為什麼大家都做錯")["question"], "為什麼大家都做錯"
+        )
+
+    def test_a_verbal_tic_is_not_a_question(self) -> None:
+        # 對不對 and 好不好 end half the sentences in spoken teaching and ask
+        # nothing; a card on each would be a card on every other cut.
+        for literal in ("這樣對不對", "我們繼續好不好"):
+            with self.subTest(literal):
+                self.assertEqual(self.beat_of(literal), "keep_aroll")
+
+    def test_a_landed_point_becomes_a_pull_quote(self) -> None:
+        self.assertEqual(self.beat_of("重點根本不在努力"), "quote")
+        self.assertEqual(self.payload_of("重點根本不在努力")["quote"], "重點根本不在努力")
+
+    def test_ordinary_speech_is_left_alone(self) -> None:
+        # 其實, 說真的 and 你會發現 open a third of ordinary Taiwanese
+        # sentences. A marker that fires on narration does not select.
+        for literal in (
+            "這件事其實沒那麼複雜",
+            "其實我覺得還好",
+            "說真的我也不知道",
+            "今天天氣很好我們出門走走",
+        ):
+            with self.subTest(literal):
+                self.assertEqual(self.beat_of(literal), "keep_aroll")
+
+    def test_a_contrast_without_a_connective_is_not_split(self) -> None:
+        # Two nouns in one sentence are not a comparison; without the word
+        # that separates them there is nothing to put on either side.
+        self.assertEqual(self.beat_of("我今天買了雪茄和香菸還有打火機"), "keep_aroll")
+
+    def test_a_quote_too_long_to_read_is_not_pulled(self) -> None:
+        long_line = "重點是" + "很長的句子" * 8
+        self.assertEqual(self.beat_of(long_line), "keep_aroll")
+
+    def test_every_new_kind_satisfies_the_contracts(self) -> None:
+        for literal in (
+            "所謂的虛主詞就是代替不定詞片語",
+            "不是抽菸而是抽雪茄",
+            "為什麼大家都做錯",
+            "重點根本不在努力",
+        ):
+            with self.subTest(literal):
+                self.assertEqual(vd.validate(self.plan(literal)), [])
+
+    def test_each_new_kind_has_a_time_on_screen(self) -> None:
+        # Without one the card inherits its whole segment and parks over the
+        # speaker, which is the first defect ever reported against this tool.
+        for kind in ("quote", "question", "comparison", "term"):
+            with self.subTest(kind):
+                self.assertIn(kind, vd.CARD_DWELL_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -837,15 +837,20 @@ def build_render_command(
         # dropped, and a dropped beat looks exactly like a plan that never
         # asked for it — which is how a picture went missing twice tonight
         # from a render that reported success.
-        if windows and len(overlays) == placed_before:
-            reason = (
-                f"no composed card for layer {layer_ref}"
-                if layer_ref
-                else "the beat names neither a card nor an asset"
-            )
+        # Only a beat that asked for something can have lost it. A beat naming
+        # neither a card nor an asset is the director saying "keep the picture
+        # as it is", which is most of them; reading that as a dropped visual
+        # made every plan with a plain beat in it fail to render.
+        if windows and (layer_ref or asset_ref) and len(overlays) == placed_before:
             dropped_beats.append(
                 f"{plan_item.get('beat', '?')} at "
-                f"{float(plan_item.get('start', 0.0)):.2f}s ({reason})"
+                f"{float(plan_item.get('start', 0.0)):.2f}s ("
+                + (
+                    f"no composed card for layer {layer_ref}"
+                    if layer_ref
+                    else f"asset {asset_ref} was not drawn"
+                )
+                + ")"
             )
     if dropped_beats:
         raise ValueError(

@@ -107,6 +107,15 @@ class DroppedBeatTests(unittest.TestCase):
         windows = renderer.map_source_range_to_post_cut(self.SEGMENTS, 4.0, 11.0)
         self.assertEqual(len(windows), 2)
 
+    def test_a_beat_asking_for_nothing_is_not_a_dropped_visual(self) -> None:
+        # keep_aroll means "keep the picture as it is", which is most beats.
+        # The guard fired on any plan item that placed no overlay, so once the
+        # director was given a real timeline instead of the clip as one
+        # segment, every plan carried plain beats and every render raised.
+        import inspect
+        source = inspect.getsource(renderer.build_render_command)
+        self.assertIn("(layer_ref or asset_ref)", source)
+
     def test_the_guard_names_the_beat_and_why(self) -> None:
         # The message has to say which beat and what was missing; "something
         # went wrong" costs another render to find out.

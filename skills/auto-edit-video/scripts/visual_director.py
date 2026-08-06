@@ -29,6 +29,12 @@ CARD_DWELL_SECONDS = {
     "stat": 4.0,
     "chart": 5.5,
     "dynamic_list": 5.5,
+    # A quote and a question are read once; a definition and a contrast are
+    # read twice, because both halves have to land.
+    "quote": 4.0,
+    "question": 3.5,
+    "comparison": 5.0,
+    "term": 4.5,
 }
 # Enumeration in speech, in the languages this tool is used in.
 LIST_MARKERS = re.compile(
@@ -67,6 +73,149 @@ def _within(evidence: list[dict[str, Any]], start: float, end: float) -> list[di
         if float(item.get("start", 0.0)) >= start - 0.001
         and float(item.get("end", 0.0)) <= end + 0.001
     ]
+
+
+# Four more kinds of card, all built the same way the first four were: the
+# words on them are lifted out of what was said, never composed. A card that
+# paraphrases is a card asserting the speaker said something they did not.
+#
+# For a quote or a question that is easy — the card is the line. For a
+# comparison or a definition it means the two halves have to be *found*, so
+# each pattern below requires the connective that separates them. Without one
+# the segment keeps its picture: the tool does not guess where "A" ends and
+# "B" begins.
+
+# A line worth pulling out and setting as a statement. These are the marks of
+# a speaker landing a point.
+#
+# Deliberately narrow. 其實, 說真的, 老實說 and 你會發現 open a third of the
+# sentences in ordinary Taiwanese speech and signal nothing; including 其實
+# turned "這件事其實沒那麼複雜" — the fixture this repo uses as its example of
+# plain prose — into a pull quote. A marker that fires on ordinary narration
+# does not select, it just decorates.
+INSIGHT_MARKERS = re.compile(
+    r"(重點|關鍵在|關鍵是|記住|最重要的|千萬別|千萬不要|問題就在|說穿了"
+    r"|\bthe point is\b|\bthe key is\b|\bhere'?s the thing\b)",
+    re.IGNORECASE,
+)
+# An asked question, not a verbal tic. 對不對 and 好不好 end half the sentences
+# in spoken teaching and ask nothing.
+QUESTION_WORDS = re.compile(
+    r"(為什麼|為何|怎麼辦|怎麼樣|該怎麼|什麼是|是什麼|哪一個|哪些|多少|如何"
+    r"|\bwhy\b|\bhow do\b|\bwhat is\b|\bwhich\b)",
+    re.IGNORECASE,
+)
+QUESTION_TAIL = re.compile(r"(嗎|呢|\?|？)\s*$")
+QUESTION_TICS = re.compile(r"(對不對|好不好|是不是啊|你知道嗎)\s*$")
+# Two things held against each other. The connective is what makes the split
+# real; both sides are copied out around it.
+CONTRASTS = (
+    re.compile(r"不是(?P<a>[^，,。.！!？?]{2,20}?)而是(?P<b>[^，,。.！!？?]{2,20})"),
+    re.compile(r"(?P<a>[^，,。.！!？?]{2,16})跟(?P<b>[^，,。.！!？?]{2,16}?)的?差別"),
+    re.compile(r"(?P<a>[^，,。.！!？?]{2,16})和(?P<b>[^，,。.！!？?]{2,16}?)的?差別"),
+    re.compile(r"比起(?P<a>[^，,。.！!？?]{2,16})[，,]?\s*(?P<b>[^，,。.！!？?]{2,20})更"),
+)
+# A term and what it means, again split on a connective that is actually said.
+DEFINITIONS = (
+    re.compile(r"所謂的?(?P<term>[^，,。.！!？?]{2,16})就是(?P<meaning>[^，,。.！!？?]{2,40})"),
+    re.compile(r"(?P<term>[^，,。.！!？?]{2,16})指的是(?P<meaning>[^，,。.！!？?]{2,40})"),
+    re.compile(r"(?P<term>[^，,。.！!？?]{2,16})的意思是(?P<meaning>[^，,。.！!？?]{2,40})"),
+)
+# "這個東西叫做虛主詞" names the thing second, so this one is read backwards.
+NAMED_AS = re.compile(
+    r"(?P<meaning>[^，,。.！!？?]{2,40})叫做(?P<term>[^，,。.！!？?]{2,16})"
+)
+# A pulled quote that fills the frame stops being a quote and starts being a
+# wall of text.
+MAX_QUOTE_CHARS = 34
+MAX_QUESTION_CHARS = 28
+
+
+def _first_match(patterns, text: str):
+    for pattern in patterns:
+        found = pattern.search(text)
+        if found:
+            return found
+    return None
+
+
+def _is_question(literal: str) -> bool:
+    text = literal.strip()
+    if not text or len(text) > MAX_QUESTION_CHARS:
+        return False
+    if QUESTION_TICS.search(text):
+        return False
+    return bool(QUESTION_WORDS.search(text) or QUESTION_TAIL.search(text))
+
+
+def _quote_payload(layer_id: str, quote: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": layer_id,
+        "type": "quote",
+        "payload": {
+            "quote": str(quote["literal"]).strip(),
+            "evidence_id": quote["id"],
+            "source_literal": str(quote["literal"]).strip(),
+        },
+    }
+
+
+def _question_payload(layer_id: str, quote: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": layer_id,
+        "type": "question",
+        "payload": {
+            "question": str(quote["literal"]).strip(),
+            "evidence_id": quote["id"],
+            "source_literal": str(quote["literal"]).strip(),
+        },
+    }
+
+
+def _comparison_payload(
+    layer_id: str, quotes: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for quote in quotes:
+        text = str(quote.get("literal", ""))
+        found = _first_match(CONTRASTS, text)
+        if not found:
+            continue
+        left, right = found.group("a").strip(), found.group("b").strip()
+        if not left or not right or left == right:
+            continue
+        return {
+            "id": layer_id,
+            "type": "comparison",
+            "payload": {
+                "left": left,
+                "right": right,
+                "evidence_id": quote["id"],
+                "source_literal": text.strip(),
+            },
+        }
+    return None
+
+
+def _term_payload(layer_id: str, quotes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for quote in quotes:
+        text = str(quote.get("literal", ""))
+        found = _first_match(DEFINITIONS, text) or NAMED_AS.search(text)
+        if not found:
+            continue
+        term, meaning = found.group("term").strip(), found.group("meaning").strip()
+        if not term or not meaning:
+            continue
+        return {
+            "id": layer_id,
+            "type": "term",
+            "payload": {
+                "term": term,
+                "meaning": meaning,
+                "evidence_id": quote["id"],
+                "source_literal": text.strip(),
+            },
+        }
+    return None
 
 
 def _label_for(literal: str) -> str:
@@ -164,6 +313,22 @@ def _classify(found: list[dict[str, Any]], is_opening: bool) -> str:
         return "dynamic_list"
     if is_opening and quotes:
         return "title"
+    # Most specific first: a definition and a contrast are recognised by a
+    # connective that is actually spoken, so when one is there it is the more
+    # certain reading. A question is next, and a pulled quote — which asks
+    # only for a marker of emphasis — last.
+    literals = [str(quote.get("literal", "")) for quote in quotes]
+    if any(_first_match(DEFINITIONS, text) or NAMED_AS.search(text) for text in literals):
+        return "term"
+    if any(_first_match(CONTRASTS, text) for text in literals):
+        return "comparison"
+    if any(_is_question(text) for text in literals):
+        return "question"
+    if any(
+        INSIGHT_MARKERS.search(text) and len(text.strip()) <= MAX_QUOTE_CHARS
+        for text in literals
+    ):
+        return "quote"
     return PLAIN_BEAT
 
 
@@ -231,6 +396,38 @@ def plan_visuals(
                 ]
                 layer = _list_payload(layer_id, enumerated)
                 evidence_ids = [entry["evidence_id"] for entry in layer["payload"]["items"]]
+            elif beat in {"term", "comparison", "quote", "question"}:
+                builder = {
+                    "term": _term_payload,
+                    "comparison": _comparison_payload,
+                }.get(beat)
+                if builder is not None:
+                    layer = builder(layer_id, quotes)
+                else:
+                    picked = next(
+                        (
+                            quote for quote in quotes
+                            if (
+                                _is_question(str(quote.get("literal", "")))
+                                if beat == "question"
+                                else INSIGHT_MARKERS.search(str(quote.get("literal", "")))
+                            )
+                        ),
+                        None,
+                    )
+                    layer = (
+                        None if picked is None
+                        else (_question_payload if beat == "question" else _quote_payload)(
+                            layer_id, picked
+                        )
+                    )
+                # The classifier found a pattern; the builder re-finds it to
+                # copy the words out. If the second look comes up empty the
+                # segment keeps its picture rather than getting an empty card.
+                if layer is None:
+                    beat, layer_id = PLAIN_BEAT, None
+                else:
+                    evidence_ids = [layer["payload"]["evidence_id"]]
             else:
                 layer = _title_payload(layer_id, quotes, editorial_title)
                 evidence_ids = []

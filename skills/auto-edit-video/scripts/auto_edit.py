@@ -3937,7 +3937,7 @@ def materialise_clip(
         evidence = read_json(project_dir / "working/evidence_map.json", None)
         if isinstance(evidence, dict) and evidence.get("items"):
             planned = visual_director.plan_visuals(
-                state["segments"],
+                planning_segments(state["segments"][0]),
                 evidence["items"],
                 editorial_title=active_editorial_title(state),
             )
@@ -3948,6 +3948,39 @@ def materialise_clip(
                 project_dir, planned["structured_layers"], planned["visual_plan"]
             )
     return state
+
+
+# How much of a clip one card is allowed to speak for. The director decides a
+# beat per segment, so handing it the clip as a single segment let it decide
+# exactly once — and, since the first segment is the opening, that decision
+# was always the opening title. Every other kind of card was unreachable.
+PLANNING_SEGMENT_SECONDS = 8.0
+
+
+def planning_segments(segment: dict[str, Any]) -> list[dict[str, Any]]:
+    """The clip cut into windows for the director to read, not to render.
+
+    The timeline still holds one segment; this is only what the director is
+    shown, so it can say "a definition here, prose there" instead of one
+    verdict for the whole clip. Windows land inside the clip, so every plan
+    item still maps onto the timeline unchanged.
+    """
+    start = float(segment.get("source_start", 0.0))
+    end = float(segment.get("source_end", 0.0))
+    span = end - start
+    if span <= PLANNING_SEGMENT_SECONDS * 1.5:
+        return [dict(segment)]
+    count = max(2, int(round(span / PLANNING_SEGMENT_SECONDS)))
+    step = span / count
+    return [
+        dict(
+            segment,
+            id=f"{segment.get('id', 'segment')}-w{index}",
+            source_start=round(start + step * index, 3),
+            source_end=round(start + step * (index + 1), 3),
+        )
+        for index in range(count)
+    ]
 
 
 def framing_for(requested: str, manifest: dict[str, Any]) -> str:

@@ -1,134 +1,138 @@
 {
- "$id": "auto-edit-video/contracts/style_pack",
- "title": "style_pack",
- "x_schema_version": 1,
- "type": "object",
- "properties": {
-  "schema_version": {
-   "const": 1
-  },
-  "id": {
-   "type": "string",
-   "minLength": 1
-  },
-  "version": {
-   "type": "integer",
-   "minimum": 1
-  },
-  "tokens": {
-   "type": "object",
-   "properties": {
-    "palette": {
-     "type": "object",
-     "properties": {},
-     "required": [],
-     "additionalProperties": true
+  "$id": "auto-edit-video/contracts/style_pack",
+  "title": "style_pack",
+  "x_schema_version": 1,
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
     },
-    "typography": {
-     "type": "object",
-     "properties": {},
-     "required": [],
-     "additionalProperties": true
-    },
-    "spacing": {
-     "type": "object",
-     "properties": {},
-     "required": [],
-     "additionalProperties": true
-    }
-   },
-   "required": [
-    "palette",
-    "spacing",
-    "typography"
-   ],
-   "additionalProperties": false
-  },
-  "components": {
-   "type": "array",
-   "items": {
-    "type": "object",
-    "properties": {
-     "id": {
+    "id": {
       "type": "string",
       "minLength": 1
-     },
-     "kind": {
-      "type": "string",
-      "enum": [
-       "prompt_card",
-       "kinetic_title",
-       "dynamic_list",
-       "dashboard",
-       "hero_stat",
-       "warning_checklist",
-       "title_lockup",
-       "carousel_grid",
-       "progress",
-       "calendar_reveal",
-       "note_card",
-       "chip",
-       "statement_card"
-      ]
-     },
-     "layout": {
-      "type": "string",
-      "minLength": 1
-     },
-     "motion": {
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "tokens": {
       "type": "object",
       "properties": {
-       "preset": {
-        "type": "string",
-        "minLength": 1
-       },
-       "enter": {
-        "type": "string"
-       },
-       "exit": {
-        "type": "string"
-       },
-       "duration_range": {
-        "type": "array",
-        "items": {
-         "type": "number",
-         "minimum": 0
+        "palette": {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": true
         },
-        "minItems": 2,
-        "maxItems": 2
-       }
+        "typography": {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": true
+        },
+        "spacing": {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": true
+        }
       },
       "required": [
-       "duration_range",
-       "enter",
-       "exit",
-       "preset"
+        "palette",
+        "spacing",
+        "typography"
       ],
       "additionalProperties": false
-     }
     },
-    "required": [
-     "id",
-     "kind",
-     "layout",
-     "motion"
-    ],
-    "additionalProperties": false
-   },
-   "minItems": 1
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "prompt_card",
+              "kinetic_title",
+              "dynamic_list",
+              "dashboard",
+              "hero_stat",
+              "warning_checklist",
+              "title_lockup",
+              "carousel_grid",
+              "progress",
+              "calendar_reveal",
+              "note_card",
+              "chip",
+              "statement_card",
+              "pull_quote",
+              "question_card",
+              "versus",
+              "definition"
+            ]
+          },
+          "layout": {
+            "type": "string",
+            "minLength": 1
+          },
+          "motion": {
+            "type": "object",
+            "properties": {
+              "preset": {
+                "type": "string",
+                "minLength": 1
+              },
+              "enter": {
+                "type": "string"
+              },
+              "exit": {
+                "type": "string"
+              },
+              "duration_range": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "minItems": 2,
+                "maxItems": 2
+              }
+            },
+            "required": [
+              "duration_range",
+              "enter",
+              "exit",
+              "preset"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "layout",
+          "motion"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1
+    }
   },
-  "license": {
-   "type": "string",
-   "minLength": 1
-  }
- },
- "required": [
-  "components",
-  "id",
-  "license",
-  "schema_version",
-  "tokens",
-  "version"
- ],
- "additionalProperties": false
+  "required": [
+    "components",
+    "id",
+    "license",
+    "schema_version",
+    "tokens",
+    "version"
+  ],
+  "additionalProperties": false
 }

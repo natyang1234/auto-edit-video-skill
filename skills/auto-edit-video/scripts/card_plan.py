@@ -30,6 +30,7 @@ ORIGIN_RANK = {"manual": 0, "model": 1, "director": 2}
 # fails loudly rather than dropping it silently.
 DRAWABLE_KINDS = (
     "title", "stat", "chart", "dynamic_list", "note", "chip", "statement",
+    "quote", "question", "comparison", "term",
 )
 # Kinds whose content is a file already in the project rather than something
 # the compositor draws.

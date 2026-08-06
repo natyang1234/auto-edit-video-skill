@@ -139,6 +139,10 @@ COMPONENTS_BY_TYPE = {
     "note": ("note_card",),
     "chip": ("chip",),
     "statement": ("statement_card",),
+    "quote": ("pull_quote",),
+    "question": ("question_card",),
+    "comparison": ("versus",),
+    "term": ("definition",),
 }
 DEFAULT_COMPONENT = {
     "title": "prompt_card",
@@ -148,6 +152,10 @@ DEFAULT_COMPONENT = {
     "note": "note_card",
     "chip": "chip",
     "statement": "statement_card",
+    "quote": "pull_quote",
+    "question": "question_card",
+    "comparison": "versus",
+    "term": "definition",
 }
 
 
@@ -286,6 +294,114 @@ def render_card(
                                   13 * scale, muted, card_width - pad * 2, scale)
             cursor -= 20 * scale
             _draw_line(ct, quartz, context, source, pad, cursor)
+    elif layer_type == "quote":
+        # A pulled quote is the line, set large, with the marks that say it is
+        # somebody's words. Sized to the text so a short line does not sit in
+        # a slab built for a sentence it does not have.
+        text = f"「{str(payload.get('quote') or '').strip()}」"
+        body, body_size = _fit_text(
+            foundation, ct, quartz, text, 38 * scale, ink, card_width - pad * 2, scale,
+        )
+        card_width = int(min(card_width, _line_width(ct, body) + pad * 2 + 6 * scale))
+        rule = int(4 * scale)
+        height = int(pad * 2 + body_size * 1.4)
+        context = _begin_card(quartz, card_width, height, panel)
+        # A bar down the leading edge, the way a print pull-quote is marked.
+        quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, accent))
+        quartz.CGContextFillRect(
+            context, quartz.CGRectMake(0, 0, rule, height)
+        )
+        _draw_line(
+            ct, quartz, context, body,
+            _layout_origin(layout, card_width, _line_width(ct, body), pad),
+            int((height - body_size) / 2),
+        )
+    elif layer_type == "question":
+        # A question is asked, so it gets the mark that asks it and nothing
+        # else. Bigger than a quote: it is meant to stop the scroll.
+        asked = str(payload.get("question") or "").strip()
+        if not asked.endswith(("?", "？")):
+            asked += "？"
+        body, body_size = _fit_text(
+            foundation, ct, quartz, asked, 46 * scale, ink, card_width - pad * 2, scale,
+        )
+        card_width = int(min(card_width, _line_width(ct, body) + pad * 2))
+        height = int(pad * 2 + body_size * 1.4)
+        context = _begin_card(quartz, card_width, height, panel)
+        _draw_line(
+            ct, quartz, context, body,
+            _layout_origin("center", card_width, _line_width(ct, body), pad),
+            int((height - body_size) / 2),
+        )
+    elif layer_type == "comparison":
+        # Two things held apart by a rule, so the eye reads them as a pair
+        # rather than as one sentence that happens to have two nouns in it.
+        left_text = str(payload.get("left") or "").strip()
+        right_text = str(payload.get("right") or "").strip()
+        column = (card_width - pad * 3) / 2
+        left, left_size = _fit_text(
+            foundation, ct, quartz, left_text, 30 * scale, ink, column, scale
+        )
+        right, right_size = _fit_text(
+            foundation, ct, quartz, right_text, 30 * scale, accent, column, scale
+        )
+        row = max(left_size, right_size)
+        # Both columns take the width of the wider side, and the card takes
+        # what those need. Holding the full card width put two short words at
+        # opposite ends of a slab of empty panel.
+        column = max(
+            _line_width(ct, left), _line_width(ct, right), 120 * scale
+        )
+        card_width = int(min(card_width, column * 2 + pad * 3))
+        height = int(pad * 2 + row * 1.4)
+        context = _begin_card(quartz, card_width, height, panel)
+        baseline = int((height - row) / 2)
+        _draw_line(
+            ct, quartz, context, left,
+            int(pad + max(0, (column - _line_width(ct, left)) / 2)), baseline,
+        )
+        _draw_line(
+            ct, quartz, context, right,
+            int(pad * 2 + column + max(0, (column - _line_width(ct, right)) / 2)),
+            baseline,
+        )
+        quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, muted))
+        quartz.CGContextFillRect(
+            context,
+            quartz.CGRectMake(
+                int(card_width / 2 - scale), int(pad * 0.6),
+                max(1, int(2 * scale)), height - int(pad * 1.2),
+            ),
+        )
+    elif layer_type == "term":
+        # The term is the headline and its meaning sits under it, because that
+        # is the order the sentence said them in.
+        term_text = str(payload.get("term") or "").strip()
+        meaning_text = str(payload.get("meaning") or "").strip()
+        term, term_size = _fit_text(
+            foundation, ct, quartz, term_text, 40 * scale, accent,
+            card_width - pad * 2, scale,
+        )
+        meaning, meaning_size = _fit_text(
+            foundation, ct, quartz, meaning_text, 22 * scale, ink,
+            card_width - pad * 2, scale,
+        )
+        card_width = int(min(
+            card_width,
+            max(_line_width(ct, term), _line_width(ct, meaning)) + pad * 2,
+        ))
+        height = int(pad * 2 + term_size * 1.3 + meaning_size * 1.6)
+        context = _begin_card(quartz, card_width, height, panel)
+        cursor = height - pad - term_size
+        _draw_line(
+            ct, quartz, context, term,
+            _layout_origin(layout, card_width, _line_width(ct, term), pad), cursor,
+        )
+        cursor -= int(meaning_size * 1.5)
+        _draw_line(
+            ct, quartz, context, meaning,
+            _layout_origin(layout, card_width, _line_width(ct, meaning), pad), cursor,
+        )
     elif layer_type == "chart":
         datums = payload.get("datums") or []
         chart_kind = payload.get("chart_kind")

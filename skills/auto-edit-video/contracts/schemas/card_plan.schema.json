@@ -1,97 +1,101 @@
 {
- "$id": "auto-edit-video/contracts/card_plan",
- "title": "card_plan",
- "x_schema_version": 1,
- "type": "object",
- "properties": {
-  "schema_version": {
-   "const": 1
-  },
-  "source_sha256": {
-   "type": "string",
-   "pattern": "^([0-9a-f]{64})?$"
-  },
-  "items": {
-   "type": "array",
-   "maxItems": 60,
-   "items": {
-    "type": "object",
-    "properties": {
-     "id": {
-      "type": "string",
-      "pattern": "^card-[0-9a-z]{6,16}$"
-     },
-     "start": {
-      "type": "number",
-      "minimum": 0
-     },
-     "end": {
-      "type": "number",
-      "minimum": 0
-     },
-     "kind": {
-      "type": "string",
-      "enum": [
-       "title",
-       "stat",
-       "chart",
-       "dynamic_list",
-       "note",
-       "chip",
-       "statement",
-       "broll",
-       "image"
-      ]
-     },
-     "payload": {
-      "type": "object",
-      "description": "shape depends on kind; the compositor validates it",
-      "additionalProperties": true
-     },
-     "origin": {
-      "type": "string",
-      "enum": [
-       "manual",
-       "model",
-       "director"
-      ]
-     },
-     "editorial": {
-      "type": "boolean",
-      "description": "true when the wording is condensed rather than spoken verbatim"
-     },
-     "evidence_ids": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     },
-     "note": {
-      "type": "string",
-      "maxLength": 400
-     }
+  "$id": "auto-edit-video/contracts/card_plan",
+  "title": "card_plan",
+  "x_schema_version": 1,
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
     },
-    "required": [
-     "end",
-     "id",
-     "kind",
-     "origin",
-     "payload",
-     "start"
-    ],
-    "additionalProperties": false
-   }
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{64})?$"
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 60,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^card-[0-9a-z]{6,16}$"
+          },
+          "start": {
+            "type": "number",
+            "minimum": 0
+          },
+          "end": {
+            "type": "number",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "title",
+              "stat",
+              "chart",
+              "dynamic_list",
+              "note",
+              "chip",
+              "statement",
+              "quote",
+              "question",
+              "comparison",
+              "term",
+              "broll",
+              "image"
+            ]
+          },
+          "payload": {
+            "type": "object",
+            "description": "shape depends on kind; the compositor validates it",
+            "additionalProperties": true
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "model",
+              "director"
+            ]
+          },
+          "editorial": {
+            "type": "boolean",
+            "description": "true when the wording is condensed rather than spoken verbatim"
+          },
+          "evidence_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 400
+          }
+        },
+        "required": [
+          "end",
+          "id",
+          "kind",
+          "origin",
+          "payload",
+          "start"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
   },
-  "revision": {
-   "type": "string",
-   "pattern": "^[0-9a-f]{64}$"
-  }
- },
- "required": [
-  "items",
-  "revision",
-  "schema_version",
-  "source_sha256"
- ],
- "additionalProperties": false
+  "required": [
+    "items",
+    "revision",
+    "schema_version",
+    "source_sha256"
+  ],
+  "additionalProperties": false
 }

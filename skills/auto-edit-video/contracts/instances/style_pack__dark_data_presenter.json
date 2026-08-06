@@ -1,212 +1,268 @@
 {
- "schema_version": 1,
- "id": "dark-data-presenter",
- "version": 1,
- "tokens": {
-  "palette": {
-   "bg": "#0E1116",
-   "panel": "#161B22",
-   "ink": "#E6EDF3",
-   "accent": "#E5484D",
-   "amber": "#F5A623",
-   "surface": "#FBF7F0",
-   "surface_ink": "#2A2622",
-   "surface_muted": "#8C8378",
-   "surface_accent": "#D2571E"
+  "schema_version": 1,
+  "id": "dark-data-presenter",
+  "version": 1,
+  "tokens": {
+    "palette": {
+      "bg": "#0E1116",
+      "panel": "#161B22",
+      "ink": "#E6EDF3",
+      "accent": "#E5484D",
+      "amber": "#F5A623",
+      "surface": "#FBF7F0",
+      "surface_ink": "#2A2622",
+      "surface_muted": "#8C8378",
+      "surface_accent": "#D2571E"
+    },
+    "typography": {
+      "title": "font-noto-sans-tc-bold",
+      "body": "font-noto-sans-tc",
+      "mono": "font-jetbrains-mono"
+    },
+    "spacing": {
+      "unit": 8,
+      "safe_margin": 24
+    }
   },
-  "typography": {
-   "title": "font-noto-sans-tc-bold",
-   "body": "font-noto-sans-tc",
-   "mono": "font-jetbrains-mono"
-  },
-  "spacing": {
-   "unit": 8,
-   "safe_margin": 24
-  }
- },
- "components": [
-  {
-   "id": "prompt-card",
-   "kind": "prompt_card",
-   "layout": "left-panel",
-   "motion": {
-    "preset": "slide-in",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "kinetic-title",
-   "kind": "kinetic_title",
-   "layout": "center",
-   "motion": {
-    "preset": "word-cascade",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "dynamic-list",
-   "kind": "dynamic_list",
-   "layout": "left-stack",
-   "motion": {
-    "preset": "staggered-reveal",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "dashboard",
-   "kind": "dashboard",
-   "layout": "grid-2x2",
-   "motion": {
-    "preset": "fade-up",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "hero-stat",
-   "kind": "hero_stat",
-   "layout": "center",
-   "motion": {
-    "preset": "count-up",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "warning-checklist",
-   "kind": "warning_checklist",
-   "layout": "left-stack",
-   "motion": {
-    "preset": "check-pop",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "title-lockup",
-   "kind": "title_lockup",
-   "layout": "lower-third",
-   "motion": {
-    "preset": "slide-up",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "carousel-grid",
-   "kind": "carousel_grid",
-   "layout": "full-bleed",
-   "motion": {
-    "preset": "pan",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "progress",
-   "kind": "progress",
-   "layout": "bottom-band",
-   "motion": {
-    "preset": "fill",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "calendar-reveal",
-   "kind": "calendar_reveal",
-   "layout": "center",
-   "motion": {
-    "preset": "flip",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "note-card",
-   "kind": "note_card",
-   "layout": "left-stack",
-   "motion": {
-    "preset": "slide-up",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  },
-  {
-   "id": "chip",
-   "kind": "chip",
-   "layout": "center",
-   "motion": {
-    "preset": "pop-in",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.2,
-     1.0
-    ]
-   }
-  },
-  {
-   "id": "statement-card",
-   "kind": "statement_card",
-   "layout": "center",
-   "motion": {
-    "preset": "slide-up",
-    "enter": "fade",
-    "exit": "fade",
-    "duration_range": [
-     0.3,
-     1.5
-    ]
-   }
-  }
- ],
- "license": "internal-original"
+  "components": [
+    {
+      "id": "prompt-card",
+      "kind": "prompt_card",
+      "layout": "left-panel",
+      "motion": {
+        "preset": "slide-in",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "kinetic-title",
+      "kind": "kinetic_title",
+      "layout": "center",
+      "motion": {
+        "preset": "word-cascade",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "dynamic-list",
+      "kind": "dynamic_list",
+      "layout": "left-stack",
+      "motion": {
+        "preset": "staggered-reveal",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "dashboard",
+      "kind": "dashboard",
+      "layout": "grid-2x2",
+      "motion": {
+        "preset": "fade-up",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "hero-stat",
+      "kind": "hero_stat",
+      "layout": "center",
+      "motion": {
+        "preset": "count-up",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "warning-checklist",
+      "kind": "warning_checklist",
+      "layout": "left-stack",
+      "motion": {
+        "preset": "check-pop",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "title-lockup",
+      "kind": "title_lockup",
+      "layout": "lower-third",
+      "motion": {
+        "preset": "slide-up",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "carousel-grid",
+      "kind": "carousel_grid",
+      "layout": "full-bleed",
+      "motion": {
+        "preset": "pan",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "progress",
+      "kind": "progress",
+      "layout": "bottom-band",
+      "motion": {
+        "preset": "fill",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "calendar-reveal",
+      "kind": "calendar_reveal",
+      "layout": "center",
+      "motion": {
+        "preset": "flip",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "note-card",
+      "kind": "note_card",
+      "layout": "left-stack",
+      "motion": {
+        "preset": "slide-up",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "chip",
+      "kind": "chip",
+      "layout": "center",
+      "motion": {
+        "preset": "pop-in",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.2,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": "statement-card",
+      "kind": "statement_card",
+      "layout": "center",
+      "motion": {
+        "preset": "slide-up",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "pull-quote",
+      "kind": "pull_quote",
+      "layout": "center",
+      "motion": {
+        "preset": "fade",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "question-card",
+      "kind": "question_card",
+      "layout": "center",
+      "motion": {
+        "preset": "pop",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.2,
+          1.2
+        ]
+      }
+    },
+    {
+      "id": "versus",
+      "kind": "versus",
+      "layout": "center",
+      "motion": {
+        "preset": "slide-in",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "definition",
+      "kind": "definition",
+      "layout": "left-stack",
+      "motion": {
+        "preset": "slide-in",
+        "enter": "fade",
+        "exit": "fade",
+        "duration_range": [
+          0.3,
+          1.5
+        ]
+      }
+    }
+  ],
+  "license": "internal-original"
 }

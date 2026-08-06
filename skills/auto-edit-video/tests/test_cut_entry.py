@@ -199,3 +199,70 @@ class OneRouteForLengthAndPlatformTests(unittest.TestCase):
                     ["set-target", "--manifest", "m.json", "--platform", platform]
                 )
                 self.assertEqual(parsed.platform, platform)
+
+
+class PlanningWindowsTests(unittest.TestCase):
+    """The director decides per segment, so it must be given more than one.
+
+    A clip handed over as a single segment gave it exactly one decision to
+    make, and — since the first segment is the opening — that decision was
+    always the opening title. Every other kind of card was unreachable in
+    the one command this tool is normally driven by.
+    """
+
+    def windows(self, start: float, end: float) -> list[dict]:
+        return auto_edit.planning_segments(
+            {"id": "segment-1", "source_start": start, "source_end": end}
+        )
+
+    def test_a_long_clip_is_read_in_several_windows(self) -> None:
+        self.assertGreater(len(self.windows(0.0, 30.0)), 1)
+
+    def test_a_short_clip_stays_whole(self) -> None:
+        # Nothing to divide: slicing eight seconds into halves would only
+        # make each half too small to say anything about.
+        self.assertEqual(len(self.windows(0.0, 8.0)), 1)
+
+    def test_the_windows_cover_the_clip_without_gaps_or_overlap(self) -> None:
+        windows = self.windows(10.0, 42.0)
+        self.assertAlmostEqual(windows[0]["source_start"], 10.0, places=3)
+        self.assertAlmostEqual(windows[-1]["source_end"], 42.0, places=3)
+        for earlier, later in zip(windows, windows[1:]):
+            self.assertAlmostEqual(
+                earlier["source_end"], later["source_start"], places=3
+            )
+
+    def test_every_window_stays_inside_the_clip(self) -> None:
+        # Plan items are mapped onto the timeline the clip actually renders;
+        # a window reaching past it would name time that is not there.
+        for window in self.windows(5.0, 37.0):
+            self.assertGreaterEqual(window["source_start"], 5.0)
+            self.assertLessEqual(window["source_end"], 37.0)
+
+    def test_windows_are_distinguishable(self) -> None:
+        ids = [window["id"] for window in self.windows(0.0, 40.0)]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_more_than_one_kind_of_card_becomes_reachable(self) -> None:
+        # The point of the split, stated as a behaviour: a clip whose later
+        # half asks a question can now carry a question card, which a single
+        # segment could never produce.
+        import visual_director
+
+        evidence = [
+            {"id": "evidence-aaaa1111", "kind": "quote",
+             "literal": "今天要講的是這個", "start": 1.0, "end": 3.0},
+            {"id": "evidence-bbbb2222", "kind": "quote",
+             "literal": "為什麼大家都做錯", "start": 25.0, "end": 27.0},
+        ]
+        segment = {"id": "segment-1", "source_start": 0.0, "source_end": 32.0}
+        whole = visual_director.plan_visuals([segment], evidence)
+        split = visual_director.plan_visuals(
+            auto_edit.planning_segments(segment), evidence
+        )
+        self.assertEqual(
+            [item["beat"] for item in whole["visual_plan"]["items"]], ["title"]
+        )
+        self.assertIn(
+            "question", [item["beat"] for item in split["visual_plan"]["items"]]
+        )

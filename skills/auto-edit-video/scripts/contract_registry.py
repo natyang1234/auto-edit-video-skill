@@ -171,7 +171,13 @@ def validate(value, schema, path: str = "$") -> list[str]:
 # express. Each returns a list of error strings.
 # ---------------------------------------------------------------------------
 
-STRUCTURED_BEATS = {"title", "stat", "chart", "dynamic_list"}
+STRUCTURED_BEATS = {
+    "title", "stat", "chart", "dynamic_list",
+    # A quote, a question, a contrast and a definition are drawn from a layer
+    # the same way the first four are; the words on them come out of the
+    # transcript, so each one still has to name the evidence it was built on.
+    "quote", "question", "comparison", "term",
+}
 TITLE_KINDS = {"full-screen-hook", "section", "lower-third", "quote", "hero-stat"}
 
 
