@@ -122,8 +122,19 @@ DEFINITIONS = (
     re.compile(r"(?P<term>[^，,。.！!？?]{2,16})的意思是(?P<meaning>[^，,。.！!？?]{2,40})"),
 )
 # "這個東西叫做虛主詞" names the thing second, so this one is read backwards.
+#
+# Anchored at the end, because unpunctuated speech gives no other signal for
+# where the name stops. "所以呢雪茄叫做cigar它是大隻的" carries on past the
+# name, and taking everything after 叫做 put "cigar它是大隻的" on a card as
+# though that were the term. When the sentence continues there is no way to
+# tell, so no card — a wrong term is worse than none.
+#
+# Six characters, because a name is a name and not a clause: every term
+# this is for fits (虛主詞, 不定詞片語, 真正的主詞), while the run-ons that
+# reach the end of a sentence — 「cigar它是大隻的」, 「香菸來補充給你」 —
+# do not.
 NAMED_AS = re.compile(
-    r"(?P<meaning>[^，,。.！!？?]{2,40})叫做(?P<term>[^，,。.！!？?]{2,16})"
+    r"(?P<meaning>[^，,。.！!？?]{2,40})叫做(?P<term>[^，,。.！!？?]{2,6})$"
 )
 # A pulled quote that fills the frame stops being a quote and starts being a
 # wall of text.
@@ -348,7 +359,13 @@ def plan_visuals(
     layers: list[dict[str, Any]] = []
     # At least one card is allowed, or a timeline that is still one long
     # take could never carry anything.
-    budget = max(1, int(len(segments) * max_decorated_share)) if segments else 0
+    #
+    # Rounded, not floored. Three windows at a half share is one and a half,
+    # and flooring made it one — which the opening title always took, so a
+    # definition or a question later in the same clip could never be drawn no
+    # matter what was said. Two of three is still the share this is set to,
+    # and the never-two-in-a-row rule below is what actually keeps them apart.
+    budget = max(1, round(len(segments) * max_decorated_share)) if segments else 0
     decorated = 0
     previous_decorated = False
 

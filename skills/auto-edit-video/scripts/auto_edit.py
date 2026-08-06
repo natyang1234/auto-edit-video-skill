@@ -4112,6 +4112,24 @@ def cmd_cut(args: argparse.Namespace) -> int:
     if cmd_set_target(_args_for("set-target", *target_argv)):
         return 2
 
+    # Spellings the recogniser gets wrong on its own. `init` has taken these
+    # since the beginning, but `cut` never offered them, so on the one command
+    # this tool is driven by there was no way to supply any — and a mis-heard
+    # word now reaches a card, where it is far more visible than in a caption.
+    if args.glossary:
+        try:
+            terms = normalize_transcription_glossary(args.glossary)
+        except ValueError as exc:
+            return die(str(exc))
+        manifest = read_json(manifest_path)
+        subtitles = manifest.get("subtitles")
+        if not isinstance(subtitles, dict):
+            return die("manifest subtitles must be an object")
+        subtitles["glossary"] = terms
+        manifest["updated_at"] = now_utc()
+        write_json(manifest_path, manifest)
+        _step(f"keeping the spelling of {len(terms)} term(s)")
+
     _step("looking at the picture and the sound")
     if cmd_analyze_video(_args_for("analyze-video", "--project-dir", str(project_dir))):
         return 2
@@ -4903,6 +4921,13 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument("--project-dir", default="", help="defaults to <out>/.project")
     cut.add_argument("--clips", type=int, default=3, help="how many clips to cut")
     cut.add_argument("--seconds", type=float, default=30.0, help="roughly how long each")
+    cut.add_argument(
+        "--glossary",
+        action="append",
+        default=[],
+        help="terms whose spelling to keep, comma or semicolon separated "
+             "(e.g. --glossary '句型,虛主詞,be 動詞')",
+    )
     cut.add_argument("--language", default="zh-TW")
     cut.add_argument("--model", default="auto")
     cut.add_argument("--platform", choices=PLATFORMS, default="instagram-reels")

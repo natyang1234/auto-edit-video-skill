@@ -266,3 +266,37 @@ class PlanningWindowsTests(unittest.TestCase):
         self.assertIn(
             "question", [item["beat"] for item in split["visual_plan"]["items"]]
         )
+
+
+class GlossaryReachesTheProjectTests(unittest.TestCase):
+    """Spellings the recogniser gets wrong on its own.
+
+    `init` has taken a glossary since the beginning; `cut` never offered one,
+    so on the one command this tool is driven by there was no way to supply
+    any. A mis-heard word now reaches a card, where it is much more visible
+    than in a caption: a real cut put 「巨型學校」 on screen for 「句型」.
+    """
+
+    def test_cut_accepts_a_glossary(self) -> None:
+        args = auto_edit.build_parser().parse_args(
+            ["cut", "--input", "a.mp4", "--out", "o", "--glossary", "句型,虛主詞"]
+        )
+        self.assertEqual(args.glossary, ["句型,虛主詞"])
+
+    def test_terms_are_split_the_same_way_init_splits_them(self) -> None:
+        # One normaliser, so a term accepted on one route is accepted on the
+        # other and split identically.
+        self.assertEqual(
+            auto_edit.normalize_transcription_glossary(["句型,虛主詞", "be 動詞"]),
+            ["句型", "虛主詞", "be 動詞"],
+        )
+
+    def test_no_glossary_is_not_an_empty_glossary(self) -> None:
+        args = auto_edit.build_parser().parse_args(
+            ["cut", "--input", "a.mp4", "--out", "o"]
+        )
+        self.assertEqual(args.glossary, [])
+
+    def test_an_oversized_term_is_refused_rather_than_truncated(self) -> None:
+        with self.assertRaises(ValueError):
+            auto_edit.normalize_transcription_glossary(["x" * 81])
