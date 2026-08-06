@@ -142,6 +142,69 @@ MAX_QUOTE_CHARS = 34
 MAX_QUESTION_CHARS = 28
 
 
+# An enumeration that starts unannounced: 「...更多的錢。第二個願望...第三個
+# 願望...」 marks its second and third items but never says 第一. The line
+# spoken immediately before the first marked item is that first item.
+_LATER_ORDINAL = re.compile(r"第[二三四五六七八九十]|其次|再來|最後|\bsecond\b|\bthird\b", re.IGNORECASE)
+
+
+_ORDINAL_VALUE = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_ORDINAL = re.compile(r"第([一二三四五六七八九十])")
+
+
+def _ordinal_of(literal: str) -> int | None:
+    found = _ORDINAL.search(literal)
+    return _ORDINAL_VALUE[found.group(1)] if found else None
+
+
+def enumerated_quotes(quotes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The spoken items of a list, in order — one rule for finding them.
+
+    Written twice before (classify and build), which is the drift this repo
+    keeps paying for; both callers now ask here.
+    """
+    ordered = sorted(quotes, key=lambda item: float(item.get("start", 0.0)))
+    marked = [
+        index for index, quote in enumerate(ordered)
+        if LIST_MARKERS.search(str(quote.get("literal", "")))
+    ]
+    # 第五顆蛋糕 carries an ordinal and is not a list item: 第二, 第三, …
+    # 第五 skips a number, and an enumeration does not. Among the marked
+    # quotes whose markers are numbered, keep the longest consecutive run;
+    # markers without numbers (首先, 然後, 最後) are kept as they are.
+    numbered = [
+        (index, _ordinal_of(str(ordered[index].get("literal", ""))))
+        for index in marked
+    ]
+    if sum(1 for _i, value in numbered if value is not None) >= 2:
+        runs: list[list[int]] = []
+        for index, value in numbered:
+            if value is None:
+                continue
+            if runs and value == runs[-1][-1][1] + 1:
+                runs[-1].append((index, value))
+            else:
+                runs.append([(index, value)])
+        best = max(runs, key=len)
+        kept = {index for index, _value in best}
+        marked = [
+            index for index, value in numbered
+            if value is None or index in kept
+        ]
+    items = [ordered[index] for index in marked]
+    if (
+        len(items) == LIST_MIN_ITEMS - 1
+        and marked
+        and marked[0] > 0
+        and _LATER_ORDINAL.search(str(ordered[marked[0]].get("literal", "")))
+    ):
+        # The words on the card are still all spoken; only the grouping is
+        # inferred, and only when the first marker says it is not the first.
+        items = [ordered[marked[0] - 1], *items]
+    return items
+
+
 def _first_match(patterns, text: str):
     for pattern in patterns:
         found = pattern.search(text)
@@ -319,11 +382,14 @@ def _classify(found: list[dict[str, Any]], is_opening: bool) -> str:
         return "chart"
     if numbers:
         return "stat"
-    enumerated = [quote for quote in quotes if LIST_MARKERS.search(str(quote.get("literal", "")))]
-    if len(enumerated) >= LIST_MIN_ITEMS:
-        return "dynamic_list"
+    # The opening window is the clip's nameplate. An enumeration that starts
+    # right at the top used to claim it, and the title — the one card every
+    # clip is expected to carry — never appeared; the clip-level list
+    # placement puts the list in a later window instead.
     if is_opening and quotes:
         return "title"
+    if len(enumerated_quotes(quotes)) >= LIST_MIN_ITEMS:
+        return "dynamic_list"
     # Most specific first: a definition and a contrast are recognised by a
     # connective that is actually spoken, so when one is there it is the more
     # certain reading. A question is next, and a pulled quote — which asks
@@ -369,6 +435,20 @@ def plan_visuals(
     decorated = 0
     previous_decorated = False
 
+    # An enumeration is a clip-level structure. 「...更多的錢。第二個願望...
+    # 第三個願望...」 spreads its items across ten seconds, so no single
+    # planning window ever holds three of them and counting per window found
+    # nothing to draw. Found once over the whole clip, drawn in the window
+    # where its middle falls — while the items are still being spoken.
+    clip_quotes = [item for item in evidence if item.get("kind") == "quote"]
+    clip_list = enumerated_quotes(clip_quotes)
+    clip_list_mid: float | None = None
+    if len(clip_list) >= LIST_MIN_ITEMS:
+        clip_list_mid = (
+            float(clip_list[0].get("start", 0.0))
+            + float(clip_list[-1].get("end", 0.0))
+        ) / 2.0
+
     for index, segment in enumerate(segments):
         # Timeline segments carry source_start/source_end; callers holding a
         # plain window use start/end.
@@ -382,6 +462,19 @@ def plan_visuals(
         item_id = _identifier("visual-beat", highlight_id, index)
         found = _within(evidence, start, end)
         beat = _classify(found, is_opening=index == 0)
+        # The clip-wide list lands in the first plain window at or after its
+        # middle. The middle itself often falls in the opening window, which
+        # the title already holds — the next window is still inside the
+        # enumeration being spoken.
+        uses_clip_list = False
+        if (
+            clip_list_mid is not None
+            and beat == PLAIN_BEAT
+            and end > clip_list_mid
+        ):
+            beat = "dynamic_list"
+            uses_clip_list = True
+            clip_list_mid = None
 
         # Two cards in a row read as a slideshow, and a decorated cut costs the
         # viewer more attention than a plain one.
@@ -408,10 +501,10 @@ def plan_visuals(
                 layer = _stat_payload(layer_id, numbers[0], quotes)
                 evidence_ids = [numbers[0]["id"]]
             elif beat == "dynamic_list":
-                enumerated = [
-                    quote for quote in quotes if LIST_MARKERS.search(str(quote.get("literal", "")))
-                ]
-                layer = _list_payload(layer_id, enumerated)
+                layer = _list_payload(
+                    layer_id,
+                    clip_list if uses_clip_list else enumerated_quotes(quotes),
+                )
                 evidence_ids = [entry["evidence_id"] for entry in layer["payload"]["items"]]
             elif beat in {"term", "comparison", "quote", "question"}:
                 builder = {
@@ -483,8 +576,17 @@ def plan_visuals(
             }
         )
         if beat != PLAIN_BEAT:
-            decorated += 1
-            previous_decorated = True
+            # The opening title is the clip's nameplate, not a mid-roll
+            # decoration: it holds the screen for three seconds and leaves.
+            # Counting it against the budget meant a short clip — two or
+            # three planning windows — spent its whole allowance on the
+            # title, and a list or a question later in the same clip could
+            # never be drawn no matter what was said.
+            if not (index == 0 and beat == "title"):
+                decorated += 1
+                previous_decorated = True
+            else:
+                previous_decorated = False
         else:
             previous_decorated = False
 

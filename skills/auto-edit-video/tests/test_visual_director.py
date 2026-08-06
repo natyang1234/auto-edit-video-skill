@@ -326,5 +326,67 @@ class MoreKindsOfCardTests(unittest.TestCase):
                 self.assertIn(kind, vd.CARD_DWELL_SECONDS)
 
 
+class EnumerationAcrossTheClipTests(unittest.TestCase):
+    """A spoken list is a clip-level structure, found once and drawn once.
+
+    「...更多的錢。第二個願望...第三個願望...」 spreads its items across ten
+    seconds: no single planning window ever held three, so nothing was ever
+    drawn. Found on a real birthday clip whose three wishes are the whole
+    point of the video.
+    """
+
+    @staticmethod
+    def beats(result: dict) -> list[str]:
+        return [item["beat"] for item in result["visual_plan"]["items"]]
+
+    WISHES = [
+        evidence("quote", "讓今年大家都賺更多更多的錢", 0.9, 3.2, "a111"),
+        evidence("quote", "第二個願望就是大家的感情都有個好歸宿", 4.6, 8.4, "b222"),
+        evidence("quote", "第三個願望", 8.8, 10.5, "c333"),
+    ]
+
+    def windows(self):
+        # Two 9s planning windows, splitting the wishes 2/1.
+        return [
+            {"id": "h0-w0", "source_start": 0.58, "source_end": 9.5},
+            {"id": "h0-w1", "source_start": 9.5, "source_end": 18.42},
+        ]
+
+    def test_a_list_split_across_windows_is_still_drawn(self) -> None:
+        result = vd.plan_visuals(self.windows(), list(self.WISHES))
+        self.assertIn("dynamic_list", self.beats(result))
+        items = result["structured_layers"]["items"][-1]["payload"]["items"]
+        self.assertEqual(len(items), 3)
+
+    def test_the_unannounced_first_item_is_the_line_before_第二(self) -> None:
+        listed = vd.enumerated_quotes(list(self.WISHES))
+        self.assertEqual(listed[0]["literal"], "讓今年大家都賺更多更多的錢")
+
+    def test_an_ordinal_in_a_noun_phrase_is_not_a_list_item(self) -> None:
+        # 第五顆蛋糕 carries 第五, spoken eight seconds after 第三; an
+        # enumeration does not skip a number.
+        with_cake = [*self.WISHES,
+                     evidence("quote", "今天的第五顆蛋糕", 16.8, 18.4, "d444")]
+        listed = [item["literal"] for item in vd.enumerated_quotes(with_cake)]
+        self.assertNotIn("今天的第五顆蛋糕", listed)
+        self.assertEqual(len(listed), 3)
+
+    def test_the_opening_window_stays_the_nameplate(self) -> None:
+        # An enumeration starting at the top used to claim the opening
+        # window, and the title never appeared; the list lands later.
+        result = vd.plan_visuals(self.windows(), list(self.WISHES))
+        beats = self.beats(result)
+        self.assertEqual(beats[0], "title")
+        self.assertEqual(beats[1], "dynamic_list")
+
+    def test_a_short_clip_still_gets_a_card_after_its_title(self) -> None:
+        # round(), not int(): two windows at a half share is one, which the
+        # title consumed — so no clip under ~24s could ever carry a second
+        # card. The nameplate no longer spends the decoration budget.
+        result = vd.plan_visuals(self.windows(), list(self.WISHES))
+        decorated = [beat for beat in self.beats(result) if beat != "keep_aroll"]
+        self.assertEqual(len(decorated), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
