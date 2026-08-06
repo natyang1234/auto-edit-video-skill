@@ -162,15 +162,119 @@ class QaPolicy:
             raise ValueError("QA policy coverage thresholds must be non-negative")
 
 
-def qa_policy_args(state: dict[str, Any] | None) -> list[str]:
-    """QA flags for a project's declared delivery kind; empty means strict."""
+# A letterboxed delivery arrives with its bars already dark, by construction:
+# a landscape lesson placed whole inside a portrait canvas is about 68% bar
+# before the picture contributes a single pixel. Judging blackness on the
+# padded frame therefore condemns good work the moment the picture itself is
+# dark — a dark slide, a night shot, a dark-themed screencast — because the
+# bars have spent most of the budget in advance. The bars are not a rendering
+# failure, so they are not measured. What is measured is the picture inside
+# them.
+#
+# The rect is carried as fractions of the frame rather than pixels: a delivery
+# is routinely rendered at a different scale than the canvas it was designed
+# on (a 1080x1920 canvas delivered at 540x960), and fractions survive that.
+# Rounding can put the real boundary within a pixel of the computed one, which
+# moves the measurement by well under a percent of the area.
+CONTENT_RECT_ARG = "--content-rect"
+# Below this share of the frame a declared content area is not believed. A
+# failed render that survives only as a small bright patch must not be able to
+# nominate that patch as "the picture" and pass; letterboxing a 16:9 source
+# into 9:16 leaves 32%, so the floor sits well clear of every real case.
+MIN_CONTENT_AREA = 0.2
+
+
+def letterbox_content_rect(
+    canvas: dict[str, Any] | None, source: dict[str, Any] | None
+) -> tuple[float, float, float, float] | None:
+    """Where the picture sits inside a padded frame, as fractions, or None.
+
+    None means there is nothing to exclude: the delivery is not padded, or
+    the geometry needed to say where the padding falls is not available.
+    """
+    if not isinstance(canvas, dict) or canvas.get("fit") != "contain":
+        return None
+    if not isinstance(source, dict):
+        return None
+    try:
+        canvas_w = float(canvas.get("width") or 0)
+        canvas_h = float(canvas.get("height") or 0)
+        source_w = float(source.get("width") or 0)
+        source_h = float(source.get("height") or 0)
+    except (TypeError, ValueError):
+        return None
+    sides = (canvas_w, canvas_h, source_w, source_h)
+    if not all(math.isfinite(side) and side > 0 for side in sides):
+        return None
+    # The same fit ffmpeg performs: scale down until both axes fit, centre.
+    scale = min(canvas_w / source_w, canvas_h / source_h)
+    width_fraction = source_w * scale / canvas_w
+    height_fraction = source_h * scale / canvas_h
+    # One axis always fills the canvas exactly; if both do, nothing is padded.
+    if width_fraction > 0.999 and height_fraction > 0.999:
+        return None
+    return (
+        (1.0 - width_fraction) / 2.0,
+        (1.0 - height_fraction) / 2.0,
+        width_fraction,
+        height_fraction,
+    )
+
+
+def content_rect_args(
+    state: dict[str, Any] | None, manifest: dict[str, Any] | None
+) -> list[str]:
+    """The flag telling QA to judge the picture rather than the padding."""
+    rect = letterbox_content_rect(
+        (state or {}).get("canvas"), (manifest or {}).get("source")
+    )
+    if rect is None:
+        return []
+    return [CONTENT_RECT_ARG, ":".join(f"{value:.6f}" for value in rect)]
+
+
+def parse_content_rect(value: str) -> tuple[float, float, float, float]:
+    """x:y:w:h as fractions of the frame, rejected unless it lands inside it."""
+    parts = str(value).split(":")
+    if len(parts) != 4:
+        raise ValueError("content rect must be x:y:w:h as fractions of the frame")
+    try:
+        x, y, width, height = (float(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError("content rect values must be numbers") from exc
+    if not all(math.isfinite(part) for part in (x, y, width, height)):
+        raise ValueError("content rect values must be finite")
+    if width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > 1 or y + height > 1:
+        raise ValueError("content rect must describe an area inside the frame")
+    if width * height < MIN_CONTENT_AREA:
+        raise ValueError(
+            f"content rect covers {width * height:.1%} of the frame, below the "
+            f"{MIN_CONTENT_AREA:.0%} floor at which it is believed"
+        )
+    return (x, y, width, height)
+
+
+def qa_policy_args(
+    state: dict[str, Any] | None, manifest: dict[str, Any] | None = None
+) -> list[str]:
+    """QA flags for a project's declared delivery kind; empty means strict.
+
+    The content rect rides along here rather than being added at each call
+    site, so a caller cannot pick up the policy and forget the geometry.
+    """
+    args = content_rect_args(state, manifest)
     declared = (state or {}).get("qa_policy")
     if not isinstance(declared, dict):
-        return []
+        return args
     profile = declared.get("profile")
     if profile not in QA_PROFILES or profile == "strict":
-        return []
-    return ["--qa-profile", str(profile), "--qa-intent", str(declared.get("intent", ""))]
+        return args
+    return args + [
+        "--qa-profile",
+        str(profile),
+        "--qa-intent",
+        str(declared.get("intent", "")),
+    ]
 
 
 def now_utc() -> str:
@@ -265,7 +369,9 @@ BLACK_DETECT_PICTURE_RATIO = 0.85
 
 
 def picture_analysis(
-    video: Path, min_duration: float = BLACK_DETECT_MIN_SECONDS
+    video: Path,
+    min_duration: float = BLACK_DETECT_MIN_SECONDS,
+    content_rect: tuple[float, float, float, float] | None = None,
 ) -> tuple[list[dict[str, float]], float]:
     """Black segments, plus how much picture actually decoded.
 
@@ -281,6 +387,15 @@ def picture_analysis(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ValueError("ffmpeg is required")
+    # Expressed against the decoded frame so the crop follows the delivery's
+    # real size, whatever scale it was rendered at.
+    crop = ""
+    if content_rect is not None:
+        x, y, width, height = content_rect
+        crop = (
+            f"crop=w=iw*{width:.6f}:h=ih*{height:.6f}"
+            f":x=iw*{x:.6f}:y=ih*{y:.6f},"
+        )
     result = run(
         [
             ffmpeg,
@@ -293,7 +408,7 @@ def picture_analysis(
             "-map",
             "0:V:0",
             "-vf",
-            f"blackdetect=d={min_duration}"
+            f"{crop}blackdetect=d={min_duration}"
             f":pic_th={BLACK_DETECT_PICTURE_RATIO}"
             f":pix_th={BLACK_DETECT_PIXEL_THRESHOLD}",
             "-an",
@@ -537,6 +652,7 @@ def inspect(
     report_path: Path,
     contact_path: Path,
     policy: QaPolicy | None = None,
+    content_rect: tuple[float, float, float, float] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     policy = policy or QaPolicy()
     media = probe(video)
@@ -569,7 +685,7 @@ def inspect(
         else:
             failures.append("audio stream is missing")
 
-    blacks, decoded = picture_analysis(video)
+    blacks, decoded = picture_analysis(video, content_rect=content_rect)
     # The declared timeline is unreliable in both directions: a short claim
     # puts the delivery below the length at which anything is judged, and a
     # long one (a second video stream, an audio track outliving the picture)
@@ -691,6 +807,14 @@ def inspect(
             "min_segment_seconds": BLACK_DETECT_MIN_SECONDS,
             "pixel_threshold": BLACK_DETECT_PIXEL_THRESHOLD,
             "picture_ratio_threshold": BLACK_DETECT_PICTURE_RATIO,
+            # Null means the whole frame was judged. A rect means the delivery
+            # is padded and only the picture inside the padding was judged, so
+            # a reader can tell which area these numbers describe.
+            "content_rect": (
+                None
+                if content_rect is None
+                else dict(zip(("x", "y", "width", "height"), content_rect))
+            ),
         },
         "loudness": levels,
         "silence": silence,
@@ -722,6 +846,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=defaults.max_black_ratio,
         help="fail when black frames cover at least this fraction of the duration",
+    )
+    parser.add_argument(
+        CONTENT_RECT_ARG,
+        default="",
+        metavar="x:y:w:h",
+        help=(
+            "where the picture sits inside a padded frame, as fractions; "
+            "blackness is judged there instead of across the letterbox bars"
+        ),
     )
     parser.add_argument(
         "--allow-missing-audio",
@@ -810,7 +943,10 @@ def main() -> int:
     report = Path(args.report).expanduser().resolve() if args.report else video.parent.parent / "qa/qa-report.json"
     contact = Path(args.contact).expanduser().resolve() if args.contact else video.parent.parent / "qa/final-contact.png"
     try:
-        payload, ok = inspect(video, report, contact, policy=policy_from_args(args))
+        rect = parse_content_rect(args.content_rect) if args.content_rect else None
+        payload, ok = inspect(
+            video, report, contact, policy=policy_from_args(args), content_rect=rect
+        )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(str(exc), file=sys.stderr)
         return 2

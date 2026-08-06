@@ -5373,8 +5373,11 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "--contact",
                 str(qa_contact),
                 # Every clip shares the declaration frozen into the batch's
-                # snapshot, not whatever the project says now.
-                *qa_policy_args(read_json(snapshot_path, {}).get("state")),
+                # snapshot, not whatever the project says now. The geometry
+                # comes from the same snapshot for the same reason.
+                *qa_policy_args(
+                    snapshot_payload.get("state"), snapshot_payload.get("manifest")
+                ),
             ]
             try:
                 qa_result = subprocess.run(
@@ -5795,8 +5798,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "--contact",
                     str(qa_contact),
                     # The declaration frozen into the snapshot this render was
-                    # authorized against, not whatever the project says now.
-                    *qa_policy_args(read_json(snapshot_path, {}).get("state")),
+                    # authorized against, not whatever the project says now,
+                    # and the geometry it was laid out against.
+                    *qa_policy_args(
+                        snapshot_payload.get("state"),
+                        snapshot_payload.get("manifest"),
+                    ),
                 ]
                 try:
                     qa_result = subprocess.run(

@@ -1180,7 +1180,9 @@ def qa_variant_output(
             "--video", str(candidate),
             "--report", str(report_path),
             "--contact", str(contact_path),
-            *qa_video.qa_policy_args(state),
+            *qa_video.qa_policy_args(
+                state, read_json(project_dir / "project.json", {}) or {}
+            ),
         ],
         text=True,
         capture_output=True,

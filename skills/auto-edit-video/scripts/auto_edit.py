@@ -4068,10 +4068,19 @@ def cmd_cut(args: argparse.Namespace) -> int:
         # silent file because nobody thought to check is the failure this
         # gate exists for, and until now `cut` was the one path that skipped
         # it — QA was something a person remembered to run afterwards.
+        # Landscape sources are delivered whole, inside letterbox bars. Those
+        # bars are dark by construction, so the gate is told where the picture
+        # actually is; judging the padded frame condemns any clip whose own
+        # picture is dark.
+        import qa_video as _qa
         verdict = _subprocess.run(
             [sys.executable, str(Path(__file__).with_name("qa_video.py")),
              "--video", str(output),
-             "--report", str(project_dir / f"qa/{output.stem}.json")],
+             "--report", str(project_dir / f"qa/{output.stem}.json"),
+             *_qa.qa_policy_args(
+                 read_json(project_dir / "working/editor_state.json", {}) or {},
+                 manifest,
+             )],
             check=False, capture_output=True, text=True,
         )
         status = "unknown"
