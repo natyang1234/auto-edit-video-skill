@@ -146,19 +146,38 @@ def join_transcript_parts(parts: list[str]) -> str:
     return text_joining.join_tokens(parts)
 
 
-def transcript_title_excerpt(text: str, max_chars: int = 36) -> str:
-    if len(text) <= max_chars:
+# How much room a title may take, measured in Latin letters. A card drawn
+# from thirty-six Chinese characters is seventy-two wide, and the compositor
+# shrank it to one unreadable line across the whole frame rather than refuse
+# it. Forty-eight is what the titles that read well actually measure.
+MAX_TITLE_WIDTH = 48.0
+
+
+def transcript_title_excerpt(text: str, max_width: float = MAX_TITLE_WIDTH) -> str:
+    """The opening of a line, cut to something a card can hold.
+
+    Cut by how much room it takes, not by how many characters it has: the
+    two differ by a factor of two between scripts, which is how a Chinese
+    title half again too long passed a limit written for Latin text.
+    """
+    if text_joining.display_width(text) <= max_width:
         return text
-    excerpt = text[:max_chars]
+    excerpt = text_joining.trim_to_width(text, max_width)
+    remainder = text[len(excerpt):]
+    # Only back up to a boundary when the cut landed inside a Latin word;
+    # Chinese has no spaces, and a recogniser that emits no punctuation
+    # offers nothing to back up to.
     if (
-        excerpt[-1].isascii()
+        excerpt
+        and remainder
+        and excerpt[-1].isascii()
         and excerpt[-1].isalnum()
-        and text[max_chars].isascii()
-        and text[max_chars].isalnum()
+        and remainder[0].isascii()
+        and remainder[0].isalnum()
     ):
         boundaries = [excerpt.rfind(character) for character in " ，。！？、,.!?：:；;—-"]
         boundary = max(boundaries)
-        if boundary >= max_chars // 2:
+        if text_joining.display_width(excerpt[:boundary]) >= max_width / 2:
             excerpt = excerpt[:boundary]
     return excerpt.rstrip()
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import text_joining
 import shutil
 import subprocess
 import uuid
@@ -210,19 +211,20 @@ def _reply_from_envelope(envelope: Any) -> str | None:
     return None
 
 
-_CJK = re.compile(r"[㐀-鿿]")
-
-
 def keyword_length_ok(term: str) -> bool:
     """Is this a term rather than a clause?
 
     Eight CJK characters is a sentence fragment; nine Latin letters is still
     one word ("cigarette"). Measuring both on one ruler either lets Chinese
     clauses through or throws English words away.
+
+    The two limits stay separate — a term and a clause are not the same
+    question as how much room text takes — but what counts as Chinese comes
+    from the shared rule, because that part had already been written twice.
     """
     if len(term) < MIN_KEYWORD_CHARS:
         return False
-    if _CJK.search(term):
+    if text_joining.has_wide(term):
         return len(term) <= MAX_KEYWORD_CHARS
     return len(term) <= MAX_LATIN_KEYWORD_CHARS and len(term.split()) <= 2
 
