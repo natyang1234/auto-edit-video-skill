@@ -482,6 +482,7 @@ def captionized_overlays(
     overlays: list[dict[str, Any]],
     caption_plan: dict[str, Any],
     width: int,
+    height: int = 0,
 ) -> list[dict[str, Any]]:
     """Swap plain caption overlays for their compositor PNG artifacts.
 
@@ -520,7 +521,16 @@ def captionized_overlays(
                 "style": {
                     "width": max(5.0, min(100.0, artifact["width"] / max(width, 1) * 100.0)),
                     "x": float(style.get("x", 50)),
-                    "y": float(style.get("y", 78)),
+                    # The declared y positions the spoken line. A translation
+                    # makes the raster taller below it; centring the whole
+                    # block at y pushed the spoken line up into the picture,
+                    # so the centre moves down by half the added height.
+                    "y": float(style.get("y", 78)) + (
+                        (artifact["height"] - artifact["spoken_height"]) / 2.0
+                        / height * 100.0
+                        if height > 0 and artifact.get("spoken_height")
+                        else 0.0
+                    ),
                     "animation": str(style.get("animation", "none")),
                 },
             }
@@ -872,7 +882,7 @@ def build_render_command(
                     f"({', '.join(disallowed)}); add the glyph coverage to the "
                     "project font or mark the caption for review"
                 )
-            overlays = captionized_overlays(overlays, caption_plan, width)
+            overlays = captionized_overlays(overlays, caption_plan, width, height)
 
     # Placement already tries to avoid the speaker. Nothing looked at the
     # result: two cards could hold the same moment, a card could sit on the

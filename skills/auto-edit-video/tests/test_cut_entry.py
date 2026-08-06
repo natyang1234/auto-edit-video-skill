@@ -414,3 +414,78 @@ class SavedTermsTests(unittest.TestCase):
         joined = "".join(word["word"] for word in data["segments"][0]["words"])
         self.assertIn("叫做 為了", joined)
         self.assertIn("lose weight", joined)
+
+
+class PauseTrimmingTests(unittest.TestCase):
+    """Dead air is cut out of the clip; words never are.
+
+    The analyzer has always proposed these edits and the renderer has always
+    accepted a timeline split around removed regions — captions and cards
+    map their windows across the gaps. `cut` simply never connected them.
+    """
+
+    def silence(self, start, end, kind="silence", risk="low"):
+        return {"type": kind, "risk": risk, "start": start, "end": end}
+
+    def test_a_pause_is_cut_with_breathing_room(self) -> None:
+        cuts = auto_edit.silence_deletions([self.silence(5.0, 6.2)], 0.0, 30.0)
+        self.assertEqual(cuts, [(5.12, 6.08)])
+
+    def test_a_short_pause_is_not_worth_a_jump_cut(self) -> None:
+        # After the breathing room a 0.35s pause has nothing left to cut;
+        # cutting it anyway reads as a stutter in the picture.
+        self.assertEqual(
+            auto_edit.silence_deletions([self.silence(9.0, 9.35)], 0.0, 30.0), []
+        )
+
+    def test_words_are_never_cut_automatically(self) -> None:
+        # A filler or a stutter has a caption; cutting its audio while the
+        # caption still shows it desynchronises the two. Those stay
+        # proposals for a person.
+        for kind in ("filler", "stutter"):
+            with self.subTest(kind):
+                self.assertEqual(
+                    auto_edit.silence_deletions(
+                        [self.silence(5.0, 6.5, kind=kind)], 0.0, 30.0
+                    ),
+                    [],
+                )
+
+    def test_a_pause_outside_the_clip_is_ignored(self) -> None:
+        self.assertEqual(
+            auto_edit.silence_deletions([self.silence(50.0, 52.0)], 0.0, 30.0), []
+        )
+
+    def test_the_surviving_pieces_cover_everything_but_the_cuts(self) -> None:
+        pieces = auto_edit.window_minus_deletions(
+            4.0, 30.0, [(10.0, 11.0), (20.0, 21.5)]
+        )
+        self.assertEqual(pieces, [(4.0, 10.0), (11.0, 20.0), (21.5, 30.0)])
+
+    def test_a_flash_frame_scrap_is_dropped(self) -> None:
+        # A 0.1s sliver between two cuts is a flash, not a segment.
+        pieces = auto_edit.window_minus_deletions(
+            0.0, 10.0, [(2.0, 4.0), (4.1, 6.0)]
+        )
+        self.assertEqual(pieces, [(0.0, 2.0), (6.0, 10.0)])
+
+    def test_cutting_everything_keeps_the_original_window(self) -> None:
+        # Rather than delivering nothing, an all-silence verdict is treated
+        # as a wrong verdict.
+        self.assertEqual(
+            auto_edit.window_minus_deletions(0.0, 1.0, [(0.0, 1.0)]),
+            [(0.0, 1.0)],
+        )
+
+    def test_overlapping_proposals_merge_into_one_cut(self) -> None:
+        cuts = auto_edit.silence_deletions(
+            [self.silence(5.0, 6.0), self.silence(5.8, 7.0)], 0.0, 30.0
+        )
+        self.assertEqual(len(cuts), 1)
+        self.assertAlmostEqual(cuts[0][1], 6.88, places=2)
+
+    def test_cut_offers_the_switch_and_defaults_to_trimming(self) -> None:
+        args = auto_edit.build_parser().parse_args(
+            ["cut", "--input", "a.mp4", "--out", "o"]
+        )
+        self.assertFalse(args.keep_pauses)

@@ -95,7 +95,7 @@ def translate(
     transcript: dict[str, Any],
     language: str,
     *,
-    provider: tuple[str, ...] = editorial_planner.DEFAULT_PROVIDER,
+    provider: tuple[str, ...] | None = None,
     timeout_s: int = editorial_planner.DEFAULT_TIMEOUT_S,
 ) -> tuple[dict[str, Any], list[str]]:
     """Translate every caption line, in batches, keeping the numbering."""
@@ -183,9 +183,7 @@ def main() -> int:
         artifact, notes = translate(
             transcript,
             args.language,
-            provider=tuple(shlex.split(args.provider))
-            if args.provider
-            else editorial_planner.DEFAULT_PROVIDER,
+            provider=tuple(shlex.split(args.provider)) if args.provider else None,
             timeout_s=args.timeout,
         )
     except (EditorialUnavailable, ValueError) as exc:

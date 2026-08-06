@@ -214,7 +214,7 @@ def propose_cards(
     *,
     duration_s: float,
     assets: dict[str, str] | None = None,
-    provider: tuple[str, ...] = editorial_planner.DEFAULT_PROVIDER,
+    provider: tuple[str, ...] | None = None,
     timeout_s: int = editorial_planner.DEFAULT_TIMEOUT_S,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Cards a model proposed and the transcript confirmed."""
@@ -268,9 +268,7 @@ def main() -> int:
             transcript,
             duration_s=float(source.get("duration_s") or 0.0),
             assets=project_assets(project_dir),
-            provider=tuple(shlex.split(args.provider))
-            if args.provider
-            else editorial_planner.DEFAULT_PROVIDER,
+            provider=tuple(shlex.split(args.provider)) if args.provider else None,
             timeout_s=args.timeout,
         )
     except (EditorialUnavailable, ValueError) as exc:

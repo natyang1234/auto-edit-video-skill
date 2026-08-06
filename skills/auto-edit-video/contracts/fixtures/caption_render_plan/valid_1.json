@@ -27,7 +27,8 @@
         "artifact_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "width": 1080,
         "height": 200,
-        "padding": 9
+        "padding": 9,
+        "spoken_height": 200
       }
     }
   ],

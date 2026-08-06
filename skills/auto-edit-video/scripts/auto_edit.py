@@ -3447,7 +3447,7 @@ def apply_editorial_selection(
             brief=str(getattr(args, "brief", "") or ""),
             provider=tuple(shlex.split(args.editorial_provider))
             if getattr(args, "editorial_provider", "")
-            else editorial_planner.DEFAULT_PROVIDER,
+            else None,
             timeout_s=int(getattr(args, "editorial_timeout", editorial_planner.DEFAULT_TIMEOUT_S)),
         )
     except (editorial_planner.EditorialUnavailable, ValueError) as exc:
@@ -3907,6 +3907,7 @@ def materialise_clip(
     *,
     fit: str,
     cards: bool,
+    trim_pauses: bool = True,
 ) -> dict[str, Any]:
     """Editor state for one highlight, with its visuals planned.
 
@@ -3926,8 +3927,33 @@ def materialise_clip(
 
     state = default_editor_state(project_dir, manifest)
     base = state["segments"][0]
+    clip_start = float(highlight["start"])
+    clip_end = float(highlight["end"])
+    # Dead air inside the clip is dropped, splitting the timeline around each
+    # pause. The renderer was built for that shape from the start — captions
+    # and cards split their windows across removed regions — and the editor's
+    # analyzer already proposes the pauses; `cut` just never used either.
+    pieces = [(clip_start, clip_end)]
+    if trim_pauses:
+        proposals = read_json(
+            project_dir / "working/edit_candidates.json", {"items": []}
+        ) or {"items": []}
+        deletions = silence_deletions(
+            proposals.get("items", []), clip_start, clip_end
+        )
+        if deletions:
+            pieces = window_minus_deletions(clip_start, clip_end, deletions)
+            removed = sum(e - s for s, e in deletions)
+            print(
+                json.dumps({"pauses_removed": {
+                    "count": len(deletions), "seconds": round(removed, 2),
+                }}, ensure_ascii=False),
+                file=sys.stderr,
+            )
     state["segments"] = [
-        dict(base, source_start=float(highlight["start"]), source_end=float(highlight["end"]))
+        dict(base, id=f"{base.get('id', 'segment')}-p{index}" if index else base.get("id"),
+             source_start=round(piece_start, 3), source_end=round(piece_end, 3))
+        for index, (piece_start, piece_end) in enumerate(pieces)
     ]
     state["canvas"]["fit"] = fit
     state["active_highlight_id"] = str(highlight["id"])
@@ -3937,7 +3963,12 @@ def materialise_clip(
         evidence = read_json(project_dir / "working/evidence_map.json", None)
         if isinstance(evidence, dict) and evidence.get("items"):
             planned = visual_director.plan_visuals(
-                planning_segments(state["segments"][0]),
+                # Planned over the whole clip, not the first surviving piece:
+                # evidence lives on the source axis, and the renderer maps
+                # every plan item across the removed pauses itself.
+                planning_segments(
+                    dict(base, source_start=clip_start, source_end=clip_end)
+                ),
                 evidence["items"],
                 editorial_title=active_editorial_title(state),
             )
@@ -4060,6 +4091,63 @@ def cut_target_seconds(requested: float, source_duration: float) -> float | None
     if math.isfinite(available) and 0 < available <= wanted:
         return None
     return wanted
+
+
+# Trimming a pause flush against the words around it clips consonant onsets
+# and breath tails; this much of every pause is left in place on each side.
+PAUSE_BREATH_S = 0.12
+# What remains of a pause after the breathing room must still be worth a cut:
+# shorter than this reads as a stutter in the picture, not as tightening.
+MIN_PAUSE_CUT_S = 0.25
+# A surviving scrap of timeline shorter than this is a flash frame.
+MIN_SEGMENT_S = 0.2
+
+
+def silence_deletions(
+    candidates: list[dict[str, Any]], start: float, end: float
+) -> list[tuple[float, float]]:
+    """Which stretches of this window to drop, from the proposed edits.
+
+    Only silence. Fillers and stutters carry words, and cutting a word's
+    audio while its caption still shows it desynchronises the two — those
+    stay proposals for a person. Silence has nothing in it to disagree with.
+    """
+    cuts: list[tuple[float, float]] = []
+    for item in candidates:
+        if item.get("type") != "silence" or item.get("risk") != "low":
+            continue
+        cut_start = max(float(item.get("start", 0.0)), start) + PAUSE_BREATH_S
+        cut_end = min(float(item.get("end", 0.0)), end) - PAUSE_BREATH_S
+        if cut_end - cut_start >= MIN_PAUSE_CUT_S:
+            cuts.append((round(cut_start, 3), round(cut_end, 3)))
+    cuts.sort()
+    merged: list[tuple[float, float]] = []
+    for cut in cuts:
+        # Two cuts with less than a segment's worth of speech between them
+        # would leave a flash frame; they are one cut that happened to be
+        # proposed in two pieces.
+        if merged and cut[0] - merged[-1][1] < MIN_SEGMENT_S:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], cut[1]))
+        else:
+            merged.append(cut)
+    return merged
+
+
+def window_minus_deletions(
+    start: float, end: float, deletions: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """The pieces of [start, end] that survive the cuts, in order."""
+    pieces: list[tuple[float, float]] = []
+    cursor = start
+    for cut_start, cut_end in deletions:
+        if cut_start > cursor:
+            pieces.append((cursor, min(cut_start, end)))
+        cursor = max(cursor, cut_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        pieces.append((cursor, end))
+    return [(s, e) for s, e in pieces if e - s >= MIN_SEGMENT_S] or [(start, end)]
 
 
 def clip_qa_command(
@@ -4196,6 +4284,10 @@ def cmd_cut(args: argparse.Namespace) -> int:
         "transcribe-local", "--manifest", str(manifest_path), "--model", args.model
     )):
         return 2
+    if not args.keep_pauses:
+        _step("finding the dead air")
+        if cmd_analyze_edits(_args_for("analyze-edits", "--manifest", str(manifest_path))):
+            return 2
     _step("indexing what can be quoted")
     if cmd_build_evidence_index(
         _args_for("build-evidence-index", "--project-dir", str(project_dir))
@@ -4213,13 +4305,38 @@ def cmd_cut(args: argparse.Namespace) -> int:
     if cmd_plan_highlights(_args_for("plan-highlights", *highlight_argv)):
         return 2
 
+    problems: list[str] = []
     if args.translate:
-        _step(f"translating the captions into {args.translate}")
-        _subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("caption_translator.py")),
-             "--project-dir", str(project_dir), "--language", args.translate],
-            check=False, capture_output=True,
+        from editor_server import caption_render_decision
+
+        render_captions, caption_reason = caption_render_decision(
+            project_dir, read_json(manifest_path)
         )
+        if not render_captions:
+            # Nothing will carry a second line, so translating would only
+            # imply otherwise. Said out loud rather than delivered around.
+            problems.append(
+                f"--translate {args.translate} had nothing to translate: "
+                f"captions are off for this source ({caption_reason})"
+            )
+        else:
+            _step(f"translating the captions into {args.translate}")
+            translated = _subprocess.run(
+                [sys.executable,
+                 str(Path(__file__).with_name("caption_translator.py")),
+                 "--project-dir", str(project_dir),
+                 "--language", args.translate],
+                check=False, capture_output=True, text=True,
+            )
+            if translated.returncode != 0:
+                # The clips are still worth delivering with one caption line,
+                # but a translation that quietly did not happen looks exactly
+                # like one nobody asked for — the step said "translating" and
+                # the delivery must not imply it succeeded.
+                problems.append(
+                    "captions were not translated: "
+                    + (translated.stderr or translated.stdout or "").strip()[-300:]
+                )
 
     manifest = read_json(manifest_path)
     plan = read_json(project_dir / "working/highlight_plan.json")
@@ -4236,7 +4353,6 @@ def cmd_cut(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     renderer = str(Path(__file__).with_name("render_editor_timeline.py"))
     made: list[dict[str, Any]] = []
-    problems: list[str] = []
 
     for highlight in highlights:
         editorial = highlight.get("editorial") or {}
@@ -4250,6 +4366,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
             materialise_clip(
                 project_dir, manifest, highlight,
                 fit=chosen_framing, cards=not args.no_cards,
+                trim_pauses=not args.keep_pauses,
             )
         except ValueError as exc:
             problems.append(f"{title}: {exc}")
@@ -4979,6 +5096,10 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument("--project-dir", default="", help="defaults to <out>/.project")
     cut.add_argument("--clips", type=int, default=3, help="how many clips to cut")
     cut.add_argument("--seconds", type=float, default=30.0, help="roughly how long each")
+    cut.add_argument(
+        "--keep-pauses", action="store_true",
+        help="leave dead air in place instead of cutting it out",
+    )
     cut.add_argument(
         "--glossary",
         action="append",

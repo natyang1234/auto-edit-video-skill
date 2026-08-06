@@ -84,6 +84,11 @@
                 "type": "integer",
                 "minimum": 0,
                 "description": "Transparent margin on each side, for stroke and emphasis growth. The ink is this much narrower than width, which is what a check about covering or being covered has to measure."
+              },
+              "spoken_height": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Height of the spoken line's part of the raster; the remainder below it is the translation."
               }
             },
             "required": [
@@ -91,6 +96,7 @@
               "height",
               "padding",
               "rgba_path",
+              "spoken_height",
               "width"
             ],
             "additionalProperties": false

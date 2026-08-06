@@ -28,6 +28,7 @@ import json
 import re
 import text_joining
 import shutil
+import tempfile
 import subprocess
 import uuid
 from typing import Any
@@ -134,33 +135,68 @@ def parse_json_payload(text: str) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)]
 
 
+# When the gateway's quota is spent, the subscription CLI still answers.
+# Tried in order; an explicitly chosen provider is used alone, because a
+# fallback behind someone's explicit choice is a different model answering
+# than the one they named.
+CLAUDE_PROVIDER = ("claude",)
+FALLBACK_PROVIDERS: tuple[tuple[str, ...], ...] = (DEFAULT_PROVIDER, CLAUDE_PROVIDER)
+
+
+def provider_command(provider: tuple[str, ...], prompt: str) -> tuple[list[str], str | None]:
+    """The invocation for this provider, and the cwd it must run from.
+
+    The claude CLI reads the repository it is started in as session context,
+    which turns a translation request into a code review. It runs from an
+    empty directory with settings stripped, so the prompt is all there is.
+    """
+    if provider[0] == "claude":
+        scratch = tempfile.mkdtemp(prefix="auto-edit-provider-")
+        return (
+            [provider[0], "-p", prompt, "--model", "haiku",
+             "--setting-sources", ""],
+            scratch,
+        )
+    return (
+        [*provider,
+         "--session-id", f"auto-edit-editorial-{uuid.uuid4().hex[:12]}",
+         "--message", prompt,
+         "--json"],
+        None,
+    )
+
+
 def call_provider(
     prompt: str,
     *,
-    provider: tuple[str, ...] = DEFAULT_PROVIDER,
+    provider: tuple[str, ...] | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
 ) -> str:
-    if not provider:
-        raise EditorialUnavailable("no editorial provider configured")
-    if shutil.which(provider[0]) is None:
-        raise EditorialUnavailable(f"editorial provider {provider[0]!r} is not installed")
-    command = [
-        *provider,
-        "--session-id", f"auto-edit-editorial-{uuid.uuid4().hex[:12]}",
-        "--message", prompt,
-        "--json",
-    ]
-    try:
-        result = subprocess.run(
-            command, check=False, text=True, capture_output=True, timeout=timeout_s
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EditorialUnavailable(f"editorial provider timed out after {timeout_s}s") from exc
-    if result.returncode != 0:
-        raise EditorialUnavailable(
-            f"editorial provider exited {result.returncode}: {(result.stderr or '')[-400:]}"
-        )
-    return extract_reply(result.stdout or "")
+    chain = (provider,) if provider else FALLBACK_PROVIDERS
+    failures: list[str] = []
+    for candidate in chain:
+        if not candidate or shutil.which(candidate[0]) is None:
+            failures.append(f"{(candidate or ('?',))[0]}: not installed")
+            continue
+        command, cwd = provider_command(candidate, prompt)
+        try:
+            result = subprocess.run(
+                command, check=False, text=True, capture_output=True,
+                timeout=timeout_s, cwd=cwd,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(f"{candidate[0]}: timed out after {timeout_s}s")
+            continue
+        if result.returncode != 0:
+            failures.append(
+                f"{candidate[0]}: exited {result.returncode}: "
+                + (result.stderr or "")[-300:]
+            )
+            continue
+        return extract_reply(result.stdout or "")
+    raise EditorialUnavailable(
+        "every provider failed — " + " | ".join(failures)
+    )
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -413,7 +449,7 @@ def plan_editorial_highlights(
     min_duration: float,
     max_duration: float,
     brief: str = "",
-    provider: tuple[str, ...] = DEFAULT_PROVIDER,
+    provider: tuple[str, ...] | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Ask a model to cut the video, then verify every cut against the source."""

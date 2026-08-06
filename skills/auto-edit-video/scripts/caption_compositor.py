@@ -570,6 +570,19 @@ def render_caption_png(
     glyph_runs: list[dict[str, Any]] = []
     disallowed_fallbacks: list[str] = []
     lines = ct.CTFrameGetLines(frame)
+    # How much of the raster the spoken line occupies. The overlay is placed
+    # by the spoken line: a translation makes the block taller, and centring
+    # the whole block pushed the spoken line up into the picture.
+    translation_height = 0.0
+    if translation_range is not None:
+        for line in lines:
+            line_range = ct.CTLineGetStringRange(line)
+            if line_range.location >= translation_range[0]:
+                _w, line_ascent, line_descent, line_leading = (
+                    ct.CTLineGetTypographicBounds(line, None, None, None)
+                )
+                translation_height += line_ascent + line_descent + line_leading
+    spoken_height = max(1, int(height - translation_height))
     for line in lines:
         for run in ct.CTLineGetGlyphRuns(line):
             attributes = ct.CTRunGetAttributes(run)
@@ -624,6 +637,10 @@ def render_caption_png(
             # transparent margin and reports text that is comfortably inside
             # a boundary as crossing it.
             "padding": padding,
+            # The spoken line's share of the height; the rest is translation.
+            # The renderer anchors the spoken line and lets the translation
+            # hang below, instead of centring the block over the picture.
+            "spoken_height": spoken_height,
         },
         "x_padding": padding,
         "x_disallowed_fallbacks": sorted(set(disallowed_fallbacks)),
@@ -683,6 +700,10 @@ def caption_content_revision(
                 "text": overlay.get("text"),
                 "style": overlay.get("style"),
                 "effect_spans": overlay.get("effect_spans"),
+                # Part of the raster, so part of the key. Left out, adding a
+                # translation changed nothing in the hash and the cached
+                # single-line rasters were served as if nothing had happened.
+                "translation": overlay.get("translation"),
             }
             for overlay in caption_overlays(state)
         ],
