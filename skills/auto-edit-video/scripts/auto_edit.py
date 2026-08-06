@@ -4112,23 +4112,40 @@ def cmd_cut(args: argparse.Namespace) -> int:
     if cmd_set_target(_args_for("set-target", *target_argv)):
         return 2
 
-    # Spellings the recogniser gets wrong on its own. `init` has taken these
-    # since the beginning, but `cut` never offered them, so on the one command
-    # this tool is driven by there was no way to supply any — and a mis-heard
-    # word now reaches a card, where it is far more visible than in a caption.
-    if args.glossary:
+    # What the recogniser gets wrong, in the two shapes it gets wrong.
+    #
+    # A glossary keeps an English term from being spelled in pieces — "c ig
+    # ar" back into "cigar". It only takes terms with Latin letters in them,
+    # so it cannot touch a Chinese mis-hearing at all.
+    #
+    # A correction is the general one: heard this, write that, with the
+    # timing of what was heard. That is what fixes 句型 arriving as 巨型 or
+    # 菸 as "yan".
+    #
+    # `init` has taken both since the beginning; `cut` offered neither, so on
+    # the one command this tool is driven by there was no way to supply any —
+    # and a mis-heard word now reaches a card, where it is far more visible
+    # than in a caption.
+    if args.glossary or args.fix:
         try:
             terms = normalize_transcription_glossary(args.glossary)
+            fixes = normalize_transcription_calibrations(args.fix)
         except ValueError as exc:
             return die(str(exc))
         manifest = read_json(manifest_path)
         subtitles = manifest.get("subtitles")
         if not isinstance(subtitles, dict):
             return die("manifest subtitles must be an object")
-        subtitles["glossary"] = terms
+        if terms:
+            subtitles["glossary"] = terms
+        if fixes:
+            subtitles["calibrations"] = fixes
         manifest["updated_at"] = now_utc()
         write_json(manifest_path, manifest)
-        _step(f"keeping the spelling of {len(terms)} term(s)")
+        _step(
+            f"keeping the spelling of {len(terms)} term(s) and correcting "
+            f"{sum(len(rule['aliases']) for rule in fixes)} mis-hearing(s)"
+        )
 
     _step("looking at the picture and the sound")
     if cmd_analyze_video(_args_for("analyze-video", "--project-dir", str(project_dir))):
@@ -4925,8 +4942,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--glossary",
         action="append",
         default=[],
-        help="terms whose spelling to keep, comma or semicolon separated "
-             "(e.g. --glossary '句型,虛主詞,be 動詞')",
+        help="English terms to keep spelled whole, comma separated "
+             "(e.g. --glossary 'cigar,cigarette')",
+    )
+    cut.add_argument(
+        "--fix",
+        action="append",
+        default=[],
+        help="what the recogniser mis-hears, as 正確=誤聽|誤聽, semicolons "
+             "between rules (e.g. --fix '句型=巨型;菸=yan')",
     )
     cut.add_argument("--language", default="zh-TW")
     cut.add_argument("--model", default="auto")

@@ -279,9 +279,52 @@ class GlossaryReachesTheProjectTests(unittest.TestCase):
 
     def test_cut_accepts_a_glossary(self) -> None:
         args = auto_edit.build_parser().parse_args(
-            ["cut", "--input", "a.mp4", "--out", "o", "--glossary", "句型,虛主詞"]
+            ["cut", "--input", "a.mp4", "--out", "o", "--glossary", "cigar,cigarette"]
         )
-        self.assertEqual(args.glossary, ["句型,虛主詞"])
+        self.assertEqual(args.glossary, ["cigar,cigarette"])
+
+    def test_cut_accepts_corrections(self) -> None:
+        args = auto_edit.build_parser().parse_args(
+            ["cut", "--input", "a.mp4", "--out", "o", "--fix", "句型=巨型;菸=yan"]
+        )
+        self.assertEqual(
+            auto_edit.normalize_transcription_calibrations(args.fix),
+            [
+                {"canonical": "句型", "aliases": ["巨型"]},
+                {"canonical": "菸", "aliases": ["yan"]},
+            ],
+        )
+
+    def test_the_two_do_different_jobs(self) -> None:
+        # A glossary only takes terms with Latin letters in them, so it
+        # cannot touch a Chinese mis-hearing — asking it to would look like
+        # the fix was applied when nothing happened.
+        self.assertEqual(auto_edit.normalize_transcription_glossary(["句型"]), ["句型"])
+        data = {"segments": [{"words": [{"word": "巨型", "start": 0.0, "end": 1.0}]}]}
+        self.assertEqual(auto_edit.apply_glossary_corrections(data, ["句型"]), [])
+        self.assertEqual(data["segments"][0]["words"][0]["word"], "巨型")
+
+    def test_a_correction_rewrites_it_and_keeps_the_timing(self) -> None:
+        data = {"segments": [{"words": [
+            {"word": "這個", "start": 0.0, "end": 0.4},
+            {"word": "巨型", "start": 0.4, "end": 1.0},
+        ]}]}
+        rules = auto_edit.normalize_transcription_calibrations(["句型=巨型"])
+        applied = auto_edit.apply_transcription_calibrations(data, rules)
+        self.assertEqual(applied[0]["to"], "句型")
+        words = data["segments"][0]["words"]
+        self.assertEqual("".join(word["word"] for word in words), "這個句型")
+        self.assertEqual(words[-1]["start"], 0.4)
+        self.assertEqual(words[-1]["end"], 1.0)
+
+    def test_a_correction_can_turn_latin_into_chinese(self) -> None:
+        # 菸 arriving as "yan" is the shape a glossary can never repair,
+        # because a glossary only ever produces Latin.
+        data = {"segments": [{"words": [{"word": "yan", "start": 0.0, "end": 0.3}]}]}
+        auto_edit.apply_transcription_calibrations(
+            data, auto_edit.normalize_transcription_calibrations(["菸=yan"])
+        )
+        self.assertEqual(data["segments"][0]["words"][0]["word"], "菸")
 
     def test_terms_are_split_the_same_way_init_splits_them(self) -> None:
         # One normaliser, so a term accepted on one route is accepted on the
