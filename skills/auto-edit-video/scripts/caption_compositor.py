@@ -235,6 +235,73 @@ def fit_caption_text(text: str, measure_at, font_size: float, max_width: float):
     return wrapped, font_size
 
 
+def _character_map(original: str, wrapped: str) -> list[int]:
+    """Where each character of `original` ended up in `wrapped`, or -1.
+
+    Wrapping inserts newlines and can drop the space it broke on, so the two
+    strings are walked together rather than assuming a fixed shift.
+    """
+    mapping: list[int] = []
+    cursor = 0
+    for character in original:
+        while (
+            cursor < len(wrapped)
+            and wrapped[cursor] == "\n"
+            and character != "\n"
+        ):
+            cursor += 1
+        if cursor < len(wrapped) and wrapped[cursor] == character:
+            mapping.append(cursor)
+            cursor += 1
+        else:
+            # Dropped at a break: the space a line was split on.
+            mapping.append(-1)
+    return mapping
+
+
+def rewrapped_effect_spans(
+    spans: list[dict[str, Any]] | None, original: str, wrapped: str
+) -> list[dict[str, Any]]:
+    """The same emphasis, addressed to the text as it is actually laid out.
+
+    Breaks are decided here, after the spans were measured against the
+    unbroken line, so every character after a break sits one place further
+    along than the span says. Drawn as given, a keyword highlight slides left
+    by one character per break — seen on a real caption as 「叫做真正的主詞」
+    lighting up 「做真正的主」.
+    """
+    if not spans or original == wrapped:
+        return list(spans or [])
+    mapping = _character_map(original, wrapped)
+    if len(mapping) != len(original):
+        return list(spans)
+    moved: list[dict[str, Any]] = []
+    for span in spans:
+        try:
+            start = caption_engine.codepoint_index_for_utf16(
+                original, int(span.get("start_char", 0))
+            )
+            end = caption_engine.codepoint_index_for_utf16(
+                original, int(span.get("end_char", 0))
+            )
+        except ValueError:
+            continue
+        kept = [mapping[index] for index in range(start, min(end, len(mapping)))
+                if 0 <= index < len(mapping) and mapping[index] >= 0]
+        if not kept:
+            # Every character of it was dropped at a break. Emphasis pointing
+            # at nothing is dropped too, rather than pointed somewhere else.
+            continue
+        moved.append(
+            dict(
+                span,
+                start_char=caption_engine.utf16_length(wrapped[: kept[0]]),
+                end_char=caption_engine.utf16_length(wrapped[: kept[-1] + 1]),
+            )
+        )
+    return moved
+
+
 def render_caption_png(
     project_dir: Path,
     overlay: dict[str, Any],
@@ -303,7 +370,14 @@ def render_caption_png(
     # it packs the first line and strands whatever is left, which is how a
     # caption ends up with one character on a line of its own.
     lines, font_size = fit_caption_text(text, measure_at, font_size, wrap_width)
+    unwrapped = text
     text = "\n".join(lines)
+    # The breaks moved the text, so the emphasis has to move with it. The
+    # translation range below has always been re-found for exactly this
+    # reason; the spans were left addressing the unbroken line.
+    drawn_spans = rewrapped_effect_spans(
+        overlay.get("effect_spans"), unwrapped, text
+    )
     if translation_range is not None and translation:
         # The breaks moved the text, so the range has to be found again.
         marker = "\n".join(
@@ -367,7 +441,7 @@ def render_caption_png(
             built.addAttributes_range_(sub, foundation.NSMakeRange(start, end - start))
 
         nonlocal max_span_scale
-        for span in overlay.get("effect_spans") or []:
+        for span in drawn_spans:
             span_style = span.get("style") or {}
             start = int(span.get("start_char", 0))
             end = int(span.get("end_char", 0))
@@ -429,7 +503,7 @@ def render_caption_png(
 
     highlight_spans = [
         (int(span.get("start_char", 0)), int(span.get("end_char", 0)), span.get("style") or {})
-        for span in overlay.get("effect_spans") or []
+        for span in drawn_spans
         if (span.get("style") or {}).get("effect") == "highlight"
         and int(span.get("end_char", 0)) > int(span.get("start_char", 0))
     ]
