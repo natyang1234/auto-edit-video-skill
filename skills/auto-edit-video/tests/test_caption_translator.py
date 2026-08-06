@@ -11,9 +11,9 @@ sys.path.insert(0, str(SKILL_DIR / "scripts"))
 import caption_translator as translator  # noqa: E402
 
 LINES = [
-    {"n": 1, "text": "今晚別宅在家跟我走", "id": "segment-0001"},
-    {"n": 2, "text": "忠孝復興四號出口", "id": "segment-0002"},
-    {"n": 3, "text": "上二樓就是 downtown", "id": "segment-0003"},
+    {"n": 1, "text": "週末別窩在家跟我走", "id": "segment-0001"},
+    {"n": 2, "text": "中央公園三號出口", "id": "segment-0002"},
+    {"n": 3, "text": "上二樓就是 lounge", "id": "segment-0003"},
 ]
 
 
@@ -21,42 +21,42 @@ class AlignmentTests(unittest.TestCase):
     def test_a_full_reply_aligns_by_number(self) -> None:
         aligned, notes = translator.align(LINES, [
             {"n": 1, "text": "don't stay in tonight, come with me"},
-            {"n": 2, "text": "Zhongxiao Fuxing exit 4"},
-            {"n": 3, "text": "second floor is Downtown"},
+            {"n": 2, "text": "Central Park exit 3"},
+            {"n": 3, "text": "second floor is the lounge"},
         ])
         self.assertEqual(sorted(aligned), [1, 2, 3])
         self.assertEqual(notes, [])
 
     def test_the_reply_order_does_not_matter_because_numbers_do(self) -> None:
         aligned, _ = translator.align(LINES, [
-            {"n": 3, "text": "second floor is Downtown"},
+            {"n": 3, "text": "second floor is the lounge"},
             {"n": 1, "text": "come with me"},
-            {"n": 2, "text": "exit 4"},
+            {"n": 2, "text": "exit 3"},
         ])
         self.assertEqual(aligned[1], "come with me")
-        self.assertEqual(aligned[3], "second floor is Downtown")
+        self.assertEqual(aligned[3], "second floor is the lounge")
 
     def test_a_missing_line_is_left_missing_and_reported(self) -> None:
         # Sliding the next line up would caption one moment with another
         # moment's words, which is worse than no second line.
         aligned, notes = translator.align(LINES, [
             {"n": 1, "text": "come with me"},
-            {"n": 3, "text": "second floor is Downtown"},
+            {"n": 3, "text": "second floor is the lounge"},
         ])
         self.assertNotIn(2, aligned)
-        self.assertEqual(aligned[3], "second floor is Downtown")
+        self.assertEqual(aligned[3], "second floor is the lounge")
         self.assertTrue(any("line 2" in note for note in notes))
 
     def test_a_line_echoed_back_unchanged_is_not_a_translation(self) -> None:
         aligned, notes = translator.align(LINES, [
-            {"n": 1, "text": "今晚別宅在家跟我走"},
-            {"n": 2, "text": "exit 4"},
+            {"n": 1, "text": "週末別窩在家跟我走"},
+            {"n": 2, "text": "exit 3"},
         ])
         self.assertNotIn(1, aligned)
         self.assertTrue(any("unchanged" in note for note in notes))
 
     def test_punctuation_only_differences_still_count_as_unchanged(self) -> None:
-        aligned, _ = translator.align(LINES, [{"n": 1, "text": "今晚別宅在家，跟我走！"}])
+        aligned, _ = translator.align(LINES, [{"n": 1, "text": "週末別窩在家，跟我走！"}])
         self.assertNotIn(1, aligned)
 
     def test_a_blank_translation_is_dropped(self) -> None:

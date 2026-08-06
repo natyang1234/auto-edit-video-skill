@@ -247,7 +247,7 @@ class HookCardShapeTests(unittest.TestCase):
 
     def test_a_longer_hook_still_stops_at_the_canvas_share(self) -> None:
         wide, _ = self.card(
-            "今晚別宅在家跟我走忠孝復興四號出口旁邊巷子右手邊小門", "full-screen-hook"
+            "週末別窩在家跟我走中央公園三號出口旁邊巷子右手邊小門", "full-screen-hook"
         )
         self.assertLessEqual(wide, int(1080 * 0.5 * 0.84))
 

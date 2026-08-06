@@ -13,7 +13,7 @@ import card_plan  # noqa: E402
 
 SPOKEN = [
     {"start": 0.0, "end": 5.0, "text": "我就把自己錄起來大概三十分鐘"},
-    {"start": 5.0, "end": 10.0, "text": "然後帶兒子從游泳池回來"},
+    {"start": 5.0, "end": 10.0, "text": "然後從市場買菜回來"},
     {"start": 10.0, "end": 16.0, "text": "透過 AI 批量發布安排"},
     {"start": 16.0, "end": 24.0, "text": "用力盡力享受生活"},
 ]
@@ -79,7 +79,7 @@ class GroundingTests(unittest.TestCase):
             proposal(at=1.0),
             proposal(at=2.0, payload={"text": "太近"}, kind="chip"),
             proposal(at=6.0, kind="chip", payload={"text": "🏊 → 🚗"},
-                     quote="帶兒子從游泳池回來"),
+                     quote="從市場買菜回來"),
         )
         self.assertEqual([card["start"] for card in cards], [1.0, 6.0])
         self.assertTrue(any("within" in note for note in notes))
@@ -87,7 +87,7 @@ class GroundingTests(unittest.TestCase):
     def test_the_budget_is_a_ceiling_and_the_cut_is_reported(self) -> None:
         cards, notes = self.ground(
             proposal(at=1.0),
-            proposal(at=6.0, quote="帶兒子從游泳池回來"),
+            proposal(at=6.0, quote="從市場買菜回來"),
             proposal(at=11.0, quote="透過 AI 批量發布"),
             budget=2,
         )

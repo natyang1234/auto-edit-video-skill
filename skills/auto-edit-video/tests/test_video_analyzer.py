@@ -60,7 +60,7 @@ class BurnedInVerdictTests(unittest.TestCase):
     def test_a_changing_caption_row_is_detected(self) -> None:
         verdict = video_analyzer.burned_in_verdict(
             self.frames(
-                ["今晚別宅在家", "忠孝復興四號出口", "旁邊巷子", "上二樓", "跟我進來", "訂位"]
+                ["週末別窩在家", "中央公園三號出口", "旁邊巷子", "上二樓", "跟我進來", "訂位"]
             )
         )
         self.assertEqual(verdict["status"], "detected")
@@ -81,7 +81,7 @@ class BurnedInVerdictTests(unittest.TestCase):
 
     def test_scenery_text_that_drifts_is_not_a_caption_row(self) -> None:
         frames = {}
-        for index, text in enumerate(["多采", "DOWNTOWN", "營業中", "多采", "招牌", "小門"]):
+        for index, text in enumerate(["多采", "LOUNGE", "營業中", "多采", "招牌", "小門"]):
             offset = 0.10 + index * 0.03  # the camera moves; the sign moves
             frames[float(index) * 4.0] = [
                 {"text": text,

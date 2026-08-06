@@ -100,13 +100,13 @@ class NarrativeEngineTests(unittest.TestCase):
         # Sentence-break-only splitting turned the whole clip into one quote,
         # and every card built from it read as a run-on cut off mid-word.
         words = [
-            {"id": "word-1", "text": "今晚", "start": 0.0, "end": 0.9,
+            {"id": "word-1", "text": "週末", "start": 0.0, "end": 0.9,
              "segment_id": "segment-0001"},
-            {"id": "word-2", "text": "別宅在家", "start": 0.9, "end": 2.0,
+            {"id": "word-2", "text": "別窩在家", "start": 0.9, "end": 2.0,
              "segment_id": "segment-0001"},
-            {"id": "word-3", "text": "忠孝復興", "start": 3.9, "end": 4.8,
+            {"id": "word-3", "text": "中央公園", "start": 3.9, "end": 4.8,
              "segment_id": "segment-0002"},
-            {"id": "word-4", "text": "四號出口", "start": 4.8, "end": 5.9,
+            {"id": "word-4", "text": "三號出口", "start": 4.8, "end": 5.9,
              "segment_id": "segment-0002"},
         ]
         quotes = [
@@ -116,7 +116,7 @@ class NarrativeEngineTests(unittest.TestCase):
         ]
         self.assertEqual(
             [item["literal"] for item in quotes],
-            ["今晚別宅在家", "忠孝復興四號出口"],
+            ["週末別窩在家", "中央公園三號出口"],
         )
 
     def test_tampered_evidence_map_is_rejected(self) -> None:

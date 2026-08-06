@@ -27,24 +27,24 @@ class BreakPointTests(unittest.TestCase):
         self.assertFalse(cc._breakable(text, text.index("3000") + 2))
 
     def test_a_space_is_always_a_break(self) -> None:
-        text = "SO GO 旁邊"
-        self.assertTrue(cc._breakable(text, text.index("GO")))
+        text = "MRT 旁邊"
+        self.assertTrue(cc._breakable(text, text.index("旁")))
 
     def test_chinese_may_break_between_characters(self) -> None:
-        self.assertTrue(cc._breakable("今晚別宅在家", 3))
+        self.assertTrue(cc._breakable("週末別窩在家", 3))
 
     def test_closing_punctuation_never_starts_a_line(self) -> None:
         text = "跟我走，然後呢"
         self.assertFalse(cc._breakable(text, text.index("，")))
 
     def test_opening_punctuation_never_ends_a_line(self) -> None:
-        text = "他說「今晚別宅在家」"
+        text = "他說「週末別窩在家」"
         self.assertFalse(cc._breakable(text, text.index("「") + 1))
 
 
 class WrapTests(unittest.TestCase):
     def test_text_that_fits_stays_on_one_line(self) -> None:
-        self.assertEqual(cc.wrap_lines("今晚別宅在家", monospace(), 100.0), ["今晚別宅在家"])
+        self.assertEqual(cc.wrap_lines("週末別窩在家", monospace(), 100.0), ["週末別窩在家"])
 
     def test_lines_are_balanced_rather_than_greedily_filled(self) -> None:
         # Greedy filling packs the first line and strands the remainder;
@@ -54,16 +54,16 @@ class WrapTests(unittest.TestCase):
         self.assertLessEqual(abs(len(lines[0]) - len(lines[1])), 1)
 
     def test_no_line_is_left_with_a_couple_of_characters(self) -> None:
-        for text in ("一二三四五六七八九十甲", "今晚別宅在家跟我走好嗎"):
+        for text in ("一二三四五六七八九十甲", "週末別窩在家跟我走好嗎"):
             for line in cc.wrap_lines(text, monospace(), 100.0) or []:
                 self.assertGreaterEqual(len(line), cc.MIN_TAIL_CHARS, text)
 
     def test_a_break_never_lands_inside_an_english_word(self) -> None:
         lines = cc.wrap_lines(
-            "旁邊巷子到 downtown 右手邊小門就是", monospace(), 100.0
+            "旁邊巷子到 lounge 右手邊小門就是", monospace(), 100.0
         ) or []
         joined = "|".join(lines)
-        self.assertIn("downtown", joined.replace("|", "")[: len(joined)])
+        self.assertIn("lounge", joined.replace("|", "")[: len(joined)])
         for line in lines:
             self.assertFalse(line.endswith("down"))
             self.assertFalse(line.startswith("town"))
@@ -85,8 +85,8 @@ class AutofitTests(unittest.TestCase):
         return lambda text: len(text) * size
 
     def test_a_line_that_fits_keeps_its_size(self) -> None:
-        lines, size = cc.fit_caption_text("今晚別宅", self.measure_at, 10.0, 100.0)
-        self.assertEqual(lines, ["今晚別宅"])
+        lines, size = cc.fit_caption_text("週末別窩", self.measure_at, 10.0, 100.0)
+        self.assertEqual(lines, ["週末別窩"])
         self.assertEqual(size, 10.0)
 
     def test_a_near_miss_shrinks_instead_of_wrapping(self) -> None:
@@ -102,8 +102,8 @@ class AutofitTests(unittest.TestCase):
         self.assertGreater(len(lines), 1)
 
     def test_an_explicit_newline_is_honoured(self) -> None:
-        lines, _ = cc.fit_caption_text("今晚別宅\n在家跟我", self.measure_at, 10.0, 100.0)
-        self.assertEqual(lines, ["今晚別宅", "在家跟我"])
+        lines, _ = cc.fit_caption_text("週末別窩\n在家跟我", self.measure_at, 10.0, 100.0)
+        self.assertEqual(lines, ["週末別窩", "在家跟我"])
 
 class CaptionSegmentTests(unittest.TestCase):
     """Which words share a caption line."""
@@ -124,16 +124,16 @@ class CaptionSegmentTests(unittest.TestCase):
         ]
 
     def test_a_line_ends_where_the_recogniser_ended_its_segment(self) -> None:
-        segments = [{"start": 0.0, "end": 2.0, "text": "今晚別宅在家"},
+        segments = [{"start": 0.0, "end": 2.0, "text": "週末別窩在家"},
                     {"start": 2.0, "end": 4.0, "text": "跟我走"}]
         words = self.words(
-            ("今晚", 0.0, 1.0, "segment-0001"),
-            ("別宅在家", 1.0, 2.0, "segment-0001"),
+            ("週末", 0.0, 1.0, "segment-0001"),
+            ("別窩在家", 1.0, 2.0, "segment-0001"),
             ("跟我走", 2.0, 4.0, "segment-0002"),
         )
         self.assertEqual(
             [item["text"] for item in self.split(segments, words)],
-            ["今晚別宅在家", "跟我走"],
+            ["週末別窩在家", "跟我走"],
         )
 
     def test_a_word_ending_on_another_segments_timestamp_does_not_end_a_line(self) -> None:
@@ -141,22 +141,22 @@ class CaptionSegmentTests(unittest.TestCase):
         # happens to end on the same rounded second as a segment elsewhere
         # in the video ends a line. On a real lesson that fired hundreds of
         # times and left captions one character long.
-        segments = [{"start": 0.0, "end": 4.0, "text": "今晚別宅在家跟我走"},
-                    {"start": 4.0, "end": 8.0, "text": "忠孝復興四號出口"}]
+        segments = [{"start": 0.0, "end": 4.0, "text": "週末別窩在家跟我走"},
+                    {"start": 4.0, "end": 8.0, "text": "中央公園三號出口"}]
         words = self.words(
-            ("今晚", 0.0, 1.0, "segment-0001"),
+            ("週末", 0.0, 1.0, "segment-0001"),
             # This one ends exactly when segment one ends, but belongs to it.
-            ("別宅在家", 1.0, 4.0, "segment-0001"),
+            ("別窩在家", 1.0, 4.0, "segment-0001"),
             ("跟我走", 4.0, 4.4, "segment-0001"),
-            ("忠孝復興", 4.4, 8.0, "segment-0002"),
+            ("中央公園", 4.4, 8.0, "segment-0002"),
         )
         lines = [item["text"] for item in self.split(segments, words)]
-        self.assertEqual(lines, ["今晚別宅在家跟我走", "忠孝復興"])
+        self.assertEqual(lines, ["週末別窩在家跟我走", "中央公園"])
 
     def test_words_without_a_segment_id_still_split_on_gaps(self) -> None:
         # Older transcripts predate the field; length and silence still apply.
         words = [
-            {"id": "word-1", "text": "今晚別宅在家", "start": 0.0, "end": 1.0},
+            {"id": "word-1", "text": "週末別窩在家", "start": 0.0, "end": 1.0},
             {"id": "word-2", "text": "跟我走", "start": 3.0, "end": 4.0},
         ]
         lines = [item["text"] for item in self.split([], words)]

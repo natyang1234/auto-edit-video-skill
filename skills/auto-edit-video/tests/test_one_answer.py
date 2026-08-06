@@ -88,7 +88,7 @@ class TokenJoiningTests(unittest.TestCase):
     """Every path that turns transcript tokens into text spaces them alike."""
 
     CASES = [
-        ["今晚", "去", "downtown", "，", "好嗎"],
+        ["今晚", "去", "lounge", "，", "好嗎"],
         ["it", "is", "fun"],
         ["雪茄", "叫做", "cigar"],
         ["（", "註", "）", "所以"],
