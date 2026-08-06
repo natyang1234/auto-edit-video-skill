@@ -1674,18 +1674,33 @@ def cmd_ingest_folder(args: argparse.Namespace) -> int:
     else:
         if not videos:
             return die("no video file found in the folder; pass --main explicitly")
-        durations: list[tuple[float, Path]] = []
-        for candidate in videos:
-            try:
-                durations.append(
-                    (float(probe_media(candidate).get("duration_s") or 0.0), candidate)
-                )
-            except (ValueError, RuntimeError) as exc:
-                warnings.append(f"unreadable video skipped for main pick: {candidate.name}: {exc}")
-        if not durations:
-            return die("no probeable video found; pass --main explicitly")
-        durations.sort(key=lambda item: (-item[0], item[1].as_posix()))
-        main_video = durations[0][1]
+        named = [
+            candidate for candidate in videos
+            if candidate.stem.lower() == "main" and candidate.parent == folder
+        ]
+        if len(named) > 1:
+            return die(
+                "more than one file is named main: "
+                + ", ".join(sorted(candidate.name for candidate in named))
+                + "; pass --main to say which one"
+            )
+        if named:
+            main_video = named[0]
+        elif len(videos) > 1:
+            # Picking the longest used to stand in for asking. It reads as a
+            # rule until the day the B-roll runs longer than the talking, and
+            # then the wrong video is cut with nothing said about it.
+            return die(
+                f"the folder has {len(videos)} videos and none is named main: "
+                + ", ".join(sorted(candidate.name for candidate in videos)[:6])
+                + "; name one main.<ext> or pass --main"
+            )
+        else:
+            main_video = videos[0]
+        try:
+            probe_media(main_video)
+        except (ValueError, RuntimeError) as exc:
+            return die(f"the main video could not be read: {main_video.name}: {exc}")
     main_rel = main_video.relative_to(folder).as_posix()
     for entry in entries:
         if entry["path"] == main_rel:
@@ -1708,6 +1723,30 @@ def cmd_ingest_folder(args: argparse.Namespace) -> int:
         if entry["role"] in {"main_video", "ignored"}:
             continue
         source_path = folder / entry["path"]
+        # An extension is a claim about content, and the renderer believes it.
+        # A text file called cover.png reaches the frame as a picture that
+        # cannot be decoded, and the failure surfaces minutes later inside
+        # ffmpeg rather than here, where the file is still in someone's hand.
+        if entry["kind"] in {"video", "image"}:
+            # A still has no duration, so it is asked the question a still can
+            # answer: does a picture of positive size decode out of it. Asking
+            # only whether a video stream is declared is not enough — ffprobe
+            # reports a 0x0 png stream for a text file called cover.png.
+            from editor_server import ffprobe_visual_dimensions
+
+            readable = ffprobe_visual_dimensions(source_path) is not None
+            if readable and entry["kind"] == "video":
+                try:
+                    probe_media(source_path)
+                except (ValueError, RuntimeError):
+                    readable = False
+            if not readable:
+                warnings.append(
+                    f"{entry['path']} is named like a {entry['kind']} but nothing "
+                    "could read a picture out of it; left out"
+                )
+                entry["role"] = "ignored"
+                continue
         # 16-hex content prefix keeps names readable while making a
         # case-insensitive-filesystem collision imply identical content
         # (which is then a legitimate dedupe, not silent loss).
