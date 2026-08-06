@@ -107,6 +107,21 @@ def _load_platform_presets() -> dict[str, dict[str, Any]]:
 
 PLATFORM_PRESETS: dict[str, dict[str, Any]] = _load_platform_presets()
 
+
+def platform_safe_area(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The margins this project's platform keeps for its own controls.
+
+    None when the project names no platform, or names one the registry does
+    not carry: a missing answer, which callers report as unchecked rather
+    than treating as "nothing is in the way".
+    """
+    canvas = (state or {}).get("canvas")
+    if not isinstance(canvas, dict):
+        return None
+    preset = PLATFORM_PRESETS.get(str(canvas.get("platform_id") or ""))
+    safe = (preset or {}).get("safe")
+    return safe if isinstance(safe, dict) and safe else None
+
 def _load_director_presets() -> dict[str, dict[str, Any]]:
     """Director presets load from the versioned registry (runtime SSOT,
     symmetric with _load_platform_presets); missing/invalid fails closed."""

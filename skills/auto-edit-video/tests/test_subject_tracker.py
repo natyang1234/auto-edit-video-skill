@@ -145,5 +145,66 @@ class CardPlacementTests(unittest.TestCase):
         self.assertEqual((y, reason), (46.0, "no_clear_band"))
 
 
+class PlatformChromeTests(unittest.TestCase):
+    """Clearing the speaker is not enough on a phone.
+
+    A card tucked under the top edge clears the head and lands behind the
+    app's own controls. Measured on a delivery on 2026-08-06: placed at
+    9.22%, top edge 6.4%, inside the 8% Instagram Reels reserves.
+    """
+
+    CARD = 0.06
+    RESERVED = 0.08
+
+    def place(self, head_top, card=CARD):
+        return tracker.card_y_percent(
+            head_top, card_height_fraction=card, caption_top=0.70,
+            default=46.0, reserved_top=self.RESERVED,
+        )
+
+    def test_a_card_that_would_sit_under_the_chrome_is_pushed_below_it(self) -> None:
+        # A head 18% down leaves a narrow band, and centring the card in it
+        # puts the top edge at 6% — inside the reserved 8%.
+        y, reason = self.place(0.18)
+        self.assertGreaterEqual(
+            round(y / 100 - self.CARD / 2, 6), self.RESERVED, "top edge clears it"
+        )
+        self.assertTrue(reason.endswith("below_chrome"), reason)
+
+    def test_a_card_already_clear_of_it_is_left_alone(self) -> None:
+        # A head 40% down leaves a wide band; the card centres at 20% and
+        # was never near the chrome. Compared against the same call with no
+        # reserved band, to show the move only happens when it is demanded.
+        with_chrome, reason = self.place(0.40)
+        without, plain = tracker.card_y_percent(
+            0.40, card_height_fraction=self.CARD, caption_top=0.70, default=46.0
+        )
+        self.assertEqual((with_chrome, reason), (without, plain))
+
+    def test_no_platform_margin_behaves_exactly_as_before(self) -> None:
+        for head in (0.21, 0.02, None):
+            with self.subTest(head=head):
+                self.assertEqual(
+                    tracker.card_y_percent(
+                        head, card_height_fraction=self.CARD,
+                        caption_top=0.70, default=46.0, reserved_top=0.0,
+                    ),
+                    tracker.card_y_percent(
+                        head, card_height_fraction=self.CARD,
+                        caption_top=0.70, default=46.0,
+                    ),
+                )
+
+    def test_the_chrome_never_pushes_the_card_onto_the_speaker(self) -> None:
+        # A head 11% down: the card's top edge lands at 2.5%, inside the
+        # reserved band, but moving it clear would put its bottom edge at
+        # 14% — on the face. Covering the speaker is the defect this whole
+        # placement path exists to avoid, and it is worse than a button.
+        y, reason = self.place(0.11)
+        self.assertLess(y / 100 - self.CARD / 2, self.RESERVED, "left in the band")
+        self.assertLess(y / 100 + self.CARD / 2, 0.11, "and still off the face")
+        self.assertEqual(reason, "above_subject")
+
+
 if __name__ == "__main__":
     unittest.main()

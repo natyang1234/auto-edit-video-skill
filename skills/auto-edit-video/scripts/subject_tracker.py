@@ -221,23 +221,45 @@ def card_y_percent(
     card_height_fraction: float,
     caption_top: float,
     default: float,
+    reserved_top: float = 0.0,
 ) -> tuple[float, str]:
     """Where the card's centre sits, as a percentage from the top.
 
     Returns the default and a reason when there is nowhere better; a caller
     that cannot tell "placed deliberately" from "left where it was" will
     report a collision as a layout choice.
+
+    `reserved_top` is the band the platform keeps for its own controls, as a
+    fraction. Clearing the speaker's head is not enough on a phone: a card
+    tucked right under the top edge lands behind the app's own chrome, which
+    a delivery measured on 2026-08-06 did.
     """
     if head_top is None:
         return default, "no_subject_found"
     margin = card_height_fraction * 0.35
+    # The highest the card's centre may sit and still clear the chrome.
+    floor = reserved_top + card_height_fraction / 2 if reserved_top > 0 else 0.0
+
+    def clear(value: float, reason: str) -> tuple[float, str]:
+        if value < floor:
+            # Only worth moving if it still leaves the head alone; a card
+            # pushed onto the speaker is worse than one under a button.
+            if head_top is not None and floor + card_height_fraction / 2 > head_top:
+                return round(value * 100, 2), reason
+            return round(floor * 100, 2), f"{reason}_below_chrome"
+        return round(value * 100, 2), reason
+
     # Centre the card in the clear band above the head, if it fits there.
     if head_top >= card_height_fraction + margin * 2:
-        return round(max(margin, (head_top - card_height_fraction) / 2) * 100 + card_height_fraction * 50, 2), "above_subject"
+        return clear(
+            max(margin, (head_top - card_height_fraction) / 2)
+            + card_height_fraction / 2,
+            "above_subject",
+        )
     # Otherwise sit between the subject and the captions, still clear of both.
     below = caption_top - card_height_fraction - margin
     if below > head_top:
-        return round(below * 100, 2), "above_captions"
+        return clear(below, "above_captions")
     return default, "no_clear_band"
 
 

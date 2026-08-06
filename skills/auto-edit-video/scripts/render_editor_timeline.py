@@ -20,9 +20,11 @@ from typing import Any
 
 from editor_server import (
     PLATFORM_PRESETS,
+    atomic_write_json,
     editor_state_revision,
     ffprobe_has_visual_stream,
     file_sha256,
+    platform_safe_area,
     read_json,
     referenced_asset_digests,
 )
@@ -423,6 +425,51 @@ def strip_caption_overlays(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def placements_of(
+    overlays: list[dict[str, Any]], width: int, height: int
+) -> list[dict[str, Any]]:
+    """What each overlay will occupy, in fractions of the canvas.
+
+    Built in one pass over the finished list rather than recorded at each of
+    the three places overlays are created, because those three have drifted
+    from each other before and would again.
+
+    Height is only known where a compositor measured it. An overlay drawn
+    from a picture on disk is listed without one, which the checker reports
+    as unmeasured rather than passing over in silence.
+    """
+    placements: list[dict[str, Any]] = []
+    for overlay in overlays:
+        if not overlay.get("visible", True):
+            continue
+        style = overlay.get("style") or {}
+        drawn = overlay.get("drawn") or {}
+        entry: dict[str, Any] = {
+            "id": str(overlay.get("id") or ""),
+            "kind": str(overlay.get("type") or "overlay"),
+            "start": float(overlay.get("start", 0.0)),
+            "end": float(overlay.get("end", 0.0)),
+            "x": float(style.get("x", 50)) / 100.0,
+            "y": float(style.get("y", 50)) / 100.0,
+        }
+        try:
+            drawn_width = float(drawn.get("width") or 0)
+            drawn_height = float(drawn.get("height") or 0)
+        except (TypeError, ValueError):
+            drawn_width = drawn_height = 0.0
+        if drawn_width > 0 and drawn_height > 0 and width > 0 and height > 0:
+            # The overlay is scaled to its style width; the height follows the
+            # asset's own proportions, which is what ffmpeg's -2 computes.
+            scaled_width = float(style.get("width", 0)) / 100.0
+            if scaled_width > 0:
+                entry["width"] = scaled_width
+                entry["height"] = (
+                    scaled_width * width * (drawn_height / drawn_width) / height
+                )
+        placements.append(entry)
+    return placements
+
+
 def captionized_overlays(
     overlays: list[dict[str, Any]],
     caption_plan: dict[str, Any],
@@ -454,6 +501,7 @@ def captionized_overlays(
                 "end": overlay.get("end"),
                 "visible": True,
                 "z_index": overlay.get("z_index", 0),
+                "drawn": {"width": artifact["width"], "height": artifact["height"]},
                 "style": {
                     "width": max(5.0, min(100.0, artifact["width"] / max(width, 1) * 100.0)),
                     "x": float(style.get("x", 50)),
@@ -707,6 +755,10 @@ def build_render_command(
                 card_y = card_y_for_window(
                     source, plan_item, artifact, height,
                     caption_top_fraction(state),
+                    # The band the platform keeps for its own controls; a
+                    # card that clears the speaker can still land behind them.
+                    float((platform_safe_area(state) or {}).get("top", 0) or 0)
+                    / 100.0,
                 )
                 overlays.append(
                     {
@@ -717,6 +769,14 @@ def build_render_command(
                         "end": window_end,
                         "visible": True,
                         "z_index": 5,
+                        # The size it was composed at, kept so the finished
+                        # frame can be checked for cards sitting on each
+                        # other. ffmpeg derives the drawn height from the
+                        # asset, so nothing downstream knows it otherwise.
+                        "drawn": {
+                            "width": artifact.get("width"),
+                            "height": artifact.get("height"),
+                        },
                         "style": {
                             # The card was composed at this canvas, so
                             # draw it at the size it was drawn. Forcing
@@ -793,6 +853,40 @@ def build_render_command(
                     "project font or mark the caption for review"
                 )
             overlays = captionized_overlays(overlays, caption_plan, width)
+
+    # Placement already tries to avoid the speaker. Nothing looked at the
+    # result: two cards could hold the same moment, a card could sit on the
+    # caption, and either renders without complaint. Now the frame is
+    # inspected before it is drawn, and what could not be inspected is named.
+    import visual_collision
+
+    placements = placements_of(overlays, width, height)
+    collision_review = visual_collision.review(
+        placements, platform_safe_area(state)
+    )
+    atomic_write_json(project_dir / "working/overlay_placements.json", {
+        "schema_version": 1,
+        "canvas": {"width": width, "height": height},
+        "placements": placements,
+        "review": collision_review,
+    })
+    print(
+        json.dumps({"visual_review": {
+            key: collision_review[key]
+            for key in ("checked", "unmeasured", "collisions", "off_frame", "safe_area")
+        }}, ensure_ascii=False),
+        file=sys.stderr,
+    )
+    # Not gated on final. `cut` — the one command this is normally driven by
+    # — renders preview, and two cards on top of each other is exactly as
+    # wrong there. Both shipped projects report none, so nothing that works
+    # today starts failing.
+    problems = visual_collision.blocking(collision_review)
+    if problems:
+        raise ValueError(
+            "the frame has overlays sitting on each other or running off it: "
+            + "; ".join(problems[:5])
+        )
 
     asset_inputs: dict[str, int] = {}
     for overlay in overlays:
@@ -1294,6 +1388,7 @@ def card_y_for_window(
     artifact: dict[str, Any],
     canvas_height: int,
     caption_top: float,
+    reserved_top: float = 0.0,
 ) -> float:
     """Put the card where the speaker is not.
 
@@ -1319,6 +1414,7 @@ def card_y_for_window(
             card_height_fraction=card_height / canvas_height,
             caption_top=caption_top,
             default=DEFAULT_CARD_Y,
+            reserved_top=reserved_top,
         )
     except Exception:
         return DEFAULT_CARD_Y
