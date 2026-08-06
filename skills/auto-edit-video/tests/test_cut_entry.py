@@ -138,3 +138,64 @@ class DeliveryGateCallTests(unittest.TestCase):
         self.assertEqual(
             qa_video.parse_content_rect(parsed.content_rect)[3], 0.316406
         )
+
+
+class ClipLengthTargetTests(unittest.TestCase):
+    """A length to aim for only means something on a source longer than it.
+
+    Asked for on 2026-08-06: set the seconds for long sources; when the
+    source is shorter, go straight on. Imposing a thirty-second window on a
+    twenty-second video turns something complete into something cut short.
+    """
+
+    def test_a_long_source_gets_the_target(self) -> None:
+        self.assertEqual(auto_edit.cut_target_seconds(30.0, 480.0), 30.0)
+
+    def test_a_source_shorter_than_the_target_is_left_alone(self) -> None:
+        self.assertIsNone(auto_edit.cut_target_seconds(30.0, 20.0))
+
+    def test_a_source_exactly_the_target_is_left_alone(self) -> None:
+        # There is nothing to choose between: the whole thing is the clip.
+        self.assertIsNone(auto_edit.cut_target_seconds(30.0, 30.0))
+
+    def test_asking_for_no_length_sets_none(self) -> None:
+        for requested in (0, 0.0, -5.0, float("nan")):
+            with self.subTest(requested):
+                self.assertIsNone(auto_edit.cut_target_seconds(requested, 480.0))
+
+    def test_an_unknown_source_length_does_not_cancel_the_target(self) -> None:
+        # Not knowing how long the source is, is not evidence that it is
+        # short; the target stands until something says otherwise.
+        self.assertEqual(auto_edit.cut_target_seconds(30.0, 0.0), 30.0)
+
+    def test_nonsense_lengths_are_refused_rather_than_guessed(self) -> None:
+        self.assertIsNone(auto_edit.cut_target_seconds("half a minute", 480.0))
+
+
+class OneRouteForLengthAndPlatformTests(unittest.TestCase):
+    """A folder and a file must reach the same target.
+
+    They did not. A folder went to ingest-folder, which takes neither
+    --seconds nor --platform, so both did nothing on that route and said so
+    only in a warning buried in the output: the same decision made in two
+    places, with one of them not making it.
+    """
+
+    def test_the_target_command_accepts_what_cut_sends_it(self) -> None:
+        # Two sub-commands, one parser each; an argument added on one side
+        # and unknown on the other fails only when a person runs it.
+        parsed = auto_edit.build_parser().parse_args([
+            "set-target", "--manifest", "m.json",
+            "--platform", "instagram-reels", "--target-duration", "30.0",
+        ])
+        self.assertEqual(parsed.target_duration, 30.0)
+        self.assertEqual(parsed.platform, "instagram-reels")
+
+    def test_every_platform_cut_offers_is_one_the_target_accepts(self) -> None:
+        parser = auto_edit.build_parser()
+        for platform in auto_edit.PLATFORMS:
+            with self.subTest(platform):
+                parsed = parser.parse_args(
+                    ["set-target", "--manifest", "m.json", "--platform", platform]
+                )
+                self.assertEqual(parsed.platform, platform)

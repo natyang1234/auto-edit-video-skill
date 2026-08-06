@@ -3939,6 +3939,26 @@ def framing_for(requested: str, manifest: dict[str, Any]) -> str:
     return "contain" if source_ratio > target_ratio * 1.15 else "cover"
 
 
+def cut_target_seconds(requested: float, source_duration: float) -> float | None:
+    """The length to aim each clip at, or None to leave length alone.
+
+    A target is for choosing moments out of something longer than itself.
+    When the source is no more than the target there is nothing to choose
+    from — the whole thing is already the clip — and imposing a window only
+    turns something complete into something cut short.
+    """
+    try:
+        wanted = float(requested)
+        available = float(source_duration)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(wanted) or wanted <= 0:
+        return None
+    if math.isfinite(available) and 0 < available <= wanted:
+        return None
+    return wanted
+
+
 def clip_qa_command(
     project_dir: Path, manifest: dict[str, Any], output: Path
 ) -> list[str]:
@@ -4002,11 +4022,23 @@ def cmd_cut(args: argparse.Namespace) -> int:
             "--source-language", args.language, "--platform", args.platform,
             "--source-has-burned-in", args.burned_in,
         ]
-        if args.seconds:
-            init_argv += ["--target-duration", str(args.seconds)]
         code = cmd_init(_args_for("init", *init_argv))
         if code:
             return code
+
+    # Where the clip length and the platform are decided, for both routes in.
+    # They were decided on one of them: a folder went to ingest-folder, which
+    # takes neither, so --seconds and --platform did nothing at all there and
+    # said so only in a warning buried in the output.
+    target = cut_target_seconds(
+        args.seconds,
+        float((read_json(manifest_path).get("source") or {}).get("duration_s") or 0.0),
+    )
+    target_argv = ["--manifest", str(manifest_path), "--platform", args.platform]
+    if target is not None:
+        target_argv += ["--target-duration", str(target)]
+    if cmd_set_target(_args_for("set-target", *target_argv)):
+        return 2
 
     _step("looking at the picture and the sound")
     if cmd_analyze_video(_args_for("analyze-video", "--project-dir", str(project_dir))):
