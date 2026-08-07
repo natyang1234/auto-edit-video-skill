@@ -475,6 +475,21 @@ class AssetRegistryTests(unittest.TestCase):
         pending = dict(allowed, review_status="pending")
         self.assertTrue(asset_registry.auto_license_errors(pending))
 
+    def test_non_provider_assets_carry_no_licence_to_verify(self) -> None:
+        # Decided, not overlooked (nat, 2026-08-08): the user's own uploads
+        # and generated images have no third-party licence, so the provider
+        # allowlist does not apply to them. Approval review still does.
+        for origin in ("user-upload", "generated", "folder-import"):
+            with self.subTest(origin):
+                own = self.item(origin=origin, spdx="GPL-3.0")
+                self.assertEqual(asset_registry.auto_license_errors(own), [])
+                unreviewed = dict(own, review_status="pending")
+                self.assertEqual(
+                    asset_registry.auto_license_errors(unreviewed),
+                    ["review_status must be approved"],
+                    "trusting the origin must not skip the review gate",
+                )
+
     def test_provider_auto_license_requires_hash_bound_consistency_evidence(self) -> None:
         item = self.item(
             asset_id="provider-openverse-a",

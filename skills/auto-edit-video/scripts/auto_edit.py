@@ -4357,6 +4357,20 @@ def cmd_cut(args: argparse.Namespace) -> int:
     highlights = plan.get("items", [])
     if not highlights:
         return die("nothing in this video came out as a clip worth cutting")
+    if target is None:
+        # A source no longer than the requested length IS the clip — the rule
+        # set for the duration target, carried through to selection. The
+        # picker still contributes its title and keywords, but it does not
+        # get to shave a nineteen-second video down to its last seven
+        # seconds, which one run did. Pauses inside still come out later.
+        source_duration = float(
+            (manifest.get("source") or {}).get("duration_s") or 0.0
+        )
+        if source_duration > 0:
+            best = max(highlights, key=lambda item: float(item.get("score") or 0.0))
+            highlights = [
+                dict(best, start=0.0, end=round(source_duration, 3), rank=1)
+            ]
 
     chosen_framing = framing_for(args.framing, manifest)
     _step(

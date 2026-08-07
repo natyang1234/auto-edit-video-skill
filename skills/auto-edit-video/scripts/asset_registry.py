@@ -610,6 +610,11 @@ def auto_license_errors(item: dict) -> list[str]:
     if item.get("review_status") != "approved":
         errors.append("review_status must be approved")
     if item.get("origin") != "provider":
+        # Decided, not overlooked (nat, 2026-08-08): assets that did not come
+        # from an external provider — the user's own uploads, folder imports,
+        # and images generated on their own account — carry no third-party
+        # licence to verify, so the allowlist below does not apply to them.
+        # Approval review above still does.
         return errors
 
     license_info = item.get("license")

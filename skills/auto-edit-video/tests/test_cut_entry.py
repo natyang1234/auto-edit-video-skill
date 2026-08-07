@@ -548,3 +548,22 @@ class RotatedSourceTests(unittest.TestCase):
         # portrait canvas instead of being letterboxed as if it were wide.
         portrait = self.probe(90)
         self.assertEqual(auto_edit.framing_for("auto", {"source": portrait}), "cover")
+
+
+class ShortSourceIsTheClipTests(unittest.TestCase):
+    """A source no longer than the requested length IS the clip.
+
+    The duration rule said so; selection did not hear it. On a 19-second
+    birthday video one run delivered only the last 7.6 seconds, because the
+    picker chose a span the way it would inside a ten-minute lesson. The
+    picker still names the clip; it does not get to shorten it.
+    """
+
+    def test_the_whole_source_ships_whichever_span_was_picked(self) -> None:
+        import inspect
+
+        source = inspect.getsource(auto_edit.cmd_cut)
+        # The collapse happens only when no target applies (short source),
+        # keeps the best-scored item's naming, and spans the full duration.
+        self.assertIn("if target is None:", source)
+        self.assertIn("start=0.0, end=round(source_duration, 3)", source)
