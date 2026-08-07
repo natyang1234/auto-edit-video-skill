@@ -232,6 +232,56 @@ MOTION_PRESETS = {
 MOTION_ANIMATIONS = {"fade", "pop", "slide-up", "slide-in", "pan"}
 
 
+def animated_card_overlay_source(
+    project_dir: Path,
+    pack: dict[str, Any],
+    layers: dict[str, Any],
+    layer_id: str,
+    artifact: dict[str, Any],
+    duration_s: float,
+    fps: int,
+) -> str | None:
+    """A transparent .mov of the card's content animation, or None.
+
+    None means the static PNG with its entrance approximation ships instead —
+    the preset is an entrance anyway, the animator is unavailable, or the
+    render failed. A delivery is never blocked on a browser.
+    """
+    import card_animator
+    import structured_card_compositor
+
+    layer = next(
+        (item for item in layers.get("items", []) if item.get("id") == layer_id), None
+    )
+    if layer is None:
+        return None
+    try:
+        component = structured_card_compositor.resolve_component(
+            pack, str(layer.get("type")), layer.get("component_id")
+        )
+    except ValueError:
+        return None
+    preset = str((component.get("motion") or {}).get("preset") or "")
+    if preset not in card_animator.CONTENT_PRESETS or not card_animator.available():
+        return None
+    try:
+        rendered = card_animator.render_card_animation(
+            project_dir, layer, pack, preset,
+            int(artifact.get("width") or 0), int(artifact.get("height") or 0),
+            duration_s, fps,
+        )
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            json.dumps({"card_animation_fallback": {
+                "layer": layer_id, "preset": preset,
+                "reason": str(exc)[:200],
+            }}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        return None
+    return rendered.relative_to(project_dir).as_posix()
+
+
 def motion_for_layer(pack: dict[str, Any], layers: dict[str, Any], layer_id: str) -> str:
     """The animation this card's component asks for."""
     import structured_card_compositor
@@ -785,11 +835,19 @@ def build_render_command(
                     float((platform_safe_area(state) or {}).get("top", 0) or 0)
                     / 100.0,
                 )
+                # A content-animating preset gets the real thing when the
+                # animator can deliver it: the same card, rebuilt as a
+                # transparent clip whose digits count and whose rows arrive.
+                animated_source = animated_card_overlay_source(
+                    project_dir, resolved_pack, layers_bundle, layer_ref,
+                    artifact, window_end - window_start,
+                    int(canvas.get("fps", 30)),
+                )
                 overlays.append(
                     {
                         "id": plan_item.get("id"),
-                        "type": "image",
-                        "source": artifact["artifact_id"],
+                        "type": "video" if animated_source else "image",
+                        "source": animated_source or artifact["artifact_id"],
                         "start": window_start,
                         "end": window_end,
                         "visible": True,
@@ -820,8 +878,11 @@ def build_render_command(
                             "y": card_y,
                             # The style pack says how this component
                             # should arrive; every card fading in
-                            # regardless was the pack going unread.
-                            "animation": motion_for_layer(
+                            # regardless was the pack going unread. An
+                            # animated card carries its motion inside the
+                            # clip, so it takes no entrance on top.
+                            "animation": "fade" if animated_source else
+                            motion_for_layer(
                                 resolved_pack, layers_bundle, layer_ref
                             ),
                         },

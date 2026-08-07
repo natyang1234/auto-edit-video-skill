@@ -23,7 +23,9 @@ from caption_compositor import _cg_color, _file_sha256, _load_coretext
 
 CARDS_REL = Path("working/structured_cards")
 ARTIFACTS_REL = Path("working/structured_layer_artifacts.json")
-COMPILER_VERSION = "static-card-compositor-v1"
+# v2: type sizes raised to caption scale — a card smaller than the
+# captions beside it reads as fine print (nat, watching a delivery).
+COMPILER_VERSION = "static-card-compositor-v2"
 MIN_LABEL_PT = 11.0
 
 
@@ -218,9 +220,12 @@ def render_card(
     muted = "#9AA4AF"
 
     if layer_type == "title":
+        # Cards share the screen with 52-68px captions; a title smaller
+        # than a caption reads as fine print. nat, watching a delivery:
+        # 「圖卡字太小了，要大一點才能看得見」.
         title, title_size = _fit_text(
             foundation, ct, quartz, str(payload.get("title") or ""),
-            44 * scale, ink, card_width - pad * 2, scale,
+            58 * scale, ink, card_width - pad * 2, scale,
         )
         kicker_text = str(payload.get("kicker") or "")
         subtitle_text = str(payload.get("subtitle") or "")
@@ -445,7 +450,7 @@ def render_card(
             quartz.CGContextStrokePath(context)
     elif layer_type == "dynamic_list":
         entries = payload.get("items") or []
-        row = int(30 * scale)
+        row = int(48 * scale)
         wrapped = 2 if component.get("kind") in {"carousel_grid", "calendar_reveal"} else 1
         rows = (len(entries) + wrapped - 1) // wrapped
         height = pad * 2 + row * max(rows, 1)
@@ -463,14 +468,14 @@ def render_card(
             line, _ = _fit_text(
                 foundation, ct, quartz,
                 f"{prefix}{entry.get('text', '')}",
-                18 * scale, ink, column_width - pad * 0.5, scale,
+                32 * scale, ink, column_width - pad * 0.5, scale,
             )
             column, position = divmod(index, max(1, (len(entries) + columns - 1) // columns)) \
                 if columns > 1 else (0, index)
             _draw_line(
                 ct, quartz, context, line,
                 pad + column * column_width,
-                height - pad - row * position - 20 * scale,
+                height - pad - row * position - 34 * scale,
             )
     elif layer_type == "note":
         # A small widget quoting something the speaker referred to: an icon,
@@ -632,6 +637,9 @@ def build_structured_artifacts(
         cached = existing_items.get(cache_key)
         if (
             cached
+            # The drawing code is an input too: the type-size bump shipped
+            # while every existing card sailed on through this cache.
+            and cached.get("compiler_version") == COMPILER_VERSION
             and cached.get("structured_layer_hash") == layer_hash
             and cached.get("style_pack_hash") == pack_hash
             and cached.get("mode_hash") == mode_hash
