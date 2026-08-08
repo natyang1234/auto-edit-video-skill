@@ -14,3 +14,4 @@ dist/
 .claude/skills/open-edit
 skills-lock.json
 skills/open-edit
+.open-edit/
