@@ -8,3 +8,9 @@ dist/
 *.mov
 *.wav
 *.mp3
+
+# Vendored agent skills (installed by `npx skills add`), not part of this project
+.agents/
+.claude/skills/open-edit
+skills-lock.json
+skills/open-edit
