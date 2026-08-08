@@ -62,11 +62,15 @@ class CardTitleTests(unittest.TestCase):
         hooks = [o for o in overlays if o.get("design_role") == "hook"]
         return hooks[0]["text"] if hooks else ""
 
-    def test_both_paths_agree_without_editorial_copy(self) -> None:
-        # They did not: one fell back to a quote from the transcript, the
-        # other to the highlight's own title, at different truncations.
+    def test_without_editorial_copy_the_director_draws_no_title(self) -> None:
+        # The two paths now deliberately part ways here: the designed deck
+        # keeps a fallback name because a person reviews it before it ships,
+        # while the director's automatic card refuses to promote a
+        # transcript excerpt — a KTV clip once shipped its own mis-heard
+        # transcript as a prominent card.
         item = highlight()
-        self.assertEqual(self.director_title(item), self.design_title(item))
+        self.assertEqual(self.director_title(item), "")
+        self.assertEqual(self.design_title(item), "逐字稿抽出來的標題")
 
     def test_both_paths_agree_with_editorial_copy(self) -> None:
         item = highlight(editorial={"title": "模型下的標題", "is_editorial_copy": True})
@@ -76,6 +80,7 @@ class CardTitleTests(unittest.TestCase):
     def test_editorial_copy_that_is_blank_does_not_blank_the_card(self) -> None:
         item = highlight(editorial={"title": "   ", "is_editorial_copy": True})
         self.assertEqual(highlight_card_title(item), "逐字稿抽出來的標題")
+        self.assertEqual(highlight_card_title(item, editorial_only=True), "")
 
     def test_copy_not_marked_editorial_is_not_used(self) -> None:
         # Unmarked wording could be a verbatim quote; the contract requires

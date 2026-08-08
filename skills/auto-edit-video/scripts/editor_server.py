@@ -2143,7 +2143,9 @@ def caption_translations(project_dir: Path) -> dict[str, str]:
 CARD_TITLE_MAX_CHARS = 40
 
 
-def highlight_card_title(highlight: dict[str, Any]) -> str:
+def highlight_card_title(
+    highlight: dict[str, Any], *, editorial_only: bool = False
+) -> str:
     """What this cut's card is called. One answer, for every card path.
 
     Two paths build title cards, and each used to work out the fallback for
@@ -2158,6 +2160,12 @@ def highlight_card_title(highlight: dict[str, Any]) -> str:
         title = str(editorial.get("title") or "").strip()
         if title:
             return title[:CARD_TITLE_MAX_CHARS]
+    if editorial_only:
+        # The director's title card needs a written name, not an excerpt: a
+        # KTV clip shipped its own mis-heard transcript as a prominent card.
+        # The designed-deck path keeps the fallback below — its hook slide
+        # needs some text, and a person reviews that deck before it ships.
+        return ""
     return str(highlight.get("title") or "").strip()[:CARD_TITLE_MAX_CHARS]
 
 
@@ -2169,7 +2177,7 @@ def active_editorial_title(state: dict[str, Any]) -> str:
             continue
         if active_id and str(item.get("id") or "") != active_id:
             continue
-        return highlight_card_title(item)
+        return highlight_card_title(item, editorial_only=True)
     return ""
 
 

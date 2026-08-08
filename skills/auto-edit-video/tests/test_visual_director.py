@@ -148,7 +148,8 @@ class VisualDirectorTests(unittest.TestCase):
         # The card used to inherit that span and park over the speaker's face.
         one_long_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.233}]
         result = vd.plan_visuals(
-            one_long_take, [evidence("quote", "週末別窩在家", 0.2, 2.6, "aa11")]
+            one_long_take, [evidence("quote", "週末別窩在家", 0.2, 2.6, "aa11")],
+            editorial_title="今晚就出門",
         )
         item = result["visual_plan"]["items"][0]
         self.assertEqual(item["beat"], "title")
@@ -175,35 +176,32 @@ class VisualDirectorTests(unittest.TestCase):
         )
         self.assertEqual(self.beats(result), ["stat"])
 
-    def test_an_editorial_title_replaces_the_transcript_extract(self) -> None:
-        # The card path through the director had to learn this separately
-        # from the highlight design cards; the two disagreed until it did.
+    def test_a_title_card_requires_editorial_copy(self) -> None:
+        # With the model unavailable the fallback was a transcript sentence,
+        # and a KTV clip shipped its own mis-heard transcript as a prominent
+        # card. The words are already on screen as captions; without a
+        # written name there is no nameplate.
         one_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.0}]
         found = [evidence("quote", "週末別窩在家跟我走", 0.2, 2.6, "aa11")]
         plain = vd.plan_visuals(one_take, found)
         named = vd.plan_visuals(one_take, found, editorial_title="台北今晚約會路線")
-        self.assertEqual(
-            plain["structured_layers"]["items"][0]["payload"]["title"],
-            "週末別窩在家跟我走",
-        )
+        self.assertNotIn("title", [i["beat"] for i in plain["visual_plan"]["items"]])
         self.assertEqual(
             named["structured_layers"]["items"][0]["payload"]["title"],
             "台北今晚約會路線",
         )
 
-    def test_a_blank_editorial_title_falls_back_to_the_transcript(self) -> None:
+    def test_a_blank_editorial_title_is_no_title_at_all(self) -> None:
         one_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.0}]
         found = [evidence("quote", "週末別窩在家跟我走", 0.2, 2.6, "aa11")]
         result = vd.plan_visuals(one_take, found, editorial_title="   ")
-        self.assertEqual(
-            result["structured_layers"]["items"][0]["payload"]["title"],
-            "週末別窩在家跟我走",
-        )
+        self.assertNotIn("title", [i["beat"] for i in result["visual_plan"]["items"]])
 
     def test_a_short_segment_is_never_stretched_to_the_dwell(self) -> None:
         brief = [{"id": "h0", "source_start": 0.0, "source_end": 1.2}]
         result = vd.plan_visuals(
-            brief, [evidence("quote", "跟我走", 0.1, 1.0, "bb22")]
+            brief, [evidence("quote", "跟我走", 0.1, 1.0, "bb22")],
+            editorial_title="出發",
         )
         item = result["visual_plan"]["items"][0]
         self.assertEqual(item["end"], 1.2, "the cap shortens; it never extends")
@@ -374,7 +372,9 @@ class EnumerationAcrossTheClipTests(unittest.TestCase):
     def test_the_opening_window_stays_the_nameplate(self) -> None:
         # An enumeration starting at the top used to claim the opening
         # window, and the title never appeared; the list lands later.
-        result = vd.plan_visuals(self.windows(), list(self.WISHES))
+        result = vd.plan_visuals(
+            self.windows(), list(self.WISHES), editorial_title="三個生日願望"
+        )
         beats = self.beats(result)
         self.assertEqual(beats[0], "title")
         self.assertEqual(beats[1], "dynamic_list")
@@ -383,7 +383,9 @@ class EnumerationAcrossTheClipTests(unittest.TestCase):
         # round(), not int(): two windows at a half share is one, which the
         # title consumed — so no clip under ~24s could ever carry a second
         # card. The nameplate no longer spends the decoration budget.
-        result = vd.plan_visuals(self.windows(), list(self.WISHES))
+        result = vd.plan_visuals(
+            self.windows(), list(self.WISHES), editorial_title="三個生日願望"
+        )
         decorated = [beat for beat in self.beats(result) if beat != "keep_aroll"]
         self.assertEqual(len(decorated), 2)
 

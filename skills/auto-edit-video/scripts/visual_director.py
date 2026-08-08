@@ -370,7 +370,9 @@ def _list_payload(layer_id: str, quotes: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-def _classify(found: list[dict[str, Any]], is_opening: bool) -> str:
+def _classify(
+    found: list[dict[str, Any]], is_opening: bool, has_editorial: bool = False
+) -> str:
     """What this segment is carrying, or PLAIN_BEAT when it is carrying prose."""
     numbers = [
         item
@@ -382,11 +384,14 @@ def _classify(found: list[dict[str, Any]], is_opening: bool) -> str:
         return "chart"
     if numbers:
         return "stat"
-    # The opening window is the clip's nameplate. An enumeration that starts
-    # right at the top used to claim it, and the title — the one card every
-    # clip is expected to carry — never appeared; the clip-level list
-    # placement puts the list in a later window instead.
-    if is_opening and quotes:
+    # The opening window is the clip's nameplate — when there is a name. A
+    # title card requires editorial copy: with the model unavailable the
+    # fallback was a transcript sentence, and a KTV clip shipped its own
+    # (mis-heard) transcript as a prominently displayed card. The words are
+    # already on screen as captions; a card repeating them adds nothing and
+    # amplifies whatever the recogniser got wrong. Without a name the
+    # opening window is read like any other.
+    if is_opening and quotes and has_editorial:
         return "title"
     if len(enumerated_quotes(quotes)) >= LIST_MIN_ITEMS:
         return "dynamic_list"
@@ -461,7 +466,10 @@ def plan_visuals(
             highlight_id = _identifier("highlight", segment.get("id"), start, end)
         item_id = _identifier("visual-beat", highlight_id, index)
         found = _within(evidence, start, end)
-        beat = _classify(found, is_opening=index == 0)
+        beat = _classify(
+            found, is_opening=index == 0,
+            has_editorial=bool(editorial_title.strip()),
+        )
         # The clip-wide list lands in the first plain window at or after its
         # middle. The middle itself often falls in the opening window, which
         # the title already holds — the next window is still inside the

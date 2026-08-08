@@ -256,9 +256,12 @@ class PlanningWindowsTests(unittest.TestCase):
              "literal": "為什麼大家都做錯", "start": 25.0, "end": 27.0},
         ]
         segment = {"id": "segment-1", "source_start": 0.0, "source_end": 32.0}
-        whole = visual_director.plan_visuals([segment], evidence)
+        whole = visual_director.plan_visuals(
+            [segment], evidence, editorial_title="做錯的原因"
+        )
         split = visual_director.plan_visuals(
-            auto_edit.planning_segments(segment), evidence
+            auto_edit.planning_segments(segment), evidence,
+            editorial_title="做錯的原因",
         )
         self.assertEqual(
             [item["beat"] for item in whole["visual_plan"]["items"]], ["title"]
