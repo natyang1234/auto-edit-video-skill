@@ -15,3 +15,6 @@ dist/
 skills-lock.json
 skills/open-edit
 .open-edit/
+.claude/
+.codex/
+.gemini/
