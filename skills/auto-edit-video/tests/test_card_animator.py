@@ -116,5 +116,46 @@ class CardCacheTests(unittest.TestCase):
         self.assertIn('cached.get("compiler_version") == COMPILER_VERSION', source)
 
 
+@unittest.skipUnless(compositor.compositor_available(), "needs CoreText")
+class TitleFloorTests(unittest.TestCase):
+    """The size ruling holds on the fallback path too.
+
+    With the editorial model unavailable the title falls back to a
+    transcript sentence, and fitting all of it shrank the card straight back
+    to fine print. Below the floor the words are cut instead: a nameplate is
+    a label, not the transcript. Seen on a KTV clip whose whole transcript
+    became its title.
+    """
+
+    def render(self, title: str):
+        import os
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory(prefix="auto-edit-title-floor-")
+        self.addCleanup(tmp.cleanup)
+        work = Path(tmp.name)
+        (work / "working/structured_cards").mkdir(parents=True)
+        return compositor.render_card(
+            work,
+            {"id": "structured-layer-floor123", "type": "title",
+             "payload": {"title": title, "title_kind": "full-screen-hook"}},
+            compositor.load_default_pack(), {"width": 1080, "height": 1920}, 1.0,
+        )
+
+    def title_size_of(self, height: int) -> float:
+        # height = pad*2 + title_size*1.4 for a bare hook card.
+        return (height - 56) / 1.4
+
+    def test_a_transcript_sentence_title_stays_at_the_floor(self) -> None:
+        _p, _d, _w, height = self.render(
+            "你一定會想說我去哪兒喝茶但你怎麼會偷偷提醒自己"
+        )
+        self.assertGreaterEqual(self.title_size_of(height), 41.0)
+
+    def test_a_short_title_keeps_its_full_size(self) -> None:
+        _p, _d, _w, height = self.render("三個生日願望")
+        self.assertGreaterEqual(self.title_size_of(height), 57.0)
+
+
 if __name__ == "__main__":
     unittest.main()

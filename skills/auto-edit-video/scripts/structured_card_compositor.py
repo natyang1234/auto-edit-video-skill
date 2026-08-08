@@ -25,7 +25,9 @@ CARDS_REL = Path("working/structured_cards")
 ARTIFACTS_REL = Path("working/structured_layer_artifacts.json")
 # v2: type sizes raised to caption scale — a card smaller than the
 # captions beside it reads as fine print (nat, watching a delivery).
-COMPILER_VERSION = "static-card-compositor-v2"
+# v3: the title refuses to shrink below its floor; a fallback title
+# holding a whole transcript sentence is trimmed instead.
+COMPILER_VERSION = "static-card-compositor-v3"
 MIN_LABEL_PT = 11.0
 
 
@@ -223,10 +225,28 @@ def render_card(
         # Cards share the screen with 52-68px captions; a title smaller
         # than a caption reads as fine print. nat, watching a delivery:
         # 「圖卡字太小了，要大一點才能看得見」.
+        #
+        # And shrinking must not undo that. When the editorial model is
+        # unavailable the fallback title is a transcript sentence, and
+        # fitting all of it shrank the card right back to fine print — the
+        # size ruling broken on the fallback path. Below the floor the words
+        # are cut instead: a nameplate is a label, not the transcript.
+        title_text = str(payload.get("title") or "")
         title, title_size = _fit_text(
-            foundation, ct, quartz, str(payload.get("title") or ""),
+            foundation, ct, quartz, title_text,
             58 * scale, ink, card_width - pad * 2, scale,
         )
+        floor = 42 * scale
+        while title_size < floor and len(title_text) > 4:
+            import text_joining
+
+            title_text = text_joining.trim_to_width(
+                title_text, text_joining.display_width(title_text) - 2
+            )
+            title, title_size = _fit_text(
+                foundation, ct, quartz, title_text,
+                58 * scale, ink, card_width - pad * 2, scale,
+            )
         kicker_text = str(payload.get("kicker") or "")
         subtitle_text = str(payload.get("subtitle") or "")
         # A hook fills the screen and is read as a statement; a lower third is
