@@ -610,6 +610,7 @@ class EditorServerTests(unittest.TestCase):
                             "status": "pass",
                             "duration_s": 10.0,
                             "minimum_primary_font_px": 48.0,
+                            "expected_visual_beat_count": 1,
                             "visual_beat_count": 1,
                             "component_ids": ["synthetic"],
                             "component_count": 1,
@@ -2302,6 +2303,7 @@ class EditorServerTests(unittest.TestCase):
             "status": "pass",
             "duration_s": 2.0,
             "minimum_primary_font_px": 48.0,
+            "expected_visual_beat_count": 1,
             "visual_beat_count": 1,
             "component_ids": ["title"],
             "component_count": 1,
@@ -2334,6 +2336,56 @@ class EditorServerTests(unittest.TestCase):
         receipt["visual_delivery"] = visual_delivery
         self.write_json("working/latest_final_qa.json", receipt)
         errors = editor_server.delivery_qa_errors(self.project, state)
+        self.assertFalse(any("visual delivery evidence" in item for item in errors), errors)
+
+    def test_schema3_variant_requires_matching_passing_visual_evidence(self) -> None:
+        visual_delivery = {
+            "schema_version": 1,
+            "source": "renderer_evidence",
+            "status": "pass",
+            "duration_s": 2.0,
+            "minimum_primary_font_px": 48.0,
+            "expected_visual_beat_count": 1,
+            "visual_beat_count": 1,
+            "component_ids": ["title"],
+            "component_count": 1,
+            "skin_ids": ["dark-data-presenter"],
+            "skin_count": 1,
+            "longest_no_change_gap_s": 0.0,
+            "motion_requested_count": 1,
+            "motion_faithful_count": 1,
+            "motion_fallback_count": 0,
+            "motion_faithful_ratio": 1.0,
+            "failures": [],
+            "warnings": [],
+        }
+        report_payload = {
+            "schema_version": 3,
+            "status": "pass",
+            "profile": "strict",
+            "policy": SYNTHETIC_QA_POLICY,
+            "visual_delivery": visual_delivery,
+            "failures": [],
+            "warnings": [],
+        }
+        report_text = json.dumps(report_payload, ensure_ascii=False, indent=2) + "\n"
+        report_path = self.project / "qa/variant-x.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(report_text, encoding="utf-8")
+        receipt = {
+            "report": "qa/variant-x.json",
+            "report_sha256": self._sha256_bytes(report_text.encode("utf-8")),
+        }
+
+        errors = editor_server._variant_report_errors(
+            self.project, receipt, "variant-x"
+        )
+        self.assertTrue(any("visual delivery evidence" in item for item in errors), errors)
+
+        receipt["visual_delivery"] = visual_delivery
+        errors = editor_server._variant_report_errors(
+            self.project, receipt, "variant-x"
+        )
         self.assertFalse(any("visual delivery evidence" in item for item in errors), errors)
 
     def test_pre_policy_variant_qa_report_blocks_variant_download(self) -> None:
@@ -4063,6 +4115,15 @@ class EditorRendererTests(unittest.TestCase):
         )
         self.assertEqual(receipt["variant_id"], "landscape-yt")
         self.assertEqual(receipt["output"], "renders/landscape-final.mp4")
+        report = json.loads(
+            (self.project / "qa/variant-landscape-yt.json").read_text("utf-8")
+        )
+        self.assertEqual(report["visual_delivery"]["source"], "renderer_evidence")
+        self.assertEqual(report["visual_delivery"]["status"], "pass")
+        self.assertEqual(receipt["visual_delivery"], report["visual_delivery"])
+        self.assertTrue(
+            (self.project / "working/render_visual_evidence/variant-landscape-yt.json").is_file()
+        )
 
         # per-variant receipts must not clobber each other
         self.assertFalse(

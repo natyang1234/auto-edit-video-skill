@@ -26,22 +26,75 @@ from visual_quality import (  # noqa: E402
 
 class RenderedVisualQualityReportTests(unittest.TestCase):
     def _evidence(self, *, motion_intensity: str = "low", items=None) -> dict:
+        resolved_items = items if items is not None else [
+            {
+                "id": "title-1",
+                "start": 0.0,
+                "end": 2.0,
+                "kind": "title",
+                "component_id": "hook",
+                "style_pack_id": "teaching",
+                "minimum_primary_font_px": 48.0,
+            }
+        ]
+        resolved_items = [
+            {
+                **item,
+                "font_evidence_required": item.get(
+                    "font_evidence_required", item.get("minimum_primary_font_px") is not None
+                ),
+            }
+            for item in resolved_items
+        ]
         return {
             "schema_version": 1,
             "duration_s": 10.0,
             "motion_intensity": motion_intensity,
-            "items": items if items is not None else [
-                {
-                    "id": "title-1",
-                    "start": 0.0,
-                    "end": 2.0,
-                    "kind": "title",
-                    "component_id": "hook",
-                    "style_pack_id": "teaching",
-                    "minimum_primary_font_px": 48.0,
-                }
-            ],
+            "expected_visual_beat_count": len(resolved_items),
+            "items": resolved_items,
         }
+
+    def test_expected_visuals_cannot_disappear_into_empty_evidence(self) -> None:
+        evidence = self._evidence(items=[])
+        evidence["expected_visual_beat_count"] = 1
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("expected" in item for item in report["failures"]))
+
+    def test_expected_visual_count_is_required_and_must_be_an_integer(self) -> None:
+        for bad_value in (None, True, -1):
+            with self.subTest(bad_value=bad_value):
+                evidence = self._evidence()
+                if bad_value is None:
+                    evidence.pop("expected_visual_beat_count")
+                else:
+                    evidence["expected_visual_beat_count"] = bad_value
+                with self.assertRaisesRegex(ValueError, "expected_visual_beat_count"):
+                    rendered_visual_quality_report(evidence)
+
+    def test_explicit_no_visual_delivery_remains_valid(self) -> None:
+        report = rendered_visual_quality_report(self._evidence(items=[]))
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["visual_beat_count"], 0)
+
+    def test_text_card_requires_primary_font_evidence(self) -> None:
+        evidence = self._evidence(
+            items=[
+                {
+                    "id": "missing-font",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "kind": "title",
+                    "font_evidence_required": True,
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "minimum_primary_font_px"):
+            rendered_visual_quality_report(evidence)
 
     def test_teaching_high_motion_all_faithful_passes(self) -> None:
         evidence = self._evidence(

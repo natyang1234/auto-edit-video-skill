@@ -673,7 +673,13 @@ def inspect(
         or visual_report.get("status") not in {"pass", "fail"}
         or not isinstance(visual_report.get("failures"), list)
         or not isinstance(visual_report.get("warnings"), list)
+        or isinstance(visual_report.get("visual_beat_count"), bool)
         or not isinstance(visual_report.get("visual_beat_count"), int)
+        or isinstance(visual_report.get("expected_visual_beat_count"), bool)
+        or not isinstance(visual_report.get("expected_visual_beat_count"), int)
+        or visual_report.get("expected_visual_beat_count") < 0
+        or visual_report.get("visual_beat_count")
+        != visual_report.get("expected_visual_beat_count")
     ):
         raise ValueError("visual report is not a valid renderer-evidence report")
     if visual_report.get("status") == "fail":

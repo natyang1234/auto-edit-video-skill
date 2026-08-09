@@ -351,6 +351,7 @@ def card_visual_evidence(
         "kind": layer_type,
         "component_id": str(component.get("id") or "") or None,
         "style_pack_id": str(pack.get("id") or "") or None,
+        "font_evidence_required": True,
         "minimum_primary_font_px": (
             round(floor * render_scale, 3)
         ),
@@ -395,6 +396,7 @@ def overlay_visual_evidence(
         "kind": kind,
         "component_id": None,
         "style_pack_id": None,
+        "font_evidence_required": False,
         "minimum_primary_font_px": font_size,
         "source": source,
         "motion": motion,
@@ -819,6 +821,7 @@ def build_render_command(
         clip_start, clip_end = segments[0]
         duration = clip_end - clip_start
     evidence_items: list[dict[str, Any]] = []
+    expected_visual_beat_count = 0
     source_rel = str(manifest.get("source", {}).get("staged_path", ""))
     source = project_dir / source_rel
     if not source.is_file():
@@ -879,6 +882,7 @@ def build_render_command(
                 baked = dict(source_overlay)
                 baked["start"] = window_start
                 baked["end"] = window_end
+                expected_visual_beat_count += 1
                 evidence_items.append(
                     overlay_visual_evidence(
                         baked, render_scale, source="graphic_package"
@@ -913,6 +917,7 @@ def build_render_command(
             overlay["end"] = window_end
             overlays.append(overlay)
             if overlay.get("type") not in {"caption", "emphasis"}:
+                expected_visual_beat_count += 1
                 evidence_items.append(
                     overlay_visual_evidence(overlay, render_scale)
                 )
@@ -998,6 +1003,7 @@ def build_render_command(
                         "source": "structured_card",
                     }
                 )
+                expected_visual_beat_count += 1
                 evidence_items.append(card_evidence)
                 overlays.append(
                     {
@@ -1057,6 +1063,7 @@ def build_render_command(
                                   "animation": "fade"},
                     }
                 overlays.append(asset_overlay)
+                expected_visual_beat_count += 1
                 evidence_items.append(
                     overlay_visual_evidence(
                         asset_overlay, render_scale, source="planned_asset"
@@ -1312,6 +1319,7 @@ def build_render_command(
                 "source": "renderer_evidence_raw",
                 "duration_s": round(duration, 3),
                 "motion_intensity": motion_intensity,
+                "expected_visual_beat_count": expected_visual_beat_count,
                 "visual_beat_count": len(evidence_items),
                 "items": evidence_items,
             }
@@ -1440,6 +1448,8 @@ def render_project(
                     raise ValueError("rights gate: " + "; ".join(rights_errors))
                 build_variant_snapshot(project_dir, state, variant_id)
             state = variant_state_for(state, variant_id)
+            if quality == "final":
+                render_id = f"variant-{variant_id}"
         elif quality == "final":
             approval = manifest.get("approvals", {}).get("timeline", {})
             from editor_server import gate_revision, rights_gate_errors
@@ -1531,7 +1541,15 @@ def render_project(
         if variant_id and quality == "final":
             # QA runs on the temporary output; only a passing QA publishes
             # the file + receipt together (no receipt-less final on disk).
-            receipt = qa_variant_output(project_dir, temporary, variant_id, state)
+            if render_id is None:
+                raise RuntimeError("variant final render has no visual evidence identity")
+            receipt = qa_variant_output(
+                project_dir,
+                temporary,
+                variant_id,
+                rendered_visual_evidence_path(project_dir, render_id),
+                state,
+            )
             os.replace(temporary, output)
             finalize_variant_delivery_receipt(project_dir, receipt, output, variant_id)
         else:
@@ -1541,7 +1559,11 @@ def render_project(
 
 
 def qa_variant_output(
-    project_dir: Path, candidate: Path, variant_id: str, state: dict[str, Any] | None = None
+    project_dir: Path,
+    candidate: Path,
+    variant_id: str,
+    visual_evidence_path: Path,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run QA on the still-unpublished output; raise before anything lands."""
     qa_dir = project_dir / "qa"
@@ -1555,6 +1577,7 @@ def qa_variant_output(
             "--video", str(candidate),
             "--report", str(report_path),
             "--contact", str(contact_path),
+            "--visual-evidence", str(visual_evidence_path),
             *qa_video.qa_policy_args(
                 state, read_json(project_dir / "project.json", {}) or {}
             ),
@@ -1569,12 +1592,26 @@ def qa_variant_output(
             "variant QA failed; final output was NOT published: "
             + (qa_result.stderr or qa_result.stdout)[-2000:]
         )
+    report = read_json(report_path, {}) or {}
+    visual_delivery = report.get("visual_delivery")
+    if (
+        not isinstance(visual_delivery, dict)
+        or visual_delivery.get("source") != "renderer_evidence"
+        or visual_delivery.get("status") != "pass"
+    ):
+        report_path.unlink(missing_ok=True)
+        contact_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "variant QA did not bind passing renderer visual evidence; "
+            "final output was NOT published"
+        )
     return {
         "report": report_path.relative_to(project_dir).as_posix(),
         "report_sha256": file_sha256(report_path),
         "contact_sheet": contact_path.relative_to(project_dir).as_posix(),
         "contact_sheet_sha256": file_sha256(contact_path),
         "output_sha256": file_sha256(candidate),
+        "visual_delivery": visual_delivery,
     }
 
 

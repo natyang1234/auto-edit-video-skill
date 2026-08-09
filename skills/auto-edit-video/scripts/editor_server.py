@@ -542,7 +542,11 @@ def _variant_report_errors(
             f"variant {variant_id} QA report predates the enforced QA policy; "
             "render the variant again"
         ]
-    return qa_profile_binding_errors(report, state, f"variant {variant_id}")
+    errors = qa_profile_binding_errors(report, state, f"variant {variant_id}")
+    errors.extend(
+        visual_delivery_binding_errors(report, receipt, f"variant {variant_id}")
+    )
+    return errors
 
 
 def render_download_errors(project_dir: Path, relative: str) -> list[str]:
@@ -1445,6 +1449,13 @@ def visual_delivery_binding_errors(
         or visual.get("schema_version") != 1
         or visual.get("source") != "renderer_evidence"
         or visual.get("status") != "pass"
+        or isinstance(visual.get("visual_beat_count"), bool)
+        or not isinstance(visual.get("visual_beat_count"), int)
+        or isinstance(visual.get("expected_visual_beat_count"), bool)
+        or not isinstance(visual.get("expected_visual_beat_count"), int)
+        or visual.get("visual_beat_count") < 0
+        or visual.get("visual_beat_count")
+        != visual.get("expected_visual_beat_count")
     ):
         return [f"{label} visual delivery evidence must be a passing renderer report"]
     if receipt.get("visual_delivery") != visual:

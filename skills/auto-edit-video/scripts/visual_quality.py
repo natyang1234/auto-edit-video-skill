@@ -436,6 +436,13 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
     items = evidence.get("items")
     if not isinstance(items, list):
         raise ValueError("items must be a list")
+    expected_visual_beat_count = evidence.get("expected_visual_beat_count")
+    if (
+        isinstance(expected_visual_beat_count, bool)
+        or not isinstance(expected_visual_beat_count, int)
+        or expected_visual_beat_count < 0
+    ):
+        raise ValueError("expected_visual_beat_count must be a non-negative integer")
 
     component_ids: set[str] = set()
     skin_ids: set[str] = set()
@@ -464,6 +471,11 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
         if style_pack_id is not None:
             skin_ids.add(style_pack_id)
 
+        font_evidence_required = item.get("font_evidence_required")
+        if not isinstance(font_evidence_required, bool):
+            raise ValueError(
+                f"items[{item_index}].font_evidence_required must be a boolean"
+            )
         if "minimum_primary_font_px" in item:
             raw_font_size = item.get("minimum_primary_font_px")
             if raw_font_size is not None:
@@ -474,6 +486,10 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
                         minimum=0.0,
                     )
                 )
+        if font_evidence_required and item.get("minimum_primary_font_px") is None:
+            raise ValueError(
+                f"items[{item_index}].minimum_primary_font_px is required"
+            )
 
         motion = item.get("motion")
         if motion is None:
@@ -514,6 +530,11 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
     visual_beat_count = len(items)
+    if visual_beat_count != expected_visual_beat_count:
+        failures.append(
+            f"renderer delivered {visual_beat_count} visual beats but expected "
+            f"{expected_visual_beat_count}"
+        )
     if visual_beat_count == 0:
         warnings.append("renderer evidence contains no visual beats")
     if visual_beat_count and minimum_font is not None and minimum_font < 32.0:
@@ -538,6 +559,7 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
         "status": "fail" if failures else "pass",
         "duration_s": duration,
         "minimum_primary_font_px": minimum_font,
+        "expected_visual_beat_count": expected_visual_beat_count,
         "visual_beat_count": visual_beat_count,
         "component_ids": sorted(component_ids),
         "component_count": len(component_ids),
