@@ -1,9 +1,13 @@
 """What `cut` accepts, and what it refuses."""
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
@@ -61,6 +65,231 @@ class EntryPointTests(unittest.TestCase):
             ["cut", "--input", "/no/such/video.mp4", "--out", "/tmp/x"]
         )
         self.assertNotEqual(auto_edit.cmd_cut(args), 0)
+
+    def test_kinetic_cut_fails_capability_preflight_before_project_mutation(self) -> None:
+        cli = SKILL_DIR / "scripts/auto_edit.py"
+        with tempfile.TemporaryDirectory(prefix="kinetic-cut-preflight-") as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            out = root / "out"
+            project = root / "project"
+            source.write_bytes(b"existing input")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(cli),
+                    "cut",
+                    "--input",
+                    str(source),
+                    "--out",
+                    str(out),
+                    "--project-dir",
+                    str(project),
+                    "--director",
+                    "kinetic-explainer",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stderr, "")
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error_code"], "capability_missing")
+            self.assertEqual(payload["missing_capabilities"], sorted(payload["missing_capabilities"]))
+            self.assertFalse(out.exists())
+            self.assertFalse(project.exists())
+
+    def test_kinetic_conflicting_cut_overrides_fail_before_project_mutation(self) -> None:
+        cli = SKILL_DIR / "scripts/auto_edit.py"
+        with tempfile.TemporaryDirectory(prefix="kinetic-cut-conflict-") as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            out = root / "out"
+            project = root / "project"
+            source.write_bytes(b"existing input")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(cli),
+                    "cut",
+                    "--input",
+                    str(source),
+                    "--out",
+                    str(out),
+                    "--project-dir",
+                    str(project),
+                    "--director",
+                    "kinetic-explainer",
+                    "--translate",
+                    "zh-TW",
+                    "--no-cards",
+                    "--no-editorial",
+                    "--burned-in",
+                    "yes",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stderr, "")
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error_code"], "profile_conflict")
+            self.assertEqual(
+                payload["conflicts"],
+                ["burned-in", "no-cards", "no-editorial", "translate"],
+            )
+            self.assertFalse(out.exists())
+            self.assertFalse(project.exists())
+
+    def test_unknown_director_fails_before_project_mutation(self) -> None:
+        cli = SKILL_DIR / "scripts/auto_edit.py"
+        with tempfile.TemporaryDirectory(prefix="unknown-cut-preflight-") as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            out = root / "out"
+            project = root / "project"
+            source.write_bytes(b"existing input")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(cli),
+                    "cut",
+                    "--input",
+                    str(source),
+                    "--out",
+                    str(out),
+                    "--project-dir",
+                    str(project),
+                    "--director",
+                    "does-not-exist",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(json.loads(result.stdout)["error_code"], "unknown_director")
+            self.assertFalse(out.exists())
+            self.assertFalse(project.exists())
+
+    def test_legacy_cut_persists_resolved_profile_and_selection_request(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="legacy-selection-artifacts-") as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            out = root / "out"
+            project = root / "project"
+            source.write_bytes(b"existing input")
+
+            def fake_init(init_args):
+                project_path = Path(init_args.project_dir)
+                project_path.mkdir(parents=True, exist_ok=True)
+                (project_path / "project.json").write_text(
+                    json.dumps({"source": {"duration_s": 10.0}}),
+                    encoding="utf-8",
+                )
+                return 0
+
+            args = self.parser().parse_args(
+                [
+                    "cut",
+                    "--input",
+                    str(source),
+                    "--out",
+                    str(out),
+                    "--project-dir",
+                    str(project),
+                ]
+            )
+            with patch.object(auto_edit, "cmd_init", side_effect=fake_init), patch.object(
+                auto_edit, "cmd_set_target", return_value=1
+            ):
+                code = auto_edit.cmd_cut(args)
+
+            self.assertEqual(code, 2)
+            resolved = json.loads(
+                (project / "working/resolved_director_profile.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            request = json.loads(
+                (project / "working/director_selection_request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(resolved["profile_id"], "high-energy")
+            self.assertEqual(request["profile_id"], "high-energy")
+            self.assertEqual(request["selection_reason"], "default_unchanged")
+            self.assertEqual(request["resolved_profile_hash"], resolved["resolved_hash"])
+
+    def test_cut_selection_request_merges_explicit_compatible_overrides(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="selection-request-merge-") as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            out = root / "out"
+            project = root / "project"
+            request_path = root / "selection-request.json"
+            source.write_bytes(b"existing input")
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "profile_id": "high-energy",
+                        "selection_reason": "explicit_profile",
+                        "evidence": "explicit profile",
+                        "overrides": {"quality": "preview"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_init(init_args):
+                project_path = Path(init_args.project_dir)
+                project_path.mkdir(parents=True, exist_ok=True)
+                (project_path / "project.json").write_text(
+                    json.dumps({"source": {"duration_s": 10.0}}),
+                    encoding="utf-8",
+                )
+                return 0
+
+            args = self.parser().parse_args(
+                [
+                    "cut",
+                    "--input",
+                    str(source),
+                    "--out",
+                    str(out),
+                    "--project-dir",
+                    str(project),
+                    "--selection-request",
+                    str(request_path),
+                    "--brief",
+                    "make the hook clear",
+                    "--keep-pauses",
+                ]
+            )
+            with patch.object(auto_edit, "cmd_init", side_effect=fake_init), patch.object(
+                auto_edit, "cmd_set_target", return_value=1
+            ):
+                code = auto_edit.cmd_cut(args)
+
+            self.assertEqual(code, 2)
+            resolved = json.loads(
+                (project / "working/resolved_director_profile.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            request = json.loads(
+                (project / "working/director_selection_request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(request["profile_id"], "high-energy")
+            self.assertEqual(request["selection_reason"], "explicit_profile")
+            self.assertEqual(request["overrides"]["quality"], "preview")
+            self.assertEqual(request["overrides"]["brief"], "make the hook clear")
+            self.assertTrue(request["overrides"]["keep-pauses"])
+            self.assertEqual(request["resolved_profile_hash"], resolved["resolved_hash"])
+            self.assertEqual(args.quality, "preview")
 
 
 if __name__ == "__main__":

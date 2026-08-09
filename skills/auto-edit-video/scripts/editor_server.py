@@ -60,6 +60,11 @@ from template_catalog import (
 import generated_images
 import visual_director
 import qa_video
+from director_resolver import (
+    DirectorResolutionError,
+    enforce_runtime_capabilities,
+    resolve_director_profile,
+)
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 EDITOR_DIR = SKILL_DIR / "editor"
@@ -124,8 +129,7 @@ def platform_safe_area(state: dict[str, Any] | None) -> dict[str, Any] | None:
     return safe if isinstance(safe, dict) and safe else None
 
 def _load_director_presets() -> dict[str, dict[str, Any]]:
-    """Director presets load from the versioned registry (runtime SSOT,
-    symmetric with _load_platform_presets); missing/invalid fails closed."""
+    """Load UI-compatible presets plus the canonical resolver envelope."""
     import contract_registry
 
     registry_path = SKILL_DIR / "contracts/instances/director_mode__registry.json"
@@ -142,12 +146,40 @@ def _load_director_presets() -> dict[str, dict[str, Any]]:
         )
     presets: dict[str, dict[str, Any]] = {}
     for mode in payload["modes"]:
+        try:
+            resolved = resolve_director_profile(mode["id"])
+        except DirectorResolutionError as exc:
+            raise RuntimeError(
+                f"director mode {mode.get('id', '<unknown>')} failed resolution: {exc.code}"
+            ) from exc
         preset = dict(mode["constraints"])
         # Planning consumes density while rendering/UI need the motion
         # envelope.  Dropping the envelope here made every director look
         # "medium" downstream even though the contract carried the setting.
         preset["cut_density"] = mode["envelope"]["cut_density"]
         preset["motion_intensity"] = mode["envelope"]["motion_intensity"]
+        preset.update(
+            {
+                "profile_id": resolved["profile_id"],
+                "registry_schema_version": resolved["registry_schema_version"],
+                "registry_entry_version": resolved["registry_entry_version"],
+                "experience": resolved["experience"],
+                "required_capabilities": resolved["required_capabilities"],
+                "rules": resolved["rules"],
+                "resolved_hash": resolved["resolved_hash"],
+                "available": True,
+                "missing_capabilities": [],
+            }
+        )
+        try:
+            enforce_runtime_capabilities(resolved)
+        except DirectorResolutionError as exc:
+            if exc.code != "capability_missing":
+                raise RuntimeError(
+                    f"director mode {mode.get('id', '<unknown>')} capability preflight failed: {exc.code}"
+                ) from exc
+            preset["available"] = False
+            preset["missing_capabilities"] = sorted(exc.missing_capabilities)
         presets[mode["id"]] = preset
     return presets
 
@@ -156,6 +188,7 @@ DIRECTOR_PRESETS: dict[str, dict[str, Any]] = _load_director_presets()
 
 DEFAULT_STYLE_PACK_BY_DIRECTOR = {
     "high-energy": "kinetic-social",
+    "kinetic-explainer": "kinetic-social",
     "teacher-punch": "dark-data-presenter",
     "editorial-clean": "editorial-paper",
     "documentary": "editorial-paper",
@@ -4801,6 +4834,24 @@ class EditorHandler(BaseHTTPRequestHandler):
         expected_revision = str(body.get("expected_revision", ""))
         if director not in DIRECTOR_PRESETS:
             self.send_json({"ok": False, "error": "unsupported director profile"}, status=422)
+            return
+        try:
+            resolved = resolve_director_profile(director)
+            enforce_runtime_capabilities(resolved)
+        except DirectorResolutionError as exc:
+            payload: dict[str, Any] = {
+                "ok": False,
+                "error_code": exc.code,
+                "error": (
+                    "missing director capabilities: "
+                    + ", ".join(exc.missing_capabilities)
+                    if exc.code == "capability_missing"
+                    else exc.code
+                ),
+            }
+            if exc.missing_capabilities:
+                payload["missing_capabilities"] = exc.missing_capabilities
+            self.send_json(payload, status=422)
             return
         if len(brief) > 2000 or isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 10:
             self.send_json({"ok": False, "error": "invalid highlight planning settings"}, status=422)

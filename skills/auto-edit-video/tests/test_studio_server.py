@@ -153,6 +153,76 @@ class StudioHarness(unittest.TestCase):
 
 
 class StudioServerTests(StudioHarness):
+    def test_studio_bootstrap_exposes_registry_director_presets(self) -> None:
+        status, payload = self.json_response("GET", "/api/studio")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(payload["director_presets"]), 6)
+        kinetic = payload["director_presets"]["kinetic-explainer"]
+        self.assertEqual(kinetic["profile_id"], "kinetic-explainer")
+        self.assertRegex(kinetic["resolved_hash"], r"^[0-9a-f]{64}$")
+        self.assertFalse(kinetic["available"])
+        self.assertEqual(
+            kinetic["missing_capabilities"], sorted(kinetic["missing_capabilities"])
+        )
+
+    def test_import_director_options_are_bootstrapped_from_registry(self) -> None:
+        html = (SKILL_DIR / "editor/import.html").read_text(encoding="utf-8")
+        script = (SKILL_DIR / "editor/import.js").read_text(encoding="utf-8")
+        self.assertNotIn('<option value="teacher-punch">', html)
+        self.assertIn("function populateDirectorOptions", script)
+        self.assertIn("payload.director_presets", script)
+        self.assertIn("尚未就緒", script)
+        self.assertIn("option.disabled", script)
+
+    def test_omitted_director_keeps_legacy_default_selection_reason(self) -> None:
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {
+                "project_name": "Default",
+                "file": {
+                    "name": self.source.name,
+                    "size_bytes": len(self.source_bytes),
+                    "type": "video/mp4",
+                },
+                "settings": {},
+            },
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 201, payload)
+        stored = self.server.imports[str(payload["import"]["id"])]
+        request = stored["settings"]["director_selection_request"]
+        self.assertEqual(stored["settings"]["director_profile"], "teacher-punch")
+        self.assertEqual(request["selection_reason"], "default_unchanged")
+        self.assertEqual(
+            request["resolved_profile_hash"],
+            stored["settings"]["resolved_director_profile"]["resolved_hash"],
+        )
+
+    def test_kinetic_import_fails_capability_preflight_before_session_mutation(self) -> None:
+        status, payload = self.json_response(
+            "POST",
+            "/api/imports",
+            {
+                "project_name": "Kinetic",
+                "file": {
+                    "name": self.source.name,
+                    "size_bytes": len(self.source_bytes),
+                    "type": "video/mp4",
+                },
+                "settings": {"director_profile": "kinetic-explainer"},
+            },
+            {"X-Auto-Edit-CSRF": self.csrf_token},
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(payload["error_code"], "capability_missing")
+        self.assertEqual(
+            payload["missing_capabilities"], sorted(payload["missing_capabilities"])
+        )
+        self.assertEqual(self.server.imports, {})
+        self.assertIsNone(self.server.active_upload_id)
+        self.assertEqual(list(self.projects_root.iterdir()), [])
+
     def test_import_creates_owned_project_and_launches_scoped_editor(self) -> None:
         html_status, _headers, html = self.request("GET", "/")
         self.assertEqual(html_status, 200)
@@ -169,6 +239,8 @@ class StudioServerTests(StudioHarness):
         response = json.loads(body.decode("utf-8"))
         self.assertEqual(status, 201, response)
         self.assertTrue(response["editor_url"].startswith("http://127.0.0.1:"))
+        self.assertEqual(response["import"]["selection_reason"], "explicit_profile")
+        self.assertRegex(response["import"]["resolved_profile_hash"], r"^[0-9a-f]{64}$")
 
         project_id = response["project"]["id"]
         self.assertRegex(project_id, r"^[a-z0-9][a-z0-9-]{8,80}$")
@@ -191,8 +263,35 @@ class StudioServerTests(StudioHarness):
             manifest["subtitles"]["contextual_semantic_calibration"]["enabled"]
         )
         self.assertTrue(all(not item["approved"] for item in manifest["approvals"].values()))
+        resolved_profile = json.loads(
+            (project / "working/resolved_director_profile.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        selection_request = json.loads(
+            (project / "working/director_selection_request.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(resolved_profile["profile_id"], "documentary")
+        self.assertEqual(selection_request["profile_id"], "documentary")
+        self.assertEqual(selection_request["selection_reason"], "explicit_profile")
+        self.assertEqual(
+            response["import"]["resolved_profile_hash"], resolved_profile["resolved_hash"]
+        )
+        self.assertEqual(
+            selection_request["resolved_profile_hash"], resolved_profile["resolved_hash"]
+        )
         stored_session = self.server.imports[str(import_payload["id"])]
         self.assertEqual(stored_session["settings"]["director_profile"], "documentary")
+        self.assertEqual(
+            stored_session["settings"]["resolved_director_profile"]["resolved_hash"],
+            resolved_profile["resolved_hash"],
+        )
+        self.assertEqual(
+            stored_session["settings"]["director_selection_request"]["resolved_profile_hash"],
+            resolved_profile["resolved_hash"],
+        )
         self.assertEqual(
             stored_session["settings"]["editing_brief"],
             "保留有證據的轉折，不要補寫內容。",

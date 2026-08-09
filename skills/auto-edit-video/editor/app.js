@@ -39,11 +39,12 @@ const PROVIDER_AVAILABILITY_MESSAGES = Object.freeze({
 const DIRECTOR_CARD_META = {
   "teacher-punch": { icon: "教", eyebrow: "清楚拆解" },
   "high-energy": { icon: "爆", eyebrow: "強 Hook" },
+  "kinetic-explainer": { icon: "動", eyebrow: "動畫解說" },
   documentary: { icon: "聞", eyebrow: "衝突脈絡" },
   minimal: { icon: "視", eyebrow: "第一視角" },
   "editorial-clean": { icon: "編", eyebrow: "克制精準" },
 };
-const DIRECTOR_ORDER = ["teacher-punch", "high-energy", "documentary", "minimal", "editorial-clean"];
+const DIRECTOR_ORDER = ["teacher-punch", "high-energy", "documentary", "minimal", "editorial-clean", "kinetic-explainer"];
 const ROLE_LAYOUTS = {
   hook: { x: 50, y: 50, width: 100, height: 100 },
   concept: { x: 50, y: 56, width: 93, height: 22 },
@@ -54,6 +55,19 @@ const ROLE_LAYOUTS = {
 
 const byId = (id) => document.getElementById(id);
 const deepCopy = (value) => JSON.parse(JSON.stringify(value));
+
+function isDirectorAvailable(preset) {
+  return Boolean(preset) && preset.available !== false;
+}
+
+function directorUnavailableReason(preset) {
+  const missing = Array.isArray(preset?.missing_capabilities)
+    ? preset.missing_capabilities.filter(Boolean).sort()
+    : [];
+  return missing.length
+    ? `尚未就緒：缺少 ${missing.join(", ")}`
+    : "尚未就緒";
+}
 
 function cacheElements() {
   [
@@ -430,9 +444,14 @@ function populatePresets() {
   elements["director-select"].replaceChildren();
   Object.entries(projectPayload.director_presets).forEach(([id, preset]) => {
     const option = document.createElement("option");
+    const available = isDirectorAvailable(preset);
     option.value = id;
-    option.textContent = preset.label;
-    option.title = preset.description;
+    option.disabled = !available;
+    option.setAttribute("aria-disabled", String(!available));
+    option.textContent = available
+      ? preset.label
+      : `${preset.label}（${directorUnavailableReason(preset)}）`;
+    option.title = available ? preset.description : directorUnavailableReason(preset);
     elements["director-select"].append(option);
   });
   elements["template-select"].replaceChildren();
@@ -471,11 +490,15 @@ function renderDirectorCards() {
     .sort(([left], [right]) => DIRECTOR_ORDER.indexOf(left) - DIRECTOR_ORDER.indexOf(right))
     .forEach(([id, preset], index) => {
       const meta = DIRECTOR_CARD_META[id] || { icon: "導", eyebrow: "導演風格" };
+      const available = isDirectorAvailable(preset);
       const button = document.createElement("button");
       button.type = "button";
       button.className = `director-card${id === state.director_style ? " is-selected" : ""}`;
+      button.disabled = !available;
       button.setAttribute("role", "radio");
       button.setAttribute("aria-checked", String(id === state.director_style));
+      button.setAttribute("aria-disabled", String(!available));
+      button.title = available ? preset.description : directorUnavailableReason(preset);
       button.dataset.directorId = id;
       button.style.setProperty("--director-index", String(index));
 
@@ -490,7 +513,9 @@ function renderDirectorCards() {
       const name = document.createElement("strong");
       name.textContent = preset.label;
       const description = document.createElement("span");
-      description.textContent = preset.description;
+      description.textContent = available
+        ? preset.description
+        : `${preset.description}（${directorUnavailableReason(preset)}）`;
       copy.append(eyebrow, name, description);
       const check = document.createElement("i");
       check.className = "director-check";
@@ -498,6 +523,10 @@ function renderDirectorCards() {
       check.textContent = "✓";
       button.append(icon, copy, check);
       button.addEventListener("click", () => {
+        if (!isDirectorAvailable(preset)) {
+          showToast(directorUnavailableReason(preset), "error");
+          return;
+        }
         elements["director-select"].value = id;
         elements["director-select"].dispatchEvent(new Event("change", { bubbles: true }));
       });
@@ -955,6 +984,11 @@ async function replanHighlights() {
   const button = elements["replan-highlights"];
   button.disabled = true;
   try {
+    const currentPreset = projectPayload?.director_presets?.[state?.director_style];
+    if (!isDirectorAvailable(currentPreset)) {
+      showToast(directorUnavailableReason(currentPreset), "error");
+      return;
+    }
     await saveState(false);
     if (stateDirty) throw new Error("目前編輯內容尚未成功儲存");
     const result = await request("/api/plan-highlights", {
@@ -2600,9 +2634,14 @@ function bindEvents() {
   elements["template-background-button"].addEventListener("click", () => elements["template-background-input"].click());
   elements["template-background-input"].addEventListener("change", () => uploadTemplateBackground(elements["template-background-input"].files[0]));
   elements["director-select"].addEventListener("change", () => {
-    pushHistory();
     const id = elements["director-select"].value;
     const preset = projectPayload.director_presets[id];
+    if (!isDirectorAvailable(preset)) {
+      elements["director-select"].value = state.director_style;
+      showToast(directorUnavailableReason(preset), "error");
+      return;
+    }
+    pushHistory();
     state.director_style = id;
     state.caption_defaults = deepCopy(preset.caption);
     state.overlays.filter((overlay) => ["caption", "emphasis", "title", "card", "animation"].includes(overlay.type)).forEach((overlay) => {

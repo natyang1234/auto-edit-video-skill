@@ -691,6 +691,77 @@ def semantic_card_plan(artifact) -> list[str]:
     return errors
 
 
+def semantic_director_mode(artifact) -> list[str]:
+    """Validate director-mode invariants beyond the schema dialect."""
+    errors: list[str] = []
+    mode_ids: set[str] = set()
+    for index, mode in enumerate(artifact.get("modes", [])):
+        path = f"$.modes[{index}]"
+        mode_id = mode.get("id")
+        if not _nonempty_str(mode_id):
+            errors.append(f"{path}.id: must be a non-empty string")
+        else:
+            normalized_mode_id = mode_id.strip()
+            if mode_id != normalized_mode_id:
+                errors.append(f"{path}.id: must not have surrounding whitespace")
+            if normalized_mode_id in mode_ids:
+                errors.append(
+                    f"{path}.id: duplicate mode id {normalized_mode_id!r}"
+                )
+            else:
+                mode_ids.add(normalized_mode_id)
+
+        has_experience = "experience" in mode
+        has_capabilities = "required_capabilities" in mode
+        if has_experience != has_capabilities:
+            errors.append(
+                f"{path}: experience and required_capabilities must both be present or absent"
+            )
+        if has_experience:
+            experience = mode["experience"]
+            if experience.get("motion_intensity") != mode.get("envelope", {}).get(
+                "motion_intensity"
+            ):
+                errors.append(
+                    f"{path}.experience.motion_intensity must match envelope.motion_intensity"
+                )
+            if experience.get("visual_density") != mode.get("constraints", {}).get(
+                "visual_density"
+            ):
+                errors.append(
+                    f"{path}.experience.visual_density must match constraints.visual_density"
+                )
+
+        if has_capabilities:
+            capability_ids = mode["required_capabilities"].get("ids", [])
+            seen_capability_ids: set[str] = set()
+            for capability_index, capability_id in enumerate(capability_ids):
+                capability_path = f"{path}.required_capabilities.ids[{capability_index}]"
+                if not _nonempty_str(capability_id):
+                    errors.append(f"{capability_path}: must be non-empty")
+                    continue
+                normalized_capability_id = capability_id.strip()
+                if normalized_capability_id in seen_capability_ids:
+                    errors.append(
+                        f"{capability_path}: duplicate capability id {normalized_capability_id!r}"
+                    )
+                else:
+                    seen_capability_ids.add(normalized_capability_id)
+
+        seen_rules: set[str] = set()
+        for rule_index, rule in enumerate(mode.get("auto_select_rules", [])):
+            rule_path = f"{path}.auto_select_rules[{rule_index}]"
+            if not _nonempty_str(rule):
+                errors.append(f"{rule_path}: must be a non-empty string")
+                continue
+            normalized_rule = rule.strip()
+            if normalized_rule in seen_rules:
+                errors.append(f"{rule_path}: duplicate auto_select_rule {normalized_rule!r}")
+            else:
+                seen_rules.add(normalized_rule)
+    return errors
+
+
 SEMANTIC_VALIDATORS = {
     "card_plan": semantic_card_plan,
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
@@ -701,6 +772,7 @@ SEMANTIC_VALIDATORS = {
     "structured_layer": semantic_structured_layer,
     "video_analysis": semantic_video_analysis,
     "rights_assertion": semantic_rights_assertion,
+    "director_mode": semantic_director_mode,
 }
 
 

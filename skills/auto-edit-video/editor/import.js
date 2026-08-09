@@ -24,6 +24,37 @@ function clearError() {
   byId("import-error").textContent = "";
 }
 
+function populateDirectorOptions(presets) {
+  const select = byId("import-director");
+  select.replaceChildren();
+  const entries = Object.entries(presets || {});
+  entries.forEach(([profileId, preset]) => {
+    const option = document.createElement("option");
+    const unavailable = preset && preset.available === false;
+    const missing = Array.isArray(preset && preset.missing_capabilities)
+      ? preset.missing_capabilities.filter(Boolean).sort()
+      : [];
+    const reason = missing.length
+      ? `尚未就緒：缺少 ${missing.join(", ")}`
+      : "尚未就緒";
+    option.value = profileId;
+    option.disabled = unavailable;
+    option.textContent = unavailable
+      ? `${(preset && preset.label) || profileId}（${reason}）`
+      : ((preset && preset.label) || profileId);
+    option.title = unavailable
+      ? reason
+      : ((preset && (preset.description || preset.label)) || profileId);
+    select.append(option);
+  });
+  const teacher = entries.find(([profileId, preset]) => (
+    profileId === "teacher-punch" && (!preset || preset.available !== false)
+  ));
+  const fallback = entries.find(([, preset]) => !preset || preset.available !== false);
+  select.value = (teacher || fallback || [""])[0];
+  select.disabled = !select.value;
+}
+
 function setProgress(percent, title, note = "請保持這個視窗開啟。") {
   const normalized = Math.max(0, Math.min(100, Math.round(percent)));
   byId("import-progress").hidden = false;
@@ -176,6 +207,7 @@ async function initialize() {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "Studio 尚未就緒");
     studio.bootstrap = payload;
+    populateDirectorOptions(payload.director_presets);
     byId("dropzone-note").textContent = `MP4、MOV、M4V、WEBM · 上限 ${formatBytes(payload.max_import_bytes)}`;
   } catch (error) {
     showError(`Studio 啟動失敗：${error.message}`);

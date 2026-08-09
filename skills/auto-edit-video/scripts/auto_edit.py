@@ -24,6 +24,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from director_resolver import (
+    DirectorResolutionError,
+    canonical_json as canonical_director_json,
+    enforce_runtime_capabilities,
+    load_selection_request,
+    persist_director_selection,
+    resolution_error_json,
+    resolve_director_profile,
+    resolve_director_selection,
+)
+
 from contextual_semantic_calibration import (
     ollama_json_model_call,
     propose_contextual_corrections,
@@ -1199,6 +1210,33 @@ def cmd_preflight(_args: argparse.Namespace) -> int:
     payload = preflight_payload()
     emit(payload)
     return 0 if payload["ready"] else 2
+
+
+def cmd_resolve_director(args: argparse.Namespace) -> int:
+    """Read-only canonical director selection preflight."""
+    try:
+        if args.selection_request:
+            request = load_selection_request(args.selection_request)
+            resolved, normalized_request = resolve_director_selection(
+                director=args.director,
+                selection_request=request,
+            )
+            print(
+                canonical_director_json(
+                    {"profile": resolved, "selection_request": normalized_request}
+                )
+            )
+            return 0
+        if not args.director:
+            raise DirectorResolutionError(
+                "registry_invalid", details=["director or selection request is required"]
+            )
+        resolved = resolve_director_profile(args.director)
+    except DirectorResolutionError as exc:
+        print(resolution_error_json(exc))
+        return 2
+    print(canonical_director_json(resolved))
+    return 0
 
 
 def empty_gate() -> dict[str, Any]:
@@ -4210,6 +4248,65 @@ def clip_qa_command(
     ]
 
 
+def cut_selection_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect only explicit/non-empty cut values for the selection request."""
+    overrides: dict[str, Any] = {}
+    for key in ("input", "folder", "main", "project_dir"):
+        value = getattr(args, key, "")
+        if value:
+            overrides["project-dir" if key == "project_dir" else key] = value
+    if getattr(args, "out", ""):
+        overrides["out"] = args.out
+    if getattr(args, "clips", 3) != 3:
+        overrides["clips"] = args.clips
+    if getattr(args, "seconds", 30.0) != 30.0:
+        overrides["seconds"] = args.seconds
+    if getattr(args, "platform", "instagram-reels") != "instagram-reels":
+        overrides["platform"] = args.platform
+    if getattr(args, "brief", ""):
+        overrides["brief"] = args.brief
+    if getattr(args, "glossary", None):
+        overrides["glossary"] = list(args.glossary)
+    if getattr(args, "fix", None):
+        overrides["fix"] = list(args.fix)
+    if getattr(args, "keep_pauses", False):
+        overrides["keep-pauses"] = True
+    if getattr(args, "framing", "auto") != "auto":
+        overrides["framing"] = args.framing
+    if getattr(args, "quality", "final") != "final":
+        overrides["quality"] = args.quality
+    if getattr(args, "model", "auto") != "auto":
+        overrides["model"] = args.model
+    if getattr(args, "translate", ""):
+        overrides["translate"] = args.translate
+    if getattr(args, "cards_from_model", False):
+        overrides["cards-from-model"] = True
+    if getattr(args, "no_cards", False):
+        overrides["no-cards"] = True
+    if getattr(args, "no_editorial", False):
+        overrides["no-editorial"] = True
+    burned_in = getattr(args, "burned_in", "auto")
+    if burned_in != "auto":
+        overrides["burned-in"] = burned_in
+    return overrides
+
+
+def apply_cut_selection_overrides(
+    args: argparse.Namespace, overrides: dict[str, Any]
+) -> None:
+    """Apply the canonical selection values that the cut runtime consumes."""
+    argument_names = {
+        "project-dir": "project_dir",
+        "keep-pauses": "keep_pauses",
+        "cards-from-model": "cards_from_model",
+        "no-cards": "no_cards",
+        "no-editorial": "no_editorial",
+        "burned-in": "burned_in",
+    }
+    for key, value in overrides.items():
+        setattr(args, argument_names.get(key, key), value)
+
+
 def cmd_cut(args: argparse.Namespace) -> int:
     """One command: a long video in, finished clips out."""
     import subprocess as _subprocess
@@ -4222,6 +4319,36 @@ def cmd_cut(args: argparse.Namespace) -> int:
         return die(f"no such folder: {folder}")
     if source is not None and not source.is_file():
         return die(f"no such video: {source}")
+
+    try:
+        selection_request = (
+            load_selection_request(args.selection_request)
+            if getattr(args, "selection_request", "")
+            else None
+        )
+        resolved, normalized_selection_request = resolve_director_selection(
+            director=getattr(args, "director", None),
+            selection_request=selection_request,
+            extra_overrides=cut_selection_overrides(args),
+            default_director="high-energy",
+        )
+        apply_cut_selection_overrides(
+            args, normalized_selection_request["overrides"]
+        )
+        folder = Path(args.folder).expanduser().resolve() if args.folder else None
+        source = Path(args.input).expanduser().resolve() if args.input else None
+        if folder is None and source is None:
+            return die("give it something to cut: --input a video, or --folder a folder")
+        if folder is not None and not folder.is_dir():
+            return die(f"no such folder: {folder}")
+        if source is not None and not source.is_file():
+            return die(f"no such video: {source}")
+        enforce_runtime_capabilities(resolved)
+    except DirectorResolutionError as exc:
+        print(resolution_error_json(exc))
+        return 2
+
+    director_id = resolved["profile_id"]
     out_dir = Path(args.out).expanduser().resolve()
     project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir \
         else out_dir / ".project"
@@ -4250,6 +4377,17 @@ def cmd_cut(args: argparse.Namespace) -> int:
         code = cmd_init(_args_for("init", *init_argv))
         if code:
             return code
+
+    try:
+        persist_director_selection(
+            project_dir, resolved, normalized_selection_request
+        )
+    except (DirectorResolutionError, OSError, ValueError) as exc:
+        if isinstance(exc, DirectorResolutionError):
+            print(resolution_error_json(exc))
+        else:
+            print(canonical_director_json({"error_code": "registry_invalid", "details": [str(exc)]}))
+        return 2
 
     # Where the clip length and the platform are decided, for both routes in.
     # They were decided on one of them: a folder went to ingest-folder, which
@@ -4330,7 +4468,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
 
     _step(f"choosing {args.clips} moment(s) worth cutting")
     highlight_argv = [
-        "--manifest", str(manifest_path), "--director", args.director,
+        "--manifest", str(manifest_path), "--director", director_id,
         "--count", str(args.clips), "--brief", args.brief,
         "--editorial-timeout", str(args.timeout),
     ]
@@ -4955,6 +5093,14 @@ def build_parser() -> argparse.ArgumentParser:
     preflight = sub.add_parser("preflight", help="Check installed editing capabilities")
     preflight.set_defaults(func=cmd_preflight)
 
+    resolve_director = sub.add_parser(
+        "resolve-director",
+        help="Resolve one director profile without creating a project or output",
+    )
+    resolve_director.add_argument("--director")
+    resolve_director.add_argument("--selection-request")
+    resolve_director.set_defaults(func=cmd_resolve_director)
+
     presets = sub.add_parser(
         "duration-presets",
         help="List platform-aware short, medium, and long editorial targets",
@@ -5174,9 +5320,9 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument("--platform", choices=PLATFORMS, default="instagram-reels")
     cut.add_argument(
         "--director",
-        choices=("teacher-punch", "high-energy", "documentary", "minimal", "editorial-clean"),
-        default="high-energy",
+        default=None,
     )
+    cut.add_argument("--selection-request")
     cut.add_argument("--brief", default="", help="what you want out of it")
     cut.add_argument("--translate", default="", help="add a second caption line, e.g. en")
     cut.add_argument(

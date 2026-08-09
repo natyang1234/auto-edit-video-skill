@@ -42,8 +42,18 @@ from auto_edit import (
     normalize_transcription_glossary,
     probe_media,
 )
-from editor_server import EDITOR_DIR, EditorServer, atomic_write_json
-from highlight_planner import DIRECTOR_PROFILES
+from editor_server import (
+    DIRECTOR_PRESETS,
+    EDITOR_DIR,
+    EditorServer,
+    atomic_write_json,
+)
+from director_resolver import (
+    DirectorResolutionError,
+    enforce_runtime_capabilities,
+    persist_director_selection,
+    resolve_director_selection,
+)
 from local_http_security import (
     csrf_token_matches,
     host_header_allowed,
@@ -87,11 +97,19 @@ def now_utc() -> str:
 
 
 class StudioRequestError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        missing_capabilities: list[str] | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.missing_capabilities = sorted(set(missing_capabilities or []))
 
 
 def safe_project_slug(value: str) -> str:
@@ -127,6 +145,9 @@ def import_public_payload(session: dict[str, Any]) -> dict[str, Any]:
             "bytes_received",
             "created_at",
             "updated_at",
+            "director_profile",
+            "selection_reason",
+            "resolved_profile_hash",
             "error_code",
             "message",
         )
@@ -496,8 +517,15 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_problem(self, error: StudioRequestError) -> None:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error": error.message,
+            "error_code": error.code,
+        }
+        if error.missing_capabilities:
+            payload["missing_capabilities"] = error.missing_capabilities
         self.send_json(
-            {"ok": False, "error": error.message, "error_code": error.code},
+            payload,
             status=error.status,
         )
 
@@ -579,6 +607,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                     "csrf_token": self.server.csrf_token,
                     "max_import_bytes": self.server.max_import_bytes,
                     "source_extensions": sorted(SOURCE_EXTENSIONS),
+                    "director_presets": DIRECTOR_PRESETS,
                     "loopback_only": True,
                 }
             )
@@ -691,6 +720,10 @@ class StudioHandler(BaseHTTPRequestHandler):
                 "invalid_settings",
                 "contextual semantic calibration must be a boolean",
             )
+        requested_director = settings.get("director_profile")
+        requested_director_id = (
+            None if requested_director is None else str(requested_director)
+        )
         normalized_settings = {
             "source_language": str(settings.get("source_language", "auto")),
             "transcription_glossary": transcription_glossary,
@@ -701,7 +734,11 @@ class StudioHandler(BaseHTTPRequestHandler):
             "platform": str(settings.get("platform", "auto")),
             "duration_profile": str(settings.get("duration_profile", "auto")),
             "edit_preset": str(settings.get("edit_preset", "balanced")),
-            "director_profile": str(settings.get("director_profile", "teacher-punch")),
+            "director_profile": (
+                requested_director_id
+                if requested_director_id is not None
+                else "teacher-punch"
+            ),
             "editing_brief": str(settings.get("editing_brief", "")).strip(),
         }
         if normalized_settings["source_language"] not in SOURCE_LANGUAGES:
@@ -714,8 +751,29 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise StudioRequestError(422, "invalid_settings", "duration profile is unsupported")
         if normalized_settings["edit_preset"] not in EDIT_PRESETS:
             raise StudioRequestError(422, "invalid_settings", "edit preset is unsupported")
-        if normalized_settings["director_profile"] not in DIRECTOR_PROFILES:
-            raise StudioRequestError(422, "invalid_settings", "director profile is unsupported")
+        try:
+            resolved_director, normalized_selection_request = resolve_director_selection(
+                director=requested_director_id,
+                default_director="teacher-punch",
+            )
+            enforce_runtime_capabilities(resolved_director)
+        except DirectorResolutionError as exc:
+            if exc.code == "capability_missing":
+                missing = ", ".join(exc.missing_capabilities)
+                message = f"missing director capabilities: {missing}"
+            elif exc.code == "unknown_director":
+                message = "director profile is unsupported"
+            else:
+                message = exc.code
+            raise StudioRequestError(
+                422,
+                exc.code,
+                message,
+                missing_capabilities=exc.missing_capabilities,
+            ) from exc
+        normalized_settings["director_profile"] = resolved_director["profile_id"]
+        normalized_settings["resolved_director_profile"] = resolved_director
+        normalized_settings["director_selection_request"] = normalized_selection_request
         if len(normalized_settings["editing_brief"]) > 2000:
             raise StudioRequestError(422, "invalid_settings", "editing brief is too long")
 
@@ -738,6 +796,11 @@ class StudioHandler(BaseHTTPRequestHandler):
             "last_modified_ms": last_modified,
             "project_name": str(body.get("project_name") or Path(filename).stem)[:120],
             "settings": normalized_settings,
+            "director_profile": normalized_settings["director_profile"],
+            "selection_reason": normalized_selection_request["selection_reason"],
+            "resolved_profile_hash": normalized_selection_request[
+                "resolved_profile_hash"
+            ],
             "created_at": created,
             "updated_at": created,
         }
@@ -1160,6 +1223,18 @@ class StudioHandler(BaseHTTPRequestHandler):
                 project_id=project_id,
                 manifest_project_dir=final_project,
             )
+            try:
+                persist_director_selection(
+                    creating,
+                    settings["resolved_director_profile"],
+                    settings["director_selection_request"],
+                )
+            except (DirectorResolutionError, OSError, ValueError) as exc:
+                raise StudioRequestError(
+                    500,
+                    "selection_artifact_failed",
+                    "Studio could not persist director selection",
+                ) from exc
             incoming = None
             os.replace(creating, final_project)
             finalized = True

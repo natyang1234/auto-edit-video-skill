@@ -371,6 +371,20 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn('name: "影片", kind: "source"', script)
         self.assertIn('name: "字幕", types: ["caption"]', script)
 
+    def test_editor_blocks_unavailable_director_before_replan_mutation(self) -> None:
+        script = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
+        self.assertIn('"kinetic-explainer"', script)
+        self.assertIn("missing_capabilities", script)
+        self.assertIn("option.disabled", script)
+        self.assertIn('button.setAttribute("aria-disabled"', script)
+        self.assertIn("if (!isDirectorAvailable(preset))", script)
+        self.assertIn("if (!isDirectorAvailable(currentPreset))", script)
+        unavailable_guard = script.index("if (!isDirectorAvailable(currentPreset))")
+        save_call = script.index("await saveState(false)", unavailable_guard)
+        post_call = script.index('request("/api/plan-highlights"', save_call)
+        self.assertLess(unavailable_guard, save_call)
+        self.assertLess(save_call, post_call)
+
     def test_inline_effect_and_layout_adjustment_controls_are_present(self) -> None:
         html = (SKILL_DIR / "editor/index.html").read_text(encoding="utf-8")
         script = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
@@ -675,7 +689,7 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(len(payload["platform_presets"]), 6)
-        self.assertEqual(len(payload["director_presets"]), 5)
+        self.assertEqual(len(payload["director_presets"]), 6)
         self.assertEqual(len(payload["video_templates"]), 8)
         self.assertIn("cutout", payload["template_capabilities"])
         self.assertEqual(payload["state"]["video_template"]["id"], "dynamic-craft")
@@ -697,8 +711,38 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(payload["pipeline_status"]["state"], "not_started")
         self.assertEqual(
             {preset["label"] for preset in payload["director_presets"].values()},
-            {"專業教學", "爆款短影音", "八卦時事", "POV 藏鏡人", "編輯精簡"},
+            {"專業教學", "爆款短影音", "八卦時事", "POV 藏鏡人", "編輯精簡", "動畫解說"},
         )
+        metadata_keys = (
+            "profile_id",
+            "registry_schema_version",
+            "registry_entry_version",
+            "experience",
+            "required_capabilities",
+            "rules",
+            "resolved_hash",
+        )
+        for preset in payload["director_presets"].values():
+            for key in metadata_keys:
+                self.assertIn(key, preset)
+        kinetic = payload["director_presets"]["kinetic-explainer"]
+        self.assertFalse(kinetic["available"])
+        self.assertEqual(
+            kinetic["missing_capabilities"], sorted(kinetic["missing_capabilities"])
+        )
+        resolved = subprocess.run(
+            [
+                sys.executable,
+                str(SKILL_DIR / "scripts/auto_edit.py"),
+                "resolve-director",
+                "--director",
+                "kinetic-explainer",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(kinetic["resolved_hash"], json.loads(resolved.stdout)["resolved_hash"])
         self.assertEqual(
             {item["type"] for item in payload["state"]["overlays"]},
             {"caption", "emphasis", "title"},
@@ -845,6 +889,35 @@ class EditorServerTests(unittest.TestCase):
             planned["state"]["style_pack"]["project_default"], "kinetic-social"
         )
         self.assertLessEqual(len(planned["state"]["highlights"]), 3)
+
+    def test_kinetic_highlight_planning_fails_before_state_or_plan_mutation(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        bootstrap = json.loads(body.decode("utf-8"))
+        state_path = self.project / "working/editor_state.json"
+        plan_path = self.project / "working/highlight_plan.json"
+        state_before = state_path.read_bytes()
+        plan_before = plan_path.read_bytes() if plan_path.is_file() else None
+        status, payload = self.json_request(
+            "POST",
+            "/api/plan-highlights",
+            {
+                "director": "kinetic-explainer",
+                "brief": "動畫解說",
+                "count": 3,
+                "expected_revision": bootstrap["state"]["revision"],
+            },
+        )
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(payload["error_code"], "capability_missing")
+        self.assertEqual(
+            payload["missing_capabilities"], sorted(payload["missing_capabilities"])
+        )
+        self.assertEqual(state_path.read_bytes(), state_before)
+        if plan_before is None:
+            self.assertFalse(plan_path.exists())
+        else:
+            self.assertEqual(plan_path.read_bytes(), plan_before)
 
     def test_media_range_request(self) -> None:
         status, headers, body = self.request(

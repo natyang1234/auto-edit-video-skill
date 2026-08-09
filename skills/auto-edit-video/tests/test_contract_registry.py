@@ -120,6 +120,91 @@ class StylePackRegistryTests(unittest.TestCase):
 
 
 class SemanticValidatorTests(unittest.TestCase):
+    def test_director_mode_experience_contract_and_semantics(self) -> None:
+        mode = {
+            "id": "kinetic-explainer",
+            "version": 1,
+            "envelope": {
+                "cut_density": "high",
+                "motion_intensity": "high",
+                "caption_style_scope": ["track", "bilingual"],
+            },
+            "constraints": {"visual_density": "dense"},
+            "experience": {
+                "caption_delivery": {
+                    "mode": "bilingual",
+                    "required": True,
+                    "artifact_version": 2,
+                },
+                "translation": {
+                    "required": True,
+                    "target_language": "en",
+                    "provider": "approved-provider-required",
+                    "consent_policy": "provider-specific-prior-consent",
+                },
+                "scene_pack": "kinetic-explainer-v1",
+                "style_pack": "kinetic-social",
+                "stage_layout": "split-graphic-presenter",
+                "visual_density": "dense",
+                "motion_intensity": "high",
+                "sfx": {
+                    "mode": "paired",
+                    "pack": "kinetic-local-starter",
+                    "cue_coverage_policy": "required",
+                },
+            },
+            "required_capabilities": {
+                "ids": ["caption-delivery-v2", "audio-event-mixer-v1"],
+                "translation_consent_policy": "provider-specific-prior-consent",
+            },
+            "auto_select_rules": ["explicit_profile", "reference_style_match"],
+        }
+        artifact = {"schema_version": 1, "modes": [mode]}
+        self.assertEqual(contract_registry.validate_artifact("director_mode", artifact), [])
+
+        blank_mode_id = json.loads(json.dumps(artifact))
+        blank_mode_id["modes"][0]["id"] = "   "
+        self.assertTrue(any(
+            "id: must be a non-empty string" in error
+            for error in contract_registry.validate_artifact("director_mode", blank_mode_id)
+        ))
+
+        strict = json.loads(json.dumps(artifact))
+        strict["modes"][0]["experience"]["caption_delivery"]["unexpected"] = True
+        strict["modes"][0]["required_capabilities"]["unexpected"] = True
+        strict_errors = contract_registry.validate_artifact("director_mode", strict)
+        self.assertTrue(any("caption_delivery: unexpected property" in error for error in strict_errors))
+        self.assertTrue(any("required_capabilities: unexpected property" in error for error in strict_errors))
+
+        unpaired = json.loads(json.dumps(artifact))
+        del unpaired["modes"][0]["required_capabilities"]
+        self.assertTrue(any(
+            "must both be present or absent" in error
+            for error in contract_registry.validate_artifact("director_mode", unpaired)
+        ))
+
+        empty_arrays = json.loads(json.dumps(artifact))
+        empty_arrays["modes"][0]["required_capabilities"]["ids"] = []
+        empty_arrays["modes"][0]["auto_select_rules"] = []
+        empty_errors = contract_registry.validate_artifact("director_mode", empty_arrays)
+        self.assertTrue(any("required_capabilities.ids: fewer than minItems" in error for error in empty_errors))
+        self.assertTrue(any("auto_select_rules: fewer than minItems" in error for error in empty_errors))
+
+        invalid = json.loads(json.dumps(artifact))
+        invalid_mode = invalid["modes"][0]
+        invalid_mode["id"] = "kinetic-explainer"
+        invalid["modes"].append(json.loads(json.dumps(invalid_mode)))
+        invalid_mode["experience"]["motion_intensity"] = "low"
+        invalid_mode["experience"]["visual_density"] = "sparse"
+        invalid_mode["required_capabilities"]["ids"] = ["caption-delivery-v2", " caption-delivery-v2 "]
+        invalid_mode["auto_select_rules"] = ["explicit_profile", " explicit_profile "]
+        errors = contract_registry.validate_artifact("director_mode", invalid)
+        self.assertTrue(any("duplicate mode id" in error for error in errors))
+        self.assertTrue(any("motion_intensity" in error for error in errors))
+        self.assertTrue(any("visual_density" in error for error in errors))
+        self.assertTrue(any("duplicate capability id" in error for error in errors))
+        self.assertTrue(any("duplicate auto_select_rule" in error for error in errors))
+
     def test_master_timeline_duration_must_match_segment_sum(self) -> None:
         timeline = {
             "segments": [{"source_start": 0.0, "source_end": 2.0}],

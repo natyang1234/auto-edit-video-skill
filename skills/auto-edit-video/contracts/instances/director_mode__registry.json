@@ -160,6 +160,76 @@
    "auto_select_rules": [
     "default"
    ]
+  },
+  {
+   "id": "kinetic-explainer",
+   "version": 1,
+   "envelope": {
+    "cut_density": "high",
+    "motion_intensity": "high",
+    "caption_style_scope": [
+     "track",
+     "bilingual"
+    ]
+   },
+   "constraints": {
+    "label": "動畫解說",
+    "description": "以語意章節、動畫圖卡、中英字幕與配對音效組成高密度解說體驗。",
+    "caption": {
+     "font_family": "PingFang TC",
+     "font_size": 58,
+     "font_weight": 800,
+     "color": "#f7f2e8",
+     "emphasis_color": "#ffd447",
+     "stroke_color": "#17130f",
+     "stroke_width": 5,
+     "x": 50,
+     "y": 76,
+     "max_width": 86,
+     "animation": "pop"
+    },
+    "visual_density": "dense"
+   },
+   "experience": {
+    "caption_delivery": {
+     "mode": "bilingual",
+     "required": true,
+     "artifact_version": 2,
+     "primary_language": "zh-TW",
+     "secondary_language": "en"
+    },
+    "translation": {
+     "required": true,
+     "target_language": "en",
+     "provider": "approved-provider-required",
+     "consent_policy": "provider-specific-prior-consent"
+    },
+    "scene_pack": "kinetic-explainer-v1",
+    "style_pack": "kinetic-social",
+    "stage_layout": "split-graphic-presenter",
+    "visual_density": "dense",
+    "motion_intensity": "high",
+    "sfx": {
+     "mode": "paired",
+     "pack": "kinetic-local-starter",
+     "cue_coverage_policy": "required"
+    }
+   },
+   "required_capabilities": {
+    "ids": [
+     "approved-translation-provider",
+     "audio-event-mixer-v1",
+     "caption-delivery-v2",
+     "kinetic-scene-director-v1",
+     "unified-delivery-envelope-v1"
+    ],
+    "translation_consent_policy": "provider-specific-prior-consent"
+   },
+   "auto_select_rules": [
+    "explicit_profile",
+    "explicit_kinetic_bundle",
+    "reference_style_match"
+   ]
   }
  ]
 }
