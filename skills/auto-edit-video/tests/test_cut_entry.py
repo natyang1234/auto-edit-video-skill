@@ -271,6 +271,84 @@ class PlanningWindowsTests(unittest.TestCase):
         )
 
 
+class MaterialiseClipVisualDensityTests(unittest.TestCase):
+    def test_director_density_reaches_visual_planner(self) -> None:
+        from unittest.mock import patch
+
+        import editor_server
+        import video_analyzer
+        import visual_director
+
+        state = {
+            "segments": [{"id": "base", "source_start": 0.0, "source_end": 8.0}],
+            "canvas": {},
+            "director_style": "high-energy",
+        }
+        evidence = {
+            "items": [{
+                "id": "evidence-aaaa1111",
+                "kind": "number",
+                "literal": "87%",
+                "start": 1.0,
+                "end": 1.5,
+            }]
+        }
+        captured: dict[str, object] = {}
+
+        def fake_read_json(path, fallback=None):
+            if str(path).endswith("evidence_map.json"):
+                return evidence
+            return fallback
+
+        def fake_plan(*args, **kwargs):
+            captured.update(kwargs)
+            return {"visual_plan": {"items": []}, "structured_layers": {"items": []}}
+
+        with (
+            patch.object(editor_server, "default_editor_state", return_value=state),
+            patch.object(editor_server, "read_json", side_effect=fake_read_json),
+            patch.object(editor_server, "active_editorial_title", return_value=""),
+            patch.object(editor_server, "publish_layer_bundle"),
+            patch.object(video_analyzer, "atomic_write_json"),
+            patch.object(visual_director, "plan_visuals", side_effect=fake_plan),
+            patch.object(visual_director, "validate", return_value=[]),
+        ):
+            auto_edit.materialise_clip(
+                Path("/tmp/auto-edit-density-test"),
+                {},
+                {"id": "highlight-aaaa1111", "start": 0.0, "end": 8.0},
+                fit="contain",
+                cards=True,
+                trim_pauses=False,
+            )
+
+        self.assertEqual(
+            captured["visual_density"],
+            editor_server.DIRECTOR_PRESETS["high-energy"]["visual_density"],
+        )
+
+
+class DirectorRegistryContractTests(unittest.TestCase):
+    def test_motion_intensity_matches_each_director_mode(self) -> None:
+        import json
+
+        payload = json.loads(
+            (SKILL_DIR / "contracts/instances/director_mode__registry.json")
+            .read_text("utf-8")
+        )
+        by_id = {mode["id"]: mode for mode in payload["modes"]}
+        expected = {
+            "teacher-punch": "medium",
+            "high-energy": "high",
+            "documentary": "low",
+            "minimal": "low",
+            "editorial-clean": "low",
+        }
+        for mode_id, intensity in expected.items():
+            with self.subTest(mode_id=mode_id):
+                self.assertEqual(by_id[mode_id]["envelope"]["motion_intensity"], intensity)
+
+
 class GlossaryReachesTheProjectTests(unittest.TestCase):
     """Spellings the recogniser gets wrong on its own.
 

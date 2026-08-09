@@ -88,6 +88,23 @@ class WhatAnimatesTests(unittest.TestCase):
         self.assertIn("line-height:31px", page)
         self.assertIn("padding:14px", page)
 
+    def test_content_animation_uses_the_packs_surface_skin(self) -> None:
+        pack = {
+            "tokens": {
+                "palette": {"panel": "#171126", "border": "#B8FF3D"},
+                "spacing": {
+                    "card_radius": 28, "border_width": 4, "panel_alpha": 0.96,
+                },
+            }
+        }
+        page = card_animator.build_card_html(
+            {"type": "dynamic_list", "payload": {"items": [{"text": "第一項"}]}},
+            pack, "staggered-reveal", 907, 200, 5.5, 30,
+        )
+        self.assertIn("border-radius:28px", page)
+        self.assertIn("border:4px solid #B8FF3D", page)
+        self.assertIn("background:#171126F5", page)
+
     def test_disabled_by_environment_means_unavailable(self) -> None:
         import os
         from unittest.mock import patch
@@ -97,6 +114,23 @@ class WhatAnimatesTests(unittest.TestCase):
 
 
 class FallbackTests(unittest.TestCase):
+    def test_renderer_uses_clip_override_then_project_default(self) -> None:
+        state = {
+            "style_pack": {
+                "project_default": "editorial-paper",
+                "per_highlight": {"highlight-kinetic": "kinetic-social"},
+            }
+        }
+        selected = renderer.style_pack_for_clip(
+            state, {"id": "highlight-kinetic"}
+        )
+        self.assertEqual(selected["id"], "kinetic-social")
+        selected = renderer.style_pack_for_clip(state, {"id": "highlight-paper"})
+        self.assertEqual(selected["id"], "editorial-paper")
+        self.assertEqual(
+            renderer.style_pack_for_clip({}, {"id": "any"})["id"], "none"
+        )
+
     def test_an_unknown_layer_falls_back_to_the_static_card(self) -> None:
         self.assertIsNone(
             renderer.animated_card_overlay_source(

@@ -139,10 +139,61 @@ def _load_director_presets() -> dict[str, dict[str, Any]]:
         raise RuntimeError(
             "director mode registry failed contract validation: " + "; ".join(errors)
         )
-    return {mode["id"]: dict(mode["constraints"]) for mode in payload["modes"]}
+    presets: dict[str, dict[str, Any]] = {}
+    for mode in payload["modes"]:
+        preset = dict(mode["constraints"])
+        # Planning consumes density while rendering/UI need the motion
+        # envelope.  Dropping the envelope here made every director look
+        # "medium" downstream even though the contract carried the setting.
+        preset["cut_density"] = mode["envelope"]["cut_density"]
+        preset["motion_intensity"] = mode["envelope"]["motion_intensity"]
+        presets[mode["id"]] = preset
+    return presets
 
 
 DIRECTOR_PRESETS: dict[str, dict[str, Any]] = _load_director_presets()
+
+DEFAULT_STYLE_PACK_BY_DIRECTOR = {
+    "high-energy": "kinetic-social",
+    "teacher-punch": "dark-data-presenter",
+    "editorial-clean": "editorial-paper",
+    "documentary": "editorial-paper",
+    "minimal": "editorial-paper",
+}
+
+STYLE_PACK_PRESENTATION = {
+    "dark-data-presenter": {
+        "label": "深色數據",
+        "description": "深色面板、冷白文字與紅色數據重點。",
+    },
+    "kinetic-social": {
+        "label": "高動態社群",
+        "description": "高對比酸性色與逐字、逐列、數字內容動畫。",
+    },
+    "editorial-paper": {
+        "label": "暖紙編輯",
+        "description": "暖紙色、深墨文字與克制淡入，保留畫面呼吸。",
+    },
+}
+
+
+def public_style_pack_catalog() -> list[dict[str, Any]]:
+    """Validated style packs exposed to the local editor picker."""
+    import structured_card_compositor
+
+    catalog = []
+    for pack_id in structured_card_compositor.style_pack_ids():
+        pack = structured_card_compositor.load_style_pack(pack_id)
+        catalog.append(
+            {
+                "id": pack_id,
+                "version": int(pack["version"]),
+                **STYLE_PACK_PRESENTATION.get(
+                    pack_id, {"label": pack_id, "description": pack_id}
+                ),
+            }
+        )
+    return catalog
 
 
 def now_utc() -> str:
@@ -1087,16 +1138,19 @@ def write_output_variant_set(
 
     selection = state.get("style_pack") or {}
     pack_id = str(selection.get("project_default") or "")
+    per_highlight = selection.get("per_highlight") or {}
     highlight_modes = []
     for highlight in state.get("highlights", []) or []:
+        highlight_id = str(highlight.get("id"))
+        override_pack_id = str(per_highlight.get(highlight_id) or "")
         highlight_modes.append(
             {
-                "highlight_id": str(highlight.get("id")),
+                "highlight_id": highlight_id,
                 "mode_id": str(state.get("director_style") or "teacher-punch"),
                 "mode_selection": "project-default",
                 "style_pack": {
-                    "id": pack_id or "dark-data-presenter",
-                    "selection": "user" if pack_id else "project-default",
+                    "id": override_pack_id or pack_id or "dark-data-presenter",
+                    "selection": "user" if override_pack_id else "project-default",
                 },
             }
         )
@@ -2352,7 +2406,9 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         "visual_quality_mode": "designed",
         "graphic_package_style": "craft-stack",
         "style_pack": {
-            "project_default": "dark-data-presenter",
+            "project_default": DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
+                director_id, "dark-data-presenter"
+            ),
             "per_highlight": {},
         },
         "video_template": default_video_template_state(),
@@ -2543,7 +2599,7 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     if style_pack is not None:
         import structured_card_compositor
 
-        known_packs = {structured_card_compositor.load_default_pack().get("id")}
+        known_packs = set(structured_card_compositor.style_pack_ids())
         if not isinstance(style_pack, dict):
             errors.append("style_pack must be an object")
         else:
@@ -4035,6 +4091,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "state": state,
                 "platform_presets": PLATFORM_PRESETS,
                 "director_presets": DIRECTOR_PRESETS,
+                "style_packs": public_style_pack_catalog(),
                 "viral_structure_plan": read_json(
                     project / "working/viral_structure_plan.json", None
                 ),
@@ -4782,8 +4839,14 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not isinstance(segments, list) or not segments:
             self.send_json({"ok": False, "error": "the timeline has no segments"}, status=422)
             return
+        director = DIRECTOR_PRESETS.get(
+            str(state.get("director_style") or ""), DIRECTOR_PRESETS["teacher-punch"]
+        )
         planned = visual_director.plan_visuals(
-            segments, evidence["items"], editorial_title=active_editorial_title(state)
+            segments,
+            evidence["items"],
+            editorial_title=active_editorial_title(state),
+            visual_density=str(director.get("visual_density") or "balanced"),
         )
         errors = visual_director.validate(planned)
         if errors:

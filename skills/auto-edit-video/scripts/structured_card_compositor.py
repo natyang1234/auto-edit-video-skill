@@ -14,6 +14,7 @@ minimum before the render FAILS CLOSED rather than truncating silently.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ ARTIFACTS_REL = Path("working/structured_layer_artifacts.json")
 # captions beside it reads as fine print (nat, watching a delivery).
 # v3: the title refuses to shrink below its floor; a fallback title
 # holding a whole transcript sentence is trimmed instead.
-COMPILER_VERSION = "static-card-compositor-v4"
+COMPILER_VERSION = "static-card-compositor-v5"
 MIN_LABEL_PT = 11.0
 # Cards are watched at phone size beside 52--68px captions.  The old list
 # ramp started at 32 design pixels and could shrink to 11, which made a 540p
@@ -66,6 +67,31 @@ def _pack_token(pack: dict[str, Any], group: str, key: str, fallback: str) -> st
     tokens = pack.get("tokens", {}).get(group, {})
     value = tokens.get(key)
     return str(value) if value else fallback
+
+
+def _pack_number(
+    pack: dict[str, Any], group: str, key: str, fallback: float,
+    minimum: float, maximum: float,
+) -> float:
+    value = pack.get("tokens", {}).get(group, {}).get(key, fallback)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return fallback
+    number = float(value)
+    if not math.isfinite(number):
+        return fallback
+    return max(minimum, min(maximum, number))
+
+
+def surface_style(pack: dict[str, Any], render_scale: float) -> dict[str, Any]:
+    """Shared card-surface geometry for the static and animated renderers."""
+    return {
+        "radius": _pack_number(pack, "spacing", "card_radius", 14, 0, 80)
+        * render_scale,
+        "border_width": _pack_number(pack, "spacing", "border_width", 0, 0, 12)
+        * render_scale,
+        "panel_alpha": _pack_number(pack, "spacing", "panel_alpha", 0.92, 0, 1),
+        "border": _pack_token(pack, "palette", "border", "#000000"),
+    }
 
 
 def _make_font(ct, size: float):
@@ -139,7 +165,11 @@ def _draw_line(ct, quartz, context, attributed, x: float, y: float) -> None:
     ct.CTLineDraw(ct.CTLineCreateWithAttributedString(attributed), context)
 
 
-def _begin_card(quartz, width: int, height: int, panel_color: str):
+def _begin_card(
+    quartz, width: int, height: int, panel_color: str, *,
+    radius: float = 14, panel_alpha: float = 0.92,
+    border_color: str = "#000000", border_width: float = 0,
+):
     color_space = quartz.CGColorSpaceCreateDeviceRGB()
     context = quartz.CGBitmapContextCreate(
         None, width, height, 8, width * 4, color_space,
@@ -147,12 +177,21 @@ def _begin_card(quartz, width: int, height: int, panel_color: str):
     )
     if context is None:
         raise RuntimeError("could not create card bitmap context")
-    quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, panel_color, 0.92))
+    quartz.CGContextSetFillColorWithColor(
+        context, _cg_color(quartz, panel_color, panel_alpha)
+    )
     path = quartz.CGPathCreateWithRoundedRect(
-        quartz.CGRectMake(0, 0, width, height), 14, 14, None
+        quartz.CGRectMake(0, 0, width, height), radius, radius, None
     )
     quartz.CGContextAddPath(context, path)
     quartz.CGContextFillPath(context)
+    if border_width > 0:
+        quartz.CGContextSetStrokeColorWithColor(
+            context, _cg_color(quartz, border_color)
+        )
+        quartz.CGContextSetLineWidth(context, border_width)
+        quartz.CGContextAddPath(context, path)
+        quartz.CGContextStrokePath(context)
     return context
 
 
@@ -266,6 +305,16 @@ def render_card(
     accent = _pack_token(pack, "palette", "accent", "#E5484D")
     panel = _pack_token(pack, "palette", "panel", "#161B22")
     muted = "#9AA4AF"
+    card_surface = surface_style(pack, scale)
+
+    def begin_card(width: int, height: int, color: str):
+        return _begin_card(
+            quartz, width, height, color,
+            radius=card_surface["radius"],
+            panel_alpha=card_surface["panel_alpha"],
+            border_color=card_surface["border"],
+            border_width=card_surface["border_width"],
+        )
 
     if layer_type == "title":
         # Cards share the screen with 52-68px captions; a title smaller
@@ -325,7 +374,7 @@ def render_card(
             + (kicker_size * 1.25 + 8 * scale if kicker is not None else 0)
             + (subtitle_size * 1.35 + 8 * scale if subtitle is not None else 0)
         )
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         cursor = height - pad
         if kicker is not None:
             cursor -= kicker_size
@@ -367,7 +416,7 @@ def render_card(
             pad * 2 + value_size * 1.2 + label_size * 1.35
             + (source_size * 1.35 if source is not None else 0)
         )
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         cursor = height - pad - value_size
         _draw_line(
             ct, quartz, context, value,
@@ -401,7 +450,7 @@ def render_card(
         card_width = int(min(card_width, _line_width(ct, body) + pad * 2 + 6 * scale))
         rule = int(4 * scale)
         height = int(pad * 2 + body_size * 1.4)
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         # A bar down the leading edge, the way a print pull-quote is marked.
         quartz.CGContextSetFillColorWithColor(context, _cg_color(quartz, accent))
         quartz.CGContextFillRect(
@@ -423,7 +472,7 @@ def render_card(
         )
         card_width = int(min(card_width, _line_width(ct, body) + pad * 2))
         height = int(pad * 2 + body_size * 1.4)
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         _draw_line(
             ct, quartz, context, body,
             _layout_origin("center", card_width, _line_width(ct, body), pad),
@@ -450,7 +499,7 @@ def render_card(
         )
         card_width = int(min(card_width, column * 2 + pad * 3))
         height = int(pad * 2 + row * 1.4)
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         baseline = int((height - row) / 2)
         _draw_line(
             ct, quartz, context, left,
@@ -487,7 +536,7 @@ def render_card(
             max(_line_width(ct, term), _line_width(ct, meaning)) + pad * 2,
         ))
         height = int(pad * 2 + term_size * 1.3 + meaning_size * 1.6)
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         cursor = height - pad - term_size
         _draw_line(
             ct, quartz, context, term,
@@ -504,7 +553,7 @@ def render_card(
         plot_height = int(150 * scale)
         label_zone = int(CHART_LABEL_ZONE_PT * scale)
         height = pad * 2 + plot_height + label_zone
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         plot_left = pad
         plot_right = card_width - pad
         plot_bottom = pad + label_zone
@@ -566,7 +615,7 @@ def render_card(
             prepared.append((column, lines, line_size))
             column_heights[column] += row * len(lines)
         height = pad * 2 + max([row, *column_heights])
-        context = _begin_card(quartz, card_width, height, panel)
+        context = begin_card(card_width, height, panel)
         cursors = [height - pad for _ in range(columns)]
         for column, lines, line_size in prepared:
             for line in lines:
@@ -610,7 +659,7 @@ def render_card(
             + (30 * scale if wave else 0)
             + (26 * scale if body else 0)
         )
-        context = _begin_card(quartz, card_width, height, surface)
+        context = begin_card(card_width, height, surface)
         cursor = height - pad - title_size
         _draw_line(ct, quartz, context, title, pad, cursor)
         if meta is not None:
@@ -660,7 +709,7 @@ def render_card(
         chip_pad = int(18 * scale)
         card_width = int(min(card_width, _line_width(ct, line) + chip_pad * 2))
         height = int(line_size * 1.9)
-        context = _begin_card(quartz, card_width, height, accent)
+        context = begin_card(card_width, height, accent)
         _draw_line(
             ct, quartz, context, line,
             (card_width - _line_width(ct, line)) / 2, (height - line_size) / 2 + line_size * 0.18,
@@ -688,7 +737,7 @@ def render_card(
         content = lead_width + _line_width(ct, body)
         card_width = int(min(card_width, content + pad * 2))
         height = int(pad * 1.6 + body_size * 1.5)
-        context = _begin_card(quartz, card_width, height, surface)
+        context = begin_card(card_width, height, surface)
         origin = max(pad, (card_width - content) / 2)
         baseline = (height - body_size) / 2 + body_size * 0.18
         if lead is not None:
@@ -787,21 +836,58 @@ def build_structured_artifacts(
     scratch.replace(index_path)
     return index
 
-_PACK_CACHE: dict[str, Any] | None = None
+# The registry is deliberately explicit.  A pack id coming from editor state
+# must resolve to one checked-in contract instance; silently falling back to
+# the default would make a selection look accepted while rendering another
+# design.
+STYLE_PACK_REGISTRY: dict[str, Path] = {
+    "dark-data-presenter": (
+        Path(__file__).resolve().parent.parent
+        / "contracts/instances/style_pack__dark_data_presenter.json"
+    ),
+    "kinetic-social": (
+        Path(__file__).resolve().parent.parent
+        / "contracts/instances/style_pack__kinetic_social.json"
+    ),
+    "editorial-paper": (
+        Path(__file__).resolve().parent.parent
+        / "contracts/instances/style_pack__editorial_paper.json"
+    ),
+}
+_PACK_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def style_pack_ids() -> tuple[str, ...]:
+    """Return the public, ordered ids accepted by the style-pack registry."""
+    return tuple(STYLE_PACK_REGISTRY)
+
+
+def load_style_pack(pack_id: str) -> dict[str, Any]:
+    """Load one checked-in style pack, failing closed on every bad selection."""
+    if not isinstance(pack_id, str) or pack_id not in STYLE_PACK_REGISTRY:
+        raise ValueError(f"unknown style pack: {pack_id}")
+    cached = _PACK_CACHE.get(pack_id)
+    if cached is not None:
+        return cached
+    pack_path = STYLE_PACK_REGISTRY[pack_id]
+    try:
+        pack = contract_registry.load_artifact_text(pack_path.read_text("utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"style pack {pack_id!r} is unavailable") from exc
+    errors = contract_registry.validate_artifact("style_pack", pack)
+    if errors:
+        raise RuntimeError(
+            f"style pack {pack_id!r} failed contract validation: "
+            + "; ".join(errors)
+        )
+    if pack.get("id") != pack_id:
+        raise RuntimeError(
+            f"style pack registry entry {pack_id!r} contains {pack.get('id')!r}"
+        )
+    _PACK_CACHE[pack_id] = pack
+    return pack
 
 
 def load_default_pack() -> dict[str, Any]:
-    """Style pack registry — fail closed like the platform/director loaders."""
-    global _PACK_CACHE
-    if _PACK_CACHE is not None:
-        return _PACK_CACHE
-    pack_path = (
-        Path(__file__).resolve().parent.parent
-        / "contracts/instances/style_pack__dark_data_presenter.json"
-    )
-    pack = contract_registry.load_artifact_text(pack_path.read_text("utf-8"))
-    errors = contract_registry.validate_artifact("style_pack", pack)
-    if errors:
-        raise RuntimeError("style pack registry invalid: " + "; ".join(errors))
-    _PACK_CACHE = pack
-    return pack
+    """Backward-compatible alias for the original dark-data-presenter pack."""
+    return load_style_pack("dark-data-presenter")

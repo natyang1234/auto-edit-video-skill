@@ -391,6 +391,14 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("renderLayoutWarning", script)
         self.assertIn("renderTranscriptStatus", script)
 
+    def test_style_pack_picker_is_populated_from_the_project_registry(self) -> None:
+        html = (SKILL_DIR / "editor/index.html").read_text(encoding="utf-8")
+        script = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")
+        picker = html.split('id="style-pack-select"', 1)[1].split("</select>", 1)[0]
+        self.assertNotIn("dark-data-presenter", picker)
+        self.assertIn("projectPayload.style_packs", script)
+        self.assertIn('elements["style-pack-select"].replaceChildren()', script)
+
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -795,6 +803,9 @@ class EditorServerTests(unittest.TestCase):
             "保留最明確的差別",
         )
         self.assertEqual(planned["state"]["director_style"], "high-energy")
+        self.assertEqual(
+            planned["state"]["style_pack"]["project_default"], "kinetic-social"
+        )
         self.assertLessEqual(len(planned["state"]["highlights"]), 3)
 
     def test_media_range_request(self) -> None:
@@ -1985,6 +1996,19 @@ class EditorServerTests(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(payload["csrf_token"], self.server.csrf_token)
 
+    def test_project_get_exposes_all_style_packs_and_director_motion(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(
+            {pack["id"] for pack in payload["style_packs"]},
+            {"dark-data-presenter", "kinetic-social", "editorial-paper"},
+        )
+        self.assertEqual(
+            payload["director_presets"]["high-energy"]["motion_intensity"],
+            "high",
+        )
+
     def test_new_default_state_selects_the_default_style_pack(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
@@ -1994,6 +2018,86 @@ class EditorServerTests(unittest.TestCase):
             {"project_default": "dark-data-presenter", "per_highlight": {}},
         )
         self.assertEqual(validate_editor_state(state, 2.0), [])
+
+    def test_director_selects_a_matching_default_style_pack(self) -> None:
+        for director, expected in (
+            ("high-energy", "kinetic-social"),
+            ("teacher-punch", "dark-data-presenter"),
+            ("editorial-clean", "editorial-paper"),
+        ):
+            with self.subTest(director=director):
+                self.write_json(
+                    "working/highlight_plan.json",
+                    {"configuration": {"director_profile": director}, "items": []},
+                )
+                manifest = json.loads(
+                    (self.project / "project.json").read_text(encoding="utf-8")
+                )
+                state = editor_server.default_editor_state(self.project, manifest)
+                self.assertEqual(state["style_pack"]["project_default"], expected)
+
+    def test_auto_visuals_passes_the_directors_density_to_the_planner(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        state["director_style"] = "high-energy"
+        self.write_json("working/editor_state.json", state)
+        self.write_json(
+            "working/evidence_map.json",
+            {
+                "schema_version": 1,
+                "source_sha256": "a" * 64,
+                "transcript_revision": "b" * 64,
+                "revision": "c" * 64,
+                "items": [{
+                    "id": "evidence-aaaa1111", "kind": "quote",
+                    "literal": "這是一段一般敘述", "start": 0.1, "end": 0.8,
+                    "confidence": 0.99, "review_status": "approved",
+                }],
+            },
+        )
+        original = editor_server.visual_director.plan_visuals
+        observed: dict[str, object] = {}
+
+        def spy(*args, **kwargs):
+            observed.update(kwargs)
+            return original(*args, **kwargs)
+
+        with patch.object(editor_server.visual_director, "plan_visuals", side_effect=spy):
+            status, _headers, body = self.request("POST", "/api/auto-visuals")
+            payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(observed.get("visual_density"), "dense")
+
+    def test_output_variant_receipt_records_per_highlight_style_pack(self) -> None:
+        state = {
+            "schema_version": 2,
+            "director_style": "high-energy",
+            "highlights": [
+                {"id": "highlight-aaaa1111"},
+                {"id": "highlight-bbbb2222"},
+            ],
+            "style_pack": {
+                "project_default": "kinetic-social",
+                "per_highlight": {"highlight-bbbb2222": "editorial-paper"},
+            },
+        }
+        editor_server.write_output_variant_set(self.project, state, {}, [])
+        receipt = json.loads(
+            (self.project / "working/output_variant_set.json").read_text("utf-8")
+        )
+        by_highlight = {
+            item["highlight_id"]: item["style_pack"]
+            for item in receipt["highlight_modes"]
+        }
+        self.assertEqual(
+            by_highlight["highlight-aaaa1111"],
+            {"id": "kinetic-social", "selection": "project-default"},
+        )
+        self.assertEqual(
+            by_highlight["highlight-bbbb2222"],
+            {"id": "editorial-paper", "selection": "user"},
+        )
 
     def test_v1_state_migrates_on_project_get_and_voids_every_gate(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
@@ -2535,11 +2639,11 @@ class EditorServerTests(unittest.TestCase):
         by_id = {mode["id"]: mode for mode in registry["modes"]}
         self.assertEqual(set(by_id), set(editor_server.DIRECTOR_PRESETS))
         for mode_id, preset in editor_server.DIRECTOR_PRESETS.items():
-            self.assertEqual(
-                by_id[mode_id]["constraints"], preset,
-                f"director registry drifted from code for {mode_id}; "
-                "regenerate contracts/instances/director_mode__registry.json",
-            )
+            mode = by_id[mode_id]
+            for key, value in mode["constraints"].items():
+                self.assertEqual(preset[key], value, f"{mode_id}.{key}")
+            for key in ("cut_density", "motion_intensity"):
+                self.assertEqual(preset[key], mode["envelope"][key], f"{mode_id}.{key}")
 
     def test_editor_ui_renders_formula_panel_and_stale_marker(self) -> None:
         app_js = (SKILL_DIR / "editor/app.js").read_text(encoding="utf-8")

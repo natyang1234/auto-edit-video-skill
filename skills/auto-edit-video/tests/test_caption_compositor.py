@@ -292,3 +292,13 @@ class PackPrecedenceTests(unittest.TestCase):
         state["style_pack"]["project_default"] = "vaporwave-9000"
         with self.assertRaises(ValueError):
             cc.build_render_plan(self.project, state)
+
+    def test_highlight_pack_wins_and_loads_the_selected_id(self) -> None:
+        state = self.state_with(None, pack=True)
+        state["style_pack"]["project_default"] = "editorial-paper"
+        state["style_pack"]["per_highlight"] = {"highlight-2": "kinetic-social"}
+        overlay = state["overlays"][0]
+        overlay["highlight_id"] = "highlight-2"
+        pack, source = cc.selected_pack(state, overlay)
+        self.assertEqual(pack["id"], "kinetic-social")
+        self.assertEqual(source, "pack-highlight:kinetic-social")

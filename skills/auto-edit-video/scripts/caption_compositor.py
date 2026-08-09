@@ -826,8 +826,6 @@ def selected_pack(state: dict[str, Any], overlay: dict[str, Any]):
     )
     if not pack_id:
         return None, "system"
-    pack = structured_card_compositor.load_default_pack()
-    if pack.get("id") != pack_id:
-        raise ValueError(f"unknown style pack: {pack_id}")
+    pack = structured_card_compositor.load_style_pack(pack_id)
     scope = "pack-highlight" if (selection.get("per_highlight") or {}).get(highlight) else "pack-project"
     return pack, f"{scope}:{pack_id}"

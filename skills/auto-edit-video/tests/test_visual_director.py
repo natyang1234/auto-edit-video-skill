@@ -112,6 +112,61 @@ class VisualDirectorTests(unittest.TestCase):
         decorated = [beat for beat in self.beats(result) if beat != "keep_aroll"]
         self.assertLessEqual(len(decorated), 5)
 
+    def test_visual_density_controls_card_share(self) -> None:
+        four_segments = segments(4)
+        found = [
+            evidence("number", f"{index * 10 + 10}%", index * 4 + 0.5,
+                     index * 4 + 0.9, f"density{index}")
+            for index in range(4)
+        ]
+        for density, expected_cards in (
+            ("sparse", 1),
+            ("balanced", 2),
+            ("dense", 3),
+        ):
+            with self.subTest(density=density):
+                result = vd.plan_visuals(
+                    four_segments, found, visual_density=density
+                )
+                decorated = [
+                    beat for beat in self.beats(result) if beat != "keep_aroll"
+                ]
+                self.assertEqual(len(decorated), expected_cards)
+                max_run = 0
+                run = 0
+                for beat in self.beats(result):
+                    run = run + 1 if beat != "keep_aroll" else 0
+                    max_run = max(max_run, run)
+                self.assertLessEqual(
+                    max_run, 2 if density == "dense" else 1
+                )
+
+    def test_explicit_share_override_beats_density_policy(self) -> None:
+        four_segments = segments(4)
+        found = [
+            evidence("number", f"{index * 10 + 10}%", index * 4 + 0.5,
+                     index * 4 + 0.9, f"override{index}")
+            for index in range(4)
+        ]
+        result = vd.plan_visuals(
+            four_segments,
+            found,
+            max_decorated_share=0.25,
+            visual_density="dense",
+        )
+        self.assertEqual(
+            len([beat for beat in self.beats(result) if beat != "keep_aroll"]),
+            1,
+        )
+
+    def test_invalid_visual_density_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            vd.plan_visuals(
+                segments(1),
+                [evidence("number", "87%", 0.5, 0.9, "invalid")],
+                visual_density="unbounded",
+            )
+
     def test_a_segment_without_a_usable_window_is_skipped(self) -> None:
         result = vd.plan_visuals(
             [{"id": "h0"}, {"id": "h1", "source_start": 0.0, "source_end": 4.0}], []

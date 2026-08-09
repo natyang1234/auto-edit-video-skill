@@ -2680,7 +2680,11 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
     state = read_json(state_path)
     manifest = read_json(project_dir / "project.json")
     try:
-        from editor_server import DIRECTOR_PRESETS, editor_state_revision
+        from editor_server import (
+            DEFAULT_STYLE_PACK_BY_DIRECTOR,
+            DIRECTOR_PRESETS,
+            editor_state_revision,
+        )
     except ImportError as exc:
         raise ValueError(f"cannot load editor highlight bridge: {exc}") from exc
     highlights = [
@@ -2734,6 +2738,18 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
     if director_id in DIRECTOR_PRESETS:
         caption_style = dict(DIRECTOR_PRESETS[director_id]["caption"])
         state["director_style"] = director_id
+        previous_pack = state.get("style_pack") or {}
+        previous_overrides = previous_pack.get("per_highlight") or {}
+        state["style_pack"] = {
+            "project_default": DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
+                director_id, "dark-data-presenter"
+            ),
+            "per_highlight": {
+                highlight_id: pack_id
+                for highlight_id, pack_id in previous_overrides.items()
+                if highlight_id in current_highlight_ids
+            },
+        }
         state["caption_defaults"] = caption_style
         generated_sources = {"working/transcript_words.json"}
         for overlay in state.get("overlays", []):
@@ -3932,6 +3948,7 @@ def materialise_clip(
     """
     import visual_director
     from editor_server import (
+        DIRECTOR_PRESETS,
         active_editorial_title,
         default_editor_state,
         publish_layer_bundle,
@@ -3940,6 +3957,8 @@ def materialise_clip(
     from video_analyzer import atomic_write_json
 
     state = default_editor_state(project_dir, manifest)
+    director_id = str(state.get("director_style") or "teacher-punch")
+    director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
     base = state["segments"][0]
     clip_start = float(highlight["start"])
     clip_end = float(highlight["end"])
@@ -3985,6 +4004,7 @@ def materialise_clip(
                 ),
                 evidence["items"],
                 editorial_title=active_editorial_title(state),
+                visual_density=director["visual_density"],
             )
             errors = visual_director.validate(planned)
             if errors:

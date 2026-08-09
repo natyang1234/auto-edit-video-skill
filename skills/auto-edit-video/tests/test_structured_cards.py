@@ -258,6 +258,44 @@ class StructuredCardTests(unittest.TestCase):
             first["items"][0]["style_pack_hash"], second["items"][0]["style_pack_hash"]
         )
 
+    def test_surface_shape_tokens_change_the_rendered_card_skin(self) -> None:
+        layer = {
+            "id": "structured-layer-surface-skin",
+            "type": "dynamic_list",
+            "payload": {"items": [{"text": "同一段內容"}]},
+        }
+        _path, plain_digest, _width, _height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 1.0
+        )
+        shaped = json.loads(json.dumps(self.pack))
+        shaped["tokens"]["spacing"].update(
+            {"card_radius": 30, "border_width": 4, "panel_alpha": 0.98}
+        )
+        shaped["tokens"]["palette"]["border"] = "#B8FF3D"
+        _path, shaped_digest, _width, _height = scc.render_card(
+            self.project, layer, shaped, self.state["canvas"], 1.0
+        )
+        self.assertNotEqual(plain_digest, shaped_digest)
+
+    def test_same_payload_has_a_distinct_artifact_for_each_style_pack(self) -> None:
+        layer = {
+            "id": "structured-layer-pack-digest",
+            "type": "title",
+            "payload": {"title": "同一份內容", "kicker": "PACK"},
+        }
+        digests = {
+            pack_id: scc.render_card(
+                self.project,
+                layer,
+                scc.load_style_pack(pack_id),
+                self.state["canvas"],
+                1.0,
+            )[1]
+            for pack_id in scc.style_pack_ids()
+        }
+        self.assertEqual(len(digests), 3)
+        self.assertEqual(len(set(digests.values())), 3)
+
     def test_label_overflow_fails_closed(self) -> None:
         layers = make_layers()
         layers["items"][2]["payload"]["datums"][0]["label"] = "超長標籤" * 30

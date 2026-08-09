@@ -10,6 +10,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 import contract_registry  # noqa: E402
+import structured_card_compositor as scc  # noqa: E402
 from contract_registry import (  # noqa: E402
     ContractError,
     canonical_hash,
@@ -82,6 +83,40 @@ class ArtifactParsingTests(unittest.TestCase):
     def test_canonical_hash_rejects_nonfinite(self) -> None:
         with self.assertRaises(ContractError):
             canonical_hash({"a": float("inf")})
+
+
+class StylePackRegistryTests(unittest.TestCase):
+    def test_registry_exposes_exactly_three_valid_packs(self) -> None:
+        self.assertEqual(
+            scc.style_pack_ids(),
+            ("dark-data-presenter", "kinetic-social", "editorial-paper"),
+        )
+        for pack_id in scc.style_pack_ids():
+            pack = scc.load_style_pack(pack_id)
+            self.assertEqual(contract_registry.validate_artifact("style_pack", pack), [])
+
+    def test_every_pack_keeps_all_component_ids_render_compatible(self) -> None:
+        expected_ids = {
+            item["id"] for item in scc.load_default_pack()["components"]
+        }
+        for pack_id in scc.style_pack_ids():
+            components = scc.load_style_pack(pack_id)["components"]
+            self.assertEqual({item["id"] for item in components}, expected_ids)
+            for item in components:
+                layer_types = [
+                    layer_type
+                    for layer_type, kinds in scc.COMPONENTS_BY_TYPE.items()
+                    if item["kind"] in kinds
+                ]
+                self.assertEqual(len(layer_types), 1)
+                resolved = scc.resolve_component(
+                    {"components": components}, layer_types[0], item["id"]
+                )
+                self.assertEqual(resolved["id"], item["id"])
+
+    def test_unknown_style_pack_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            scc.load_style_pack("vaporwave-9000")
 
 
 class SemanticValidatorTests(unittest.TestCase):

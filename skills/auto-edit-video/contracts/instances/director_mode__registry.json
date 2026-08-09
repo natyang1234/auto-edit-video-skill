@@ -38,7 +38,7 @@
    "version": 1,
    "envelope": {
     "cut_density": "medium",
-    "motion_intensity": "medium",
+    "motion_intensity": "low",
     "caption_style_scope": [
      "track"
     ]
@@ -70,7 +70,7 @@
    "version": 1,
    "envelope": {
     "cut_density": "medium",
-    "motion_intensity": "medium",
+    "motion_intensity": "low",
     "caption_style_scope": [
      "track"
     ]
@@ -102,7 +102,7 @@
    "version": 1,
    "envelope": {
     "cut_density": "medium",
-    "motion_intensity": "medium",
+    "motion_intensity": "high",
     "caption_style_scope": [
      "track"
     ]
@@ -134,7 +134,7 @@
    "version": 1,
    "envelope": {
     "cut_density": "medium",
-    "motion_intensity": "medium",
+    "motion_intensity": "low",
     "caption_style_scope": [
      "track"
     ]

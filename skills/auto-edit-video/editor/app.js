@@ -57,7 +57,7 @@ const deepCopy = (value) => JSON.parse(JSON.stringify(value));
 
 function cacheElements() {
   [
-    "project-name", "platform-select", "director-select", "save-state", "save-button",
+    "project-name", "platform-select", "director-select", "style-pack-select", "save-state", "save-button",
     "template-select", "template-group-tabs", "template-grid", "template-controls",
     "template-name", "template-description", "template-motion-chip", "frame-controls",
     "template-frame-x", "template-frame-x-output", "template-frame-y", "template-frame-y-output",
@@ -443,11 +443,24 @@ function populatePresets() {
     option.disabled = preset.available === false;
     elements["template-select"].append(option);
   });
+  elements["style-pack-select"].replaceChildren();
+  const noPack = document.createElement("option");
+  noPack.value = "";
+  noPack.textContent = "（無——系統預設）";
+  elements["style-pack-select"].append(noPack);
+  for (const pack of projectPayload.style_packs || []) {
+    const option = document.createElement("option");
+    option.value = pack.id;
+    option.textContent = pack.label || pack.id;
+    option.title = pack.description || pack.id;
+    elements["style-pack-select"].append(option);
+  }
   elements["platform-select"].value = state.canvas.platform_id;
   elements["director-select"].value = state.director_style;
   const template = projectPayload.video_templates?.[state.video_template?.id];
   activeTemplateGroup = template?.group || "fixed";
   elements["template-select"].value = state.video_template?.id || "dynamic-craft";
+  elements["style-pack-select"].value = state.style_pack?.project_default || "";
   renderTemplatePicker();
   renderDirectorCards();
 }

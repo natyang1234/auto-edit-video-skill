@@ -16,9 +16,17 @@ import contract_registry
 
 # A segment carrying nothing worth a card keeps the picture it already has.
 PLAIN_BEAT = "keep_aroll"
-# Cards compete with the speaker for attention, so they stay sparse: at most
-# this share of segments gets one, and never two in a row.
+# Cards compete with the speaker for attention, so the balanced policy keeps
+# them to this share of segments and never two in a row.
 MAX_DECORATED_SHARE = 0.5
+VISUAL_DENSITY_POLICY = {
+    "sparse": {"max_decorated_share": 0.34, "max_consecutive_cards": 1},
+    "balanced": {
+        "max_decorated_share": MAX_DECORATED_SHARE,
+        "max_consecutive_cards": 1,
+    },
+    "dense": {"max_decorated_share": 0.75, "max_consecutive_cards": 2},
+}
 # Numbers are only a chart when there are enough of them to compare.
 CHART_MIN_DATUMS = 3
 LIST_MIN_ITEMS = 3
@@ -417,8 +425,9 @@ def _classify(
 def plan_visuals(
     segments: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
-    max_decorated_share: float = MAX_DECORATED_SHARE,
+    max_decorated_share: float | None = None,
     editorial_title: str = "",
+    visual_density: str = "balanced",
 ) -> dict[str, Any]:
     """Decide a beat for every segment, and build the cards those beats need.
 
@@ -426,6 +435,11 @@ def plan_visuals(
     the rules cannot read confidently keeps its picture rather than getting a
     card built from a guess.
     """
+    try:
+        density_policy = VISUAL_DENSITY_POLICY[visual_density]
+    except (KeyError, TypeError):
+        raise ValueError(f"unsupported visual density: {visual_density}") from None
+
     plan_items: list[dict[str, Any]] = []
     layers: list[dict[str, Any]] = []
     # At least one card is allowed, or a timeline that is still one long
@@ -434,11 +448,16 @@ def plan_visuals(
     # Rounded, not floored. Three windows at a half share is one and a half,
     # and flooring made it one — which the opening title always took, so a
     # definition or a question later in the same clip could never be drawn no
-    # matter what was said. Two of three is still the share this is set to,
-    # and the never-two-in-a-row rule below is what actually keeps them apart.
-    budget = max(1, round(len(segments) * max_decorated_share)) if segments else 0
+    # matter what was said. Two of three is still the balanced share, and the
+    # density policy below controls how many cards can run together.
+    share = (
+        density_policy["max_decorated_share"]
+        if max_decorated_share is None
+        else max_decorated_share
+    )
+    budget = max(1, round(len(segments) * share)) if segments else 0
     decorated = 0
-    previous_decorated = False
+    consecutive_decorated = 0
 
     # An enumeration is a clip-level structure. 「...更多的錢。第二個願望...
     # 第三個願望...」 spreads its items across ten seconds, so no single
@@ -484,9 +503,13 @@ def plan_visuals(
             uses_clip_list = True
             clip_list_mid = None
 
-        # Two cards in a row read as a slideshow, and a decorated cut costs the
-        # viewer more attention than a plain one.
-        if beat != PLAIN_BEAT and (previous_decorated or decorated >= budget):
+        # Consecutive-card limits keep a decorated run from becoming a
+        # slideshow, while a decorated cut costs more attention than a plain one.
+        if (
+            beat != PLAIN_BEAT
+            and (consecutive_decorated >= density_policy["max_consecutive_cards"]
+                 or decorated >= budget)
+        ):
             beat = PLAIN_BEAT
 
         layer_id = None
@@ -592,11 +615,11 @@ def plan_visuals(
             # never be drawn no matter what was said.
             if not (index == 0 and beat == "title"):
                 decorated += 1
-                previous_decorated = True
+                consecutive_decorated += 1
             else:
-                previous_decorated = False
+                consecutive_decorated = 0
         else:
-            previous_decorated = False
+            consecutive_decorated = 0
 
     plan = {
         "schema_version": 1,

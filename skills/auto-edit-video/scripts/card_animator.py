@@ -31,7 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-ANIMATOR_VERSION = "hyperframes-card-animator-v2"
+ANIMATOR_VERSION = "hyperframes-card-animator-v3"
 ANIMATIONS_REL = Path("working/structured_cards")
 # The presets whose motion lives inside the card. `flip` stays approximated:
 # a page turn needs a second page to turn to, which these payloads carry no
@@ -158,6 +158,8 @@ def build_card_html(
     ink = _token(pack, "palette", "ink", "#E6EDF3")
     accent = _token(pack, "palette", "accent", "#E5484D")
     panel = _token(pack, "palette", "panel", "#161B22")
+    surface = compositor.surface_style(pack, render_scale)
+    panel_alpha = f"{round(float(surface['panel_alpha']) * 255):02X}"
     # Type sizes and geometry come from the static compositor's public ramp;
     # the animated clip replaces that PNG in-place, so even a preview-scale
     # artifact must not jump to a different layout or crop its rows.
@@ -168,7 +170,8 @@ def build_card_html(
 html,body{{margin:0;background:transparent}}
 #stage{{position:relative;width:{width}px;height:{height}px;
   font-family:'PingFang TC','Noto Sans TC',sans-serif}}
-.card{{position:absolute;inset:0;background:{panel}EB;border-radius:{px(14)};
+.card{{position:absolute;inset:0;background:{panel}{panel_alpha};border-radius:{surface['radius']:g}px;
+  border:{surface['border_width']:g}px solid {surface['border']};
   padding:{px(28)};box-sizing:border-box;color:{ink};overflow:hidden}}
 .title{{font-size:{px(compositor.TITLE_PT)};font-weight:700;text-align:center}}
 .u{{display:inline-block;white-space:pre}}

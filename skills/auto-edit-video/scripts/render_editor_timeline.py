@@ -657,6 +657,29 @@ def map_source_range_to_post_cut(
     return windows
 
 
+def style_pack_for_clip(
+    state: dict[str, Any], clip: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve the render pack for one clip, or the explicit ``none`` fallback."""
+    import structured_card_compositor
+
+    selection = state.get("style_pack")
+    if selection is None:
+        return {"id": "none", "tokens": {}}
+    if not isinstance(selection, dict):
+        raise ValueError("style_pack must be an object")
+    per_highlight = selection.get("per_highlight")
+    if per_highlight is not None and not isinstance(per_highlight, dict):
+        raise ValueError("style_pack.per_highlight must be an object")
+    clip_id = str((clip or {}).get("id") or "")
+    pack_id = (
+        (per_highlight or {}).get(clip_id) if clip_id else None
+    ) or selection.get("project_default")
+    if not pack_id:
+        return {"id": "none", "tokens": {}}
+    return structured_card_compositor.load_style_pack(pack_id)
+
+
 def build_render_command(
     project_dir: Path,
     state: dict[str, Any],
@@ -801,7 +824,7 @@ def build_render_command(
     # reported success. Cards are composed only when there are cards; every
     # plan item is placed either way.
     artifact_by_layer: dict[str, Any] = {}
-    resolved_pack: dict[str, Any] = {"id": "none", "tokens": {}}
+    resolved_pack = style_pack_for_clip(state, clip)
     if layers_bundle.get("items"):
         import structured_card_compositor
 
@@ -812,9 +835,6 @@ def build_render_command(
                     "unavailable on this host; final would silently lose content"
                 )
         else:
-            selection = state.get("style_pack") or {}
-            if selection.get("project_default") or selection.get("per_highlight"):
-                resolved_pack = structured_card_compositor.load_default_pack()
             artifacts_index = structured_card_compositor.build_structured_artifacts(
                 project_dir, state, layers_bundle, resolved_pack, render_scale,
             )
