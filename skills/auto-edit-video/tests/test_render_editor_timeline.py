@@ -117,6 +117,51 @@ class CardMotionTests(unittest.TestCase):
         self.assertIn("overlay=x=", built)
         self.assertIn("if(lt(t,", built.split("overlay=x=")[1][:80])
 
+    def test_text_overlay_evidence_uses_the_actual_drawtext_default(self) -> None:
+        from render_editor_timeline import overlay_visual_evidence
+        from visual_quality import rendered_visual_quality_report
+
+        item = overlay_visual_evidence(
+            {
+                "id": "plain-card",
+                "type": "card",
+                "start": 0.0,
+                "end": 2.0,
+                "style": {},
+            },
+            0.5,
+        )
+        report = rendered_visual_quality_report(
+            {
+                "schema_version": 1,
+                "duration_s": 2.0,
+                "motion_intensity": "low",
+                "expected_visual_beat_count": 1,
+                "items": [item],
+            }
+        )
+
+        self.assertTrue(item["font_evidence_required"])
+        self.assertEqual(item["minimum_primary_font_px"], 26.0)
+        self.assertEqual(report["status"], "fail")
+
+    def test_image_overlay_does_not_require_font_evidence(self) -> None:
+        from render_editor_timeline import overlay_visual_evidence
+
+        item = overlay_visual_evidence(
+            {
+                "id": "planned-image",
+                "type": "image",
+                "start": 0.0,
+                "end": 2.0,
+                "style": {},
+            },
+            0.5,
+        )
+
+        self.assertFalse(item["font_evidence_required"])
+        self.assertIsNone(item["minimum_primary_font_px"])
+
     def test_real_content_animation_is_recorded_as_faithful(self) -> None:
         import structured_card_compositor
         from render_editor_timeline import card_visual_evidence

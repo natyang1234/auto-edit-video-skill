@@ -383,12 +383,17 @@ def overlay_visual_evidence(
         }
     kind = str(overlay.get("type") or "")
     font_size = None
-    if kind not in {"image", "gif", "video"}:
-        raw_size = style.get("font_size")
-        if isinstance(raw_size, (int, float)) and not isinstance(raw_size, bool):
-            value = float(raw_size) * render_scale
-            if math.isfinite(value):
-                font_size = round(value, 3)
+    font_evidence_required = kind not in {"image", "gif", "video"}
+    if font_evidence_required:
+        raw_size = style.get("font_size", 52)
+        if isinstance(raw_size, bool) or not isinstance(raw_size, (int, float)):
+            raise ValueError("text overlay font_size must be a finite number")
+        value = float(raw_size) * render_scale
+        if not math.isfinite(value):
+            raise ValueError("text overlay font_size must be a finite number")
+        # Keep this identical to text_filter(): the evidence records the size
+        # FFmpeg receives after output scaling and its emergency minimum.
+        font_size = float(max(14, int(value)))
     return {
         "id": str(overlay.get("id") or ""),
         "start": round(float(overlay.get("start", 0.0)), 3),
@@ -396,7 +401,7 @@ def overlay_visual_evidence(
         "kind": kind,
         "component_id": None,
         "style_pack_id": None,
-        "font_evidence_required": False,
+        "font_evidence_required": font_evidence_required,
         "minimum_primary_font_px": font_size,
         "source": source,
         "motion": motion,
