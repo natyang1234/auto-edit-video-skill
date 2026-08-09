@@ -28,7 +28,7 @@ ARTIFACTS_REL = Path("working/structured_layer_artifacts.json")
 # captions beside it reads as fine print (nat, watching a delivery).
 # v3: the title refuses to shrink below its floor; a fallback title
 # holding a whole transcript sentence is trimmed instead.
-COMPILER_VERSION = "static-card-compositor-v5"
+COMPILER_VERSION = "static-card-compositor-v6"
 MIN_LABEL_PT = 11.0
 # Cards are watched at phone size beside 52--68px captions.  The old list
 # ramp started at 32 design pixels and could shrink to 11, which made a 540p
@@ -40,14 +40,35 @@ LIST_ROW_PT = 62.0
 TITLE_PT = 58.0
 STAT_VALUE_PT = 64.0
 STAT_LABEL_PT = 34.0
-MIN_STAT_LABEL_PT = 30.0
+MIN_STAT_LABEL_PT = 32.0
 METADATA_PT = 26.0
 MIN_METADATA_PT = 22.0
-CHART_LABEL_PT = 28.0
-MIN_CHART_LABEL_PT = 24.0
-CHART_LABEL_ZONE_PT = 42.0
+CHART_LABEL_PT = 32.0
+MIN_CHART_LABEL_PT = 32.0
+CHART_LABEL_ZONE_PT = 46.0
 KICKER_PT = 24.0
 SUBTITLE_PT = 32.0
+PRIMARY_FONT_FLOORS_PT = {
+    "title": 42.0,
+    "stat": 32.0,
+    "chart": 32.0,
+    "dynamic_list": 36.0,
+    "quote": 32.0,
+    "question": 36.0,
+    "comparison": 32.0,
+    "term": 32.0,
+    "note": 32.0,
+    "chip": 32.0,
+    "statement": 32.0,
+}
+
+
+def primary_font_floor(layer_type: str) -> float:
+    """Minimum output-space primary copy at render scale 1."""
+    try:
+        return PRIMARY_FONT_FLOORS_PT[layer_type]
+    except KeyError as exc:
+        raise ValueError(f"unsupported structured layer type: {layer_type}") from exc
 
 
 def compositor_available() -> bool:
@@ -396,8 +417,11 @@ def render_card(
             _draw_line(ct, quartz, context, subtitle, pad, cursor)
     elif layer_type == "stat":
         value_text = str(payload.get("value"))
-        value, value_size = _fit_text(foundation, ct, quartz, value_text,
-                                      STAT_VALUE_PT * scale, accent, card_width - pad * 2, scale)
+        value, value_size = _fit_text(
+            foundation, ct, quartz, value_text,
+            STAT_VALUE_PT * scale, accent, card_width - pad * 2, scale,
+            primary_font_floor("stat"),
+        )
         label, label_size = _fit_text(
             foundation, ct, quartz, str(payload.get("label") or ""),
             STAT_LABEL_PT * scale, ink, card_width - pad * 2, scale,
@@ -445,7 +469,8 @@ def render_card(
         # a slab built for a sentence it does not have.
         text = f"「{str(payload.get('quote') or '').strip()}」"
         body, body_size = _fit_text(
-            foundation, ct, quartz, text, 38 * scale, ink, card_width - pad * 2, scale,
+            foundation, ct, quartz, text, 38 * scale, ink,
+            card_width - pad * 2, scale, primary_font_floor("quote"),
         )
         card_width = int(min(card_width, _line_width(ct, body) + pad * 2 + 6 * scale))
         rule = int(4 * scale)
@@ -468,7 +493,8 @@ def render_card(
         if not asked.endswith(("?", "？")):
             asked += "？"
         body, body_size = _fit_text(
-            foundation, ct, quartz, asked, 46 * scale, ink, card_width - pad * 2, scale,
+            foundation, ct, quartz, asked, 46 * scale, ink,
+            card_width - pad * 2, scale, primary_font_floor("question"),
         )
         card_width = int(min(card_width, _line_width(ct, body) + pad * 2))
         height = int(pad * 2 + body_size * 1.4)
@@ -485,10 +511,12 @@ def render_card(
         right_text = str(payload.get("right") or "").strip()
         column = (card_width - pad * 3) / 2
         left, left_size = _fit_text(
-            foundation, ct, quartz, left_text, 30 * scale, ink, column, scale
+            foundation, ct, quartz, left_text, 36 * scale, ink, column, scale,
+            primary_font_floor("comparison"),
         )
         right, right_size = _fit_text(
-            foundation, ct, quartz, right_text, 30 * scale, accent, column, scale
+            foundation, ct, quartz, right_text, 36 * scale, accent, column, scale,
+            primary_font_floor("comparison"),
         )
         row = max(left_size, right_size)
         # Both columns take the width of the wider side, and the card takes
@@ -525,11 +553,11 @@ def render_card(
         meaning_text = str(payload.get("meaning") or "").strip()
         term, term_size = _fit_text(
             foundation, ct, quartz, term_text, 40 * scale, accent,
-            card_width - pad * 2, scale,
+            card_width - pad * 2, scale, primary_font_floor("term"),
         )
         meaning, meaning_size = _fit_text(
-            foundation, ct, quartz, meaning_text, 22 * scale, ink,
-            card_width - pad * 2, scale,
+            foundation, ct, quartz, meaning_text, 34 * scale, ink,
+            card_width - pad * 2, scale, primary_font_floor("term"),
         )
         card_width = int(min(
             card_width,
@@ -637,27 +665,29 @@ def render_card(
         head = f"{icon} {payload.get('title') or ''}".strip()
         meta_text = str(payload.get("meta") or "").strip()
         title, title_size = _fit_text(
-            foundation, ct, quartz, head, 26 * scale, surface_ink,
-            card_width - pad * 3, scale,
+            foundation, ct, quartz, head, 34 * scale, surface_ink,
+            card_width - pad * 3, scale, primary_font_floor("note"),
         )
         meta = None
+        meta_size = 0.0
         if meta_text:
-            meta, _ = _fit_text(
-                foundation, ct, quartz, meta_text, 22 * scale, accent_ink,
-                card_width / 3, scale,
+            meta, meta_size = _fit_text(
+                foundation, ct, quartz, meta_text, 32 * scale, accent_ink,
+                card_width / 3, scale, primary_font_floor("note"),
             )
         body_text = str(payload.get("body") or "").strip()
         body = None
+        body_size = 0.0
         if body_text:
-            body, _ = _fit_text(
-                foundation, ct, quartz, body_text, 18 * scale, surface_muted,
-                card_width - pad * 2, scale,
+            body, body_size = _fit_text(
+                foundation, ct, quartz, body_text, 32 * scale, surface_muted,
+                card_width - pad * 2, scale, primary_font_floor("note"),
             )
         wave = bool(payload.get("waveform"))
         height = int(
             pad * 2 + title_size * 1.4
             + (30 * scale if wave else 0)
-            + (26 * scale if body else 0)
+            + (body_size * 1.35 if body else 0)
         )
         context = begin_card(card_width, height, surface)
         cursor = height - pad - title_size
@@ -692,7 +722,7 @@ def render_card(
                     ),
                 )
         if body is not None:
-            cursor -= 26 * scale
+            cursor -= body_size * 1.25
             _draw_line(ct, quartz, context, body, pad, cursor)
     elif layer_type == "chip":
         # One short line, sized to itself. A chip that stretches to a fixed
@@ -703,8 +733,8 @@ def render_card(
         if not text_value:
             raise ValueError("a chip card needs text")
         line, line_size = _fit_text(
-            foundation, ct, quartz, text_value, 26 * scale, chip_ink,
-            card_width - pad * 2, scale,
+            foundation, ct, quartz, text_value, 34 * scale, chip_ink,
+            card_width - pad * 2, scale, primary_font_floor("chip"),
         )
         chip_pad = int(18 * scale)
         card_width = int(min(card_width, _line_width(ct, line) + chip_pad * 2))
@@ -727,12 +757,13 @@ def render_card(
         if lead_text:
             lead, _ = _fit_text(
                 foundation, ct, quartz, lead_text, 46 * scale, accent_ink,
-                card_width / 3, scale,
+                card_width / 3, scale, primary_font_floor("statement"),
             )
         lead_width = (_line_width(ct, lead) + 14 * scale) if lead is not None else 0.0
         body, body_size = _fit_text(
             foundation, ct, quartz, text_value, 34 * scale, surface_ink,
             card_width - pad * 2 - lead_width, scale,
+            primary_font_floor("statement"),
         )
         content = lead_width + _line_width(ct, body)
         card_width = int(min(card_width, content + pad * 2))

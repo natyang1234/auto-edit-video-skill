@@ -19,8 +19,183 @@ from template_catalog import default_video_template_state  # noqa: E402
 from visual_quality import (  # noqa: E402
     build_highlight_design_overlays,
     overlays_for_clip,
+    rendered_visual_quality_report,
     visual_quality_report,
 )
+
+
+class RenderedVisualQualityReportTests(unittest.TestCase):
+    def _evidence(self, *, motion_intensity: str = "low", items=None) -> dict:
+        return {
+            "schema_version": 1,
+            "duration_s": 10.0,
+            "motion_intensity": motion_intensity,
+            "items": items if items is not None else [
+                {
+                    "id": "title-1",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "kind": "title",
+                    "component_id": "hook",
+                    "style_pack_id": "teaching",
+                    "minimum_primary_font_px": 48.0,
+                }
+            ],
+        }
+
+    def test_teaching_high_motion_all_faithful_passes(self) -> None:
+        evidence = self._evidence(
+            motion_intensity="high",
+            items=[
+                {
+                    "id": "title-1",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "kind": "title",
+                    "component_id": "hook",
+                    "style_pack_id": "teaching",
+                    "minimum_primary_font_px": 48.0,
+                    "motion": {
+                        "requested": "slide-up",
+                        "delivered": "slide-up",
+                        "faithful": True,
+                        "status": "delivered",
+                    },
+                },
+                {
+                    "id": "card-1",
+                    "start": 3.0,
+                    "end": 6.0,
+                    "kind": "card",
+                    "component_id": "concept",
+                    "style_pack_id": "teaching",
+                    "minimum_primary_font_px": 48.0,
+                    "motion": {
+                        "requested": "pop",
+                        "delivered": "pop",
+                        "faithful": True,
+                        "status": "delivered",
+                    },
+                },
+            ],
+        )
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["source"], "renderer_evidence")
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["visual_beat_count"], 2)
+        self.assertEqual(report["component_ids"], ["concept", "hook"])
+        self.assertEqual(report["component_count"], 2)
+        self.assertEqual(report["skin_ids"], ["teaching"])
+        self.assertEqual(report["skin_count"], 1)
+        self.assertEqual(report["motion_requested_count"], 2)
+        self.assertEqual(report["motion_faithful_count"], 2)
+        self.assertEqual(report["motion_fallback_count"], 0)
+        self.assertEqual(report["motion_faithful_ratio"], 1.0)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["warnings"], [])
+
+    def test_live_medium_static_fallback_warns_but_passes(self) -> None:
+        evidence = self._evidence(
+            motion_intensity="medium",
+            items=[
+                {
+                    "id": "live-card",
+                    "start": 1.0,
+                    "end": 4.0,
+                    "kind": "card",
+                    "component_id": "live-caption",
+                    "style_pack_id": "live",
+                    "minimum_primary_font_px": 40.0,
+                    "motion": {
+                        "requested": "slide-up",
+                        "delivered": "static",
+                        "faithful": False,
+                        "status": "fallback",
+                        "reason": "renderer lacks motion support",
+                    },
+                }
+            ],
+        )
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["motion_requested_count"], 1)
+        self.assertEqual(report["motion_faithful_count"], 0)
+        self.assertEqual(report["motion_fallback_count"], 1)
+        self.assertEqual(report["motion_faithful_ratio"], 0.0)
+        self.assertEqual(report["failures"], [])
+        self.assertTrue(report["warnings"])
+
+    def test_brand_high_motion_fallback_fails(self) -> None:
+        evidence = self._evidence(
+            motion_intensity="high",
+            items=[
+                {
+                    "id": "brand-card",
+                    "start": 1.0,
+                    "end": 4.0,
+                    "kind": "card",
+                    "component_id": "brand-lockup",
+                    "style_pack_id": "brand",
+                    "minimum_primary_font_px": 40.0,
+                    "motion": {
+                        "requested": "slide-up",
+                        "delivered": "static",
+                        "faithful": False,
+                        "status": "fallback",
+                        "reason": "renderer lacks motion support",
+                    },
+                }
+            ],
+        )
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertTrue(any("motion" in failure for failure in report["failures"]))
+
+    def test_font_threshold_is_strictly_below_32(self) -> None:
+        for font_size, expected_status in ((31.99, "fail"), (32.0, "pass")):
+            with self.subTest(font_size=font_size):
+                evidence = self._evidence(
+                    items=[
+                        {
+                            "id": "font-test",
+                            "start": 0.0,
+                            "end": 1.0,
+                            "kind": "title",
+                            "minimum_primary_font_px": font_size,
+                        }
+                    ]
+                )
+
+                report = rendered_visual_quality_report(evidence)
+
+                self.assertEqual(report["status"], expected_status)
+
+    def test_longest_gap_unions_clipped_intervals_and_includes_edges(self) -> None:
+        evidence = self._evidence(
+            items=[
+                {"id": "a", "start": 2.0, "end": 4.0, "kind": "card"},
+                {"id": "b", "start": 3.0, "end": 5.0, "kind": "card"},
+                {"id": "c", "start": 7.0, "end": 12.0, "kind": "card"},
+            ]
+        )
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["longest_no_change_gap_s"], 2.0)
+
+    def test_nonfinite_duration_is_invalid(self) -> None:
+        evidence = self._evidence()
+        evidence["duration_s"] = float("nan")
+
+        with self.assertRaises(ValueError):
+            rendered_visual_quality_report(evidence)
 
 
 class HighlightVisualPlanningTests(unittest.TestCase):

@@ -43,6 +43,7 @@ from local_http_security import (
 from visual_quality import (
     ROLE_LAYOUTS,
     build_highlight_design_overlays,
+    rendered_visual_evidence_path,
     visual_quality_errors,
     visual_quality_report,
 )
@@ -1428,6 +1429,29 @@ def delivery_qa_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
     return single_delivery_qa_errors(project_dir, state, receipt)
 
 
+def visual_delivery_binding_errors(
+    report: dict[str, Any],
+    receipt: dict[str, Any],
+    label: str,
+) -> list[str]:
+    """Schema-3 QA must bind passing renderer evidence into its receipt."""
+    schema_version = report.get("schema_version")
+    if not isinstance(schema_version, int) or schema_version < 3:
+        # Schema 1/2 receipts remain readable; every new qa_video report is 3.
+        return []
+    visual = report.get("visual_delivery")
+    if (
+        not isinstance(visual, dict)
+        or visual.get("schema_version") != 1
+        or visual.get("source") != "renderer_evidence"
+        or visual.get("status") != "pass"
+    ):
+        return [f"{label} visual delivery evidence must be a passing renderer report"]
+    if receipt.get("visual_delivery") != visual:
+        return [f"{label} visual delivery evidence does not match its QA report"]
+    return []
+
+
 def single_delivery_qa_errors(
     project_dir: Path,
     state: dict[str, Any],
@@ -1471,6 +1495,7 @@ def single_delivery_qa_errors(
         )
     else:
         errors.extend(qa_profile_binding_errors(report, state, "delivery"))
+        errors.extend(visual_delivery_binding_errors(report, receipt, "delivery QA"))
     render_receipt = read_json(resolved.get("render_receipt", Path("/nonexistent")), None)
     if not isinstance(render_receipt, dict):
         errors.append("render receipt is unreadable")
@@ -1605,6 +1630,11 @@ def batch_delivery_qa_errors(
         else:
             errors.extend(
                 qa_profile_binding_errors(report, state, f"batch item {clip_id or index}")
+            )
+            errors.extend(
+                visual_delivery_binding_errors(
+                    report, item, f"batch item {clip_id or index}"
+                )
             )
         render_receipt = read_json(
             resolved.get("render_receipt", Path("/nonexistent")),
@@ -5462,6 +5492,8 @@ class EditorHandler(BaseHTTPRequestHandler):
                 str(qa_report),
                 "--contact",
                 str(qa_contact),
+                "--visual-evidence",
+                str(rendered_visual_evidence_path(self.server.project_dir, render_id)),
                 # Every clip shares the declaration frozen into the batch's
                 # snapshot, not whatever the project says now. The geometry
                 # comes from the same snapshot for the same reason.
@@ -5481,7 +5513,13 @@ class EditorHandler(BaseHTTPRequestHandler):
             qa_payload = read_json(qa_report, {}) or {}
             qa_payload["visual_quality"] = visual_quality
             atomic_write_json(qa_report, qa_payload)
-            if qa_result.returncode != 0 or qa_payload.get("status") != "pass":
+            visual_delivery = qa_payload.get("visual_delivery")
+            if (
+                qa_result.returncode != 0
+                or qa_payload.get("status") != "pass"
+                or not isinstance(visual_delivery, dict)
+                or visual_delivery.get("status") != "pass"
+            ):
                 failure_receipt = {
                     "schema_version": 1,
                     "batch_id": batch_id,
@@ -5497,6 +5535,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "failures": qa_payload.get("failures", []),
                     "warnings": qa_payload.get("warnings", []),
                     "visual_quality": visual_quality,
+                    "visual_delivery": visual_delivery,
                     "completed_at": now_utc(),
                 }
                 atomic_write_json(
@@ -5558,6 +5597,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "warnings": qa_payload.get("warnings", []),
                 "failures": qa_payload.get("failures", []),
                 "visual_quality": visual_quality,
+                "visual_delivery": visual_delivery,
                 "human_review_required": True,
                 "completed_at": now_utc(),
             }
@@ -5887,6 +5927,8 @@ class EditorHandler(BaseHTTPRequestHandler):
                     str(qa_report),
                     "--contact",
                     str(qa_contact),
+                    "--visual-evidence",
+                    str(rendered_visual_evidence_path(self.server.project_dir, render_id)),
                     # The declaration frozen into the snapshot this render was
                     # authorized against, not whatever the project says now,
                     # and the geometry it was laid out against.
@@ -5907,7 +5949,13 @@ class EditorHandler(BaseHTTPRequestHandler):
                 qa_payload = read_json(qa_report, {}) or {}
                 qa_payload["visual_quality"] = visual_quality
                 atomic_write_json(qa_report, qa_payload)
-                if qa_result.returncode != 0 or qa_payload.get("status") != "pass":
+                visual_delivery = qa_payload.get("visual_delivery")
+                if (
+                    qa_result.returncode != 0
+                    or qa_payload.get("status") != "pass"
+                    or not isinstance(visual_delivery, dict)
+                    or visual_delivery.get("status") != "pass"
+                ):
                     failure_receipt = {
                         "schema_version": 1,
                         "render_id": render_id,
@@ -5922,6 +5970,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "failures": qa_payload.get("failures", []),
                         "warnings": qa_payload.get("warnings", []),
                         "visual_quality": visual_quality,
+                        "visual_delivery": visual_delivery,
                         "completed_at": now_utc(),
                     }
                     atomic_write_json(
@@ -5987,6 +6036,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "warnings": qa_payload.get("warnings", []),
                     "failures": qa_payload.get("failures", []),
                     "visual_quality": visual_quality,
+                    "visual_delivery": qa_payload.get("visual_delivery"),
                     "human_review_required": True,
                     "completed_at": now_utc(),
                 }

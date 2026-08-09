@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import math
 import re
+from pathlib import Path
 from typing import Any
 
 
 DESIGN_ROLES = ("hook", "concept", "rule", "memory", "recap")
+RENDER_VISUAL_EVIDENCE_REL = Path("working/render_visual_evidence")
 ROLE_WINDOWS = {
     "hook": (0.00, 0.12),
     "concept": (0.18, 0.31),
@@ -345,3 +347,214 @@ def visual_quality_errors(
     clip: dict[str, Any] | None,
 ) -> list[str]:
     return list(visual_quality_report(state, manifest, clip).get("failures", []))
+
+
+def _renderer_finite_number(value: Any, field: str, *, minimum: float | None = None) -> float:
+    """Validate a JSON number without allowing coercion or non-finite values."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite number")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field} must be >= {minimum}")
+    return number
+
+
+def _renderer_identifier(
+    item: dict[str, Any], field: str, item_index: int, *, required: bool = False
+) -> str | None:
+    value = item.get(field)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        requirement = "required " if required else ""
+        raise ValueError(f"items[{item_index}].{field} must be a non-empty {requirement}string")
+    return value
+
+
+def _renderer_motion_requested(value: Any, field: str) -> bool:
+    # The renderer records the requested motion preset as a string (an empty
+    # preset means no request); callers may also provide an explicit boolean.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return bool(value)
+    raise ValueError(f"{field} must be a motion preset string or boolean")
+
+
+def _renderer_longest_no_change_gap(
+    intervals: list[tuple[float, float]], duration: float
+) -> float:
+    """Return the largest uncovered interval after clipping and unioning beats."""
+    if duration <= 0:
+        return 0.0
+    clipped = sorted(
+        (
+            max(0.0, start),
+            min(duration, end),
+        )
+        for start, end in intervals
+        if min(duration, end) > max(0.0, start)
+    )
+    if not clipped:
+        return round(duration, 6)
+
+    longest = 0.0
+    cursor = 0.0
+    for start, end in clipped:
+        if start > cursor:
+            longest = max(longest, start - cursor)
+        cursor = max(cursor, end)
+    longest = max(longest, duration - cursor)
+    return round(longest, 6)
+
+
+def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate deterministic visual-quality metrics from renderer evidence.
+
+    This is intentionally separate from ``visual_quality_report``: the latter
+    validates an editable timeline, while this report describes what the
+    renderer actually delivered and is suitable for a final QA receipt.
+    """
+    if not isinstance(evidence, dict):
+        raise ValueError("renderer evidence must be an object")
+    if (
+        isinstance(evidence.get("schema_version"), bool)
+        or not isinstance(evidence.get("schema_version"), int)
+        or evidence.get("schema_version") != 1
+    ):
+        raise ValueError("renderer evidence schema_version must be 1")
+
+    duration = _renderer_finite_number(evidence.get("duration_s"), "duration_s", minimum=0.0)
+    motion_intensity = evidence.get("motion_intensity")
+    if motion_intensity not in {"low", "medium", "high"}:
+        raise ValueError("motion_intensity must be low, medium, or high")
+    items = evidence.get("items")
+    if not isinstance(items, list):
+        raise ValueError("items must be a list")
+
+    component_ids: set[str] = set()
+    skin_ids: set[str] = set()
+    font_sizes: list[float] = []
+    intervals: list[tuple[float, float]] = []
+    requested_motion_count = 0
+    faithful_motion_count = 0
+    fallback_motion_count = 0
+    unfaithful_motion: list[tuple[str, str]] = []
+
+    for item_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"items[{item_index}] must be an object")
+        item_id = _renderer_identifier(item, "id", item_index, required=True)
+        _renderer_identifier(item, "kind", item_index, required=True)
+        start = _renderer_finite_number(item.get("start"), f"items[{item_index}].start")
+        end = _renderer_finite_number(item.get("end"), f"items[{item_index}].end")
+        if end < start:
+            raise ValueError(f"items[{item_index}].end must be >= start")
+        intervals.append((start, end))
+
+        component_id = _renderer_identifier(item, "component_id", item_index)
+        if component_id is not None:
+            component_ids.add(component_id)
+        style_pack_id = _renderer_identifier(item, "style_pack_id", item_index)
+        if style_pack_id is not None:
+            skin_ids.add(style_pack_id)
+
+        if "minimum_primary_font_px" in item:
+            raw_font_size = item.get("minimum_primary_font_px")
+            if raw_font_size is not None:
+                font_sizes.append(
+                    _renderer_finite_number(
+                        raw_font_size,
+                        f"items[{item_index}].minimum_primary_font_px",
+                        minimum=0.0,
+                    )
+                )
+
+        motion = item.get("motion")
+        if motion is None:
+            continue
+        if not isinstance(motion, dict):
+            raise ValueError(f"items[{item_index}].motion must be an object")
+        for field in ("requested", "delivered", "faithful", "status"):
+            if field not in motion:
+                raise ValueError(f"items[{item_index}].motion.{field} is required")
+        requested = _renderer_motion_requested(
+            motion.get("requested"), f"items[{item_index}].motion.requested"
+        )
+        delivered = motion.get("delivered")
+        if not isinstance(delivered, str):
+            raise ValueError(f"items[{item_index}].motion.delivered must be a string")
+        faithful = motion.get("faithful")
+        if not isinstance(faithful, bool):
+            raise ValueError(f"items[{item_index}].motion.faithful must be a boolean")
+        status = motion.get("status")
+        if not isinstance(status, str) or not status:
+            raise ValueError(f"items[{item_index}].motion.status must be a non-empty string")
+        if "reason" in motion and motion.get("reason") is not None and not isinstance(
+            motion.get("reason"), str
+        ):
+            raise ValueError(f"items[{item_index}].motion.reason must be a string")
+        if not requested:
+            continue
+        requested_motion_count += 1
+        if faithful:
+            faithful_motion_count += 1
+        if status == "fallback" or not faithful:
+            fallback_motion_count += 1
+        if not faithful:
+            reason = motion.get("reason") or "requested motion was not delivered faithfully"
+            unfaithful_motion.append((str(item_id), str(reason)))
+
+    minimum_font = min(font_sizes) if font_sizes else None
+    failures: list[str] = []
+    warnings: list[str] = []
+    visual_beat_count = len(items)
+    if visual_beat_count == 0:
+        warnings.append("renderer evidence contains no visual beats")
+    if visual_beat_count and minimum_font is not None and minimum_font < 32.0:
+        failures.append(
+            f"minimum primary font size {minimum_font:g}px is below the 32px floor"
+        )
+    for item_id, reason in unfaithful_motion:
+        message = f"requested motion for {item_id} is not faithful: {reason}"
+        if motion_intensity == "high":
+            failures.append(message)
+        else:
+            warnings.append(message)
+
+    ratio = (
+        round(faithful_motion_count / requested_motion_count, 6)
+        if requested_motion_count
+        else None
+    )
+    return {
+        "schema_version": 1,
+        "source": "renderer_evidence",
+        "status": "fail" if failures else "pass",
+        "duration_s": duration,
+        "minimum_primary_font_px": minimum_font,
+        "visual_beat_count": visual_beat_count,
+        "component_ids": sorted(component_ids),
+        "component_count": len(component_ids),
+        "skin_ids": sorted(skin_ids),
+        "skin_count": len(skin_ids),
+        "longest_no_change_gap_s": _renderer_longest_no_change_gap(intervals, duration),
+        "motion_requested_count": requested_motion_count,
+        "motion_faithful_count": faithful_motion_count,
+        "motion_fallback_count": fallback_motion_count,
+        "motion_faithful_ratio": ratio,
+        "failures": failures,
+        "warnings": warnings,
+    }
+
+
+def rendered_visual_evidence_path(project_dir: Path, render_id: str) -> Path:
+    """Project-owned receipt path for one frozen render identity."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", render_id):
+        raise ValueError("render visual evidence identity is invalid")
+    return project_dir / RENDER_VISUAL_EVIDENCE_REL / f"{render_id}.json"

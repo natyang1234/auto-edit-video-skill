@@ -653,11 +653,40 @@ def inspect(
     contact_path: Path,
     policy: QaPolicy | None = None,
     content_rect: tuple[float, float, float, float] | None = None,
+    visual_report: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     policy = policy or QaPolicy()
     media = probe(video)
     failures: list[str] = []
     warnings: list[str] = []
+    if visual_report is None:
+        visual_report = {
+            "schema_version": 1,
+            "source": "not_provided",
+            "status": "not_evaluated",
+            "failures": [],
+            "warnings": ["renderer visual evidence was not provided"],
+        }
+    elif (
+        visual_report.get("schema_version") != 1
+        or visual_report.get("source") != "renderer_evidence"
+        or visual_report.get("status") not in {"pass", "fail"}
+        or not isinstance(visual_report.get("failures"), list)
+        or not isinstance(visual_report.get("warnings"), list)
+        or not isinstance(visual_report.get("visual_beat_count"), int)
+    ):
+        raise ValueError("visual report is not a valid renderer-evidence report")
+    if visual_report.get("status") == "fail":
+        failures.extend(
+            f"visual delivery: {item}"
+            for item in visual_report.get("failures", [])
+        )
+        if not visual_report.get("failures"):
+            failures.append("visual delivery: renderer evidence failed without a reason")
+    warnings.extend(
+        f"visual delivery: {item}"
+        for item in visual_report.get("warnings", [])
+    )
     visual = media["video"] or {}
     audio = media["audio"]
     if not visual:
@@ -794,7 +823,7 @@ def inspect(
             )
     contact_sheet(video, contact_path, media["duration_s"])
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": now_utc(),
         "profile": policy.profile,
         "intent": policy.intent,
@@ -818,6 +847,7 @@ def inspect(
         },
         "loudness": levels,
         "silence": silence,
+        "visual_delivery": visual_report,
         "policy": asdict(policy),
         "contact_sheet": str(contact_path),
         "failures": failures,
@@ -835,6 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", required=True)
     parser.add_argument("--report")
     parser.add_argument("--contact")
+    parser.add_argument(
+        "--visual-evidence",
+        help="renderer-produced visual evidence JSON to merge into delivery QA",
+    )
     parser.add_argument(
         "--max-black-segment-seconds",
         type=float,
@@ -944,8 +978,21 @@ def main() -> int:
     contact = Path(args.contact).expanduser().resolve() if args.contact else video.parent.parent / "qa/final-contact.png"
     try:
         rect = parse_content_rect(args.content_rect) if args.content_rect else None
+        visual_report = None
+        if args.visual_evidence:
+            visual_path = Path(args.visual_evidence).expanduser().resolve()
+            if not visual_path.is_file():
+                raise ValueError(f"visual evidence not found: {visual_path}")
+            visual_report = json.loads(visual_path.read_text(encoding="utf-8"))
+            if not isinstance(visual_report, dict):
+                raise ValueError("visual report must be a JSON object")
         payload, ok = inspect(
-            video, report, contact, policy=policy_from_args(args), content_rect=rect
+            video,
+            report,
+            contact,
+            policy=policy_from_args(args),
+            content_rect=rect,
+            visual_report=visual_report,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(str(exc), file=sys.stderr)

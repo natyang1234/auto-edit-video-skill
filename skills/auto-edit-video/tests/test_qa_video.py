@@ -66,6 +66,63 @@ class QaVideoGateTest(unittest.TestCase):
         self.assertEqual(report["status"], "pass")
         self.assertIn("policy", report, "report must echo the enforced QA policy")
 
+    def test_renderer_visual_evidence_is_embedded_in_the_qa_report(self) -> None:
+        video = self.dir / "visual-pass.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        visual = {
+            "schema_version": 1,
+            "source": "renderer_evidence",
+            "status": "pass",
+            "visual_beat_count": 3,
+            "failures": [],
+            "warnings": [],
+        }
+        report_path = self.dir / "visual-pass-report.json"
+        contact_path = self.dir / "visual-pass-contact.png"
+        report, ok = qa_video.inspect(
+            video,
+            report_path,
+            contact_path,
+            visual_report=visual,
+        )
+        self.assertTrue(ok, report["failures"])
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["visual_delivery"], visual)
+
+    def test_failed_renderer_visual_evidence_fails_the_delivery(self) -> None:
+        video = self.dir / "visual-fail.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        visual = {
+            "schema_version": 1,
+            "source": "renderer_evidence",
+            "status": "fail",
+            "visual_beat_count": 1,
+            "failures": ["motion fallback"],
+            "warnings": [],
+        }
+        report_path = self.dir / "visual-fail-report.json"
+        contact_path = self.dir / "visual-fail-contact.png"
+        report, ok = qa_video.inspect(
+            video,
+            report_path,
+            contact_path,
+            visual_report=visual,
+        )
+        self.assertFalse(ok)
+        self.assertIn("visual delivery: motion fallback", report["failures"])
+        self.assertEqual(report["visual_delivery"], visual)
+
+    def test_invalid_renderer_visual_evidence_is_rejected(self) -> None:
+        video = self.dir / "visual-invalid.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        with self.assertRaisesRegex(ValueError, "visual report"):
+            qa_video.inspect(
+                video,
+                self.dir / "invalid-report.json",
+                self.dir / "invalid-contact.png",
+                visual_report={"schema_version": 1, "status": "pass"},
+            )
+
     def test_black_silent_video_fails_closed(self) -> None:
         video = self.dir / "black-silent.mp4"
         make_video(video, video_source="color=c=black", audio_source="anullsrc=r=48000:cl=stereo")

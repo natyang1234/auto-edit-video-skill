@@ -594,9 +594,39 @@ class EditorServerTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, "", "synthetic render failure")
                 output = Path(command[command.index("--output") + 1])
                 snapshot = Path(command[command.index("--snapshot") + 1])
-                clip_id = json.loads(snapshot.read_text(encoding="utf-8"))["clip"]["id"]
+                snapshot_payload = json.loads(snapshot.read_text(encoding="utf-8"))
+                clip_id = snapshot_payload["clip"]["id"]
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes(f"fake-mp4:{clip_id}".encode("utf-8"))
+                visual_path = editor_server.rendered_visual_evidence_path(
+                    self.project, snapshot_payload["render_id"]
+                )
+                visual_path.parent.mkdir(parents=True, exist_ok=True)
+                visual_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "source": "renderer_evidence",
+                            "status": "pass",
+                            "duration_s": 10.0,
+                            "minimum_primary_font_px": 48.0,
+                            "visual_beat_count": 1,
+                            "component_ids": ["synthetic"],
+                            "component_count": 1,
+                            "skin_ids": ["synthetic"],
+                            "skin_count": 1,
+                            "longest_no_change_gap_s": 5.0,
+                            "motion_requested_count": 1,
+                            "motion_faithful_count": 1,
+                            "motion_fallback_count": 0,
+                            "motion_faithful_ratio": 1.0,
+                            "failures": [],
+                            "warnings": [],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
                 if callable(after_render):
                     after_render(render_count)
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -606,12 +636,19 @@ class EditorServerTests(unittest.TestCase):
                 contact = Path(command[command.index("--contact") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
                 qa_failed = fail_qa_number == qa_count
+                visual_delivery = json.loads(
+                    Path(command[command.index("--visual-evidence") + 1]).read_text(
+                        encoding="utf-8"
+                    )
+                )
                 report.write_text(
                     json.dumps(
                         {
-                            "schema_version": 1,
+                            "schema_version": 3,
                             "status": "fail" if qa_failed else "pass",
+                            "profile": "strict",
                             "policy": SYNTHETIC_QA_POLICY,
+                            "visual_delivery": visual_delivery,
                             "warnings": [],
                             "failures": ["synthetic QA failure"] if qa_failed else [],
                         }
@@ -2258,6 +2295,47 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, _body = self.request("GET", "/renders/final-ok.mp4")
         self.assertEqual(status, 403)
 
+    def test_schema3_delivery_requires_matching_passing_visual_evidence(self) -> None:
+        visual_delivery = {
+            "schema_version": 1,
+            "source": "renderer_evidence",
+            "status": "pass",
+            "duration_s": 2.0,
+            "minimum_primary_font_px": 48.0,
+            "visual_beat_count": 1,
+            "component_ids": ["title"],
+            "component_count": 1,
+            "skin_ids": ["dark-data-presenter"],
+            "skin_count": 1,
+            "longest_no_change_gap_s": 0.0,
+            "motion_requested_count": 1,
+            "motion_faithful_count": 1,
+            "motion_fallback_count": 0,
+            "motion_faithful_ratio": 1.0,
+            "failures": [],
+            "warnings": [],
+        }
+        state = self._install_synthetic_final_delivery(
+            report_payload={
+                "schema_version": 3,
+                "status": "pass",
+                "profile": "strict",
+                "policy": SYNTHETIC_QA_POLICY,
+                "visual_delivery": visual_delivery,
+                "failures": [],
+                "warnings": [],
+            }
+        )
+        errors = editor_server.delivery_qa_errors(self.project, state)
+        self.assertTrue(any("visual delivery evidence" in item for item in errors), errors)
+
+        receipt_path = self.project / "working/latest_final_qa.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["visual_delivery"] = visual_delivery
+        self.write_json("working/latest_final_qa.json", receipt)
+        errors = editor_server.delivery_qa_errors(self.project, state)
+        self.assertFalse(any("visual delivery evidence" in item for item in errors), errors)
+
     def test_pre_policy_variant_qa_report_blocks_variant_download(self) -> None:
         # The variant download slot must re-verify the QA report: a
         # hash-consistent variant delivery whose report lacks the enforced
@@ -2891,11 +2969,19 @@ class EditorServerTests(unittest.TestCase):
 
         # renderer picks the card PNG as an overlay
         manifest = json.loads((self.project / "project.json").read_text("utf-8"))
+        renderer_evidence = {}
         command = build_render_command(
             self.project, state, manifest,
             self.project / "renders/layer-route.mp4", "preview",
+            visual_evidence=renderer_evidence,
         )
         self.assertIn("working/structured_cards/", " ".join(command))
+        self.assertEqual(renderer_evidence["source"], "renderer_evidence_raw")
+        self.assertGreaterEqual(renderer_evidence["visual_beat_count"], 1)
+        stat_evidence = next(
+            item for item in renderer_evidence["items"] if item["kind"] == "stat"
+        )
+        self.assertIn("motion", stat_evidence)
 
         # delete removes both sides transactionally
         status, deleted = self.json_request(

@@ -19,6 +19,7 @@ import qa_video
 from typing import Any
 
 from editor_server import (
+    DIRECTOR_PRESETS,
     PLATFORM_PRESETS,
     atomic_write_json,
     editor_state_revision,
@@ -29,7 +30,13 @@ from editor_server import (
     referenced_asset_digests,
 )
 from graphic_package import ensure_graphic_package
-from visual_quality import DESIGN_ROLES, overlays_for_clip, visual_quality_errors
+from visual_quality import (
+    DESIGN_ROLES,
+    overlays_for_clip,
+    rendered_visual_evidence_path,
+    rendered_visual_quality_report,
+    visual_quality_errors,
+)
 
 
 FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
@@ -231,7 +238,6 @@ MOTION_PRESETS = {
 }
 MOTION_ANIMATIONS = {"fade", "pop", "slide-up", "slide-in", "pan"}
 
-
 def animated_card_overlay_source(
     project_dir: Path,
     pack: dict[str, Any],
@@ -309,6 +315,90 @@ def motion_for_layer(pack: dict[str, Any], layers: dict[str, Any], layer_id: str
         return "fade"
     preset = (component.get("motion") or {}).get("preset")
     return resolve_motion(preset)[0]
+
+
+def card_visual_evidence(
+    pack: dict[str, Any],
+    layers: dict[str, Any],
+    layer_id: str,
+    render_scale: float,
+    animated_source: str | None,
+) -> dict[str, Any]:
+    """Describe what a structured card asked for and what reached FFmpeg."""
+    import structured_card_compositor
+
+    layer = next(
+        (item for item in layers.get("items", []) if item.get("id") == layer_id),
+        None,
+    )
+    if layer is None:
+        raise ValueError(f"structured layer {layer_id!r} is missing from visual evidence")
+    component = structured_card_compositor.resolve_component(
+        pack, str(layer.get("type")), layer.get("component_id")
+    )
+    preset = str((component.get("motion") or {}).get("preset") or "")
+    delivered, native_faithful = resolve_motion(preset)
+    if animated_source:
+        delivered = preset
+        faithful = True
+        status = "rendered"
+    else:
+        faithful = native_faithful
+        status = "native" if native_faithful else "fallback"
+    layer_type = str(layer.get("type") or "")
+    floor = structured_card_compositor.primary_font_floor(layer_type)
+    return {
+        "kind": layer_type,
+        "component_id": str(component.get("id") or "") or None,
+        "style_pack_id": str(pack.get("id") or "") or None,
+        "minimum_primary_font_px": (
+            round(floor * render_scale, 3)
+        ),
+        "motion": {
+            "requested": preset,
+            "delivered": delivered,
+            "faithful": faithful,
+            "status": status,
+        },
+    }
+
+
+def overlay_visual_evidence(
+    overlay: dict[str, Any],
+    render_scale: float,
+    source: str = "editor_overlay",
+) -> dict[str, Any]:
+    """Describe a non-card visual after its timing was mapped to output time."""
+    style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+    requested = str(style.get("animation") or "")
+    motion: dict[str, Any] | None = None
+    if requested and requested != "none":
+        faithful = requested in MOTION_ANIMATIONS
+        motion = {
+            "requested": requested,
+            "delivered": requested if faithful else "none",
+            "faithful": faithful,
+            "status": "native" if faithful else "fallback",
+        }
+    kind = str(overlay.get("type") or "")
+    font_size = None
+    if kind not in {"image", "gif", "video"}:
+        raw_size = style.get("font_size")
+        if isinstance(raw_size, (int, float)) and not isinstance(raw_size, bool):
+            value = float(raw_size) * render_scale
+            if math.isfinite(value):
+                font_size = round(value, 3)
+    return {
+        "id": str(overlay.get("id") or ""),
+        "start": round(float(overlay.get("start", 0.0)), 3),
+        "end": round(float(overlay.get("end", 0.0)), 3),
+        "kind": kind,
+        "component_id": None,
+        "style_pack_id": None,
+        "minimum_primary_font_px": font_size,
+        "source": source,
+        "motion": motion,
+    }
 
 
 def resolve_motion(preset: str | None) -> tuple[str, bool]:
@@ -688,6 +778,7 @@ def build_render_command(
     quality: str,
     clip: dict[str, Any] | None = None,
     visual_source: Path | None = None,
+    visual_evidence: dict[str, Any] | None = None,
 ) -> list[str]:
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -727,6 +818,7 @@ def build_render_command(
     else:
         clip_start, clip_end = segments[0]
         duration = clip_end - clip_start
+    evidence_items: list[dict[str, Any]] = []
     source_rel = str(manifest.get("source", {}).get("staged_path", ""))
     source = project_dir / source_rel
     if not source.is_file():
@@ -779,6 +871,19 @@ def build_render_command(
             continue
         if visual_source is not None and source_overlay.get("design_role"):
             # design-role cards are baked by the graphic package
+            for window_start, window_end in map_source_range_to_post_cut(
+                segments,
+                float(source_overlay.get("start", 0.0)),
+                float(source_overlay.get("end", 0.0)),
+            ):
+                baked = dict(source_overlay)
+                baked["start"] = window_start
+                baked["end"] = window_end
+                evidence_items.append(
+                    overlay_visual_evidence(
+                        baked, render_scale, source="graphic_package"
+                    )
+                )
             continue
         if card_plan_adopted and source_overlay.get("design_role"):
             # The card plan answers "which cards" on its own. These were put
@@ -807,6 +912,10 @@ def build_render_command(
             overlay["start"] = window_start
             overlay["end"] = window_end
             overlays.append(overlay)
+            if overlay.get("type") not in {"caption", "emphasis"}:
+                evidence_items.append(
+                    overlay_visual_evidence(overlay, render_scale)
+                )
     overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
     from editor_server import load_layer_bundle
 
@@ -874,6 +983,22 @@ def build_render_command(
                     int(canvas.get("fps", 30)),
                     render_scale,
                 )
+                card_evidence = card_visual_evidence(
+                    resolved_pack,
+                    layers_bundle,
+                    str(layer_ref),
+                    render_scale,
+                    animated_source,
+                )
+                card_evidence.update(
+                    {
+                        "id": str(plan_item.get("id") or ""),
+                        "start": round(window_start, 3),
+                        "end": round(window_end, 3),
+                        "source": "structured_card",
+                    }
+                )
+                evidence_items.append(card_evidence)
                 overlays.append(
                     {
                         "id": plan_item.get("id"),
@@ -920,8 +1045,7 @@ def build_render_command(
                     }
                 )
             elif asset_ref:
-                overlays.append(
-                    {
+                asset_overlay = {
                         "id": plan_item.get("id"),
                         "type": "image",
                         "source": str(asset_ref),
@@ -932,6 +1056,11 @@ def build_render_command(
                         "style": {"width": 60.0, "x": 50, "y": 42,
                                   "animation": "fade"},
                     }
+                overlays.append(asset_overlay)
+                evidence_items.append(
+                    overlay_visual_evidence(
+                        asset_overlay, render_scale, source="planned_asset"
+                    )
                 )
 
         # A beat whose window fell inside removed material legitimately
@@ -1169,6 +1298,24 @@ def build_render_command(
             str(output),
         ]
     )
+    if visual_evidence is not None:
+        director = DIRECTOR_PRESETS.get(str(state.get("director_style") or ""), {})
+        motion_intensity = (
+            str(director.get("motion_intensity") or "low")
+            if isinstance(director, dict)
+            else "low"
+        )
+        visual_evidence.clear()
+        visual_evidence.update(
+            {
+                "schema_version": 1,
+                "source": "renderer_evidence_raw",
+                "duration_s": round(duration, 3),
+                "motion_intensity": motion_intensity,
+                "visual_beat_count": len(evidence_items),
+                "items": evidence_items,
+            }
+        )
     return command
 
 
@@ -1262,6 +1409,7 @@ def render_project(
     snapshot_path: Path | None = None,
     variant_id: str | None = None,
 ) -> None:
+    render_id: str | None = None
     if snapshot_path is None:
         manifest = read_json(project_dir / "project.json", {}) or {}
         state = read_json(project_dir / "working/editor_state.json", {}) or {}
@@ -1307,6 +1455,8 @@ def render_project(
                 raise ValueError("rights gate: " + "; ".join(rights_errors))
     else:
         manifest, state, clip = load_render_snapshot(project_dir, snapshot_path, quality)
+        snapshot_payload = read_json(snapshot_path, {}) or {}
+        render_id = str(snapshot_payload.get("render_id") or "") or None
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
     try:
@@ -1349,6 +1499,9 @@ def render_project(
                         "which is unavailable on this host; remove the effects or "
                         "install the macOS CoreText stack"
                     )
+        raw_visual_evidence: dict[str, Any] | None = (
+            {} if quality == "final" and render_id is not None else None
+        )
         command = build_render_command(
             project_dir,
             state,
@@ -1357,6 +1510,7 @@ def render_project(
             quality,
             clip,
             visual_source,
+            visual_evidence=raw_visual_evidence,
         )
         try:
             result = subprocess.run(
@@ -1369,6 +1523,11 @@ def render_project(
             raise RuntimeError("ffmpeg render timed out") from exc
         if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
             raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
+        if raw_visual_evidence is not None and render_id is not None:
+            atomic_write_json(
+                rendered_visual_evidence_path(project_dir, render_id),
+                rendered_visual_quality_report(raw_visual_evidence),
+            )
         if variant_id and quality == "final":
             # QA runs on the temporary output; only a passing QA publishes
             # the file + receipt together (no receipt-less final on disk).

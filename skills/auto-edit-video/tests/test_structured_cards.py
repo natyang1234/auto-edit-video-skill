@@ -62,6 +62,16 @@ def make_layers() -> dict:
     }
 
 
+class TypographyContractTests(unittest.TestCase):
+    def test_every_primary_card_type_has_a_32px_or_larger_floor(self) -> None:
+        for layer_type in (
+            "title", "stat", "chart", "dynamic_list", "quote", "question",
+            "comparison", "term", "note", "chip", "statement",
+        ):
+            with self.subTest(layer_type=layer_type):
+                self.assertGreaterEqual(scc.primary_font_floor(layer_type), 32.0)
+
+
 @unittest.skipUnless(scc.compositor_available(), "needs macOS CoreText")
 class StructuredCardTests(unittest.TestCase):
     def setUp(self) -> None:

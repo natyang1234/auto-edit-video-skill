@@ -116,3 +116,56 @@ class CardMotionTests(unittest.TestCase):
         built = image_filter("in", "out", "asset", overlay, 1080, 1920)
         self.assertIn("overlay=x=", built)
         self.assertIn("if(lt(t,", built.split("overlay=x=")[1][:80])
+
+    def test_real_content_animation_is_recorded_as_faithful(self) -> None:
+        import structured_card_compositor
+        from render_editor_timeline import card_visual_evidence
+
+        pack = structured_card_compositor.load_style_pack("kinetic-social")
+        layers = {
+            "items": [{
+                "id": "L-list",
+                "type": "dynamic_list",
+                "component_id": "dynamic-list",
+            }]
+        }
+        evidence = card_visual_evidence(
+            pack,
+            layers,
+            "L-list",
+            1.0,
+            "working/structured_cards/anim-L-list.mov",
+        )
+        self.assertEqual(evidence["minimum_primary_font_px"], 36.0)
+        self.assertEqual(evidence["motion"]["requested"], "staggered-reveal")
+        self.assertEqual(evidence["motion"]["delivered"], "staggered-reveal")
+        self.assertTrue(evidence["motion"]["faithful"])
+        self.assertEqual(evidence["motion"]["status"], "rendered")
+
+    def test_static_content_fallback_is_never_claimed_faithful(self) -> None:
+        import structured_card_compositor
+        from render_editor_timeline import card_visual_evidence
+
+        pack = structured_card_compositor.load_style_pack("kinetic-social")
+        layers = {
+            "items": [{
+                "id": "L-list",
+                "type": "dynamic_list",
+                "component_id": "dynamic-list",
+            }]
+        }
+        evidence = card_visual_evidence(pack, layers, "L-list", 1.0, None)
+        self.assertEqual(evidence["motion"]["delivered"], "fade")
+        self.assertFalse(evidence["motion"]["faithful"])
+        self.assertEqual(evidence["motion"]["status"], "fallback")
+
+    def test_native_entrance_is_faithful_without_browser_animation(self) -> None:
+        from render_editor_timeline import card_visual_evidence
+
+        evidence = card_visual_evidence(
+            self.pack, self.layers, "L-carousel", 1.0, None
+        )
+        self.assertEqual(evidence["motion"]["requested"], "pan")
+        self.assertEqual(evidence["motion"]["delivered"], "pan")
+        self.assertTrue(evidence["motion"]["faithful"])
+        self.assertEqual(evidence["motion"]["status"], "native")
