@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,11 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 import asset_registry  # noqa: E402
-from render_editor_timeline import font_path, project_font_binding  # noqa: E402
+from render_editor_timeline import (  # noqa: E402
+    build_render_command,
+    font_path,
+    project_font_binding,
+)
 
 
 class ProjectFontResolverTests(unittest.TestCase):
@@ -214,3 +219,109 @@ class CardMotionTests(unittest.TestCase):
         self.assertEqual(evidence["motion"]["delivered"], "pan")
         self.assertTrue(evidence["motion"]["faithful"])
         self.assertEqual(evidence["motion"]["status"], "native")
+
+
+class Phase0dRenderCommandTests(unittest.TestCase):
+    """The mixed SFX route must have one unambiguous audio graph."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="renderer-sfx-")
+        self.project = Path(self.temp.name)
+        (self.project / "source").mkdir()
+        (self.project / "assets").mkdir()
+        (self.project / "working").mkdir()
+        (self.project / "source/source.mp4").write_bytes(b"source")
+        (self.project / "assets/card.png").write_bytes(b"image")
+        self.stem = self.project / "working/stem.wav"
+        self.stem.write_bytes(b"stem")
+        self.manifest = {
+            "source": {"staged_path": "source/source.mp4", "duration_s": 2.0, "has_audio": True}
+        }
+        self.state = {
+            "canvas": {"width": 1080, "height": 1920, "fps": 30},
+            "segments": [{"source_start": 0.0, "source_end": 2.0}],
+            "overlays": [{
+                "id": "card", "type": "image", "source": "assets/card.png",
+                "start": 0.0, "end": 1.0, "visible": True,
+                "style": {"width": 50, "x": 50, "y": 50},
+            }],
+        }
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    @patch("render_editor_timeline.source_has_audible_signal", return_value=True)
+    def test_sfx_input_follows_image_assets_and_graph_normalizes_once(self, _audible: object) -> None:
+        command = build_render_command(
+            self.project, self.state, self.manifest, self.project / "out.mp4", "final",
+            sfx_stem=self.stem,
+        )
+        inputs = [command[index + 1] for index, item in enumerate(command) if item == "-i"]
+        self.assertEqual(inputs, [
+            str(self.project / "source/source.mp4"),
+            str((self.project / "assets/card.png").resolve()),
+            str(self.stem),
+        ])
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("[2:a]", graph)
+        self.assertIn("atrim=0:2.000000", graph)
+        self.assertEqual(graph.count("loudnorm="), 1)
+        self.assertIn("LRA=11,aresample=48000[aout]", graph)
+        self.assertEqual(" ".join(command).count("loudnorm="), 1)
+
+    def test_sfx_rejects_multi_cut_timeline(self) -> None:
+        self.state["segments"] = [
+            {"source_start": 0.0, "source_end": 0.8},
+            {"source_start": 1.0, "source_end": 1.8},
+        ]
+        with self.assertRaisesRegex(ValueError, "single-cut"):
+            build_render_command(
+                self.project, self.state, self.manifest, self.project / "out.mp4", "final",
+                sfx_stem=self.stem,
+            )
+
+    def test_sfx_rejects_missing_dialogue(self) -> None:
+        self.manifest["source"]["has_audio"] = False
+        with self.assertRaisesRegex(ValueError, "dialogue"):
+            build_render_command(
+                self.project, self.state, self.manifest, self.project / "out.mp4", "final",
+                sfx_stem=self.stem,
+            )
+
+    @patch("render_editor_timeline.subprocess.run")
+    def test_direct_qa_passes_complete_sfx_bindings(self, run: object) -> None:
+        from types import SimpleNamespace
+        from render_editor_timeline import qa_direct_final_output
+
+        candidate = self.project / "candidate.mp4"
+        candidate.write_bytes(b"candidate")
+        evidence = self.project / "evidence.json"
+        evidence.write_text("{}", encoding="utf-8")
+        plan = self.project / "plan.json"
+        catalog = self.project / "catalog.json"
+        plan.write_text("{}", encoding="utf-8")
+        catalog.write_text("{}", encoding="utf-8")
+        report = self.project / "report.json"
+        contact = self.project / "contact.png"
+
+        def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            report_arg = Path(command[command.index("--report") + 1])
+            contact_arg = Path(command[command.index("--contact") + 1])
+            report_arg.write_text(json.dumps({
+                "visual_delivery": {"source": "renderer_evidence", "status": "pass"},
+                "sfx_delivery": {"source": "independent_sfx_evidence", "status": "pass"},
+            }), encoding="utf-8")
+            contact_arg.write_bytes(b"contact")
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        run.side_effect = fake_run  # type: ignore[attr-defined]
+        qa_direct_final_output(
+            self.project, candidate, "direct-final-test", evidence, {}, report, contact,
+            plan, catalog, self.stem, "timeline-revision", "a" * 64,
+        )
+        command = run.call_args.args[0]  # type: ignore[attr-defined]
+        self.assertEqual(command[command.index("--audio-event-plan") + 1], str(plan))
+        self.assertEqual(command[command.index("--audio-catalog") + 1], str(catalog))
+        self.assertEqual(command[command.index("--sfx-stem") + 1], str(self.stem))
+        self.assertEqual(command[command.index("--expected-timeline-revision") + 1], "timeline-revision")
+        self.assertEqual(command[command.index("--expected-cut-map-sha256") + 1], "a" * 64)

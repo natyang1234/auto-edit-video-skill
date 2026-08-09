@@ -10,6 +10,8 @@
   "card_plan",
   "content_analysis",
   "delivery_envelope",
+  "sfx_catalog",
+  "audio_event_plan",
   "director_mode",
   "editor_state_v2",
   "evidence_map",

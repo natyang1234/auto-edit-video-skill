@@ -585,6 +585,10 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
         "motion_faithful_count": faithful_motion_count,
         "motion_fallback_count": fallback_motion_count,
         "motion_faithful_ratio": ratio,
+        # Downstream motion/audio QA must recompute trigger identity and final
+        # timing from item-level renderer observations. Aggregate counts alone
+        # cannot prove which title or animation was actually delivered.
+        "items": items,
         "failures": failures,
         "warnings": warnings,
     }

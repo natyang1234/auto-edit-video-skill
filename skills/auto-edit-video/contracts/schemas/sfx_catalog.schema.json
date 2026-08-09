@@ -1,0 +1,93 @@
+{
+  "$id": "sfx_catalog",
+  "title": "Phase 0d generated SFX catalog",
+  "x_schema_version": 1,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "sample_rate",
+    "channels",
+    "sample_width_bytes",
+    "assets"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "sample_rate": {"const": 48000},
+    "channels": {"const": 2},
+    "sample_width_bytes": {"const": 3},
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "asset_id",
+          "pack",
+          "role",
+          "generator",
+          "duration_samples",
+          "transient_anchor_sample",
+          "noise_floor_dbfs",
+          "rms_dbfs",
+          "peak_dbfs",
+          "wav_sha256",
+          "decoded_pcm_sha256",
+          "provenance",
+          "review_state"
+        ],
+        "properties": {
+          "asset_id": {"const": "soft-ui-tick-v1"},
+          "pack": {"const": "phase0d-local-procedural"},
+          "role": {"const": "title_enter"},
+          "generator": {
+            "type": "object",
+            "required": ["name", "version", "recipe"],
+            "properties": {
+              "name": {"const": "soft_ui_tick"},
+              "version": {"const": 1},
+              "recipe": {"const": "two_sine_exponential_decay"}
+            },
+            "additionalProperties": false
+          },
+          "duration_samples": {
+            "type": "integer",
+            "minimum": 1920,
+            "maximum": 72000
+          },
+          "transient_anchor_sample": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "noise_floor_dbfs": {
+            "type": "number",
+            "minimum": -120,
+            "maximum": 0
+          },
+          "rms_dbfs": {
+            "type": "number",
+            "exclusiveMinimum": -45,
+            "maximum": 0
+          },
+          "peak_dbfs": {
+            "type": "number",
+            "minimum": -12,
+            "maximum": -1
+          },
+          "wav_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "decoded_pcm_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "provenance": {"type": "string", "minLength": 1},
+          "review_state": {"const": "approved_generated"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -158,6 +158,11 @@ class RenderedVisualQualityReportTests(unittest.TestCase):
         self.assertEqual(report["motion_faithful_count"], 2)
         self.assertEqual(report["motion_fallback_count"], 0)
         self.assertEqual(report["motion_faithful_ratio"], 1.0)
+        self.assertEqual(
+            report["items"],
+            evidence["items"],
+            "published renderer evidence must retain item-level trigger timing for independent QA",
+        )
         self.assertEqual(report["failures"], [])
         self.assertEqual(report["warnings"], [])
 

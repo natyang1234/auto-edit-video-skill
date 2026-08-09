@@ -48,6 +48,9 @@ DEFAULT_DESTINATIONS = {
     "visual_evidence": "working/render_visual_evidence/{render_id}.json",
     "motion_evidence": "working/render_visual_evidence/{render_id}.json",
     "caption_v2": "working/caption_delivery_v2.json",
+    "audio_event_plan": "working/audio_event_plans/{render_id}.json",
+    "audio_catalog": "working/audio_catalogs/{render_id}.json",
+    "sfx_stem": "working/sfx_stems/{render_id}.wav",
 }
 STAGE_FILENAMES = {
     "output": "candidate.mp4",
@@ -77,6 +80,9 @@ RECOVERY_ARTIFACT_NAMES = (
     "contact_sheet",
     "visual_evidence",
     "motion_evidence",
+    "audio_event_plan",
+    "audio_catalog",
+    "sfx_stem",
 )
 
 
@@ -471,13 +477,23 @@ def build_prepared_envelope(
 ) -> dict[str, Any]:
     """Build a prepared v1 payload from observed private artifact bytes."""
     root = project_dir.resolve()
+    sfx_names = ("audio_event_plan", "audio_catalog", "sfx_stem")
+    included_sfx = [name for name in sfx_names if staged_sources.get(name) is not None]
+    if included_sfx and len(included_sfx) != len(sfx_names):
+        raise DeliveryEnvelopeError("SFX delivery artifacts must be all-or-none")
     profile_id, profile_hash = _profile_binding(state)
     import editor_server
 
     cut_map = root / "working/cut_map.json"
     if cut_map.is_symlink():
         raise DeliveryEnvelopeError("working/cut_map.json must not be a symlink")
-    cut_map_hash = _sha256(cut_map) if cut_map.is_file() else None
+    sfx_names = ("audio_event_plan", "audio_catalog", "sfx_stem")
+    if all(staged_sources.get(name) is not None for name in sfx_names):
+        import sfx_delivery
+
+        cut_map_hash = sfx_delivery.effective_cut_map_sha256(root, state)
+    else:
+        cut_map_hash = _sha256(cut_map) if cut_map.is_file() else None
     artifact_payload: dict[str, Any] = {}
     destination_overrides = dict(destinations or {})
     stage_root = staging_path(root, render_id).resolve()
@@ -604,6 +620,7 @@ def _phase0b_destinations(
     expected_output: Path,
     *,
     include_caption_v2: bool = False,
+    include_sfx: bool = False,
 ) -> dict[str, tuple[str, bool]]:
     root = project_dir.resolve()
     output = _canonical_expected_output(expected_output)
@@ -622,6 +639,12 @@ def _phase0b_destinations(
     }
     if include_caption_v2:
         destinations["caption_v2"] = ("working/caption_delivery_v2.json", False)
+    if include_sfx:
+        destinations.update({
+            "audio_event_plan": (f"working/audio_event_plans/{render_id}.json", False),
+            "audio_catalog": (f"working/audio_catalogs/{render_id}.json", False),
+            "sfx_stem": (f"working/sfx_stems/{render_id}.wav", False),
+        })
     for relative, external in destinations.values():
         destination = _destination_path(root, relative, allow_external=external)
         if external:
@@ -647,11 +670,16 @@ def _validate_phase0b_artifact_destinations(
     artifacts = envelope.get("artifacts")
     if not isinstance(artifacts, dict):
         raise DeliveryEnvelopeError("delivery envelope artifacts are invalid")
+    sfx_names = ("audio_event_plan", "audio_catalog", "sfx_stem")
+    present_sfx = [name for name in sfx_names if artifacts.get(name) is not None]
+    if present_sfx and len(present_sfx) != len(sfx_names):
+        raise DeliveryEnvelopeError("SFX delivery artifacts must be all-or-none")
     destinations = _phase0b_destinations(
         project_dir,
         render_id,
         expected_output,
         include_caption_v2=artifacts.get("caption_v2") is not None,
+        include_sfx=bool(present_sfx),
     )
     for name, (expected_path, _external) in destinations.items():
         item = artifacts.get(name)
@@ -705,7 +733,7 @@ def _recovery_expected_entries(
     expected: list[dict[str, Any]] = []
     seen: set[str] = set()
     artifacts = prepared["artifacts"]
-    recovery_names = list(RECOVERY_ARTIFACT_NAMES)
+    recovery_names = [name for name in RECOVERY_ARTIFACT_NAMES if artifacts.get(name) is not None]
     if artifacts.get("caption_v2") is not None:
         recovery_names.append("caption_v2")
     for name in recovery_names:

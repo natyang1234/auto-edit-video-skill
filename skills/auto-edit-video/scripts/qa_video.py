@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import sfx_delivery
+
 
 # A project declares what kind of delivery it is making, rather than dialling
 # individual thresholds: an open set of numbers is an open set of ways to turn
@@ -647,6 +649,180 @@ def contact_sheet(video: Path, output: Path, duration: float) -> None:
         raise ValueError(result.stderr.strip() or "contact-sheet render failed")
 
 
+def _non_negative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"SFX report {field} must be a non-negative integer")
+    return value
+
+
+def validate_sfx_report(sfx_report: Any) -> dict[str, Any]:
+    """Validate independent SFX evidence before it enters the schema-3 report.
+
+    The verifier is deliberately independent from this QA gate.  A report that
+    merely claims ``status=pass`` is not enough: the evidence source, failure
+    and warning lists, delivered cue list, and expected/delivered counts must
+    agree at this boundary as well.
+    """
+    if not isinstance(sfx_report, dict):
+        raise ValueError("SFX report must be a JSON object")
+    if sfx_report.get("schema_version") != 1:
+        raise ValueError("SFX report schema_version must be 1")
+    if sfx_report.get("source") != "independent_sfx_evidence":
+        raise ValueError("SFX report source must be independent_sfx_evidence")
+    status = sfx_report.get("status")
+    if status not in {"pass", "fail"}:
+        raise ValueError("SFX report status must be pass or fail")
+    failures = sfx_report.get("failures")
+    warnings = sfx_report.get("warnings")
+    if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
+        raise ValueError("SFX report failures must be a list of strings")
+    if not isinstance(warnings, list) or not all(isinstance(item, str) for item in warnings):
+        raise ValueError("SFX report warnings must be a list of strings")
+    if status == "pass" and failures:
+        raise ValueError("SFX report pass status cannot contain failures")
+    if status == "fail" and not failures:
+        raise ValueError("SFX report fail status requires failures")
+
+    if not isinstance(sfx_report.get("events"), list):
+        raise ValueError("SFX report events must be a list")
+    delivered_items = sfx_report["events"]
+    if not all(isinstance(item, dict) for item in delivered_items):
+        raise ValueError("SFX report events must be a list of objects")
+    for alias in (
+        "event_results",
+        "cues",
+        "cue_results",
+        "expected_count",
+        "expected_cue_count",
+        "delivered_count",
+        "verified_count",
+        "verified_event_count",
+        "delivered_cue_count",
+        "verified_cue_count",
+        "event_count",
+        "cue_count",
+    ):
+        if alias in sfx_report:
+            raise ValueError(f"SFX report contains unsupported count/list field {alias}")
+    expected_key = "expected_event_count"
+    delivered_key = "delivered_event_count"
+    if expected_key not in sfx_report or delivered_key not in sfx_report:
+        raise ValueError("SFX report must contain expected and delivered event counts")
+    expected_count = _non_negative_int(sfx_report[expected_key], expected_key)
+    delivered_count = _non_negative_int(sfx_report[delivered_key], delivered_key)
+    if delivered_count != len(delivered_items):
+        raise ValueError(
+            f"SFX report {delivered_key} does not match events length"
+        )
+    # A passing report must prove complete delivery.  A failing report may
+    # legitimately have fewer delivered cues, provided its failures explain it.
+    if status == "pass" and expected_count != delivered_count:
+        raise ValueError("SFX report pass status requires matching event counts")
+
+    # A passing independent SFX receipt is valid only when it also binds the
+    # exact final candidate audio.  Sidecar cue evidence by itself is not
+    # final-domain proof and must never be accepted as a publishable pass.
+    candidate_hash = sfx_report.get("candidate_output_sha256")
+    if candidate_hash is not None and (
+        not isinstance(candidate_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", candidate_hash) is None
+    ):
+        raise ValueError("SFX report candidate_output_sha256 must be lowercase 64-hex")
+    if status == "pass" and not isinstance(candidate_hash, str):
+        raise ValueError("SFX report pass requires candidate_output_sha256")
+    audio_evidence = sfx_report.get("output_audio_evidence")
+    if isinstance(candidate_hash, str):
+        if not isinstance(audio_evidence, dict):
+            raise ValueError("SFX report requires output_audio_evidence")
+        if (
+            audio_evidence.get("sample_rate") != 48000
+            or audio_evidence.get("channels") != 2
+            or audio_evidence.get("sample_width_bytes") != 4
+            or _non_negative_int(audio_evidence.get("sample_count"), "output_audio_evidence.sample_count") <= 0
+            or not isinstance(audio_evidence.get("decoded_pcm_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", audio_evidence["decoded_pcm_sha256"]) is None
+        ):
+            raise ValueError(
+                "SFX report requires native 48kHz stereo output_audio_evidence"
+            )
+        expected_audio_count = _non_negative_int(
+            audio_evidence.get("expected_sample_count"),
+            "output_audio_evidence.expected_sample_count",
+        )
+        observed_audio_count = _non_negative_int(
+            audio_evidence.get("sample_count"),
+            "output_audio_evidence.sample_count",
+        )
+        delta = audio_evidence.get("sample_count_delta")
+        if isinstance(delta, bool) or type(delta) is not int:
+            raise ValueError(
+                "SFX report output_audio_evidence.sample_count_delta must be an integer"
+            )
+        tolerance = _non_negative_int(
+            audio_evidence.get("sample_count_tolerance_samples"),
+            "output_audio_evidence.sample_count_tolerance_samples",
+        )
+        if tolerance != sfx_delivery.CANDIDATE_SAMPLE_COUNT_TOLERANCE:
+            raise ValueError(
+                "SFX report sample count tolerance does not match the independent policy"
+            )
+        if delta != observed_audio_count - expected_audio_count:
+            raise ValueError(
+                "SFX report output_audio_evidence sample count delta is inconsistent"
+            )
+        if status == "pass" and abs(delta) > tolerance:
+            raise ValueError(
+                "SFX report pass requires candidate sample count within codec tolerance"
+            )
+    if status == "pass":
+        cue_evidence = sfx_report.get("observed_cue_evidence")
+        candidate_cues = (
+            [
+                item for item in cue_evidence
+                if isinstance(item, dict)
+                and item.get("evidence_source") == "candidate_output_audio"
+            ]
+            if isinstance(cue_evidence, list) else []
+        )
+        if len(candidate_cues) != expected_count:
+            raise ValueError(
+                "SFX report pass requires one candidate output cue per expected event"
+            )
+        cue_ids = [item.get("event_id") for item in candidate_cues]
+        delivered_ids = [item.get("id") for item in delivered_items]
+        identifiers_are_valid = all(
+            isinstance(identifier, str) and bool(identifier)
+            for identifier in (*cue_ids, *delivered_ids)
+        )
+        if (
+            not identifiers_are_valid
+            or len(set(cue_ids)) != len(cue_ids)
+            or len(set(delivered_ids)) != len(delivered_ids)
+            or set(cue_ids) != set(delivered_ids)
+            or not all(
+                item.get("status") == "pass"
+                and item.get("aligned") is True
+                and isinstance(item.get("correlation"), (int, float))
+                and math.isfinite(float(item["correlation"]))
+                and float(item["correlation"]) >= sfx_delivery.CANDIDATE_CORRELATION_THRESHOLD
+                for item in candidate_cues
+            )
+        ):
+            raise ValueError("SFX report pass requires candidate output cue pass evidence")
+    return sfx_report
+
+
+def default_sfx_report() -> dict[str, Any]:
+    """Legacy-compatible placeholder when no SFX artifacts were requested."""
+    return {
+        "schema_version": 1,
+        "source": "not_provided",
+        "status": "not_evaluated",
+        "failures": [],
+        "warnings": ["independent SFX evidence was not provided"],
+    }
+
+
 def inspect(
     video: Path,
     report_path: Path,
@@ -654,6 +830,7 @@ def inspect(
     policy: QaPolicy | None = None,
     content_rect: tuple[float, float, float, float] | None = None,
     visual_report: dict[str, Any] | None = None,
+    sfx_report: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     policy = policy or QaPolicy()
     media = probe(video)
@@ -682,6 +859,29 @@ def inspect(
         != visual_report.get("expected_visual_beat_count")
     ):
         raise ValueError("visual report is not a valid renderer-evidence report")
+    if sfx_report is None:
+        sfx_report = default_sfx_report()
+    else:
+        sfx_report = validate_sfx_report(sfx_report)
+        if sfx_report.get("status") == "pass":
+            candidate_hash = sfx_report.get("candidate_output_sha256")
+            try:
+                actual_candidate_hash = sfx_delivery.sha256_file(video)
+            except OSError as exc:
+                raise ValueError(f"SFX candidate video is unreadable: {exc}") from exc
+            if candidate_hash != actual_candidate_hash:
+                raise ValueError(
+                    "SFX report candidate_output_sha256 does not match live video bytes"
+                )
+        if sfx_report.get("status") == "fail":
+            failures.extend(
+                f"sfx delivery: {item}" for item in sfx_report.get("failures", [])
+            )
+            if not sfx_report.get("failures"):
+                failures.append("sfx delivery: independent evidence failed without a reason")
+        warnings.extend(
+            f"sfx delivery: {item}" for item in sfx_report.get("warnings", [])
+        )
     if visual_report.get("status") == "fail":
         failures.extend(
             f"visual delivery: {item}"
@@ -854,6 +1054,7 @@ def inspect(
         "loudness": levels,
         "silence": silence,
         "visual_delivery": visual_report,
+        "sfx_delivery": sfx_report,
         "policy": asdict(policy),
         "contact_sheet": str(contact_path),
         "failures": failures,
@@ -874,6 +1075,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--visual-evidence",
         help="renderer-produced visual evidence JSON to merge into delivery QA",
+    )
+    parser.add_argument(
+        "--audio-event-plan",
+        help="final-domain audio event plan to verify independently",
+    )
+    parser.add_argument(
+        "--audio-catalog",
+        help="generated SFX catalog to verify independently",
+    )
+    parser.add_argument(
+        "--sfx-stem",
+        help="hash-bound 48kHz SFX stem to verify independently",
+    )
+    parser.add_argument(
+        "--expected-timeline-revision",
+        help="timeline revision bound to the SFX event plan",
+    )
+    parser.add_argument(
+        "--expected-cut-map-sha256",
+        help="cut-map SHA-256 bound to the SFX event plan",
     )
     parser.add_argument(
         "--max-black-segment-seconds",
@@ -976,6 +1197,23 @@ def policy_from_args(args: argparse.Namespace) -> QaPolicy:
 
 def main() -> int:
     args = build_parser().parse_args()
+    sfx_values = (
+        args.audio_event_plan,
+        args.audio_catalog,
+        args.sfx_stem,
+        args.expected_timeline_revision,
+        args.expected_cut_map_sha256,
+    )
+    if any(value is not None for value in sfx_values) and not all(
+        value is not None for value in sfx_values
+    ):
+        print(
+            "SFX artifact and binding arguments are all-or-none: provide "
+            "--audio-event-plan, --audio-catalog, --sfx-stem, "
+            "--expected-timeline-revision, and --expected-cut-map-sha256 together",
+            file=sys.stderr,
+        )
+        return 2
     video = Path(args.video).expanduser().resolve()
     if not video.is_file():
         print(f"video not found: {video}", file=sys.stderr)
@@ -992,6 +1230,29 @@ def main() -> int:
             visual_report = json.loads(visual_path.read_text(encoding="utf-8"))
             if not isinstance(visual_report, dict):
                 raise ValueError("visual report must be a JSON object")
+        sfx_report = None
+        if any(value is not None for value in sfx_values):
+            if visual_report is None:
+                raise ValueError("SFX delivery requires renderer visual evidence")
+            plan_path = Path(args.audio_event_plan).expanduser().resolve()
+            catalog_path = Path(args.audio_catalog).expanduser().resolve()
+            stem_path = Path(args.sfx_stem).expanduser().resolve()
+            for label, artifact_path in (
+                ("audio event plan", plan_path),
+                ("audio catalog", catalog_path),
+                ("SFX stem", stem_path),
+            ):
+                if not artifact_path.is_file():
+                    raise ValueError(f"{label} not found: {artifact_path}")
+            sfx_report = sfx_delivery.verify_delivery(
+                plan_path,
+                catalog_path,
+                stem_path,
+                visual_report,
+                expected_timeline_revision=args.expected_timeline_revision,
+                expected_cut_map_sha256=args.expected_cut_map_sha256,
+                candidate_path=video,
+            )
         payload, ok = inspect(
             video,
             report,
@@ -999,8 +1260,16 @@ def main() -> int:
             policy=policy_from_args(args),
             content_rect=rect,
             visual_report=visual_report,
+            sfx_report=sfx_report,
         )
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(json.dumps(payload, ensure_ascii=False, indent=2))

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = SKILL_DIR / "scripts"
@@ -58,6 +59,40 @@ class QaVideoGateTest(unittest.TestCase):
             return qa_video.inspect(video, report_path, contact_path)
         return qa_video.inspect(video, report_path, contact_path, policy=policy)
 
+    @staticmethod
+    def sfx_report(
+        *, status: str = "pass", failures: list[str] | None = None
+    ) -> dict[str, object]:
+        events = [{"id": "sfx-title-enter-0001", "status": "pass"}]
+        return {
+            "schema_version": 1,
+            "source": "independent_sfx_evidence",
+            "status": status,
+            "expected_event_count": 1,
+            "delivered_event_count": len(events),
+            "events": events,
+            "failures": [] if failures is None else failures,
+            "warnings": [],
+            "candidate_output_sha256": "a" * 64,
+            "output_audio_evidence": {
+                "sample_rate": 48000,
+                "channels": 2,
+                "sample_width_bytes": 4,
+                "sample_count": 96000,
+                "expected_sample_count": 96000,
+                "sample_count_delta": 0,
+                "sample_count_tolerance_samples": 1024,
+                "decoded_pcm_sha256": "b" * 64,
+            },
+            "observed_cue_evidence": [{
+                "event_id": "sfx-title-enter-0001",
+                "evidence_source": "candidate_output_audio",
+                "status": "pass",
+                "aligned": True,
+                "correlation": 0.99,
+            }],
+        }
+
     def test_reference_video_with_audio_passes(self) -> None:
         video = self.dir / "reference.mp4"
         make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
@@ -65,6 +100,219 @@ class QaVideoGateTest(unittest.TestCase):
         self.assertTrue(ok, report["failures"])
         self.assertEqual(report["status"], "pass")
         self.assertIn("policy", report, "report must echo the enforced QA policy")
+        self.assertEqual(report["sfx_delivery"]["source"], "not_provided")
+        self.assertEqual(report["sfx_delivery"]["status"], "not_evaluated")
+
+    def test_valid_independent_sfx_evidence_is_embedded(self) -> None:
+        video = self.dir / "sfx-pass.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        sfx = self.sfx_report()
+        sfx["candidate_output_sha256"] = qa_video.sfx_delivery.sha256_file(video)
+        report_path = self.dir / "sfx-pass-report.json"
+        contact_path = self.dir / "sfx-pass-contact.png"
+        report, ok = qa_video.inspect(
+            video,
+            report_path,
+            contact_path,
+            sfx_report=sfx,
+        )
+        self.assertTrue(ok, report["failures"])
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["sfx_delivery"], sfx)
+
+    def test_stale_sfx_pass_report_cannot_bind_a_different_video(self) -> None:
+        first = self.dir / "sfx-first.mp4"
+        second = self.dir / "sfx-second.mp4"
+        make_video(first, video_source="testsrc", audio_source="sine=frequency=440")
+        make_video(second, video_source="testsrc", audio_source="sine=frequency=880")
+        sfx = self.sfx_report()
+        sfx["candidate_output_sha256"] = qa_video.sfx_delivery.sha256_file(first)
+        with self.assertRaisesRegex(ValueError, "does not match live video"):
+            qa_video.inspect(
+                second,
+                self.dir / "stale-report.json",
+                self.dir / "stale-contact.png",
+                sfx_report=sfx,
+            )
+
+    def test_candidate_correlation_threshold_is_explicit_and_inclusive(self) -> None:
+        below = self.sfx_report()
+        below["observed_cue_evidence"][0]["correlation"] = (
+            qa_video.sfx_delivery.CANDIDATE_CORRELATION_THRESHOLD - 0.001
+        )
+        with self.assertRaisesRegex(ValueError, "candidate output cue pass"):
+            qa_video.validate_sfx_report(below)
+        at_boundary = self.sfx_report()
+        at_boundary["observed_cue_evidence"][0]["correlation"] = (
+            qa_video.sfx_delivery.CANDIDATE_CORRELATION_THRESHOLD
+        )
+        qa_video.validate_sfx_report(at_boundary)
+
+    def test_candidate_sample_count_tolerance_is_explicit_and_consistent(self) -> None:
+        at_boundary = self.sfx_report()
+        evidence = at_boundary["output_audio_evidence"]
+        evidence["sample_count"] = evidence["expected_sample_count"] + 1024
+        evidence["sample_count_delta"] = 1024
+        qa_video.validate_sfx_report(at_boundary)
+
+        over_boundary = self.sfx_report()
+        evidence = over_boundary["output_audio_evidence"]
+        evidence["sample_count"] = evidence["expected_sample_count"] + 1025
+        evidence["sample_count_delta"] = 1025
+        with self.assertRaisesRegex(ValueError, "within codec tolerance"):
+            qa_video.validate_sfx_report(over_boundary)
+
+        forged_delta = self.sfx_report()
+        forged_delta["output_audio_evidence"]["sample_count_delta"] = 1
+        with self.assertRaisesRegex(ValueError, "delta is inconsistent"):
+            qa_video.validate_sfx_report(forged_delta)
+
+    def test_failed_independent_sfx_evidence_fails_the_delivery(self) -> None:
+        video = self.dir / "sfx-fail.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        sfx = self.sfx_report(status="fail", failures=["cue transient missing"])
+        report, ok = qa_video.inspect(
+            video,
+            self.dir / "sfx-fail-report.json",
+            self.dir / "sfx-fail-contact.png",
+            sfx_report=sfx,
+        )
+        self.assertFalse(ok)
+        self.assertIn("sfx delivery: cue transient missing", report["failures"])
+        self.assertEqual(report["sfx_delivery"], sfx)
+
+    def test_invalid_independent_sfx_evidence_is_rejected(self) -> None:
+        video = self.dir / "sfx-invalid.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        invalid_reports = (
+            {**self.sfx_report(), "schema_version": 2},
+            {**self.sfx_report(), "source": "renderer_evidence"},
+            {**self.sfx_report(), "events": [], "delivered_event_count": 1},
+            {**self.sfx_report(), "expected_event_count": 2},
+            {**self.sfx_report(), "failures": "not-a-list"},
+            {**self.sfx_report(), "expected_count": 1},
+            {**self.sfx_report(), "event_count": 1},
+            {key: value for key, value in self.sfx_report().items()
+             if key != "candidate_output_sha256"},
+            {key: value for key, value in self.sfx_report().items()
+             if key != "output_audio_evidence"},
+            {key: value for key, value in self.sfx_report().items()
+             if key != "observed_cue_evidence"},
+            {**self.sfx_report(), "candidate_output_sha256": "A" * 64},
+        )
+        for invalid in invalid_reports:
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "SFX report"):
+                    qa_video.inspect(
+                        video,
+                        self.dir / "sfx-invalid-report.json",
+                        self.dir / "sfx-invalid-contact.png",
+                        sfx_report=invalid,
+                    )
+
+    def test_cli_failed_verifier_is_not_allowed_to_pass(self) -> None:
+        video = self.dir / "sfx-cli-fail.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        visual_path = self.dir / "visual.json"
+        visual_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source": "renderer_evidence",
+                    "status": "pass",
+                    "expected_visual_beat_count": 1,
+                    "visual_beat_count": 1,
+                    "failures": [],
+                    "warnings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self.dir / "audio-event-plan.json"
+        catalog = self.dir / "audio-catalog.json"
+        stem = self.dir / "sfx-stem.wav"
+        for artifact in (plan, catalog, stem):
+            artifact.write_bytes(b"placeholder")
+        sfx = self.sfx_report(status="fail", failures=["independent verifier failure"])
+        report_path = self.dir / "sfx-cli-fail-report.json"
+        contact_path = self.dir / "sfx-cli-fail-contact.png"
+        with patch.object(
+            qa_video.sfx_delivery, "verify_delivery", return_value=sfx, create=True
+        ) as verify:
+            with patch("builtins.print"):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPTS_DIR / "qa_video.py"),
+                        "--video",
+                        str(video),
+                        "--report",
+                        str(report_path),
+                        "--contact",
+                        str(contact_path),
+                        "--visual-evidence",
+                        str(visual_path),
+                        "--audio-event-plan",
+                        str(plan),
+                        "--audio-catalog",
+                        str(catalog),
+                        "--sfx-stem",
+                        str(stem),
+                        "--expected-timeline-revision",
+                        "a" * 64,
+                        "--expected-cut-map-sha256",
+                        "b" * 64,
+                    ],
+                ):
+                    exit_code = qa_video.main()
+        self.assertEqual(exit_code, 2)
+        verify.assert_called_once_with(
+            plan.resolve(),
+            catalog.resolve(),
+            stem.resolve(),
+            {
+                "schema_version": 1,
+                "source": "renderer_evidence",
+                "status": "pass",
+                "expected_visual_beat_count": 1,
+                "visual_beat_count": 1,
+                "failures": [],
+                "warnings": [],
+            },
+            expected_timeline_revision="a" * 64,
+            expected_cut_map_sha256="b" * 64,
+            candidate_path=video.resolve(),
+        )
+
+    def test_cli_rejects_partial_sfx_artifacts_or_bindings(self) -> None:
+        partial_sets = (
+            ("--audio-event-plan", "plan.json"),
+            ("--audio-catalog", "catalog.json"),
+            ("--sfx-stem", "stem.wav"),
+            ("--expected-timeline-revision", "a" * 64),
+            ("--expected-cut-map-sha256", "b" * 64),
+        )
+        for flag, value in partial_sets:
+            with self.subTest(flag=flag):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPTS_DIR / "qa_video.py"),
+                        "--video",
+                        str(self.dir / "does-not-exist.mp4"),
+                        flag,
+                        value,
+                    ],
+                ):
+                    with patch("builtins.print") as printed:
+                        exit_code = qa_video.main()
+                self.assertEqual(exit_code, 2)
+                self.assertTrue(
+                    any("all-or-none" in str(call) for call in printed.call_args_list),
+                    f"partial {flag} must report all-or-none failure",
+                )
 
     def test_renderer_visual_evidence_is_embedded_in_the_qa_report(self) -> None:
         video = self.dir / "visual-pass.mp4"

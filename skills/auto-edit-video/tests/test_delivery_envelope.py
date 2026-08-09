@@ -200,6 +200,59 @@ class DeliveryEnvelopeTests(unittest.TestCase):
                 destinations={"caption_v2": "working/not-canonical.json"},
             )
 
+    def test_sfx_artifacts_are_all_or_none(self) -> None:
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+            "audio_event_plan": stage / "audio_event_plan.json",
+        }
+        for name, path in sources.items():
+            path.write_bytes(name.encode("utf-8"))
+        with self.assertRaisesRegex(delivery_envelope.DeliveryEnvelopeError, "all-or-none"):
+            delivery_envelope.build_prepared_envelope(
+                self.project, self.render_id, self.external_output, self.state, sources,
+                renderer_script=Path(__file__).resolve(), ffmpeg_executable=self.ffmpeg,
+            )
+
+    def test_sfx_artifacts_publish_to_canonical_destinations(self) -> None:
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+            "audio_event_plan": stage / "audio_event_plan.json",
+            "audio_catalog": stage / "audio_catalog.json",
+            "sfx_stem": stage / "sfx_stem.wav",
+        }
+        for name, path in sources.items():
+            path.write_bytes(("sfx-" + name).encode("utf-8"))
+        prepared = delivery_envelope.build_prepared_envelope(
+            self.project, self.render_id, self.external_output, self.state, sources,
+            renderer_script=Path(__file__).resolve(), ffmpeg_executable=self.ffmpeg,
+        )
+        self.assertEqual(
+            prepared["artifacts"]["audio_event_plan"]["path"],
+            f"working/audio_event_plans/{self.render_id}.json",
+        )
+        delivery_envelope.write_prepared_envelope(stage, prepared)
+        delivery_envelope.publish_direct_delivery(
+            self.project, stage, staged_sources=sources, expected_output=self.external_output,
+        )
+        self.assertEqual(
+            (self.project / f"working/audio_catalogs/{self.render_id}.json").read_bytes(),
+            b"sfx-audio_catalog",
+        )
+        self.assertEqual(
+            (self.project / f"working/sfx_stems/{self.render_id}.wav").read_bytes(),
+            b"sfx-sfx_stem",
+        )
+
     def test_caption_v2_participates_in_stale_journal_recovery(self) -> None:
         prior_output = b"prior-output"
         prior_caption = b"prior-caption"

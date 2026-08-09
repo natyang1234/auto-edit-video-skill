@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_width_bytes": 3,
+  "assets": [
+    {
+      "asset_id": "soft-ui-tick-v1",
+      "pack": "phase0d-local-procedural",
+      "role": "title_enter",
+      "generator": {
+        "name": "soft_ui_tick",
+        "version": 1,
+        "recipe": "two_sine_exponential_decay"
+      },
+      "duration_samples": 7200,
+      "transient_anchor_sample": 7200,
+      "noise_floor_dbfs": -120.0,
+      "rms_dbfs": -18.879128,
+      "peak_dbfs": -4.41845,
+      "wav_sha256": "500d88bd6f9aa8d80406c6662c38fe1a7a9248b98ff7308682319b14a4799261",
+      "decoded_pcm_sha256": "7ca3e73bd028720163c39f3e70bf4cd5e211b08e7536113eb59755a88a705ea1",
+      "provenance": "original local procedural generation; no external/reference audio",
+      "review_state": "approved_generated"
+    }
+  ]
+}

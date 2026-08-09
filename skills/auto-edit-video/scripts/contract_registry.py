@@ -806,10 +806,111 @@ def semantic_delivery_envelope(artifact) -> list[str]:
             errors.append(
                 "$.artifacts.caption_v2.path: must be working/caption_delivery_v2.json"
             )
+        sfx_names = ("audio_event_plan", "audio_catalog", "sfx_stem")
+        sfx_present = [artifacts.get(name) is not None for name in sfx_names]
+        if any(sfx_present) and not all(sfx_present):
+            errors.append("$.artifacts: SFX plan, catalog and stem must be all-null or all-present")
+        profile = artifact.get("profile")
+        if isinstance(profile, dict) and profile.get("id") == "kinetic-explainer" and not all(sfx_present):
+            errors.append("$.artifacts: kinetic-explainer direct delivery requires SFX artifacts")
     renderer = artifact.get("renderer_identity")
     if isinstance(renderer, dict):
         if type(renderer.get("contract_version")) is not int or renderer.get("contract_version") != 1:
             errors.append("$.renderer_identity.contract_version: must be integer 1")
+    return errors
+
+
+def semantic_sfx_catalog(artifact) -> list[str]:
+    """Validate generated-asset measurements and transient identity."""
+    errors: list[str] = []
+    assets = artifact.get("assets") if isinstance(artifact, dict) else None
+    if not isinstance(assets, list) or len(assets) != 1:
+        return errors
+    asset = assets[0]
+    if not isinstance(asset, dict):
+        return errors
+    duration = asset.get("duration_samples")
+    anchor = asset.get("transient_anchor_sample")
+    if type(duration) is int and type(anchor) is int and not 0 <= anchor < duration:
+        errors.append("$.assets[0].transient_anchor_sample: must be below duration_samples")
+    rms = asset.get("rms_dbfs")
+    if isinstance(rms, (int, float)) and not isinstance(rms, bool) and rms <= -45:
+        errors.append("$.assets[0].rms_dbfs: must be above -45 dBFS")
+    peak = asset.get("peak_dbfs")
+    if isinstance(peak, (int, float)) and not isinstance(peak, bool) and not -12 <= peak <= -1:
+        errors.append("$.assets[0].peak_dbfs: must be between -12 and -1 dBFS")
+    provenance = asset.get("provenance")
+    if not isinstance(provenance, str) or not provenance.strip():
+        errors.append("$.assets[0].provenance: must be non-empty")
+    if asset.get("review_state") != "approved_generated":
+        errors.append("$.assets[0].review_state: generated asset must be approved_generated")
+    return errors
+
+
+def semantic_audio_event_plan(artifact) -> list[str]:
+    """Validate final-domain event arithmetic and renderer evidence binding."""
+    errors: list[str] = []
+    events = artifact.get("events") if isinstance(artifact, dict) else None
+    if not isinstance(events, list):
+        return errors
+    seen_ids: set[str] = set()
+    seen_triggers: set[str] = set()
+    stem_count = artifact.get("sfx_stem_sample_count")
+    for index, event in enumerate(events):
+        path = f"$.events[{index}]"
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("id")
+        trigger_id = event.get("trigger_id")
+        if event_id in seen_ids:
+            errors.append(f"{path}.id: duplicate event id")
+        seen_ids.add(event_id)
+        if trigger_id in seen_triggers:
+            errors.append(f"{path}.trigger_id: duplicate trigger id")
+        seen_triggers.add(trigger_id)
+        start = event.get("event_start_sample")
+        anchor = event.get("asset_transient_anchor_sample")
+        expected = event.get("expected_transient_sample")
+        trigger_onset = event.get("trigger_onset_sample")
+        if all(type(value) is int for value in (start, anchor, expected)):
+            if expected != start + anchor:
+                errors.append(f"{path}.expected_transient_sample: must equal event_start_sample + asset_transient_anchor_sample")
+        if all(type(value) is int for value in (expected, trigger_onset)):
+            if abs(expected - trigger_onset) > 3840:
+                errors.append(f"{path}: expected transient is outside 3840-sample trigger tolerance")
+        duration = event.get("duration_samples")
+        if all(type(value) is int for value in (start, duration, stem_count)):
+            if start < 0 or duration <= 0 or start + duration > stem_count:
+                errors.append(f"{path}: event is outside sfx stem bounds")
+        fades = event.get("fades")
+        if isinstance(fades, dict) and isinstance(duration, int):
+            fade_in = fades.get("in_samples")
+            fade_out = fades.get("out_samples")
+            if all(type(value) is int for value in (fade_in, fade_out)) and fade_in + fade_out > duration:
+                errors.append(f"{path}.fades: fades exceed event duration")
+        evidence = event.get("evidence")
+        trigger = evidence.get("trigger") if isinstance(evidence, dict) else None
+        if not isinstance(trigger, dict):
+            continue
+        if trigger.get("id") != trigger_id:
+            errors.append(f"{path}.evidence.trigger.id: does not match trigger_id")
+        if trigger.get("onset_sample") != trigger_onset:
+            errors.append(f"{path}.evidence.trigger.onset_sample: does not match trigger_onset_sample")
+        motion = trigger.get("motion")
+        requested = motion.get("requested") if isinstance(motion, dict) else None
+        delivered = motion.get("delivered") if isinstance(motion, dict) else None
+        status = motion.get("status") if isinstance(motion, dict) else None
+        if trigger.get("kind") != "title":
+            errors.append(f"{path}.evidence.trigger.kind: must be title")
+        if not (
+            requested == "pop"
+            or (isinstance(requested, str) and requested.startswith("slide"))
+        ):
+            errors.append(f"{path}.evidence.trigger.motion.requested: unsupported trigger motion")
+        if not isinstance(delivered, str) or not delivered.strip() or delivered.lower() in {"none", "static"}:
+            errors.append(f"{path}.evidence.trigger.motion.delivered: motion was not delivered")
+        if status == "fallback" or motion.get("faithful") is not True:
+            errors.append(f"{path}.evidence.trigger.motion: trigger is not faithful")
     return errors
 
 
@@ -925,6 +1026,8 @@ SEMANTIC_VALIDATORS = {
     "rights_assertion": semantic_rights_assertion,
     "director_mode": semantic_director_mode,
     "delivery_envelope": semantic_delivery_envelope,
+    "sfx_catalog": semantic_sfx_catalog,
+    "audio_event_plan": semantic_audio_event_plan,
     "transcript_source": semantic_transcript_source,
     "caption_segmentation": semantic_caption_segmentation,
     "caption_delivery": semantic_caption_delivery,

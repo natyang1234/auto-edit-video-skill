@@ -1,0 +1,132 @@
+{
+  "$id": "audio_event_plan",
+  "title": "Phase 0d final-domain audio event plan",
+  "x_schema_version": 1,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "timeline_revision",
+    "cut_map_sha256",
+    "resolved_motion_plan_hash",
+    "sample_rate",
+    "channels",
+    "sample_width_bytes",
+    "alignment_tolerance_samples",
+    "sfx_stem_sha256",
+    "sfx_stem_decoded_pcm_sha256",
+    "sfx_stem_sample_count",
+    "events"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "timeline_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cut_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "resolved_motion_plan_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sample_rate": {"const": 48000},
+    "channels": {"const": 2},
+    "sample_width_bytes": {"const": 3},
+    "alignment_tolerance_samples": {"const": 3840},
+    "sfx_stem_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sfx_stem_decoded_pcm_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sfx_stem_sample_count": {"type": "integer", "minimum": 1},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "trigger_id",
+          "trigger_onset_sample",
+          "event_start_sample",
+          "duration_samples",
+          "asset_id",
+          "asset_transient_anchor_sample",
+          "expected_transient_sample",
+          "role",
+          "gain_db",
+          "fades",
+          "duck_group",
+          "evidence",
+          "reason",
+          "review_state"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "trigger_id": {"type": "string", "minLength": 1},
+          "trigger_onset_sample": {"type": "integer", "minimum": 0},
+          "event_start_sample": {"type": "integer", "minimum": 0},
+          "duration_samples": {"type": "integer", "minimum": 1},
+          "asset_id": {"const": "soft-ui-tick-v1"},
+          "asset_transient_anchor_sample": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expected_transient_sample": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "role": {"const": "title_enter"},
+          "gain_db": {"const": -12},
+          "fades": {
+            "type": "object",
+            "required": ["in_samples", "out_samples"],
+            "properties": {
+              "in_samples": {"type": "integer", "minimum": 0},
+              "out_samples": {"type": "integer", "minimum": 0}
+            },
+            "additionalProperties": false
+          },
+          "duck_group": {"const": "dialogue_priority"},
+          "evidence": {
+            "type": "object",
+            "required": ["trigger"],
+            "properties": {
+              "trigger": {
+                "type": "object",
+                "required": ["id", "onset_sample", "kind", "motion"],
+                "properties": {
+                  "id": {"type": "string", "minLength": 1},
+                  "onset_sample": {"type": "integer", "minimum": 0},
+                  "kind": {"const": "title"},
+                  "motion": {
+                    "type": "object",
+                    "required": [
+                      "requested",
+                      "delivered",
+                      "faithful",
+                      "status"
+                    ],
+                    "properties": {
+                      "requested": {"type": "string", "minLength": 1},
+                      "delivered": {"type": "string", "minLength": 1},
+                      "faithful": {"type": "boolean"},
+                      "status": {"type": "string", "minLength": 1}
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "reason": {"type": "string", "minLength": 1},
+          "review_state": {"const": "approved_generated"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "timeline_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "cut_map_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "resolved_motion_plan_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_width_bytes": 3,
+  "alignment_tolerance_samples": 3840,
+  "sfx_stem_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "sfx_stem_decoded_pcm_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "sfx_stem_sample_count": 20000,
+  "events": [
+    {
+      "id": "sfx-title-enter-0001",
+      "trigger_id": "title-1",
+      "trigger_onset_sample": 1240,
+      "event_start_sample": 1000,
+      "duration_samples": 7200,
+      "asset_id": "soft-ui-tick-v1",
+      "asset_transient_anchor_sample": 240,
+      "expected_transient_sample": 1240,
+      "role": "title_enter",
+      "gain_db": -12,
+      "fades": {"in_samples": 0, "out_samples": 0},
+      "duck_group": "dialogue_priority",
+      "evidence": {
+        "trigger": {
+          "id": "title-1",
+          "onset_sample": 1240,
+          "kind": "title",
+          "motion": {
+            "requested": "pop",
+            "delivered": "pop",
+            "faithful": true,
+            "status": "native"
+          }
+        }
+      },
+      "reason": "faithful title enter",
+      "review_state": "approved_generated"
+    }
+  ]
+}
