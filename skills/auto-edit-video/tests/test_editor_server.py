@@ -45,7 +45,12 @@ from editor_server import (  # noqa: E402
 # Mirrors what the policy-enforcing qa_video writes; delivery validation
 # rejects QA reports that lack this block (pre-policy reports).
 SYNTHETIC_QA_POLICY = dataclasses.asdict(qa_video.QaPolicy())
-from render_editor_timeline import build_render_command, image_filter, text_filter  # noqa: E402
+from render_editor_timeline import (  # noqa: E402
+    build_render_command,
+    direct_final_render_id,
+    image_filter,
+    text_filter,
+)
 
 
 class FakeAssetProviderService:
@@ -3546,8 +3551,78 @@ class EditorRendererTests(unittest.TestCase):
             (self.project / f"qa/{direct_render_id}.json").read_text(encoding="utf-8")
         )
         self.assertEqual(direct_report["schema_version"], 3)
+        self.assertEqual(direct_report["video"], str(final.resolve()))
         self.assertEqual(direct_report["visual_delivery"]["source"], "renderer_evidence")
         self.assertEqual(direct_report["visual_delivery"]["status"], "pass")
+        envelope_path = (
+            self.project
+            / "working/delivery_envelopes"
+            / f"{direct_render_id}.json"
+        )
+        self.assertTrue(envelope_path.is_file())
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["schema_version"], 1)
+        self.assertEqual(envelope["route"], "direct")
+        self.assertEqual(envelope["state"], "finalized")
+        self.assertEqual(envelope["quality"], "final")
+        self.assertEqual(envelope["render_id"], direct_render_id)
+        self.assertEqual(envelope["profile"]["id"], "teacher-punch")
+        self.assertRegex(envelope["profile"]["resolved_profile_hash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            envelope["timeline"]["editor_state_revision"],
+            editor_server.editor_state_revision(state),
+        )
+        self.assertIsNone(envelope["timeline"]["cut_map_sha256"])
+        self.assertEqual(
+            envelope["artifacts"]["output"]["sha256"],
+            editor_server.file_sha256(final),
+        )
+        self.assertEqual(
+            envelope["artifacts"]["qa_report"]["sha256"],
+            editor_server.file_sha256(self.project / f"qa/{direct_render_id}.json"),
+        )
+        self.assertEqual(
+            envelope["artifacts"]["contact_sheet"]["sha256"],
+            editor_server.file_sha256(
+                self.project / f"qa/{direct_render_id}-contact.png"
+            ),
+        )
+        visual_path = editor_server.rendered_visual_evidence_path(
+            self.project, direct_render_id
+        )
+        self.assertEqual(
+            envelope["artifacts"]["visual_evidence"]["sha256"],
+            editor_server.file_sha256(visual_path),
+        )
+        self.assertEqual(
+            envelope["artifacts"]["motion_evidence"],
+            envelope["artifacts"]["visual_evidence"],
+        )
+        for optional_artifact in (
+            "caption_v2",
+            "audio_event_plan",
+            "audio_catalog",
+            "sfx_stem",
+        ):
+            self.assertIsNone(envelope["artifacts"][optional_artifact])
+        self.assertEqual(
+            envelope["renderer_identity"]["name"], "render_editor_timeline"
+        )
+        self.assertRegex(
+            envelope["renderer_identity"]["script_sha256"], r"^[0-9a-f]{64}$"
+        )
+        self.assertRegex(
+            envelope["renderer_identity"]["ffmpeg_executable_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertRegex(envelope["prepared_envelope_hash"], r"^[0-9a-f]{64}$")
+        staging_root = self.project / "working/delivery_envelopes/.staging"
+        stage_residue = (
+            [entry for entry in staging_root.iterdir() if entry.name != ".locks"]
+            if staging_root.is_dir()
+            else []
+        )
+        self.assertEqual(stage_residue, [])
         dimensions = subprocess.run(
             [
                 self.ffprobe,
@@ -3612,6 +3687,40 @@ class EditorRendererTests(unittest.TestCase):
 
         self.assertFalse(final.exists())
         self.assertIn("QA failed", result.stderr + result.stdout)
+
+    def test_direct_final_external_output_is_bound_by_its_envelope(self) -> None:
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        manifest["approvals"]["timeline"] = {
+            "approved": True,
+            "state_revision": gate_revision(self.project, "timeline", state),
+        }
+        self.write_json("project.json", manifest)
+        final = Path(self._tmp.name) / "external-delivery/final.mp4"
+
+        self.run_renderer("--quality", "final", "--output", str(final))
+
+        render_id = direct_final_render_id(state, final)
+        envelope = json.loads(
+            (
+                self.project
+                / "working/delivery_envelopes"
+                / f"{render_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(envelope["artifacts"]["output"]["path"], str(final.resolve()))
+        self.assertEqual(
+            envelope["artifacts"]["output"]["sha256"],
+            editor_server.file_sha256(final),
+        )
+        self.assertEqual(
+            json.loads(
+                (self.project / f"qa/{render_id}.json").read_text(encoding="utf-8")
+            )["video"],
+            str(final.resolve()),
+        )
 
     def test_snapshot_render_trims_to_selected_highlight_and_preserves_last_good_output(self) -> None:
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))

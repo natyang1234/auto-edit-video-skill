@@ -762,6 +762,52 @@ def semantic_director_mode(artifact) -> list[str]:
     return errors
 
 
+def semantic_delivery_envelope(artifact) -> list[str]:
+    """Validate delivery-envelope invariants not expressible in the dialect."""
+    errors: list[str] = []
+    if type(artifact.get("schema_version")) is not int or artifact.get("schema_version") != 1:
+        errors.append("$.schema_version: must be integer 1")
+    state = artifact.get("state")
+    prepared_hash = artifact.get("prepared_envelope_hash")
+    if state == "prepared" and prepared_hash is not None:
+        errors.append("$.prepared_envelope_hash: prepared envelope must be null")
+    if state == "finalized" and not isinstance(prepared_hash, str):
+        errors.append(
+            "$.prepared_envelope_hash: finalized envelope must bind a canonical prepared hash"
+        )
+    artifacts = artifact.get("artifacts")
+    if isinstance(artifacts, dict):
+        for required_name in (
+            "output",
+            "qa_report",
+            "contact_sheet",
+            "visual_evidence",
+            "motion_evidence",
+        ):
+            if artifacts.get(required_name) is None:
+                errors.append(f"$.artifacts.{required_name}: required for direct delivery")
+        for name, item in artifacts.items():
+            if item is None:
+                continue
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            if name != "output" and isinstance(path, str) and (path.startswith("/") or "\\" in path):
+                errors.append(f"$.artifacts.{name}.path: must be a project-relative POSIX path")
+            if name != "output" and isinstance(path, str):
+                parts = path.split("/")
+                if any(part in {"", ".", ".."} for part in parts):
+                    errors.append(f"$.artifacts.{name}.path: must be normalized")
+            digest = item.get("sha256")
+            if isinstance(digest, str) and digest != digest.lower():
+                errors.append(f"$.artifacts.{name}.sha256: must use lowercase hexadecimal")
+    renderer = artifact.get("renderer_identity")
+    if isinstance(renderer, dict):
+        if type(renderer.get("contract_version")) is not int or renderer.get("contract_version") != 1:
+            errors.append("$.renderer_identity.contract_version: must be integer 1")
+    return errors
+
+
 SEMANTIC_VALIDATORS = {
     "card_plan": semantic_card_plan,
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
@@ -773,6 +819,7 @@ SEMANTIC_VALIDATORS = {
     "video_analysis": semantic_video_analysis,
     "rights_assertion": semantic_rights_assertion,
     "director_mode": semantic_director_mode,
+    "delivery_envelope": semantic_delivery_envelope,
 }
 
 

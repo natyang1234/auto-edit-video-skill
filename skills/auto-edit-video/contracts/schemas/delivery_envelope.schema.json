@@ -1,0 +1,191 @@
+{
+  "$id": "delivery_envelope",
+  "title": "Direct finalized delivery envelope",
+  "x_schema_version": 1,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "route",
+    "render_id",
+    "state",
+    "quality",
+    "profile",
+    "timeline",
+    "artifacts",
+    "renderer_identity",
+    "prepared_envelope_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "route": {"const": "direct"},
+    "render_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,120}$"
+    },
+    "state": {"enum": ["prepared", "finalized"]},
+    "quality": {"const": "final"},
+    "profile": {
+      "type": "object",
+      "required": ["id", "resolved_profile_hash"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,120}$"
+        },
+        "resolved_profile_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "timeline": {
+      "type": "object",
+      "required": ["editor_state_revision", "cut_map_sha256"],
+      "properties": {
+        "editor_state_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "cut_map_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "output",
+        "qa_report",
+        "contact_sheet",
+        "visual_evidence",
+        "motion_evidence",
+        "caption_v2",
+        "audio_event_plan",
+        "audio_catalog",
+        "sfx_stem"
+      ],
+      "properties": {
+        "output": {
+          "type": "object",
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "qa_report": {
+          "type": "object",
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "contact_sheet": {
+          "type": "object",
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "visual_evidence": {
+          "type": "object",
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "motion_evidence": {
+          "type": "object",
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "caption_v2": {
+          "type": ["object", "null"],
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "audio_event_plan": {
+          "type": ["object", "null"],
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "audio_catalog": {
+          "type": ["object", "null"],
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "sfx_stem": {
+          "type": ["object", "null"],
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,500}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "renderer_identity": {
+      "type": "object",
+      "required": [
+        "name",
+        "contract_version",
+        "script_sha256",
+        "ffmpeg_executable_sha256"
+      ],
+      "properties": {
+        "name": {"const": "render_editor_timeline"},
+        "contract_version": {"const": 1},
+        "script_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "ffmpeg_executable_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "prepared_envelope_hash": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

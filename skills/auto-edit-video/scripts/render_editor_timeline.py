@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import qa_video
+import delivery_envelope
 from typing import Any
 
 from editor_server import (
@@ -1475,8 +1476,21 @@ def render_project(
         manifest, state, clip = load_render_snapshot(project_dir, snapshot_path, quality)
         snapshot_payload = read_json(snapshot_path, {}) or {}
         render_id = str(snapshot_payload.get("render_id") or "") or None
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
+    direct_stage: delivery_envelope.StagingAttempt | None = None
+    if direct_final:
+        if render_id is None:
+            raise RuntimeError("direct final render has no delivery identity")
+        direct_stage = delivery_envelope.begin_staging(
+            project_dir,
+            render_id,
+            expected_output=output,
+        )
+        temporary = direct_stage / delivery_envelope.STAGE_FILENAMES["output"]
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
+    published = False
+    publication_attempted = False
     try:
         visual_source: Path | None = None
         if clip is not None and state.get("visual_quality_mode") == "designed":
@@ -1542,8 +1556,13 @@ def render_project(
         if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
             raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
         if raw_visual_evidence is not None and render_id is not None:
+            evidence_output = (
+                direct_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
+                if direct_stage is not None
+                else rendered_visual_evidence_path(project_dir, render_id)
+            )
             atomic_write_json(
-                rendered_visual_evidence_path(project_dir, render_id),
+                evidence_output,
                 rendered_visual_quality_report(raw_visual_evidence),
             )
         if variant_id and quality == "final":
@@ -1561,20 +1580,63 @@ def render_project(
             os.replace(temporary, output)
             finalize_variant_delivery_receipt(project_dir, receipt, output, variant_id)
         elif direct_final:
-            if render_id is None:
+            if render_id is None or direct_stage is None:
                 raise RuntimeError("direct final render has no visual evidence identity")
+            staged_evidence = direct_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
             qa_direct_final_output(
                 project_dir,
                 temporary,
                 render_id,
-                rendered_visual_evidence_path(project_dir, render_id),
+                staged_evidence,
                 state,
+                report_path=direct_stage / delivery_envelope.STAGE_FILENAMES["qa_report"],
+                contact_path=direct_stage / delivery_envelope.STAGE_FILENAMES["contact_sheet"],
             )
-            os.replace(temporary, output)
+            staged_report = direct_stage / delivery_envelope.STAGE_FILENAMES["qa_report"]
+            report_payload = read_json(staged_report, {}) or {}
+            report_payload["video"] = str(output.expanduser().resolve())
+            atomic_write_json(staged_report, report_payload)
+            staged_sources = {
+                "output": temporary,
+                "qa_report": staged_report,
+                "contact_sheet": direct_stage / delivery_envelope.STAGE_FILENAMES["contact_sheet"],
+                "visual_evidence": staged_evidence,
+                "motion_evidence": staged_evidence,
+            }
+            prepared = delivery_envelope.build_prepared_envelope(
+                project_dir,
+                render_id,
+                output,
+                state,
+                staged_sources,
+                renderer_script=Path(__file__).resolve(),
+                ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+            )
+            delivery_envelope.write_prepared_envelope(direct_stage, prepared)
+            publication_attempted = True
+            delivery_envelope.publish_direct_delivery(
+                project_dir,
+                direct_stage,
+                staged_sources=staged_sources,
+                expected_output=output,
+            )
+            published = True
         else:
             os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
+        if (
+            direct_final
+            and render_id is not None
+            and direct_stage is not None
+            and not published
+            and not publication_attempted
+        ):
+            delivery_envelope.discard_staging(
+                project_dir,
+                render_id,
+                authority=direct_stage,
+            )
 
 
 def direct_final_render_id(state: dict[str, Any], output: Path) -> str:
@@ -1594,12 +1656,16 @@ def qa_unpublished_output(
     visual_evidence_path: Path,
     delivery_label: str,
     state: dict[str, Any] | None = None,
+    report_path: Path | None = None,
+    contact_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run QA on a still-unpublished final; raise before anything lands."""
     qa_dir = project_dir / "qa"
     qa_dir.mkdir(exist_ok=True)
-    report_path = qa_dir / f"{report_stem}.json"
-    contact_path = qa_dir / f"{report_stem}-contact.png"
+    report_path = report_path or qa_dir / f"{report_stem}.json"
+    contact_path = contact_path or qa_dir / f"{report_stem}-contact.png"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    contact_path.parent.mkdir(parents=True, exist_ok=True)
     qa_result = subprocess.run(
         [
             sys.executable,
@@ -1668,6 +1734,8 @@ def qa_direct_final_output(
     render_id: str,
     visual_evidence_path: Path,
     state: dict[str, Any] | None = None,
+    report_path: Path | None = None,
+    contact_path: Path | None = None,
 ) -> dict[str, Any]:
     return qa_unpublished_output(
         project_dir,
@@ -1676,6 +1744,8 @@ def qa_direct_final_output(
         visual_evidence_path,
         "direct final",
         state,
+        report_path=report_path,
+        contact_path=contact_path,
     )
 
 

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "route": "direct",
+  "render_id": "direct-final-demo",
+  "state": "finalized",
+  "quality": "final",
+  "profile": {
+    "id": "teacher-punch",
+    "resolved_profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "timeline": {
+    "editor_state_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "cut_map_sha256": null
+  },
+  "artifacts": {
+    "output": {"path": "/tmp/delivery-envelope-final.mp4", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 12},
+    "qa_report": {"path": "qa/direct-final-demo.json", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "bytes": 10},
+    "contact_sheet": {"path": "qa/direct-final-demo-contact.png", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "bytes": 8},
+    "visual_evidence": {"path": "working/render_visual_evidence/direct-final-demo.json", "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "bytes": 9},
+    "motion_evidence": {"path": "working/render_visual_evidence/direct-final-demo.json", "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "bytes": 9},
+    "caption_v2": null,
+    "audio_event_plan": null,
+    "audio_catalog": null,
+    "sfx_stem": null
+  },
+  "renderer_identity": {
+    "name": "render_editor_timeline",
+    "contract_version": 1,
+    "script_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "ffmpeg_executable_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "prepared_envelope_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+}
