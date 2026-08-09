@@ -80,6 +80,17 @@ class RenderedVisualQualityReportTests(unittest.TestCase):
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["visual_beat_count"], 0)
 
+    def test_explicit_no_visual_delivery_remains_valid_at_high_motion(self) -> None:
+        report = rendered_visual_quality_report(
+            self._evidence(motion_intensity="high", items=[])
+        )
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["visual_beat_count"], 0)
+        self.assertEqual(report["motion_requested_count"], 0)
+        self.assertEqual(report["motion_fallback_count"], 0)
+        self.assertIsNone(report["motion_faithful_ratio"])
+
     def test_text_card_requires_primary_font_evidence(self) -> None:
         evidence = self._evidence(
             items=[
@@ -149,6 +160,158 @@ class RenderedVisualQualityReportTests(unittest.TestCase):
         self.assertEqual(report["motion_faithful_ratio"], 1.0)
         self.assertEqual(report["failures"], [])
         self.assertEqual(report["warnings"], [])
+
+    def test_high_motion_missing_evidence_fails_and_counts_as_fallback(self) -> None:
+        evidence = self._evidence(
+            motion_intensity="high",
+            items=[
+                {
+                    "id": "text-1",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "kind": "text",
+                    "minimum_primary_font_px": 48.0,
+                }
+            ],
+        )
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["motion_requested_count"], 1)
+        self.assertEqual(report["motion_faithful_count"], 0)
+        self.assertEqual(report["motion_fallback_count"], 1)
+        self.assertEqual(report["motion_faithful_ratio"], 0.0)
+        self.assertTrue(any("motion evidence missing" in failure for failure in report["failures"]))
+
+    def test_high_motion_empty_request_is_missing_evidence(self) -> None:
+        for requested in ("", False):
+            with self.subTest(requested=requested):
+                evidence = self._evidence(
+                    motion_intensity="high",
+                    items=[
+                        {
+                            "id": "text-empty-request",
+                            "start": 0.0,
+                            "end": 2.0,
+                            "kind": "text",
+                            "minimum_primary_font_px": 48.0,
+                            "motion": {
+                                "requested": requested,
+                                "delivered": "static",
+                                "faithful": True,
+                                "status": "native",
+                            },
+                        }
+                    ],
+                )
+
+                report = rendered_visual_quality_report(evidence)
+
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["motion_requested_count"], 1)
+                self.assertEqual(report["motion_faithful_count"], 0)
+                self.assertEqual(report["motion_fallback_count"], 1)
+                self.assertEqual(report["motion_faithful_ratio"], 0.0)
+                self.assertTrue(
+                    any("motion evidence missing" in failure for failure in report["failures"])
+                )
+
+    def test_high_motion_fallback_status_cannot_claim_faithful(self) -> None:
+        for status in ("fallback", " FALLBACK "):
+            with self.subTest(status=status):
+                evidence = self._evidence(
+                    motion_intensity="high",
+                    items=[
+                        {
+                            "id": "text-fallback-status",
+                            "start": 0.0,
+                            "end": 2.0,
+                            "kind": "text",
+                            "minimum_primary_font_px": 48.0,
+                            "motion": {
+                                "requested": "slide-up",
+                                "delivered": "fade",
+                                "faithful": True,
+                                "status": status,
+                            },
+                        }
+                    ],
+                )
+
+                report = rendered_visual_quality_report(evidence)
+
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["motion_requested_count"], 1)
+                self.assertEqual(report["motion_faithful_count"], 0)
+                self.assertEqual(report["motion_fallback_count"], 1)
+                self.assertEqual(report["motion_faithful_ratio"], 0.0)
+
+    def test_high_motion_empty_delivered_cannot_claim_faithful(self) -> None:
+        for delivered in ("", "none", "static", " STATIC "):
+            with self.subTest(delivered=delivered):
+                evidence = self._evidence(
+                    motion_intensity="high",
+                    items=[
+                        {
+                            "id": "text-empty-delivered",
+                            "start": 0.0,
+                            "end": 2.0,
+                            "kind": "text",
+                            "minimum_primary_font_px": 48.0,
+                            "motion": {
+                                "requested": "slide-up",
+                                "delivered": delivered,
+                                "faithful": True,
+                                "status": "native",
+                            },
+                        }
+                    ],
+                )
+
+                report = rendered_visual_quality_report(evidence)
+
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["motion_requested_count"], 1)
+                self.assertEqual(report["motion_faithful_count"], 0)
+                self.assertEqual(report["motion_fallback_count"], 1)
+                self.assertEqual(report["motion_faithful_ratio"], 0.0)
+
+    def test_high_motion_mixed_missing_evidence_fails_coverage(self) -> None:
+        evidence = self._evidence(
+            motion_intensity="high",
+            items=[
+                {
+                    "id": "text-faithful",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "kind": "text",
+                    "minimum_primary_font_px": 48.0,
+                    "motion": {
+                        "requested": "slide-up",
+                        "delivered": "slide-up",
+                        "faithful": True,
+                        "status": "delivered",
+                    },
+                },
+                {
+                    "id": "text-missing",
+                    "start": 2.0,
+                    "end": 4.0,
+                    "kind": "text",
+                    "minimum_primary_font_px": 48.0,
+                },
+            ],
+        )
+
+        report = rendered_visual_quality_report(evidence)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["motion_requested_count"], 2)
+        self.assertEqual(report["motion_faithful_count"], 1)
+        self.assertEqual(report["motion_fallback_count"], 1)
+        self.assertEqual(report["motion_faithful_ratio"], 0.5)
+        self.assertTrue(any("motion evidence missing" in failure for failure in report["failures"]))
 
     def test_live_medium_static_fallback_warns_but_passes(self) -> None:
         evidence = self._evidence(

@@ -493,6 +493,10 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
 
         motion = item.get("motion")
         if motion is None:
+            if motion_intensity == "high":
+                requested_motion_count += 1
+                fallback_motion_count += 1
+                unfaithful_motion.append((str(item_id), "motion evidence missing"))
             continue
         if not isinstance(motion, dict):
             raise ValueError(f"items[{item_index}].motion must be an object")
@@ -515,7 +519,18 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
             motion.get("reason"), str
         ):
             raise ValueError(f"items[{item_index}].motion.reason must be a string")
+        normalized_status = status.strip().lower()
+        normalized_delivery = delivered.strip().lower()
+        if motion_intensity == "high" and (
+            normalized_status == "fallback"
+            or (faithful and normalized_delivery in {"", "none", "static"})
+        ):
+            faithful = False
         if not requested:
+            if motion_intensity == "high":
+                requested_motion_count += 1
+                fallback_motion_count += 1
+                unfaithful_motion.append((str(item_id), "motion evidence missing"))
             continue
         requested_motion_count += 1
         if faithful:
