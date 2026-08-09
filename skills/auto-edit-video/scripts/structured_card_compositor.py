@@ -27,8 +27,26 @@ ARTIFACTS_REL = Path("working/structured_layer_artifacts.json")
 # captions beside it reads as fine print (nat, watching a delivery).
 # v3: the title refuses to shrink below its floor; a fallback title
 # holding a whole transcript sentence is trimmed instead.
-COMPILER_VERSION = "static-card-compositor-v3"
+COMPILER_VERSION = "static-card-compositor-v4"
 MIN_LABEL_PT = 11.0
+# Cards are watched at phone size beside 52--68px captions.  The old list
+# ramp started at 32 design pixels and could shrink to 11, which made a 540p
+# preview render body copy at just 16 (or fewer) output pixels.  Keep primary
+# card copy near caption scale and refuse a shrink into fine print.
+LIST_BODY_PT = 44.0
+MIN_LIST_BODY_PT = 36.0
+LIST_ROW_PT = 62.0
+TITLE_PT = 58.0
+STAT_VALUE_PT = 64.0
+STAT_LABEL_PT = 34.0
+MIN_STAT_LABEL_PT = 30.0
+METADATA_PT = 26.0
+MIN_METADATA_PT = 22.0
+CHART_LABEL_PT = 28.0
+MIN_CHART_LABEL_PT = 24.0
+CHART_LABEL_ZONE_PT = 42.0
+KICKER_PT = 24.0
+SUBTITLE_PT = 32.0
 
 
 def compositor_available() -> bool:
@@ -74,16 +92,44 @@ def _line_width(ct, attributed) -> float:
     return float(width)
 
 
-def _fit_text(foundation, ct, quartz, text, size, color, max_width, render_scale):
+def _fit_text(
+    foundation, ct, quartz, text, size, color, max_width, render_scale,
+    minimum_pt: float = MIN_LABEL_PT,
+):
     """Shrink to fit; below the minimum point size the card fails closed."""
     current = size
-    while current >= MIN_LABEL_PT * render_scale:
+    while current >= minimum_pt * render_scale:
         attributed = _attributed(foundation, ct, quartz, text, current, color)
         if _line_width(ct, attributed) <= max_width:
             return attributed, current
         current *= 0.9
     raise ValueError(
         f"label does not fit at the minimum size: {text!r} "
+        "(shorten the copy or widen the layer)"
+    )
+
+
+def _fit_text_lines(
+    foundation, ct, quartz, text, size, color, max_width, render_scale,
+    minimum_pt: float, max_lines: int,
+):
+    """Keep readable type and wrap before considering a smaller size."""
+    current = size
+    while current >= minimum_pt * render_scale:
+        def measure(candidate: str) -> float:
+            return _line_width(
+                ct, _attributed(foundation, ct, quartz, candidate, current, color)
+            )
+
+        lines = caption_compositor.wrap_lines(str(text), measure, max_width)
+        if lines and len(lines) <= max_lines:
+            return [
+                _attributed(foundation, ct, quartz, line, current, color)
+                for line in lines
+            ], current
+        current *= 0.9
+    raise ValueError(
+        f"label does not fit in {max_lines} readable lines: {text!r} "
         "(shorten the copy or widen the layer)"
     )
 
@@ -234,7 +280,7 @@ def render_card(
         title_text = str(payload.get("title") or "")
         title, title_size = _fit_text(
             foundation, ct, quartz, title_text,
-            58 * scale, ink, card_width - pad * 2, scale,
+            TITLE_PT * scale, ink, card_width - pad * 2, scale,
         )
         floor = 42 * scale
         while title_size < floor and len(title_text) > 4:
@@ -245,10 +291,24 @@ def render_card(
             )
             title, title_size = _fit_text(
                 foundation, ct, quartz, title_text,
-                58 * scale, ink, card_width - pad * 2, scale,
+                TITLE_PT * scale, ink, card_width - pad * 2, scale,
             )
         kicker_text = str(payload.get("kicker") or "")
         subtitle_text = str(payload.get("subtitle") or "")
+        kicker = None
+        kicker_size = 0.0
+        if kicker_text:
+            kicker, kicker_size = _fit_text(
+                foundation, ct, quartz, kicker_text, KICKER_PT * scale,
+                accent, card_width - pad * 2, scale, MIN_METADATA_PT,
+            )
+        subtitle = None
+        subtitle_size = 0.0
+        if subtitle_text:
+            subtitle, subtitle_size = _fit_text(
+                foundation, ct, quartz, subtitle_text, SUBTITLE_PT * scale,
+                muted, card_width - pad * 2, scale, MIN_STAT_LABEL_PT,
+            )
         # A hook fills the screen and is read as a statement; a lower third is
         # a band along the bottom. The payload has said which since the
         # director started emitting these, and only the pack's default was
@@ -260,14 +320,15 @@ def render_card(
                 card_width = int(
                     min(card_width, _line_width(ct, title) + pad * 2)
                 )
-        height = int(pad * 2 + title_size * 1.4 + (22 * scale if kicker_text else 0)
-                     + (26 * scale if subtitle_text else 0))
+        height = int(
+            pad * 2 + title_size * 1.4
+            + (kicker_size * 1.25 + 8 * scale if kicker is not None else 0)
+            + (subtitle_size * 1.35 + 8 * scale if subtitle is not None else 0)
+        )
         context = _begin_card(quartz, card_width, height, panel)
         cursor = height - pad
-        if kicker_text:
-            kicker, _ = _fit_text(foundation, ct, quartz, kicker_text, 16 * scale,
-                                  accent, card_width - pad * 2, scale)
-            cursor -= 16 * scale
+        if kicker is not None:
+            cursor -= kicker_size
             _draw_line(ct, quartz, context, kicker, pad, cursor)
             cursor -= 8 * scale
         cursor -= title_size
@@ -281,19 +342,31 @@ def render_card(
             quartz.CGContextFillRect(
                 context, quartz.CGRectMake(pad, cursor - 10 * scale, card_width - pad * 2, 2 * scale)
             )
-        if subtitle_text:
-            subtitle, _ = _fit_text(foundation, ct, quartz, subtitle_text, 18 * scale,
-                                    muted, card_width - pad * 2, scale)
-            cursor -= 26 * scale
+        if subtitle is not None:
+            cursor -= subtitle_size * 1.35
             _draw_line(ct, quartz, context, subtitle, pad, cursor)
     elif layer_type == "stat":
         value_text = str(payload.get("value"))
         value, value_size = _fit_text(foundation, ct, quartz, value_text,
-                                      64 * scale, accent, card_width - pad * 2, scale)
-        label, _ = _fit_text(foundation, ct, quartz, str(payload.get("label") or ""),
-                             20 * scale, ink, card_width - pad * 2, scale)
+                                      STAT_VALUE_PT * scale, accent, card_width - pad * 2, scale)
+        label, label_size = _fit_text(
+            foundation, ct, quartz, str(payload.get("label") or ""),
+            STAT_LABEL_PT * scale, ink, card_width - pad * 2, scale,
+            MIN_STAT_LABEL_PT,
+        )
         source_text = str(payload.get("source_literal") or "")
-        height = int(pad * 2 + value_size * 1.2 + 30 * scale + (20 * scale if source_text else 0))
+        source = None
+        source_size = 0.0
+        if source_text:
+            source, source_size = _fit_text(
+                foundation, ct, quartz, f"「{source_text}」",
+                METADATA_PT * scale, muted, card_width - pad * 2, scale,
+                MIN_METADATA_PT,
+            )
+        height = int(
+            pad * 2 + value_size * 1.2 + label_size * 1.35
+            + (source_size * 1.35 if source is not None else 0)
+        )
         context = _begin_card(quartz, card_width, height, panel)
         cursor = height - pad - value_size
         _draw_line(
@@ -312,12 +385,10 @@ def render_card(
             quartz.CGContextFillRect(
                 context, quartz.CGRectMake(pad, pad, track * filled, 6 * scale)
             )
-        cursor -= 26 * scale
+        cursor -= label_size * 1.25
         _draw_line(ct, quartz, context, label, pad, cursor)
-        if source_text:
-            source, _ = _fit_text(foundation, ct, quartz, f"「{source_text}」",
-                                  13 * scale, muted, card_width - pad * 2, scale)
-            cursor -= 20 * scale
+        if source is not None:
+            cursor -= source_size * 1.35
             _draw_line(ct, quartz, context, source, pad, cursor)
     elif layer_type == "quote":
         # A pulled quote is the line, set large, with the marks that say it is
@@ -431,7 +502,7 @@ def render_card(
         datums = payload.get("datums") or []
         chart_kind = payload.get("chart_kind")
         plot_height = int(150 * scale)
-        label_zone = int(26 * scale)
+        label_zone = int(CHART_LABEL_ZONE_PT * scale)
         height = pad * 2 + plot_height + label_zone
         context = _begin_card(quartz, card_width, height, panel)
         plot_left = pad
@@ -457,7 +528,8 @@ def render_card(
                 points.append((x0 + slot / 2, baseline + value * unit))
             label, _ = _fit_text(
                 foundation, ct, quartz, str(datums[index].get("label") or ""),
-                13 * scale, ink, slot * 0.9, scale,
+                CHART_LABEL_PT * scale, ink, slot * 0.9, scale,
+                MIN_CHART_LABEL_PT,
             )
             _draw_line(ct, quartz, context, label, x0 + slot * 0.08, pad * 0.6)
         if chart_kind == "line" and len(points) >= 2:
@@ -470,14 +542,13 @@ def render_card(
             quartz.CGContextStrokePath(context)
     elif layer_type == "dynamic_list":
         entries = payload.get("items") or []
-        row = int(48 * scale)
-        wrapped = 2 if component.get("kind") in {"carousel_grid", "calendar_reveal"} else 1
-        rows = (len(entries) + wrapped - 1) // wrapped
-        height = pad * 2 + row * max(rows, 1)
-        context = _begin_card(quartz, card_width, height, panel)
+        row = int(LIST_ROW_PT * scale)
         kind = component.get("kind")
         columns = 2 if kind in {"carousel_grid", "calendar_reveal"} else 1
         column_width = (card_width - pad * 2) / columns
+        per_column = max(1, (len(entries) + columns - 1) // columns)
+        prepared: list[tuple[int, list[Any], float]] = []
+        column_heights = [0 for _ in range(columns)]
         for index, entry in enumerate(entries):
             if kind == "warning_checklist":
                 prefix = "⚠ " if entry.get("severity") == "warning" else "✓ "
@@ -485,18 +556,26 @@ def render_card(
                 prefix = ""
             else:
                 prefix = f"{index + 1}. "
-            line, _ = _fit_text(
+            lines, line_size = _fit_text_lines(
                 foundation, ct, quartz,
                 f"{prefix}{entry.get('text', '')}",
-                32 * scale, ink, column_width - pad * 0.5, scale,
+                LIST_BODY_PT * scale, ink, column_width - pad * 0.5, scale,
+                MIN_LIST_BODY_PT, 2,
             )
-            column, position = divmod(index, max(1, (len(entries) + columns - 1) // columns)) \
-                if columns > 1 else (0, index)
-            _draw_line(
-                ct, quartz, context, line,
-                pad + column * column_width,
-                height - pad - row * position - 34 * scale,
-            )
+            column = min(columns - 1, index // per_column)
+            prepared.append((column, lines, line_size))
+            column_heights[column] += row * len(lines)
+        height = pad * 2 + max([row, *column_heights])
+        context = _begin_card(quartz, card_width, height, panel)
+        cursors = [height - pad for _ in range(columns)]
+        for column, lines, line_size in prepared:
+            for line in lines:
+                cursors[column] -= line_size
+                _draw_line(
+                    ct, quartz, context, line,
+                    pad + column * column_width, cursors[column],
+                )
+                cursors[column] -= row - line_size
     elif layer_type == "note":
         # A small widget quoting something the speaker referred to: an icon,
         # what it is, and when. Light surface — the footage these sit on is
@@ -726,4 +805,3 @@ def load_default_pack() -> dict[str, Any]:
         raise RuntimeError("style pack registry invalid: " + "; ".join(errors))
     _PACK_CACHE = pack
     return pack
-

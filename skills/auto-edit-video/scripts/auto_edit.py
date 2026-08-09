@@ -5163,7 +5163,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--framing", choices=("auto", "contain", "cover"), default="auto",
         help="auto keeps the whole picture when the source is wider than the target",
     )
-    cut.add_argument("--quality", choices=("preview", "final"), default="preview")
+    cut.add_argument("--quality", choices=("preview", "final"), default="final")
     cut.add_argument("--timeout", type=int, default=900)
     cut.add_argument(
         "--cards-from-model", action="store_true",

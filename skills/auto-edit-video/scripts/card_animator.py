@@ -31,7 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-ANIMATOR_VERSION = "hyperframes-card-animator-v1"
+ANIMATOR_VERSION = "hyperframes-card-animator-v2"
 ANIMATIONS_REL = Path("working/structured_cards")
 # The presets whose motion lives inside the card. `flip` stays approximated:
 # a page turn needs a second page to turn to, which these payloads carry no
@@ -151,25 +151,32 @@ def build_card_html(
     height: int,
     duration_s: float,
     fps: int,
+    render_scale: float = 1.0,
 ) -> str:
+    import structured_card_compositor as compositor
+
     ink = _token(pack, "palette", "ink", "#E6EDF3")
     accent = _token(pack, "palette", "accent", "#E5484D")
     panel = _token(pack, "palette", "panel", "#161B22")
-    # Type sizes mirror the static compositor's constants; the two draw the
-    # same card or the swap is visible.
+    # Type sizes and geometry come from the static compositor's public ramp;
+    # the animated clip replaces that PNG in-place, so even a preview-scale
+    # artifact must not jump to a different layout or crop its rows.
+    def px(value: float) -> str:
+        return f"{value * render_scale:g}px"
+
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
 html,body{{margin:0;background:transparent}}
 #stage{{position:relative;width:{width}px;height:{height}px;
   font-family:'PingFang TC','Noto Sans TC',sans-serif}}
-.card{{position:absolute;inset:0;background:{panel}EB;border-radius:14px;
-  padding:28px;box-sizing:border-box;color:{ink};overflow:hidden}}
-.title{{font-size:58px;font-weight:700;text-align:center}}
+.card{{position:absolute;inset:0;background:{panel}EB;border-radius:{px(14)};
+  padding:{px(28)};box-sizing:border-box;color:{ink};overflow:hidden}}
+.title{{font-size:{px(compositor.TITLE_PT)};font-weight:700;text-align:center}}
 .u{{display:inline-block;white-space:pre}}
-.list{{font-size:32px;line-height:48px}}
+.list{{font-size:{px(compositor.LIST_BODY_PT)};line-height:{px(compositor.LIST_ROW_PT)}}}
 .index{{color:{accent}}}
-.value{{font-size:64px;font-weight:700;color:{accent}}}
-.label{{font-size:20px;margin-top:6px}}
-.track{{height:6px;background:#9AA4AF55;margin-top:10px}}
+.value{{font-size:{px(compositor.STAT_VALUE_PT)};font-weight:700;color:{accent}}}
+.label{{font-size:{px(compositor.STAT_LABEL_PT)};margin-top:{px(6)}}}
+.track{{height:{px(6)};background:#9AA4AF55;margin-top:{px(10)}}}
 .bar{{height:100%;background:{accent};transform-origin:left center}}
 </style></head><body>
 <div id="stage" data-composition-id="card-animation" data-start="0"
@@ -202,6 +209,7 @@ def render_card_animation(
     height: int,
     duration_s: float,
     fps: int,
+    render_scale: float = 1.0,
 ) -> Path:
     """The card's animation as a transparent .mov, cached by what shaped it."""
     if preset not in CONTENT_PRESETS:
@@ -210,12 +218,14 @@ def render_card_animation(
     if command is None:
         raise ValueError("HyperFrames CLI is not installed")
     seconds = round(float(duration_s) + TAIL_SECONDS, 3)
-    page = build_card_html(layer, pack, preset, width, height, seconds, fps)
+    page = build_card_html(
+        layer, pack, preset, width, height, seconds, fps, render_scale
+    )
     key = hashlib.sha256(
         json.dumps(
             [ANIMATOR_VERSION, layer.get("type"), layer.get("payload"),
              pack.get("id"), pack.get("version"), preset,
-             width, height, seconds, fps],
+             width, height, seconds, fps, render_scale],
             ensure_ascii=False, sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()[:16]

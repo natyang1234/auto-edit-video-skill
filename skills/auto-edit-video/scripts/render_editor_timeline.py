@@ -240,6 +240,7 @@ def animated_card_overlay_source(
     artifact: dict[str, Any],
     duration_s: float,
     fps: int,
+    render_scale: float = 1.0,
 ) -> str | None:
     """A transparent .mov of the card's content animation, or None.
 
@@ -262,13 +263,22 @@ def animated_card_overlay_source(
     except ValueError:
         return None
     preset = str((component.get("motion") or {}).get("preset") or "")
-    if preset not in card_animator.CONTENT_PRESETS or not card_animator.available():
+    if preset not in card_animator.CONTENT_PRESETS:
+        return None
+    if not card_animator.available():
+        print(
+            json.dumps({"card_animation_fallback": {
+                "layer": layer_id, "preset": preset,
+                "reason": "card animator unavailable",
+            }}, ensure_ascii=False),
+            file=sys.stderr,
+        )
         return None
     try:
         rendered = card_animator.render_card_animation(
             project_dir, layer, pack, preset,
             int(artifact.get("width") or 0), int(artifact.get("height") or 0),
-            duration_s, fps,
+            duration_s, fps, render_scale,
         )
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         print(
@@ -842,6 +852,7 @@ def build_render_command(
                     project_dir, resolved_pack, layers_bundle, layer_ref,
                     artifact, window_end - window_start,
                     int(canvas.get("fps", 30)),
+                    render_scale,
                 )
                 overlays.append(
                     {

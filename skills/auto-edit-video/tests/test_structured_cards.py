@@ -153,6 +153,75 @@ class StructuredCardTests(unittest.TestCase):
                 scc.COMPONENTS_BY_TYPE[layer_type],
             )
 
+    def test_dynamic_list_allocates_caption_scale_rows_at_preview_resolution(self) -> None:
+        """A preview must preserve the same readable proportions as final.
+
+        The birthday delivery rendered list copy at 16 output pixels in a
+        540-wide preview: scaling that back to the 1080 design canvas was a
+        32-pixel body beside 52--68-pixel captions.  Row geometry is the
+        public artifact-level signal that the list is no longer fine print.
+        """
+        layer = {
+            "id": "structured-layer-readable-list",
+            "type": "dynamic_list",
+            "payload": {"items": [{"text": "第一個願望"}, {"text": "第二個願望"}]},
+        }
+        _path, _digest, _width, height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 0.5
+        )
+        self.assertGreaterEqual(height / 0.5, 180)
+
+    def test_dynamic_list_wraps_long_copy_instead_of_shrinking_it_to_one_line(self) -> None:
+        layer = {
+            "id": "structured-layer-readable-wrapped-list",
+            "type": "dynamic_list",
+            "payload": {"items": [{"text": "把時間留給真正重要而且值得長久陪伴的人們"}]},
+        }
+        _path, _digest, _width, height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 0.5
+        )
+        self.assertGreaterEqual(height / 0.5, 170)
+
+    def test_stat_label_is_not_laid_out_as_metadata_fine_print(self) -> None:
+        layer = {
+            "id": "structured-layer-readable-stat",
+            "type": "stat",
+            "payload": {"value": "87%", "label": "完成率"},
+        }
+        _path, _digest, _width, height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 0.5
+        )
+        self.assertGreaterEqual(height / 0.5, 178)
+
+    def test_chart_labels_get_a_readable_label_zone(self) -> None:
+        layer = {
+            "id": "structured-layer-readable-chart",
+            "type": "chart",
+            "payload": {
+                "chart_kind": "bar",
+                "datums": [{"label": "第一季", "value": 40}, {"label": "第二季", "value": 60}],
+            },
+        }
+        _path, _digest, _width, height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 0.5
+        )
+        self.assertGreaterEqual(height / 0.5, 248)
+
+    def test_title_supporting_copy_is_not_smaller_than_card_metadata(self) -> None:
+        layer = {
+            "id": "structured-layer-readable-title",
+            "type": "title",
+            "payload": {
+                "title": "三個生日願望",
+                "kicker": "TODAY",
+                "subtitle": "送給現在的自己",
+            },
+        }
+        _path, _digest, _width, height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 0.5
+        )
+        self.assertGreaterEqual(height / 0.5, 210)
+
     def test_progress_component_requires_a_ratio(self) -> None:
         layer = {
             "id": "layer-progress",

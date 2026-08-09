@@ -2351,6 +2351,10 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         "director_style": director_id,
         "visual_quality_mode": "designed",
         "graphic_package_style": "craft-stack",
+        "style_pack": {
+            "project_default": "dark-data-presenter",
+            "per_highlight": {},
+        },
         "video_template": default_video_template_state(),
         "editing_brief": str(plan_configuration.get("editing_brief", ""))[:2000],
         "caption_defaults": caption_style,

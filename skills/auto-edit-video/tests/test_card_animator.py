@@ -8,6 +8,7 @@ ships with its approximation, exactly as before.
 """
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -70,6 +71,23 @@ class WhatAnimatesTests(unittest.TestCase):
         self.assertIn('data-width="907"', page)
         self.assertIn('data-height="200"', page)
 
+    def test_content_animation_uses_the_static_cards_readable_type_ramp(self) -> None:
+        page = card_animator.build_card_html(
+            {"type": "dynamic_list", "payload": {"items": [{"text": "第一項"}]}},
+            {}, "staggered-reveal", 907, 200, 5.5, 30,
+        )
+        self.assertIn("font-size:44px", page)
+        self.assertIn("line-height:62px", page)
+
+    def test_content_animation_scales_with_its_preview_artifact(self) -> None:
+        page = card_animator.build_card_html(
+            {"type": "dynamic_list", "payload": {"items": [{"text": "第一項"}]}},
+            {}, "staggered-reveal", 453, 90, 5.5, 30, render_scale=0.5,
+        )
+        self.assertIn("font-size:22px", page)
+        self.assertIn("line-height:31px", page)
+        self.assertIn("padding:14px", page)
+
     def test_disabled_by_environment_means_unavailable(self) -> None:
         import os
         from unittest.mock import patch
@@ -102,6 +120,36 @@ class FallbackTests(unittest.TestCase):
                 {"width": 800, "height": 200}, 5.5, 30,
             )
         )
+
+    def test_unavailable_content_animation_reports_its_static_fallback(self) -> None:
+        import contextlib
+        import io
+        import os
+        from unittest.mock import patch
+
+        pack = {"components": [
+            {"id": "dynamic-list", "kind": "dynamic_list", "layout": "left-stack",
+             "motion": {"preset": "staggered-reveal"}},
+        ]}
+        layers = {"items": [{
+            "id": "structured-layer-aaaa1111", "type": "dynamic_list",
+            "payload": {"items": [{"text": "第一項"}]},
+        }]}
+        warning = io.StringIO()
+        with (
+            patch.dict(os.environ, {"AUTO_EDIT_DISABLE_CARD_ANIMATION": "1"}),
+            contextlib.redirect_stderr(warning),
+        ):
+            result = renderer.animated_card_overlay_source(
+                Path("/tmp"), pack, layers, "structured-layer-aaaa1111",
+                {"width": 800, "height": 200}, 5.5, 30,
+            )
+        self.assertIsNone(result)
+        payload = json.loads(warning.getvalue())
+        self.assertEqual(
+            payload["card_animation_fallback"]["preset"], "staggered-reveal"
+        )
+        self.assertIn("unavailable", payload["card_animation_fallback"]["reason"])
 
 
 class CardCacheTests(unittest.TestCase):

@@ -45,7 +45,7 @@ from editor_server import (  # noqa: E402
 # Mirrors what the policy-enforcing qa_video writes; delivery validation
 # rejects QA reports that lack this block (pre-policy reports).
 SYNTHETIC_QA_POLICY = dataclasses.asdict(qa_video.QaPolicy())
-from render_editor_timeline import build_render_command, text_filter  # noqa: E402
+from render_editor_timeline import build_render_command, image_filter, text_filter  # noqa: E402
 
 
 class FakeAssetProviderService:
@@ -177,6 +177,36 @@ class CaptionEffectModelTests(unittest.TestCase):
         )
         self.assertEqual(spans[0]["text"], "真正的主詞")
         self.assertEqual("真正的主詞，也就是最重要的意思。"[spans[0]["start_char"] : spans[0]["end_char"]], "真正的主詞")
+
+
+class StructuredCardMotionFilterTests(unittest.TestCase):
+    """Finished card images must still move horizontally during their hold."""
+
+    def test_slide_in_and_pan_change_image_x_over_time(self) -> None:
+        for animation, expected in (
+            ("slide-in", ("if(lt(t,", "-t)/")),
+            ("pan", ("min(1,max(0,(t-", "*min(1,max(0,")),
+        ):
+            with self.subTest(animation=animation):
+                overlay = {
+                    "id": "structured-card-image",
+                    "type": "image",
+                    "source": "working/structured_cards/card.png",
+                    "start": 1.0,
+                    "end": 3.0,
+                    "style": {
+                        "width": 60.0,
+                        "x": 50,
+                        "y": 42,
+                        "animation": animation,
+                    },
+                }
+                rendered = image_filter("base", "out", "asset", overlay, 960, 540)
+                x_expression = rendered.split("overlay=x='", 1)[1].split("':y=", 1)[0]
+                self.assertTrue(
+                    all(fragment in x_expression for fragment in expected),
+                    x_expression,
+                )
 
 
 class EditorServerTests(unittest.TestCase):
@@ -1954,6 +1984,16 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(payload["csrf_token"], self.server.csrf_token)
+
+    def test_new_default_state_selects_the_default_style_pack(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body.decode("utf-8"))["state"]
+        self.assertEqual(
+            state["style_pack"],
+            {"project_default": "dark-data-presenter", "per_highlight": {}},
+        )
+        self.assertEqual(validate_editor_state(state, 2.0), [])
 
     def test_v1_state_migrates_on_project_get_and_voids_every_gate(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")

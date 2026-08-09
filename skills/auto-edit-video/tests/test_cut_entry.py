@@ -493,6 +493,19 @@ class PauseTrimmingTests(unittest.TestCase):
         )
         self.assertFalse(args.keep_pauses)
 
+    def test_cut_defaults_to_final_quality_but_honors_explicit_quality(self) -> None:
+        parser = auto_edit.build_parser()
+        self.assertEqual(
+            parser.parse_args(["cut", "--input", "a.mp4", "--out", "o"]).quality,
+            "final",
+        )
+        for quality in ("preview", "final"):
+            with self.subTest(quality=quality):
+                args = parser.parse_args(
+                    ["cut", "--input", "a.mp4", "--out", "o", "--quality", quality]
+                )
+                self.assertEqual(args.quality, quality)
+
 
 class RotatedSourceTests(unittest.TestCase):
     """A phone stores the sensor frame and a rotation to display it by.
