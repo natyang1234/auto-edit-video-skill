@@ -3462,6 +3462,19 @@ class EditorRendererTests(unittest.TestCase):
         self.write_json("project.json", manifest)
         self.run_renderer("--quality", "final", "--output", str(final))
         self.assertTrue(final.is_file())
+        import render_editor_timeline
+
+        direct_render_id = render_editor_timeline.direct_final_render_id(state, final)
+        evidence_path = editor_server.rendered_visual_evidence_path(
+            self.project, direct_render_id
+        )
+        self.assertTrue(evidence_path.is_file())
+        direct_report = json.loads(
+            (self.project / f"qa/{direct_render_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(direct_report["schema_version"], 3)
+        self.assertEqual(direct_report["visual_delivery"]["source"], "renderer_evidence")
+        self.assertEqual(direct_report["visual_delivery"]["status"], "pass")
         dimensions = subprocess.run(
             [
                 self.ffprobe,
@@ -3494,6 +3507,38 @@ class EditorRendererTests(unittest.TestCase):
             str(cover),
         )
         self.assertTrue(cover.is_file())
+
+    def test_direct_final_visual_failure_is_not_published(self) -> None:
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["overlays"].append(
+            {
+                "id": "tiny-card",
+                "type": "card",
+                "text": "這張字卡太小",
+                "start": 0.05,
+                "end": 0.35,
+                "visible": True,
+                "style": {"font_size": 31},
+                "layout": {},
+            }
+        )
+        self.write_json("working/editor_state.json", state)
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        manifest["approvals"]["timeline"] = {
+            "approved": True,
+            "state_revision": gate_revision(self.project, "timeline", state),
+        }
+        self.write_json("project.json", manifest)
+        final = self.project / "renders/tiny-direct-final.mp4"
+
+        result = self.run_renderer(
+            "--quality", "final", "--output", str(final), expected=2
+        )
+
+        self.assertFalse(final.exists())
+        self.assertIn("QA failed", result.stderr + result.stdout)
 
     def test_snapshot_render_trims_to_selected_highlight_and_preserves_last_good_output(self) -> None:
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))

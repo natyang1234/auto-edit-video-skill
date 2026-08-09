@@ -154,6 +154,10 @@ class CaptionGoldenTests(unittest.TestCase):
                 "fit": "cover",
             },
             "director_style": "teacher-punch",
+            "qa_policy": {
+                "profile": "silent_delivery",
+                "intent": "caption raster golden uses intentionally silent synthetic audio",
+            },
             "caption_defaults": {},
             "highlights": [],
             "asset_digests": {},

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1422,6 +1423,7 @@ def render_project(
     snapshot_path: Path | None = None,
     variant_id: str | None = None,
 ) -> None:
+    direct_final = quality == "final" and snapshot_path is None and variant_id is None
     render_id: str | None = None
     if snapshot_path is None:
         manifest = read_json(project_dir / "project.json", {}) or {}
@@ -1468,6 +1470,7 @@ def render_project(
             rights_errors = rights_gate_errors(project_dir, state)
             if rights_errors:
                 raise ValueError("rights gate: " + "; ".join(rights_errors))
+            render_id = direct_final_render_id(state, output)
     else:
         manifest, state, clip = load_render_snapshot(project_dir, snapshot_path, quality)
         snapshot_payload = read_json(snapshot_path, {}) or {}
@@ -1557,24 +1560,46 @@ def render_project(
             )
             os.replace(temporary, output)
             finalize_variant_delivery_receipt(project_dir, receipt, output, variant_id)
+        elif direct_final:
+            if render_id is None:
+                raise RuntimeError("direct final render has no visual evidence identity")
+            qa_direct_final_output(
+                project_dir,
+                temporary,
+                render_id,
+                rendered_visual_evidence_path(project_dir, render_id),
+                state,
+            )
+            os.replace(temporary, output)
         else:
             os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def qa_variant_output(
+def direct_final_render_id(state: dict[str, Any], output: Path) -> str:
+    """Deterministic project-local identity for one direct final destination."""
+    material = (
+        editor_state_revision(state)
+        + "\0"
+        + str(output.expanduser().resolve())
+    ).encode("utf-8")
+    return "direct-final-" + hashlib.sha256(material).hexdigest()[:20]
+
+
+def qa_unpublished_output(
     project_dir: Path,
     candidate: Path,
-    variant_id: str,
+    report_stem: str,
     visual_evidence_path: Path,
+    delivery_label: str,
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run QA on the still-unpublished output; raise before anything lands."""
+    """Run QA on a still-unpublished final; raise before anything lands."""
     qa_dir = project_dir / "qa"
     qa_dir.mkdir(exist_ok=True)
-    report_path = qa_dir / f"variant-{variant_id}.json"
-    contact_path = qa_dir / f"variant-{variant_id}-contact.png"
+    report_path = qa_dir / f"{report_stem}.json"
+    contact_path = qa_dir / f"{report_stem}-contact.png"
     qa_result = subprocess.run(
         [
             sys.executable,
@@ -1594,7 +1619,7 @@ def qa_variant_output(
         report_path.unlink(missing_ok=True)
         contact_path.unlink(missing_ok=True)
         raise RuntimeError(
-            "variant QA failed; final output was NOT published: "
+            f"{delivery_label} QA failed; final output was NOT published: "
             + (qa_result.stderr or qa_result.stdout)[-2000:]
         )
     report = read_json(report_path, {}) or {}
@@ -1607,7 +1632,7 @@ def qa_variant_output(
         report_path.unlink(missing_ok=True)
         contact_path.unlink(missing_ok=True)
         raise RuntimeError(
-            "variant QA did not bind passing renderer visual evidence; "
+            f"{delivery_label} QA did not bind passing renderer visual evidence; "
             "final output was NOT published"
         )
     return {
@@ -1618,6 +1643,40 @@ def qa_variant_output(
         "output_sha256": file_sha256(candidate),
         "visual_delivery": visual_delivery,
     }
+
+
+def qa_variant_output(
+    project_dir: Path,
+    candidate: Path,
+    variant_id: str,
+    visual_evidence_path: Path,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return qa_unpublished_output(
+        project_dir,
+        candidate,
+        f"variant-{variant_id}",
+        visual_evidence_path,
+        "variant",
+        state,
+    )
+
+
+def qa_direct_final_output(
+    project_dir: Path,
+    candidate: Path,
+    render_id: str,
+    visual_evidence_path: Path,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return qa_unpublished_output(
+        project_dir,
+        candidate,
+        render_id,
+        visual_evidence_path,
+        "direct final",
+        state,
+    )
 
 
 def finalize_variant_delivery_receipt(
