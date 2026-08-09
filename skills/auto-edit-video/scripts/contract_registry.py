@@ -801,10 +801,115 @@ def semantic_delivery_envelope(artifact) -> list[str]:
             digest = item.get("sha256")
             if isinstance(digest, str) and digest != digest.lower():
                 errors.append(f"$.artifacts.{name}.sha256: must use lowercase hexadecimal")
+        caption_v2 = artifacts.get("caption_v2")
+        if isinstance(caption_v2, dict) and caption_v2.get("path") != "working/caption_delivery_v2.json":
+            errors.append(
+                "$.artifacts.caption_v2.path: must be working/caption_delivery_v2.json"
+            )
     renderer = artifact.get("renderer_identity")
     if isinstance(renderer, dict):
         if type(renderer.get("contract_version")) is not int or renderer.get("contract_version") != 1:
             errors.append("$.renderer_identity.contract_version: must be integer 1")
+    return errors
+
+
+def semantic_transcript_source(artifact) -> list[str]:
+    errors: list[str] = []
+    words = artifact.get("raw_words")
+    if isinstance(words, list):
+        previous_start = -1
+        for index, word in enumerate(words):
+            if not isinstance(word, dict):
+                continue
+            if word.get("source_word_index") != index:
+                errors.append(f"$.raw_words[{index}].source_word_index: must equal ordered index")
+            start = word.get("start_us")
+            end = word.get("end_us")
+            if type(start) is int and type(end) is int:
+                if end < start:
+                    errors.append(f"$.raw_words[{index}]: end_us precedes start_us")
+                if start < previous_start:
+                    errors.append(f"$.raw_words[{index}]: raw words are unordered")
+                previous_start = start
+    material = dict(artifact)
+    revision = material.pop("revision", None)
+    if isinstance(revision, str) and revision != canonical_hash(material):
+        errors.append("$.revision: does not match canonical source payload")
+    return errors
+
+
+def semantic_caption_segmentation(artifact) -> list[str]:
+    errors: list[str] = []
+    spans = artifact.get("spans")
+    if isinstance(spans, list):
+        for index, span in enumerate(spans):
+            if not isinstance(span, dict):
+                continue
+            first = span.get("first_source_word_index")
+            last = span.get("last_source_word_index")
+            start = span.get("fallback_start_us")
+            end = span.get("fallback_end_us")
+            indexed = type(first) is int and type(last) is int and start is None and end is None
+            fallback = first is None and last is None and type(start) is int and type(end) is int
+            if not (indexed or fallback):
+                errors.append(f"$.spans[{index}]: must use exactly one span identity mode")
+            elif indexed and last < first:
+                errors.append(f"$.spans[{index}]: word span is reversed")
+            elif fallback and end <= start:
+                errors.append(f"$.spans[{index}]: fallback span is empty or reversed")
+    material = dict(artifact)
+    revision = material.pop("segmentation_revision", None)
+    if isinstance(revision, str) and revision != canonical_hash(material):
+        errors.append("$.segmentation_revision: does not match canonical segmentation payload")
+    return errors
+
+
+def semantic_caption_delivery(artifact) -> list[str]:
+    errors: list[str] = []
+    root_fields = (
+        "source_revision",
+        "segmentation_revision",
+        "source_list_hash",
+        "cut_map_sha256",
+        "timeline_revision",
+        "target_language",
+        "provider_receipt",
+    )
+    seen_instances: set[str] = set()
+    previous_start = -1
+    for index, item in enumerate(artifact.get("items", [])):
+        if not isinstance(item, dict):
+            continue
+        for name in root_fields:
+            if item.get(name) != artifact.get(name):
+                errors.append(f"$.items[{index}].{name}: does not match root binding")
+        instance_id = item.get("caption_instance_id")
+        if instance_id in seen_instances:
+            errors.append(f"$.items[{index}].caption_instance_id: duplicate")
+        seen_instances.add(instance_id)
+        source_start = item.get("source_start_us")
+        source_end = item.get("source_end_us")
+        final_start = item.get("final_start_us")
+        final_end = item.get("final_end_us")
+        if all(type(value) is int for value in (source_start, source_end, final_start, final_end)):
+            if source_end <= source_start or final_end <= final_start:
+                errors.append(f"$.items[{index}]: timing range is empty or reversed")
+            if final_start < previous_start:
+                errors.append(f"$.items[{index}]: final timing order is not canonical")
+            previous_start = final_start
+        corrected = item.get("corrected_source")
+        corrected_hash = item.get("corrected_source_sha256")
+        if isinstance(corrected, str) and isinstance(corrected_hash, str):
+            actual = hashlib.sha256(corrected.encode("utf-8")).hexdigest()
+            if corrected_hash != actual:
+                errors.append(f"$.items[{index}].corrected_source_sha256: mismatch")
+        identity = item.get("identity_preserved")
+        reason = item.get("identity_reason")
+        status = item.get("translation_status")
+        if identity is True and (reason is None or status != "identity_preserved"):
+            errors.append(f"$.items[{index}]: identity exception is incomplete")
+        if identity is False and (reason is not None or status != "translated"):
+            errors.append(f"$.items[{index}]: translated item has identity exception fields")
     return errors
 
 
@@ -820,6 +925,9 @@ SEMANTIC_VALIDATORS = {
     "rights_assertion": semantic_rights_assertion,
     "director_mode": semantic_director_mode,
     "delivery_envelope": semantic_delivery_envelope,
+    "transcript_source": semantic_transcript_source,
+    "caption_segmentation": semantic_caption_segmentation,
+    "caption_delivery": semantic_caption_delivery,
 }
 
 

@@ -47,6 +47,7 @@ DEFAULT_DESTINATIONS = {
     "contact_sheet": "qa/{render_id}-contact.png",
     "visual_evidence": "working/render_visual_evidence/{render_id}.json",
     "motion_evidence": "working/render_visual_evidence/{render_id}.json",
+    "caption_v2": "working/caption_delivery_v2.json",
 }
 STAGE_FILENAMES = {
     "output": "candidate.mp4",
@@ -598,7 +599,11 @@ def _canonical_expected_output(expected_output: Path) -> Path:
 
 
 def _phase0b_destinations(
-    project_dir: Path, render_id: str, expected_output: Path
+    project_dir: Path,
+    render_id: str,
+    expected_output: Path,
+    *,
+    include_caption_v2: bool = False,
 ) -> dict[str, tuple[str, bool]]:
     root = project_dir.resolve()
     output = _canonical_expected_output(expected_output)
@@ -615,6 +620,8 @@ def _phase0b_destinations(
             False,
         ),
     }
+    if include_caption_v2:
+        destinations["caption_v2"] = ("working/caption_delivery_v2.json", False)
     for relative, external in destinations.values():
         destination = _destination_path(root, relative, allow_external=external)
         if external:
@@ -637,17 +644,23 @@ def _validate_phase0b_artifact_destinations(
 ) -> dict[str, tuple[str, bool]]:
     if envelope.get("render_id") != render_id:
         raise DeliveryEnvelopeError("delivery envelope render_id does not match recovery target")
-    destinations = _phase0b_destinations(project_dir, render_id, expected_output)
     artifacts = envelope.get("artifacts")
     if not isinstance(artifacts, dict):
         raise DeliveryEnvelopeError("delivery envelope artifacts are invalid")
+    destinations = _phase0b_destinations(
+        project_dir,
+        render_id,
+        expected_output,
+        include_caption_v2=artifacts.get("caption_v2") is not None,
+    )
     for name, (expected_path, _external) in destinations.items():
         item = artifacts.get(name)
         if not isinstance(item, dict) or item.get("path") != expected_path:
             raise DeliveryEnvelopeError(
                 f"delivery artifact {name} destination does not match this render"
             )
-    for name in set(ARTIFACT_NAMES) - set(RECOVERY_ARTIFACT_NAMES):
+    recovery_names = set(RECOVERY_ARTIFACT_NAMES) | {"caption_v2"}
+    for name in set(ARTIFACT_NAMES) - recovery_names:
         if artifacts.get(name) is not None:
             raise DeliveryEnvelopeError(
                 f"delivery artifact {name} is outside the Phase 0b recovery allowlist"
@@ -692,7 +705,10 @@ def _recovery_expected_entries(
     expected: list[dict[str, Any]] = []
     seen: set[str] = set()
     artifacts = prepared["artifacts"]
-    for name in RECOVERY_ARTIFACT_NAMES:
+    recovery_names = list(RECOVERY_ARTIFACT_NAMES)
+    if artifacts.get("caption_v2") is not None:
+        recovery_names.append("caption_v2")
+    for name in recovery_names:
         destination, external = destinations[name]
         if destination in seen:
             continue

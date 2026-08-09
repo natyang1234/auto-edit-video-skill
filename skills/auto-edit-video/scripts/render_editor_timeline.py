@@ -872,6 +872,9 @@ def build_render_command(
     planned_cards = card_plan_bundle(project_dir)
     card_plan_adopted = planned_cards is not None
     overlays: list[dict[str, Any]] = []
+    import caption_delivery
+
+    delivery_items = caption_delivery.render_item_map(state)
     for source_overlay in state.get("overlays", []):
         if not isinstance(source_overlay, dict) or not source_overlay.get("visible", True):
             continue
@@ -922,6 +925,22 @@ def build_render_command(
             overlay["style"] = dict(source_overlay.get("style") or {})
             overlay["start"] = window_start
             overlay["end"] = window_end
+            if overlay.get("type") == "caption" and delivery_items:
+                source_id = str(source_overlay.get("caption_source_id") or "")
+                key = (
+                    source_id,
+                    int(round(window_start * 1_000_000)),
+                    int(round(window_end * 1_000_000)),
+                )
+                delivered = delivery_items.get(key)
+                if delivered is None:
+                    raise caption_delivery.CaptionDeliveryError(
+                        "caption_binding_missing",
+                        f"renderer instance {source_id}@{key[1]}-{key[2]}",
+                    )
+                overlay["id"] = delivered["caption_instance_id"]
+                overlay["caption_instance_id"] = delivered["caption_instance_id"]
+                overlay["translation"] = delivered["translated_text"]
             overlays.append(overlay)
             if overlay.get("type") not in {"caption", "emphasis"}:
                 expected_visual_beat_count += 1
@@ -1107,8 +1126,10 @@ def build_render_command(
         import caption_compositor
 
         if caption_compositor.compositor_available():
+            render_caption_state = dict(state)
+            render_caption_state["overlays"] = overlays
             caption_plan = caption_compositor.build_render_plan(
-                project_dir, state, render_scale
+                project_dir, render_caption_state, render_scale
             )
             disallowed = caption_plan.get("receipt", {}).get("disallowed_fallbacks") or []
             if disallowed and quality == "final":
@@ -1477,9 +1498,26 @@ def render_project(
         snapshot_payload = read_json(snapshot_path, {}) or {}
         render_id = str(snapshot_payload.get("render_id") or "") or None
     direct_stage: delivery_envelope.StagingAttempt | None = None
+    caption_v2_artifact: dict[str, Any] | None = None
     if direct_final:
         if render_id is None:
             raise RuntimeError("direct final render has no delivery identity")
+        # Required caption delivery is reloaded and matched against the live
+        # transcript/timeline before begin_staging creates any private or
+        # public delivery state.
+        import caption_delivery
+
+        caption_v2_artifact, state = caption_delivery.validate_for_render(
+            project_dir, state, manifest
+        )
+        if caption_v2_artifact is not None:
+            import caption_compositor
+
+            if not caption_compositor.compositor_available():
+                raise caption_delivery.CaptionDeliveryError(
+                    "caption_binding_missing",
+                    "required translated captions need the caption compositor",
+                )
         direct_stage = delivery_envelope.begin_staging(
             project_dir,
             render_id,
@@ -1603,6 +1641,43 @@ def render_project(
                 "visual_evidence": staged_evidence,
                 "motion_evidence": staged_evidence,
             }
+            if caption_v2_artifact is not None:
+                canonical_caption = project_dir / caption_delivery.CAPTION_REL
+                expected_caption_sha = str(
+                    state.get("_caption_delivery_v2", {}).get("artifact_sha256") or ""
+                )
+                if (
+                    canonical_caption.is_symlink()
+                    or not canonical_caption.is_file()
+                    or file_sha256(canonical_caption) != expected_caption_sha
+                ):
+                    raise caption_delivery.CaptionDeliveryError(
+                        "caption_binding_missing", "caption artifact changed during render"
+                    )
+                staged_caption = direct_stage / delivery_envelope.STAGE_FILENAMES["caption_v2"]
+                shutil.copyfile(canonical_caption, staged_caption)
+                try:
+                    import contract_registry
+
+                    staged_caption_bytes = staged_caption.read_bytes()
+                    staged_caption_payload = contract_registry.load_artifact_text(
+                        staged_caption_bytes.decode("utf-8")
+                    )
+                except (OSError, UnicodeDecodeError, ValueError) as exc:
+                    raise caption_delivery.CaptionDeliveryError(
+                        "caption_binding_missing", "staged caption artifact is invalid"
+                    ) from exc
+                if (
+                    staged_caption.is_symlink()
+                    or hashlib.sha256(staged_caption_bytes).hexdigest()
+                    != expected_caption_sha
+                    or staged_caption_payload != caption_v2_artifact
+                ):
+                    raise caption_delivery.CaptionDeliveryError(
+                        "caption_binding_missing",
+                        "staged caption artifact differs from approved bytes",
+                    )
+                staged_sources["caption_v2"] = staged_caption
             prepared = delivery_envelope.build_prepared_envelope(
                 project_dir,
                 render_id,

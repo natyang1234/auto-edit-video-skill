@@ -17,7 +17,7 @@ SCHEMA_VERSION = 1
 RESOLVER_VERSION = 1
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DIRECTOR_REGISTRY_PATH = SKILL_DIR / "contracts/instances/director_mode__registry.json"
-IMPLEMENTED_CAPABILITIES = frozenset()
+IMPLEMENTED_CAPABILITIES = frozenset({"caption-delivery-v2"})
 SELECTION_SCHEMA_VERSION = 1
 SELECTION_REASONS = frozenset(
     {

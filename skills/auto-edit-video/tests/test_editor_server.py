@@ -29,6 +29,9 @@ RUMI_FIXTURE = Path(__file__).resolve().parent / "fixtures/rumi_voice_system.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import editor_server  # noqa: E402
+import caption_delivery  # noqa: E402
+import contract_registry  # noqa: E402
+import render_editor_timeline  # noqa: E402
 import qa_video  # noqa: E402
 from editor_server import (  # noqa: E402
     EditorServer,
@@ -3687,6 +3690,205 @@ class EditorRendererTests(unittest.TestCase):
 
         self.assertFalse(final.exists())
         self.assertIn("QA failed", result.stderr + result.stdout)
+
+    def test_required_caption_missing_fails_before_direct_staging_and_preserves_output(self) -> None:
+        transcript_source = {
+            "schema_version": 1,
+            "revision": "",
+            "source_media_sha256": "a" * 64,
+            "audio_stream_index": 0,
+            "decoded_pcm": {
+                "sample_rate_hz": 48000,
+                "channels": 2,
+                "sample_format": "s16le",
+                "sha256": "b" * 64,
+            },
+            "engine": "openai-whisper",
+            "engine_version": "1.0",
+            "model": "base",
+            "language": "zh",
+            "decoding_params": {},
+            "source_generation": 0,
+            "raw_words": [
+                {
+                    "source_word_index": 0,
+                    "start_us": 20_000,
+                    "end_us": 400_000,
+                    "text": "核心重點",
+                    "speaker": None,
+                }
+            ],
+        }
+        material = dict(transcript_source)
+        material.pop("revision")
+        transcript_source["revision"] = contract_registry.canonical_hash(material)
+        source_path = (
+            self.project
+            / f"working/transcript_sources/{transcript_source['revision']}.json"
+        )
+        caption_delivery._atomic_write(source_path, transcript_source)
+        caption_delivery._atomic_write(
+            self.project / "working/transcript_source_current.json",
+            {
+                "schema_version": 1,
+                "revision": transcript_source["revision"],
+                "path": f"working/transcript_sources/{transcript_source['revision']}.json",
+                "artifact_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            },
+        )
+        self.write_json(
+            "working/transcript_words.json",
+            {
+                "words": [
+                    {"id": "word-00001", "text": "核心重點", "start": 0.02, "end": 0.40}
+                ],
+                "caption_segments": [
+                    {
+                        "id": "caption-segment-0001",
+                        "text": "核心重點",
+                        "start": 0.02,
+                        "end": 0.40,
+                        "word_ids": ["word-00001"],
+                    }
+                ],
+            },
+        )
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["overlays"][0]["source"] = "working/transcript_words.json"
+        self.write_json("working/editor_state.json", state)
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        manifest["subtitles"] = {
+            "glossary": [],
+            "contextual_semantic_calibration": {"model": "qwen2.5:7b"},
+        }
+        self.write_json("project.json", manifest)
+
+        def fake_model(prompt: str, _stage: str, **_kwargs):
+            requested = json.loads(prompt.rsplit("\n", 1)[-1])
+            return {
+                "items": [
+                    {
+                        "caption_instance_id": requested[0]["caption_instance_id"],
+                        "translated_text": "Core point",
+                    }
+                ]
+            }
+
+        caption_delivery.create_delivery(
+            self.project,
+            "en",
+            required=True,
+            model_call=fake_model,
+        )
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        manifest["approvals"]["timeline"] = {
+            "approved": True,
+            "state_revision": gate_revision(self.project, "timeline", state),
+        }
+        self.write_json("project.json", manifest)
+        successful = self.project / "renders/caption-bound-success.mp4"
+        self.run_renderer("--quality", "final", "--output", str(successful))
+        success_render_id = direct_final_render_id(state, successful)
+        success_envelope = json.loads(
+            (
+                self.project
+                / f"working/delivery_envelopes/{success_render_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        canonical_caption = self.project / caption_delivery.CAPTION_REL
+        self.assertEqual(
+            success_envelope["artifacts"]["caption_v2"]["path"],
+            caption_delivery.CAPTION_REL.as_posix(),
+        )
+        self.assertEqual(
+            success_envelope["artifacts"]["caption_v2"]["sha256"],
+            hashlib.sha256(canonical_caption.read_bytes()).hexdigest(),
+        )
+        caption_artifact = json.loads(canonical_caption.read_text(encoding="utf-8"))
+        render_plan = json.loads(
+            (self.project / "working/caption_render_plan.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [item["caption_item_id"] for item in render_plan["items"]],
+            [item["caption_instance_id"] for item in caption_artifact["items"]],
+        )
+
+        race_output = self.project / "renders/caption-copy-race.mp4"
+        race_output.write_bytes(b"prior-copy-race-output")
+        finalized_before_race = set(
+            (self.project / "working/delivery_envelopes").glob("*.json")
+        )
+        canonical_before_race = canonical_caption.read_bytes()
+        real_copyfile = render_editor_timeline.shutil.copyfile
+
+        def mutate_caption_during_copy(source, destination, *args, **kwargs):
+            if Path(source).resolve() == canonical_caption.resolve():
+                tampered = json.loads(canonical_caption.read_text(encoding="utf-8"))
+                tampered["items"][0]["translated_text"] = "copy-race-tamper"
+                caption_delivery._atomic_write(canonical_caption, tampered)
+            return real_copyfile(source, destination, *args, **kwargs)
+
+        with patch.object(
+            render_editor_timeline.shutil,
+            "copyfile",
+            side_effect=mutate_caption_during_copy,
+        ):
+            with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+                render_editor_timeline.render_project(
+                    self.project.resolve(),
+                    race_output.resolve(),
+                    "final",
+                )
+        self.assertEqual(caught.exception.code, "caption_binding_missing")
+        self.assertEqual(race_output.read_bytes(), b"prior-copy-race-output")
+        self.assertEqual(
+            set((self.project / "working/delivery_envelopes").glob("*.json")),
+            finalized_before_race,
+        )
+        caption_delivery._atomic_write(
+            canonical_caption,
+            json.loads(canonical_before_race.decode("utf-8")),
+        )
+
+        state["overlays"] = []
+        self.write_json("working/editor_state.json", state)
+        manifest = json.loads(
+            (self.project / "project.json").read_text(encoding="utf-8")
+        )
+        manifest["approvals"]["timeline"] = {
+            "approved": True,
+            "state_revision": gate_revision(self.project, "timeline", state),
+        }
+        self.write_json("project.json", manifest)
+        final = self.project / "renders/caption-required.mp4"
+        final.write_bytes(b"last-good-output")
+        envelopes = self.project / "working/delivery_envelopes"
+        finalized_before = set(envelopes.glob("*.json")) if envelopes.is_dir() else set()
+
+        result = self.run_renderer(
+            "--quality", "final", "--output", str(final), expected=2
+        )
+
+        self.assertIn("caption_binding_missing", result.stderr + result.stdout)
+        self.assertEqual(final.read_bytes(), b"last-good-output")
+        finalized_after = set(envelopes.glob("*.json")) if envelopes.is_dir() else set()
+        self.assertEqual(finalized_after, finalized_before)
+        staging = self.project / "working/delivery_envelopes/.staging"
+        residue = (
+            [entry for entry in staging.iterdir() if entry.name != ".locks"]
+            if staging.is_dir()
+            else []
+        )
+        self.assertEqual(residue, [])
 
     def test_direct_final_external_output_is_bound_by_its_envelope(self) -> None:
         state = json.loads(

@@ -1,0 +1,46 @@
+{
+  "$id": "transcript_source",
+  "x_schema_version": 1,
+  "type": "object",
+  "required": ["schema_version", "revision", "source_media_sha256", "audio_stream_index", "decoded_pcm", "engine", "engine_version", "model", "language", "decoding_params", "source_generation", "raw_words"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_media_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "audio_stream_index": {"const": 0},
+    "decoded_pcm": {
+      "type": "object",
+      "required": ["sample_rate_hz", "channels", "sample_format", "sha256"],
+      "properties": {
+        "sample_rate_hz": {"const": 48000},
+        "channels": {"const": 2},
+        "sample_format": {"const": "s16le"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "engine": {"type": "string", "minLength": 1, "maxLength": 120},
+    "engine_version": {"type": "string", "minLength": 1, "maxLength": 120},
+    "model": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,120}$"},
+    "language": {"type": "string", "minLength": 1, "maxLength": 40},
+    "decoding_params": {"type": "object", "additionalProperties": true},
+    "source_generation": {"type": "integer", "minimum": 0},
+    "raw_words": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["source_word_index", "start_us", "end_us", "text", "speaker"],
+        "properties": {
+          "source_word_index": {"type": "integer", "minimum": 0},
+          "start_us": {"type": "integer", "minimum": 0},
+          "end_us": {"type": "integer", "minimum": 0},
+          "text": {"type": "string", "minLength": 1},
+          "speaker": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

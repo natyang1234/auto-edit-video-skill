@@ -290,6 +290,10 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         "highlights": state.get("highlights"),
         "asset_digests": state.get("asset_digests"),
         "caption_defaults": state.get("caption_defaults"),
+        # Required caption publication is authorized as exact adopted bytes,
+        # not merely as the visible overlay text. Re-translation or receipt
+        # changes must therefore invalidate the timeline approval.
+        "caption_delivery": state.get("caption_delivery"),
         "overlays": revision_overlays,
         # Which QA gates apply is part of what was approved: relaxing them
         # must invalidate an approval given under stricter ones.

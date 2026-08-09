@@ -133,6 +133,124 @@ class DeliveryEnvelopeTests(unittest.TestCase):
         )
         self.assertFalse(stage.exists())
 
+    def test_caption_v2_is_hash_bound_at_its_fixed_canonical_destination(self) -> None:
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+            "caption_v2": stage / "caption_v2.json",
+        }
+        for name, path in sources.items():
+            path.write_bytes(("caption-bound-" + name).encode("utf-8"))
+        prepared = delivery_envelope.build_prepared_envelope(
+            self.project,
+            self.render_id,
+            self.external_output,
+            self.state,
+            sources,
+            renderer_script=Path(__file__).resolve(),
+            ffmpeg_executable=self.ffmpeg,
+        )
+        self.assertEqual(
+            prepared["artifacts"]["caption_v2"]["path"],
+            "working/caption_delivery_v2.json",
+        )
+        self.assertIsNone(prepared["artifacts"]["audio_event_plan"])
+        self.assertIsNone(prepared["artifacts"]["audio_catalog"])
+        self.assertIsNone(prepared["artifacts"]["sfx_stem"])
+        delivery_envelope.write_prepared_envelope(stage, prepared)
+        expected_caption_bytes = sources["caption_v2"].read_bytes()
+        finalized = delivery_envelope.publish_direct_delivery(
+            self.project,
+            stage,
+            staged_sources=sources,
+            expected_output=self.external_output,
+        )
+        canonical = self.project / "working/caption_delivery_v2.json"
+        self.assertEqual(canonical.read_bytes(), expected_caption_bytes)
+        self.assertEqual(
+            finalized["artifacts"]["caption_v2"]["sha256"],
+            delivery_envelope._sha256(canonical),
+        )
+
+    def test_caption_v2_destination_override_is_rejected(self) -> None:
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+            "caption_v2": stage / "caption_v2.json",
+        }
+        for name, path in sources.items():
+            path.write_bytes(name.encode("utf-8"))
+        with self.assertRaises(delivery_envelope.DeliveryEnvelopeError):
+            delivery_envelope.build_prepared_envelope(
+                self.project,
+                self.render_id,
+                self.external_output,
+                self.state,
+                sources,
+                renderer_script=Path(__file__).resolve(),
+                ffmpeg_executable=self.ffmpeg,
+                destinations={"caption_v2": "working/not-canonical.json"},
+            )
+
+    def test_caption_v2_participates_in_stale_journal_recovery(self) -> None:
+        prior_output = b"prior-output"
+        prior_caption = b"prior-caption"
+        self.external_output.parent.mkdir(parents=True)
+        self.external_output.write_bytes(prior_output)
+        canonical_caption = self.project / "working/caption_delivery_v2.json"
+        canonical_caption.parent.mkdir(parents=True)
+        canonical_caption.write_bytes(prior_caption)
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+            "caption_v2": stage / "caption_v2.json",
+        }
+        for name, path in sources.items():
+            path.write_bytes(("new-" + name).encode("utf-8"))
+        prepared = delivery_envelope.build_prepared_envelope(
+            self.project,
+            self.render_id,
+            self.external_output,
+            self.state,
+            sources,
+            renderer_script=Path(__file__).resolve(),
+            ffmpeg_executable=self.ffmpeg,
+        )
+        delivery_envelope.write_prepared_envelope(stage, prepared)
+        finalized = json.loads(json.dumps(prepared))
+        finalized["state"] = "finalized"
+        finalized["prepared_envelope_hash"] = contract_registry.canonical_hash(prepared)
+        entries = delivery_envelope._journal_entries(
+            self.project, prepared, finalized, stage
+        )
+        delivery_envelope._atomic_write_json(
+            stage / delivery_envelope.JOURNAL_NAME,
+            {"schema_version": 1, "render_id": self.render_id, "entries": entries},
+        )
+        delivery_envelope._copy_atomic(sources["output"], self.external_output)
+        delivery_envelope._copy_atomic(sources["caption_v2"], canonical_caption)
+        self._simulate_crash(stage)
+        delivery_envelope.recover_stale_staging(
+            self.project,
+            self.render_id,
+            expected_output=self.external_output,
+        )
+        self.assertEqual(self.external_output.read_bytes(), prior_output)
+        self.assertEqual(canonical_caption.read_bytes(), prior_caption)
+        self.assertFalse(stage.exists())
+
     def test_candidate_mutation_after_prepared_is_rejected_before_publication(self) -> None:
         stage, sources, _prepared = self._stage()
         sources["output"].write_bytes(b"tampered-output")

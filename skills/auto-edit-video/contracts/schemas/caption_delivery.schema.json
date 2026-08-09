@@ -1,0 +1,73 @@
+{
+  "$id": "caption_delivery",
+  "x_schema_version": 2,
+  "type": "object",
+  "required": ["schema_version", "source_revision", "segmentation_revision", "source_list_hash", "cut_map_sha256", "timeline_revision", "target_language", "required", "provider_receipt", "items"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "source_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "segmentation_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_list_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cut_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "timeline_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "target_language": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,19}$"},
+    "required": {"type": "boolean"},
+    "provider_receipt": {
+      "type": "object",
+      "required": ["provider_id", "mode", "model", "config_sha256", "consent_mode", "consent_sha256"],
+      "properties": {
+        "provider_id": {"const": "ollama"},
+        "mode": {"const": "local_loopback"},
+        "model": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,120}$"},
+        "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "consent_mode": {"const": "not_required_local"},
+        "consent_sha256": {"type": "null"}
+      },
+      "additionalProperties": false
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["caption_source_id", "caption_instance_id", "occurrence_ordinal", "corrected_source", "corrected_source_sha256", "source_start_us", "source_end_us", "final_start_us", "final_end_us", "source_revision", "segmentation_revision", "source_list_hash", "cut_map_sha256", "timeline_revision", "target_language", "provider_receipt", "translation_status", "translated_text", "identity_preserved", "identity_reason"],
+        "properties": {
+          "caption_source_id": {"type": "string", "pattern": "^caption-[0-9a-f]{16}$"},
+          "caption_instance_id": {"type": "string", "pattern": "^caption-instance-[0-9a-f]{16}$"},
+          "occurrence_ordinal": {"type": "integer", "minimum": 0},
+          "corrected_source": {"type": "string", "minLength": 1},
+          "corrected_source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_start_us": {"type": "integer", "minimum": 0},
+          "source_end_us": {"type": "integer", "minimum": 1},
+          "final_start_us": {"type": "integer", "minimum": 0},
+          "final_end_us": {"type": "integer", "minimum": 1},
+          "source_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "segmentation_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_list_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "cut_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "timeline_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "target_language": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,19}$"},
+          "provider_receipt": {
+            "type": "object",
+            "required": ["provider_id", "mode", "model", "config_sha256", "consent_mode", "consent_sha256"],
+            "properties": {
+              "provider_id": {"const": "ollama"},
+              "mode": {"const": "local_loopback"},
+              "model": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,120}$"},
+              "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "consent_mode": {"const": "not_required_local"},
+              "consent_sha256": {"type": "null"}
+            },
+            "additionalProperties": false
+          },
+          "translation_status": {"enum": ["translated", "identity_preserved"]},
+          "translated_text": {"type": "string", "minLength": 1},
+          "identity_preserved": {"type": "boolean"},
+          "identity_reason": {"type": ["string", "null"], "enum": ["brand", "proper_name", "code", "number_unit", null]}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

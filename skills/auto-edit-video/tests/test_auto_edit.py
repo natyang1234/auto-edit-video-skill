@@ -74,6 +74,104 @@ class AutoEditVoiceTests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stderr or result.stdout)
         return result
 
+    def test_import_captures_real_decoded_pcm_and_force_advances_source_generation(self) -> None:
+        project = self.root / "transcript-source-identity"
+        self.run_cli(
+            "init",
+            "--input",
+            str(self.source),
+            "--project-dir",
+            str(project),
+            "--source-language",
+            "zh-TW",
+        )
+        whisper = self.root / "transcript-source-identity.json"
+        whisper.write_text(
+            json.dumps(
+                {
+                    "engine": "openai-whisper",
+                    "engine_version": "test-1",
+                    "language": "zh",
+                    "decoding_params": {"temperature": 0},
+                    "text": "真實音訊",
+                    "segments": [
+                        {
+                            "start": 0.02,
+                            "end": 0.30,
+                            "text": "真實音訊",
+                            "words": [
+                                {
+                                    "word": "真實音訊",
+                                    "start": 0.02,
+                                    "end": 0.30,
+                                    "probability": 0.99,
+                                }
+                            ],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        first = json.loads(
+            self.run_cli(
+                "import-whisper",
+                "--manifest",
+                str(project / "project.json"),
+                "--whisper-json",
+                str(whisper),
+                "--model",
+                "base",
+            ).stdout
+        )
+        second = json.loads(
+            self.run_cli(
+                "import-whisper",
+                "--manifest",
+                str(project / "project.json"),
+                "--whisper-json",
+                str(whisper),
+                "--model",
+                "base",
+            ).stdout
+        )
+        forced = json.loads(
+            self.run_cli(
+                "import-whisper",
+                "--manifest",
+                str(project / "project.json"),
+                "--whisper-json",
+                str(whisper),
+                "--model",
+                "base",
+                "--force-retranscription",
+            ).stdout
+        )
+        self.assertEqual(first["source_revision"], second["source_revision"])
+        self.assertEqual(first["source_generation"], 0)
+        self.assertEqual(forced["source_generation"], 1)
+        self.assertNotEqual(first["source_revision"], forced["source_revision"])
+        source_artifact = json.loads(
+            (
+                project
+                / f"working/transcript_sources/{first['source_revision']}.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertNotEqual(
+            source_artifact["decoded_pcm"]["sha256"],
+            source_artifact["source_media_sha256"],
+        )
+        self.assertEqual(
+            source_artifact["decoded_pcm"],
+            {
+                "sample_rate_hz": 48000,
+                "channels": 2,
+                "sample_format": "s16le",
+                "sha256": source_artifact["decoded_pcm"]["sha256"],
+            },
+        )
+
     def test_local_transcription_and_highlight_planning_sync_editor(self) -> None:
         project = self.root / "local-pipeline"
         self.run_cli(

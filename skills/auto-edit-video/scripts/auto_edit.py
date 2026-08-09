@@ -2847,6 +2847,7 @@ def import_whisper_artifacts(
     *,
     srt_path: Path | None,
     model: str,
+    force_retranscription: bool = False,
 ) -> dict[str, Any]:
     manifest = read_json(manifest_path)
     project_dir = manifest_path.parent
@@ -2871,6 +2872,18 @@ def import_whisper_artifacts(
     data = read_json(whisper_path)
     if not isinstance(data.get("segments"), list):
         raise ValueError("Whisper JSON must contain a segments array")
+    # Capture the recognizer's bytes and decoded-audio identity before any
+    # glossary, calibration, orthography, or contextual correction mutates
+    # ``data``.  Caption IDs must never inherit corrected wording as identity.
+    import caption_delivery
+
+    transcript_source = caption_delivery.capture_transcript_source(
+        project_dir,
+        manifest,
+        data,
+        model=model,
+        force_retranscription=force_retranscription,
+    )
     semantic_corrections = apply_transcription_calibrations(data, calibrations)
     glossary_corrections = apply_glossary_corrections(data, glossary)
     orthography_enabled = should_normalize_taiwan_traditional(
@@ -3006,6 +3019,9 @@ def import_whisper_artifacts(
     manifest["artifacts"]["transcript_semantic_review"] = (
         "working/transcript_semantic_review.json"
     )
+    manifest["artifacts"]["transcript_source_current"] = (
+        "working/transcript_source_current.json"
+    )
     if orthography_enabled:
         manifest.setdefault("subtitles", {})["source_variant"] = ORTHOGRAPHY_VARIANT
     manifest["transcription"] = {
@@ -3050,6 +3066,9 @@ def import_whisper_artifacts(
         "segment_count": len(transcript["segments"]),
         "caption_count": len(transcript["caption_segments"]),
         "source_json": str(whisper_path),
+        "source_revision": transcript_source["revision"],
+        "source_generation": transcript_source["source_generation"],
+        "decoded_pcm_sha256": transcript_source["decoded_pcm"]["sha256"],
         "imported_at": now_utc(),
     }
     manifest["updated_at"] = now_utc()
@@ -3085,6 +3104,8 @@ def import_whisper_artifacts(
         "segments": len(transcript["segments"]),
         "synced_editor_captions": synced,
         "code_switching": source_language_mode == "zh-en",
+        "source_revision": transcript_source["revision"],
+        "source_generation": transcript_source["source_generation"],
     }
 
 
@@ -3097,6 +3118,7 @@ def cmd_import_whisper(args: argparse.Namespace) -> int:
             whisper_path,
             srt_path=Path(args.srt) if args.srt else None,
             model=args.model,
+            force_retranscription=args.force_retranscription,
         )
     except ValueError as exc:
         return die(str(exc))
@@ -3375,7 +3397,11 @@ def transcribe_with_breeze(
     write_json(transcript_json, payload)
     try:
         imported = import_whisper_artifacts(
-            manifest_path, transcript_json, srt_path=None, model=breeze_asr.MODEL_REPO
+            manifest_path,
+            transcript_json,
+            srt_path=None,
+            model=breeze_asr.MODEL_REPO,
+            force_retranscription=args.force_retranscription,
         )
     except ValueError as exc:
         return die(str(exc))
@@ -3482,6 +3508,7 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
             whisper_json,
             srt_path=whisper_srt if whisper_srt.is_file() else None,
             model=args.model,
+            force_retranscription=args.force_retranscription,
         )
     except ValueError as exc:
         return die(str(exc))
@@ -4994,6 +5021,40 @@ def cmd_approve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_translate_captions(args: argparse.Namespace) -> int:
+    """Create the canonical, instance-bound local caption translation."""
+    import caption_delivery
+
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    try:
+        artifact = caption_delivery.create_delivery(
+            project_dir,
+            args.language,
+            required=args.required,
+            timeout=args.timeout,
+        )
+    except caption_delivery.CaptionDeliveryError as exc:
+        return die(str(exc))
+    emit(
+        {
+            "ok": True,
+            "artifact": str(project_dir / caption_delivery.CAPTION_REL),
+            "source_revision": artifact["source_revision"],
+            "segmentation_revision": artifact["segmentation_revision"],
+            "timeline_revision": artifact["timeline_revision"],
+            "source_list_hash": artifact["source_list_hash"],
+            "cut_map_sha256": artifact["cut_map_sha256"],
+            "language": artifact["target_language"],
+            "required": artifact["required"],
+            "items": len(artifact["items"]),
+            "caption_source_ids": [item["caption_source_id"] for item in artifact["items"]],
+            "caption_instance_ids": [item["caption_instance_id"] for item in artifact["items"]],
+            "provider_receipt": artifact["provider_receipt"],
+        }
+    )
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     path = Path(args.manifest).expanduser().resolve()
     try:
@@ -5250,6 +5311,7 @@ def build_parser() -> argparse.ArgumentParser:
     whisper_import.add_argument("--whisper-json", required=True)
     whisper_import.add_argument("--srt")
     whisper_import.add_argument("--model", default="unknown")
+    whisper_import.add_argument("--force-retranscription", action="store_true")
     whisper_import.set_defaults(func=cmd_import_whisper)
 
     transcribe = sub.add_parser(
@@ -5264,6 +5326,7 @@ def build_parser() -> argparse.ArgumentParser:
     # model got all of them. Name a Whisper size here to force one.
     transcribe.add_argument("--model", default="auto")
     transcribe.add_argument("--timeout", type=int, default=21600)
+    transcribe.add_argument("--force-retranscription", action="store_true")
     transcribe.set_defaults(func=cmd_transcribe_local)
 
     semantic = sub.add_parser(
@@ -5434,6 +5497,16 @@ def build_parser() -> argparse.ArgumentParser:
     edge.add_argument("--allow-cloud", action="store_true")
     edge.add_argument("--dry-run", action="store_true")
     edge.set_defaults(func=cmd_synthesize_edge)
+
+    translate_captions = sub.add_parser(
+        "translate-captions",
+        help="Translate instance-bound captions through loopback Ollama",
+    )
+    translate_captions.add_argument("--project-dir", required=True)
+    translate_captions.add_argument("--language", default="en")
+    translate_captions.add_argument("--required", action="store_true")
+    translate_captions.add_argument("--timeout", type=int, default=300)
+    translate_captions.set_defaults(func=cmd_translate_captions)
 
     approve = sub.add_parser("approve", help="Record an explicit human gate approval")
     approve.add_argument("--manifest", required=True)

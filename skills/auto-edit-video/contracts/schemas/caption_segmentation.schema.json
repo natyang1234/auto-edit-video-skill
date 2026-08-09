@@ -1,0 +1,49 @@
+{
+  "$id": "caption_segmentation",
+  "x_schema_version": 1,
+  "type": "object",
+  "required": ["schema_version", "source_revision", "segmentation_revision", "chunker", "spans"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "segmentation_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "chunker": {
+      "type": "object",
+      "required": ["name", "version", "config"],
+      "properties": {
+        "name": {"const": "readable_caption_segments"},
+        "version": {"const": 1},
+        "config": {
+          "type": "object",
+          "required": ["gap_us", "max_duration_us", "max_display_units", "sentence_flush_min_us", "clause_flush_min_us"],
+          "properties": {
+            "gap_us": {"type": "integer", "minimum": 1},
+            "max_duration_us": {"type": "integer", "minimum": 1},
+            "max_display_units": {"type": "integer", "minimum": 1},
+            "sentence_flush_min_us": {"type": "integer", "minimum": 1},
+            "clause_flush_min_us": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "spans": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["first_source_word_index", "last_source_word_index", "fallback_start_us", "fallback_end_us", "within_span_ordinal"],
+        "properties": {
+          "first_source_word_index": {"type": ["integer", "null"], "minimum": 0},
+          "last_source_word_index": {"type": ["integer", "null"], "minimum": 0},
+          "fallback_start_us": {"type": ["integer", "null"], "minimum": 0},
+          "fallback_end_us": {"type": ["integer", "null"], "minimum": 0},
+          "within_span_ordinal": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
