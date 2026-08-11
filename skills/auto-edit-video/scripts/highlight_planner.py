@@ -112,6 +112,15 @@ DIRECTOR_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+# Kinetic uses the proven high-energy selection envelope.  Its distinct scene,
+# caption, motion, and SFX decisions begin during timeline materialisation;
+# keeping a separate profile id here preserves that end-to-end binding.
+DIRECTOR_PROFILES["kinetic-explainer"] = {
+    **DIRECTOR_PROFILES["high-energy"],
+    "label": "動畫解說",
+    "weights": dict(DIRECTOR_PROFILES["high-energy"]["weights"]),
+}
+
 HOOK_RE = re.compile(r"你以為|你知道|為什麼|怎麼|竟然|真相|關鍵|最大的|先講結論|[？?]")
 PAYOFF_RE = re.compile(r"所以|因此|結果|答案|關鍵|最後|才發現|增加|降低|成功|失敗")
 TEACHING_RE = re.compile(r"第一|第二|第三|步驟|方法|做法|先|接著|然後|定義|原因|案例")

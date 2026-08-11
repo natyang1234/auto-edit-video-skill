@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import contextlib
+from collections.abc import Callable
 from difflib import SequenceMatcher
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import mimetypes
@@ -403,6 +407,143 @@ def resolve_output_target(
 
 def emit(payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+_FINAL_DELIVERY_PRE_WRITE_HOOK: Callable[
+    [dict[str, Any], tuple[Any, ...]], None
+] | None = None
+
+
+def _serialized_stdout_json(payload: Any) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _prepare_stdout_writer() -> Callable[[bytes], None]:
+    """Prepare one stdout writer without buffering across the delivery CAS."""
+    stream = sys.stdout
+    stream.flush()
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, io.UnsupportedOperation, OSError):
+        # Tests and embedded callers commonly redirect stdout to StringIO.
+        def write_buffered(payload: bytes) -> None:
+            stream.write(payload.decode("utf-8"))
+            stream.flush()
+
+        return write_buffered
+
+    def write_unbuffered(payload: bytes) -> None:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("stdout write made no progress")
+            remaining = remaining[written:]
+        stream.flush()
+
+    return write_unbuffered
+
+
+def _emit_final_delivery_handoff(
+    payload: dict[str, Any],
+    delivery_snapshots: list[Any],
+    deferred_publications: list[Any],
+) -> bool:
+    """Write one final result with delivery validation adjacent to stdout.
+
+    The success payload is fully serialized before the final revalidation.  Its
+    linearization point is the completed path/identity/hash revalidation
+    immediately before the first stdout write.  This prevents repo-owned code
+    from inserting work in that gap; it cannot prevent an arbitrary same-user
+    process from replacing an artifact after that point.
+    """
+    import delivery_envelope
+
+    def abort_all() -> list[str]:
+        errors: list[str] = []
+        for authority in reversed(deferred_publications):
+            try:
+                delivery_envelope.abort_deferred_publication(authority)
+            except (ValueError, OSError, RuntimeError) as exc:
+                errors.append(str(exc))
+        return errors
+
+    try:
+        serialized = _serialized_stdout_json(payload)
+        writer = _prepare_stdout_writer()
+    except BaseException:
+        abort_all()
+        raise
+
+    intended_success = bool(payload.get("ok"))
+    if not intended_success:
+        abort_errors = abort_all()
+        if abort_errors:
+            problems = payload.get("problems")
+            payload = {
+                **payload,
+                "problems": [
+                    *(problems if isinstance(problems, list) else []),
+                    *(f"deferred delivery rollback failed: {item}" for item in abort_errors),
+                ],
+            }
+            serialized = _serialized_stdout_json(payload)
+        writer(serialized)
+        return False
+
+    try:
+        hook = _FINAL_DELIVERY_PRE_WRITE_HOOK
+        if hook is not None:
+            hook(payload, tuple(delivery_snapshots))
+        clips = payload.get("clips")
+        if not isinstance(clips, list) or not clips:
+            raise ValueError("final success must contain at least one clip")
+        if (
+            len(delivery_snapshots) != len(clips)
+            or len(deferred_publications) != len(clips)
+        ):
+            raise ValueError("final success clips do not match deferred deliveries")
+        pairs = sorted(
+            zip(delivery_snapshots, deferred_publications, strict=True),
+            key=lambda item: (str(item[0].project_dir), item[0].render_id),
+        )
+        for snapshot, authority in pairs:
+            if (
+                authority.project_dir != snapshot.project_dir
+                or authority.render_id != snapshot.render_id
+                or authority.expected_output != snapshot.expected_output
+            ):
+                raise ValueError("deferred publication does not match delivery snapshot")
+            delivery_envelope.validate_deferred_publication(authority)
+            delivery_envelope.revalidate_finalized_delivery(snapshot)
+    except BaseException as exc:
+        abort_errors = abort_all()
+        if not isinstance(exc, (ValueError, OSError, RuntimeError)):
+            raise
+        problems = payload.get("problems")
+        failure = {
+            **payload,
+            "ok": False,
+            "clips": [],
+            "problems": [
+                *(problems if isinstance(problems, list) else []),
+                f"finalized delivery changed before result handoff: {exc}",
+                *(f"deferred delivery rollback failed: {item}" for item in abort_errors),
+            ],
+        }
+        writer(_serialized_stdout_json(failure))
+        return False
+
+    # Do not append a second document after a partial write.  Every render
+    # lease and rollback backup remains live through the write and flush.
+    try:
+        writer(serialized)
+    except BaseException:
+        abort_all()
+        raise
+    for authority in deferred_publications:
+        delivery_envelope.commit_deferred_publication(authority)
+    return True
 
 
 def die(message: str, code: int = 2) -> int:
@@ -4024,6 +4165,28 @@ def materialise_clip(
     state = default_editor_state(project_dir, manifest)
     director_id = str(state.get("director_style") or "teacher-punch")
     director = DIRECTOR_PRESETS.get(director_id, DIRECTOR_PRESETS["teacher-punch"])
+    highlight_id = str(highlight.get("id") or "")
+    if not highlight_id:
+        raise ValueError("materialised highlight needs an id")
+    state_highlights = state.get("highlights", [])
+    if not isinstance(state_highlights, list) or any(
+        not isinstance(item, dict) for item in state_highlights
+    ):
+        raise ValueError("editor highlights must be an array of objects")
+    matching = [
+        item for item in state_highlights if str(item.get("id") or "") == highlight_id
+    ]
+    if len(matching) > 1:
+        raise ValueError("materialised highlight id is ambiguous")
+    materialised_highlight = {**(matching[0] if matching else {}), **highlight}
+    state["highlights"] = [
+        materialised_highlight
+        if str(item.get("id") or "") == highlight_id
+        else item
+        for item in state_highlights
+    ]
+    if not matching:
+        state["highlights"].append(materialised_highlight)
     base = state["segments"][0]
     clip_start = float(highlight["start"])
     clip_end = float(highlight["end"])
@@ -4054,7 +4217,7 @@ def materialise_clip(
         for index, (piece_start, piece_end) in enumerate(pieces)
     ]
     state["canvas"]["fit"] = fit
-    state["active_highlight_id"] = str(highlight["id"])
+    state["active_highlight_id"] = highlight_id
     atomic_write_json(project_dir / "working/editor_state.json", state)
 
     if cards:
@@ -4334,6 +4497,154 @@ def apply_cut_selection_overrides(
         setattr(args, argument_names.get(key, key), value)
 
 
+def kinetic_caption_target(resolved: dict[str, Any]) -> str:
+    """Return the registry-bound, required caption target for kinetic cuts."""
+    experience = resolved.get("experience")
+    if not isinstance(experience, dict):
+        raise ValueError("kinetic director experience is missing")
+    caption = experience.get("caption_delivery")
+    translation = experience.get("translation")
+    if not isinstance(caption, dict) or not isinstance(translation, dict):
+        raise ValueError("kinetic caption delivery contract is missing")
+    target = translation.get("target_language")
+    if (
+        caption.get("required") is not True
+        or translation.get("required") is not True
+        or not isinstance(target, str)
+        or not target
+    ):
+        raise ValueError("kinetic caption delivery must require a target language")
+    return target
+
+
+def approve_kinetic_timeline(project_dir: Path) -> None:
+    """Record the current agent-first timeline gate after caption adoption.
+
+    Caption v2 deliberately invalidates timeline/final approvals.  The cut
+    route has no person in the loop between its deterministic materialisation
+    and direct final renderer, so it records only the current timeline gate;
+    it never manufactures a final approval or a QA receipt.
+    """
+    import caption_delivery
+    import delivery_envelope
+    from director_resolver import resolve_director_profile
+    from editor_server import gate_revision
+
+    root = project_dir.resolve()
+    try:
+        manifest, manifest_snapshot = delivery_envelope.snapshot_owned_json(
+            root,
+            "project.json",
+            label="kinetic approval manifest",
+        )
+        state, state_snapshot = delivery_envelope.snapshot_owned_json(
+            root,
+            "working/editor_state.json",
+            label="kinetic approval editor state",
+        )
+    except delivery_envelope.DeliveryEnvelopeError as exc:
+        raise ValueError(f"kinetic approval inputs changed or are unsafe: {exc}") from exc
+    if state.get("director_style") != "kinetic-explainer":
+        raise ValueError("kinetic timeline approval requires kinetic-explainer")
+    try:
+        persisted_profile, profile_snapshot = delivery_envelope.snapshot_owned_json(
+            root,
+            "working/resolved_director_profile.json",
+            label="kinetic resolved director profile",
+        )
+    except delivery_envelope.DeliveryEnvelopeError as exc:
+        raise ValueError(f"kinetic-explainer profile binding is unavailable: {exc}") from exc
+    overrides = persisted_profile.get("overrides")
+    if not isinstance(overrides, dict):
+        raise ValueError("kinetic-explainer profile overrides are invalid")
+    resolved = resolve_director_profile("kinetic-explainer", overrides=overrides)
+    if persisted_profile != resolved or not isinstance(resolved.get("resolved_hash"), str):
+        raise ValueError("kinetic-explainer profile binding is stale")
+    caption_artifact, bound_state = caption_delivery.validate_for_render(
+        root,
+        state,
+        manifest,
+    )
+    if not isinstance(caption_artifact, dict) or caption_artifact.get("required") is not True:
+        raise ValueError("kinetic timeline approval requires adopted caption v2")
+    adopted = state.get("caption_delivery")
+    adopted_hash = (
+        str(adopted.get("artifact_sha256") or "")
+        if isinstance(adopted, dict)
+        else ""
+    )
+    render_binding = bound_state.get("_caption_delivery_v2")
+    render_hash = (
+        str(render_binding.get("artifact_sha256") or "")
+        if isinstance(render_binding, dict)
+        else ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", adopted_hash) or render_hash != adopted_hash:
+        raise ValueError("kinetic caption artifact hash binding is incomplete")
+    revision = gate_revision(root, "timeline", state)
+    try:
+        delivery_envelope.revalidate_file_snapshot(state_snapshot)
+        delivery_envelope.revalidate_file_snapshot(manifest_snapshot)
+        delivery_envelope.revalidate_file_snapshot(profile_snapshot)
+    except delivery_envelope.DeliveryEnvelopeError as exc:
+        raise ValueError(f"kinetic approval inputs changed during validation: {exc}") from exc
+    approvals = manifest.setdefault("approvals", {})
+    approvals["timeline"] = {
+        "approved": True,
+        "confirmed_by": "auto-edit-agent",
+        "at": now_utc(),
+        "note": "Agent-first approval after required kinetic caption adoption",
+        "state_revision": revision,
+        "revision_kind": "timeline",
+    }
+    manifest["updated_at"] = now_utc()
+    write_json(root / "project.json", manifest)
+
+
+def run_cut_stage(command, args: argparse.Namespace) -> int:
+    """Run a public subcommand without leaking its JSON into cut stdout.
+
+    ``cut`` is itself the public orchestration command.  Its progress belongs
+    on stderr and its stdout is one final machine-readable document, so JSON
+    emitted by the reusable subcommands is intentionally private here.
+    """
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        code = int(command(args))
+    if code:
+        detail = captured.getvalue().strip()
+        if detail:
+            print(detail, file=sys.stderr)
+    return code
+
+
+def verified_final_delivery(
+    project_dir: Path,
+    output: Path,
+    *,
+    kinetic: bool,
+    expected_profile_id: str | None = None,
+    expected_profile_hash: str | None = None,
+):
+    """Capture the current context-bound finalized delivery exactly once."""
+    import delivery_envelope
+    required = (
+        "caption_v2",
+        "audio_event_plan",
+        "audio_catalog",
+        "sfx_stem",
+        "visual_evidence",
+        "motion_evidence",
+    ) if kinetic else ()
+    return delivery_envelope.snapshot_finalized_delivery(
+        project_dir,
+        output,
+        expected_profile_id=expected_profile_id,
+        expected_profile_hash=expected_profile_hash,
+        required_artifacts=required,
+    )
+
+
 def cmd_cut(args: argparse.Namespace) -> int:
     """One command: a long video in, finished clips out."""
     import subprocess as _subprocess
@@ -4376,6 +4687,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
         return 2
 
     director_id = resolved["profile_id"]
+    direct_final = args.quality == "final"
     out_dir = Path(args.out).expanduser().resolve()
     project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir \
         else out_dir / ".project"
@@ -4392,7 +4704,9 @@ def cmd_cut(args: argparse.Namespace) -> int:
         ]
         if args.main:
             ingest_argv += ["--main", args.main]
-        if cmd_ingest_folder(_args_for("ingest-folder", *ingest_argv)):
+        if run_cut_stage(
+            cmd_ingest_folder, _args_for("ingest-folder", *ingest_argv)
+        ):
             return 2
     elif not manifest_path.is_file():
         _step("preparing the project")
@@ -4401,7 +4715,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
             "--source-language", args.language, "--platform", args.platform,
             "--source-has-burned-in", args.burned_in,
         ]
-        code = cmd_init(_args_for("init", *init_argv))
+        code = run_cut_stage(cmd_init, _args_for("init", *init_argv))
         if code:
             return code
 
@@ -4427,7 +4741,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
     target_argv = ["--manifest", str(manifest_path), "--platform", args.platform]
     if target is not None:
         target_argv += ["--target-duration", str(target)]
-    if cmd_set_target(_args_for("set-target", *target_argv)):
+    if run_cut_stage(cmd_set_target, _args_for("set-target", *target_argv)):
         return 2
 
     # What the recogniser gets wrong, in the two shapes it gets wrong.
@@ -4476,20 +4790,30 @@ def cmd_cut(args: argparse.Namespace) -> int:
         )
 
     _step("looking at the picture and the sound")
-    if cmd_analyze_video(_args_for("analyze-video", "--project-dir", str(project_dir))):
+    if run_cut_stage(
+        cmd_analyze_video,
+        _args_for("analyze-video", "--project-dir", str(project_dir)),
+    ):
         return 2
     _step("listening to what is said")
-    if cmd_transcribe_local(_args_for(
-        "transcribe-local", "--manifest", str(manifest_path), "--model", args.model
-    )):
+    if run_cut_stage(
+        cmd_transcribe_local,
+        _args_for(
+            "transcribe-local", "--manifest", str(manifest_path), "--model", args.model
+        ),
+    ):
         return 2
     if not args.keep_pauses:
         _step("finding the dead air")
-        if cmd_analyze_edits(_args_for("analyze-edits", "--manifest", str(manifest_path))):
+        if run_cut_stage(
+            cmd_analyze_edits,
+            _args_for("analyze-edits", "--manifest", str(manifest_path)),
+        ):
             return 2
     _step("indexing what can be quoted")
-    if cmd_build_evidence_index(
-        _args_for("build-evidence-index", "--project-dir", str(project_dir))
+    if run_cut_stage(
+        cmd_build_evidence_index,
+        _args_for("build-evidence-index", "--project-dir", str(project_dir)),
     ):
         return 2
 
@@ -4501,11 +4825,12 @@ def cmd_cut(args: argparse.Namespace) -> int:
     ]
     if not args.no_editorial:
         highlight_argv.append("--editorial")
-    if cmd_plan_highlights(_args_for("plan-highlights", *highlight_argv)):
+    if run_cut_stage(
+        cmd_plan_highlights, _args_for("plan-highlights", *highlight_argv)
+    ):
         return 2
-
     problems: list[str] = []
-    if args.translate:
+    if args.translate and director_id != "kinetic-explainer":
         from editor_server import caption_render_decision
 
         render_captions, caption_reason = caption_render_decision(
@@ -4566,6 +4891,9 @@ def cmd_cut(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     renderer = str(Path(__file__).with_name("render_editor_timeline.py"))
     made: list[dict[str, Any]] = []
+    delivery_snapshots: list[Any] = []
+    deferred_publications: list[Any] = []
+    final_delivery_failure = False
 
     for highlight in highlights:
         editorial = highlight.get("editorial") or {}
@@ -4590,31 +4918,92 @@ def cmd_cut(args: argparse.Namespace) -> int:
                  "--project-dir", str(project_dir)],
                 check=False, capture_output=True,
             )
+        if director_id == "kinetic-explainer":
+            try:
+                import caption_delivery
+
+                caption_delivery.create_delivery(
+                    project_dir,
+                    kinetic_caption_target(resolved),
+                    required=True,
+                    timeout=args.timeout,
+                )
+                approve_kinetic_timeline(project_dir)
+                # Caption adoption writes both the state and manifest.  The
+                # next clip must start from those current bindings.
+                manifest = read_json(manifest_path)
+            except (ValueError, OSError, caption_delivery.CaptionDeliveryError) as exc:
+                problems.append(f"{title}: required kinetic caption delivery failed: {exc}")
+                continue
         # A stale artifact index would reuse cards drawn for the previous clip.
         (project_dir / "working/structured_layer_artifacts.json").unlink(missing_ok=True)
-        result = _subprocess.run(
-            [sys.executable, renderer, "--project-dir", str(project_dir),
-             "--output", str(output), "--quality", args.quality],
-            check=False, capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            problems.append(f"{title}: {(result.stderr or '').strip()[-200:]}")
-            continue
-        # Every clip goes through the delivery gate. Handing back a black or
-        # silent file because nobody thought to check is the failure this
-        # gate exists for, and until now `cut` was the one path that skipped
-        # it — QA was something a person remembered to run afterwards.
-        verdict = _subprocess.run(
-            clip_qa_command(project_dir, manifest, output),
-            check=False, capture_output=True, text=True,
-        )
-        status = "unknown"
-        try:
-            status = str(json.loads(verdict.stdout or "{}").get("status") or "unknown")
-        except ValueError:
-            pass
-        if status != "pass":
-            problems.append(f"{title}: delivery QA said {status}")
+        deferred_publication = None
+        if direct_final:
+            try:
+                import render_editor_timeline as renderer_runtime
+
+                deferred_publication = renderer_runtime.render_project(
+                    project_dir,
+                    output,
+                    args.quality,
+                    defer_delivery_handoff=True,
+                )
+                if not isinstance(
+                    deferred_publication,
+                    renderer_runtime.delivery_envelope.DeferredPublication,
+                ):
+                    raise RuntimeError(
+                        "direct final renderer returned no deferred publication authority"
+                    )
+                # Ownership transfers to the command immediately after acquisition.
+                # Every later failure is handled by the one final handoff/rollback
+                # boundary, including failures before a clip enters `made`.
+                deferred_publications.append(deferred_publication)
+            except (ValueError, OSError, RuntimeError, SystemExit) as exc:
+                problems.append(f"{title}: {str(exc).strip()[-200:]}")
+                continue
+        else:
+            result = _subprocess.run(
+                [sys.executable, renderer, "--project-dir", str(project_dir),
+                 "--output", str(output), "--quality", args.quality],
+                check=False, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                problems.append(f"{title}: {(result.stderr or '').strip()[-200:]}")
+                continue
+        if direct_final:
+            try:
+                delivery_snapshot = verified_final_delivery(
+                    project_dir,
+                    output,
+                    kinetic=director_id == "kinetic-explainer",
+                    expected_profile_id=director_id,
+                    expected_profile_hash=str(resolved.get("resolved_hash") or ""),
+                )
+            except (ValueError, OSError, RuntimeError) as exc:
+                problems.append(f"{title}: finalized delivery verification failed: {exc}")
+                # A direct-final mismatch means the command cannot attest to
+                # any of its outputs as a delivery.  Do not return a partial
+                # success list beside an unbound/tampered final artifact.
+                final_delivery_failure = True
+                break
+            status = "pass"
+        else:
+            # Legacy delivery remains compatible with the original command
+            # route.  Kinetic final delivery is validated from its bound,
+            # finalized direct envelope above instead of a later unrelated QA.
+            verdict = _subprocess.run(
+                clip_qa_command(project_dir, manifest, output),
+                check=False, capture_output=True, text=True,
+            )
+            status = "unknown"
+            try:
+                status = str(json.loads(verdict.stdout or "{}").get("status") or "unknown")
+            except ValueError:
+                pass
+            if status != "pass":
+                problems.append(f"{title}: delivery QA said {status}")
+                continue
         # The delivered file's length, not the selection's: trimming pauses
         # shortens the clip after the highlight span was chosen, and a report
         # that repeats the span says 17.8s about a 14.3s file.
@@ -4622,17 +5011,45 @@ def cmd_cut(args: argparse.Namespace) -> int:
             delivered = round(float(probe_media(output).get("duration_s")), 2)
         except (ValueError, RuntimeError):
             delivered = round(float(highlight["end"]) - float(highlight["start"]), 2)
-        made.append({"title": title, "file": str(output), "qa": status,
-                     "seconds": delivered})
+        item = {"title": title, "file": str(output), "qa": status,
+                "seconds": delivered}
+        if direct_final:
+            artifacts = copy.deepcopy(delivery_snapshot.envelope["artifacts"])
+            item.update({
+                "output_sha256": delivery_snapshot.output_sha256,
+                "delivery_envelope": str(delivery_snapshot.envelope_path),
+                "delivery_envelope_sha256": delivery_snapshot.envelope_sha256,
+                "artifacts": artifacts,
+            })
+            try:
+                import delivery_envelope
 
-    emit({
-        "ok": bool(made),
-        "clips": made,
+                delivery_envelope.revalidate_finalized_delivery(delivery_snapshot)
+            except (ValueError, OSError, RuntimeError) as exc:
+                problems.append(
+                    f"{title}: finalized delivery changed before success: {exc}"
+                )
+                final_delivery_failure = True
+                break
+        made.append(item)
+        if direct_final:
+            delivery_snapshots.append(delivery_snapshot)
+
+    payload = {
+        "ok": bool(made) and not final_delivery_failure,
+        "clips": [] if final_delivery_failure else made,
         "out": str(out_dir),
         "project": str(project_dir),
         "problems": problems,
-    })
-    return 0 if made else 2
+    }
+    if direct_final:
+        return 0 if _emit_final_delivery_handoff(
+            payload,
+            delivery_snapshots,
+            deferred_publications,
+        ) else 2
+    emit(payload)
+    return 0 if made and not final_delivery_failure else 2
 
 
 def cmd_plan_overlays(args: argparse.Namespace) -> int:

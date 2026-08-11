@@ -11,7 +11,7 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from editor_server import editor_state_revision, validate_editor_state  # noqa: E402
-from auto_edit import analyze_edit_candidates  # noqa: E402
+from auto_edit import analyze_edit_candidates, build_parser  # noqa: E402
 from highlight_planner import (  # noqa: E402
     DIRECTOR_PROFILES,
     build_highlight_plan,
@@ -79,6 +79,24 @@ class HighlightPlannerTests(unittest.TestCase):
                 "max_seconds": 30,
             },
         }
+
+    def test_kinetic_profile_is_a_public_parser_choice_with_its_own_plan_identity(self) -> None:
+        args = build_parser().parse_args(
+            ["plan-highlights", "--manifest", "project.json", "--director", "kinetic-explainer"]
+        )
+        self.assertEqual(args.director, "kinetic-explainer")
+        self.assertEqual(
+            DIRECTOR_PROFILES["kinetic-explainer"]["weights"],
+            DIRECTOR_PROFILES["high-energy"]["weights"],
+        )
+        plan = build_highlight_plan(
+            self.transcript,
+            self.manifest,
+            director_profile="kinetic-explainer",
+            requested_count=1,
+            editing_brief="",
+        )
+        self.assertEqual(plan["configuration"]["director_profile"], "kinetic-explainer")
 
     def test_plans_are_deterministic_bounded_and_profile_specific(self) -> None:
         plans = {}

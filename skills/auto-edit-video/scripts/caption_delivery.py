@@ -485,15 +485,21 @@ def decoded_pcm_sha256(project_dir: Path, manifest: dict[str, Any]) -> str:
     with tempfile.TemporaryFile() as error_log:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=error_log)
         assert process.stdout is not None
-        for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
-            decoded_bytes += len(chunk)
-            digest.update(chunk)
         try:
-            return_code = process.wait(timeout=3600)
-        except subprocess.TimeoutExpired as exc:
-            process.kill()
-            process.wait()
-            raise CaptionDeliveryError("pcm_decode_failed", "ffmpeg decode timed out") from exc
+            for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+                decoded_bytes += len(chunk)
+                digest.update(chunk)
+            try:
+                return_code = process.wait(timeout=3600)
+            except subprocess.TimeoutExpired as exc:
+                raise CaptionDeliveryError(
+                    "pcm_decode_failed", "ffmpeg decode timed out"
+                ) from exc
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
         error_log.seek(0)
         stderr = error_log.read()
     if return_code != 0 or decoded_bytes == 0:

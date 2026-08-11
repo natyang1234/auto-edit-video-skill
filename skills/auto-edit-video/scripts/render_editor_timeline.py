@@ -782,6 +782,35 @@ def style_pack_for_clip(
     return structured_card_compositor.load_style_pack(pack_id)
 
 
+def resolve_active_highlight(
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve the direct-render clip without guessing on malformed state."""
+    active_id = state.get("active_highlight_id")
+    if active_id is None:
+        return None
+    if not isinstance(active_id, str):
+        raise ValueError("active_highlight_id must be a non-empty string")
+    if not active_id.strip():
+        raise ValueError("active_highlight_id must be a non-empty string")
+    highlights = state.get("highlights")
+    if not isinstance(highlights, list):
+        raise ValueError("active_highlight_id must reference exactly one highlight")
+    matches = [
+        item
+        for item in highlights
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and item.get("id")
+        and item.get("id") == active_id
+    ]
+    if len(matches) != 1:
+        if not matches:
+            raise ValueError("active_highlight_id must reference exactly one highlight")
+        raise ValueError("active_highlight_id references duplicate highlights")
+    return matches[0]
+
+
 def build_render_command(
     project_dir: Path,
     state: dict[str, Any],
@@ -1468,8 +1497,12 @@ def render_project(
     quality: str,
     snapshot_path: Path | None = None,
     variant_id: str | None = None,
-) -> None:
+    *,
+    defer_delivery_handoff: bool = False,
+) -> delivery_envelope.DeferredPublication | None:
     direct_final = quality == "final" and snapshot_path is None and variant_id is None
+    if defer_delivery_handoff and not direct_final:
+        raise ValueError("deferred delivery handoff requires a direct final render")
     render_id: str | None = None
     if snapshot_path is None:
         manifest = read_json(project_dir / "project.json", {}) or {}
@@ -1480,6 +1513,8 @@ def render_project(
                 "editor page once to run the v1→v2 migration"
             )
         clip = None
+        if not variant_id:
+            clip = resolve_active_highlight(state)
         if variant_id:
             from editor_server import (
                 build_variant_snapshot,
@@ -1555,6 +1590,7 @@ def render_project(
         temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
     published = False
     publication_attempted = False
+    deferred_publication: delivery_envelope.DeferredPublication | None = None
     try:
         visual_source: Path | None = None
         if clip is not None and state.get("visual_quality_mode") == "designed":
@@ -1762,10 +1798,10 @@ def render_project(
                 ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
             )
             delivery_envelope.write_prepared_envelope(direct_stage, prepared)
-            # The prepared envelope is durable but still private. Re-read the
+            # The prepared envelope is persisted but still private. Re-read the
             # live bindings once more in the final publication window; neither
             # the plan nor the just-written envelope can attest to current
-            # editor/cut state.
+            # editor/cut state. Host/power-loss ordering is outside this contract.
             if staged_sfx is not None:
                 if sfx_bindings is None:
                     raise RuntimeError("kinetic SFX has no freshness bindings")
@@ -1783,17 +1819,23 @@ def render_project(
                     raise RuntimeError("staged SFX verification did not pass before publication")
                 assert_sfx_candidate_binding(verification, report_payload, temporary)
             publication_attempted = True
-            delivery_envelope.publish_direct_delivery(
+            publication = delivery_envelope.publish_direct_delivery(
                 project_dir,
                 direct_stage,
                 staged_sources=staged_sources,
                 expected_output=output,
+                defer_commit=defer_delivery_handoff,
             )
+            if defer_delivery_handoff:
+                if not isinstance(publication, delivery_envelope.DeferredPublication):
+                    raise RuntimeError("renderer did not retain deferred publication authority")
+                deferred_publication = publication
             published = True
         else:
             os.replace(temporary, output)
     finally:
-        temporary.unlink(missing_ok=True)
+        if deferred_publication is None:
+            temporary.unlink(missing_ok=True)
         if (
             direct_final
             and render_id is not None
@@ -1806,6 +1848,7 @@ def render_project(
                 render_id,
                 authority=direct_stage,
             )
+    return deferred_publication
 
 
 def direct_final_render_id(state: dict[str, Any], output: Path) -> str:

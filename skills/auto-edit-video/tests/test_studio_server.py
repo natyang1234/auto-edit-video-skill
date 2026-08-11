@@ -160,10 +160,8 @@ class StudioServerTests(StudioHarness):
         kinetic = payload["director_presets"]["kinetic-explainer"]
         self.assertEqual(kinetic["profile_id"], "kinetic-explainer")
         self.assertRegex(kinetic["resolved_hash"], r"^[0-9a-f]{64}$")
-        self.assertFalse(kinetic["available"])
-        self.assertEqual(
-            kinetic["missing_capabilities"], sorted(kinetic["missing_capabilities"])
-        )
+        self.assertTrue(kinetic["available"])
+        self.assertEqual(kinetic["missing_capabilities"], [])
 
     def test_import_director_options_are_bootstrapped_from_registry(self) -> None:
         html = (SKILL_DIR / "editor/import.html").read_text(encoding="utf-8")
@@ -199,7 +197,7 @@ class StudioServerTests(StudioHarness):
             stored["settings"]["resolved_director_profile"]["resolved_hash"],
         )
 
-    def test_kinetic_import_fails_capability_preflight_before_session_mutation(self) -> None:
+    def test_kinetic_import_creates_awaiting_upload_session_with_resolved_profile(self) -> None:
         status, payload = self.json_response(
             "POST",
             "/api/imports",
@@ -214,13 +212,30 @@ class StudioServerTests(StudioHarness):
             },
             {"X-Auto-Edit-CSRF": self.csrf_token},
         )
-        self.assertEqual(status, 422, payload)
-        self.assertEqual(payload["error_code"], "capability_missing")
+        self.assertEqual(status, 201, payload)
+        import_payload = payload["import"]
+        self.assertEqual(import_payload["state"], "awaiting_upload")
+        self.assertEqual(import_payload["director_profile"], "kinetic-explainer")
         self.assertEqual(
-            payload["missing_capabilities"], sorted(payload["missing_capabilities"])
+            import_payload["resolved_profile_hash"],
+            self.json_response("GET", "/api/studio")[1]["director_presets"][
+                "kinetic-explainer"
+            ]["resolved_hash"],
         )
-        self.assertEqual(self.server.imports, {})
-        self.assertIsNone(self.server.active_upload_id)
+        session = self.server.imports[str(import_payload["id"])]
+        self.assertEqual(
+            session["settings"]["director_selection_request"]["profile_id"],
+            "kinetic-explainer",
+        )
+        self.assertEqual(
+            session["settings"]["director_selection_request"]["resolved_profile_hash"],
+            import_payload["resolved_profile_hash"],
+        )
+        self.assertEqual(
+            session["settings"]["resolved_director_profile"]["resolved_hash"],
+            import_payload["resolved_profile_hash"],
+        )
+        self.assertEqual(self.server.active_upload_id, import_payload["id"])
         self.assertEqual(list(self.projects_root.iterdir()), [])
 
     def test_import_creates_owned_project_and_launches_scoped_editor(self) -> None:

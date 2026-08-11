@@ -734,10 +734,8 @@ class EditorServerTests(unittest.TestCase):
             for key in metadata_keys:
                 self.assertIn(key, preset)
         kinetic = payload["director_presets"]["kinetic-explainer"]
-        self.assertFalse(kinetic["available"])
-        self.assertEqual(
-            kinetic["missing_capabilities"], sorted(kinetic["missing_capabilities"])
-        )
+        self.assertTrue(kinetic["available"])
+        self.assertEqual(kinetic["missing_capabilities"], [])
         resolved = subprocess.run(
             [
                 sys.executable,
@@ -898,14 +896,11 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertLessEqual(len(planned["state"]["highlights"]), 3)
 
-    def test_kinetic_highlight_planning_fails_before_state_or_plan_mutation(self) -> None:
+    def test_kinetic_highlight_planning_persists_director_state_and_plan(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
         bootstrap = json.loads(body.decode("utf-8"))
-        state_path = self.project / "working/editor_state.json"
         plan_path = self.project / "working/highlight_plan.json"
-        state_before = state_path.read_bytes()
-        plan_before = plan_path.read_bytes() if plan_path.is_file() else None
         status, payload = self.json_request(
             "POST",
             "/api/plan-highlights",
@@ -916,16 +911,21 @@ class EditorServerTests(unittest.TestCase):
                 "expected_revision": bootstrap["state"]["revision"],
             },
         )
-        self.assertEqual(status, 422, payload)
-        self.assertEqual(payload["error_code"], "capability_missing")
+        self.assertEqual(status, 200, payload)
         self.assertEqual(
-            payload["missing_capabilities"], sorted(payload["missing_capabilities"])
+            payload["highlight_plan"]["configuration"]["director_profile"],
+            "kinetic-explainer",
         )
-        self.assertEqual(state_path.read_bytes(), state_before)
-        if plan_before is None:
-            self.assertFalse(plan_path.exists())
-        else:
-            self.assertEqual(plan_path.read_bytes(), plan_before)
+        self.assertEqual(payload["state"]["director_style"], "kinetic-explainer")
+        self.assertEqual(
+            payload["state"]["style_pack"]["project_default"], "kinetic-social"
+        )
+        self.assertNotEqual(payload["state"]["revision"], bootstrap["state"]["revision"])
+        self.assertTrue(plan_path.is_file())
+        stored_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            stored_plan["configuration"]["director_profile"], "kinetic-explainer"
+        )
 
     def test_media_range_request(self) -> None:
         status, headers, body = self.request(

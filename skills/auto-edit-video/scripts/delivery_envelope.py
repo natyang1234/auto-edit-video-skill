@@ -10,6 +10,8 @@ when recovery cannot prove that a destination is still ours.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import fcntl
 import json
@@ -28,7 +30,21 @@ import contract_registry
 DELIVERY_REL = Path("working/delivery_envelopes")
 STAGING_REL = DELIVERY_REL / ".staging"
 LOCKS_REL = STAGING_REL / ".locks"
+QUARANTINE_REL = DELIVERY_REL / ".quarantine"
 JOURNAL_NAME = "publication_journal.json"
+DEFERRED_NAME = "deferred_handoff.json"
+DEFERRED_MARKER_KEYS = {
+    "schema_version",
+    "state",
+    "render_id",
+    "transaction_id",
+    "expected_output",
+    "journal_sha256",
+    "output_sha256",
+    "finalized_sha256",
+    "binding_sha256",
+}
+DEFERRED_MARKER_STATES = {"pending", "committed"}
 PREPARED_NAME = "prepared.json"
 FINALIZED_NAME = "{render_id}.json"
 ARTIFACT_NAMES = (
@@ -101,6 +117,57 @@ class StagingAttempt(os.PathLike[str]):
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.stage_dir, name)
+
+
+@dataclass(frozen=True, slots=True)
+class FileSnapshot:
+    """One regular file observed through a stable no-follow descriptor."""
+
+    path: Path
+    label: str
+    sha256: str
+    size: int
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+    payload: bytes | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizedDeliverySnapshot:
+    """Context-bound bytes and identities accepted by a final consumer."""
+
+    project_dir: Path
+    expected_output: Path
+    envelope_path: Path
+    render_id: str
+    envelope: dict[str, Any]
+    envelope_sha256: str
+    output_sha256: str
+    state_revision: str
+    profile_id: str
+    resolved_profile_hash: str
+    cut_map_sha256: str | None
+    files: tuple[FileSnapshot, ...]
+    editor_state: dict[str, Any] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredPublication:
+    """Uncommitted publication owned by one live render attempt.
+
+    The owner token is an in-process object capability.  It is deliberately
+    neither serializable nor included in renderer/public command payloads.
+    """
+
+    project_dir: Path
+    render_id: str
+    stage_dir: Path
+    expected_output: Path
+    finalized: dict[str, Any] = field(repr=False, compare=False)
+    _transaction_id: str = field(repr=False, compare=False)
+    _owner_token: object = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,12 +326,175 @@ def _validate_staging_attempt(
     return authority
 
 
+def _validate_deferred_publication(
+    authority: DeferredPublication,
+    *,
+    expected_state: str = "pending",
+) -> DeferredPublication:
+    if not isinstance(authority, DeferredPublication):
+        raise DeliveryEnvelopeError("deferred publication authority is required")
+    root = authority.project_dir.resolve()
+    if (
+        authority.project_dir != root
+        or authority.stage_dir != staging_path(root, authority.render_id)
+        or not authority.expected_output.is_absolute()
+    ):
+        raise DeliveryEnvelopeError(
+            f"deferred publication authority does not match: {authority.render_id}"
+        )
+    _require_staging_lease(root, authority.render_id, authority._owner_token)
+    stage_root, stage_render_id, stage = _stage_identity(authority.stage_dir)
+    if stage_root != root or stage_render_id != authority.render_id or stage != authority.stage_dir:
+        raise DeliveryEnvelopeError(
+            f"deferred publication authority does not match: {authority.render_id}"
+        )
+    marker, _plan = _validated_deferred_marker(
+        root,
+        stage,
+        authority.render_id,
+        expected_output=authority.expected_output,
+        expected_state=expected_state,
+    )
+    if (
+        marker["transaction_id"] != authority._transaction_id
+        or marker["finalized_sha256"] != _sha256_bytes(_json_bytes(authority.finalized))
+    ):
+        raise DeliveryEnvelopeError(
+            f"deferred publication marker authority is invalid: {authority.render_id}"
+        )
+    return authority
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _snapshot_regular_file(
+    path: Path,
+    *,
+    label: str,
+    capture_bytes: bool = False,
+) -> FileSnapshot:
+    """Hash one pathname exactly once, rejecting link and in-read identity changes."""
+    entry = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(entry, flags)
+        before = os.fstat(descriptor)
+        linked = entry.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or (before.st_dev, before.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise DeliveryEnvelopeError(f"{label} is not an owned regular file: {entry}")
+        digest = hashlib.sha256()
+        chunks: list[bytes] | None = [] if capture_bytes else None
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_after != identity_before or total != before.st_size:
+            raise DeliveryEnvelopeError(f"{label} changed while it was read: {entry}")
+        return FileSnapshot(
+            path=entry,
+            label=label,
+            sha256=digest.hexdigest(),
+            size=total,
+            device=before.st_dev,
+            inode=before.st_ino,
+            mtime_ns=before.st_mtime_ns,
+            ctime_ns=before.st_ctime_ns,
+            payload=b"".join(chunks) if chunks is not None else None,
+        )
+    except DeliveryEnvelopeError:
+        raise
+    except OSError as exc:
+        raise DeliveryEnvelopeError(
+            f"{label} could not be opened safely: {entry}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def revalidate_file_snapshot(snapshot: FileSnapshot) -> None:
+    """Compare the current pathname to a previously captured file identity."""
+    current = _snapshot_regular_file(snapshot.path, label=snapshot.label)
+    if (
+        current.sha256 != snapshot.sha256
+        or current.size != snapshot.size
+        or current.device != snapshot.device
+        or current.inode != snapshot.inode
+        or current.mtime_ns != snapshot.mtime_ns
+        or current.ctime_ns != snapshot.ctime_ns
+    ):
+        raise DeliveryEnvelopeError(
+            f"{snapshot.label} changed after verification: {snapshot.path}"
+        )
+
+
+def _decode_json_snapshot(snapshot: FileSnapshot) -> dict[str, Any]:
+    if snapshot.payload is None:
+        raise DeliveryEnvelopeError(f"{snapshot.label} bytes were not captured")
+    try:
+        value = contract_registry.load_artifact_text(snapshot.payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, contract_registry.ContractError) as exc:
+        raise DeliveryEnvelopeError(f"{snapshot.label} JSON is unreadable: {exc}") from exc
+    if not isinstance(value, dict):
+        raise DeliveryEnvelopeError(f"{snapshot.label} must be a JSON object")
+    return value
+
+
+def snapshot_owned_json(
+    project_dir: Path,
+    relative: str,
+    *,
+    label: str,
+) -> tuple[dict[str, Any], FileSnapshot]:
+    """Capture a canonical project JSON file for a later compare-and-swap check."""
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise DeliveryEnvelopeError(f"{label} path is invalid")
+    parts = relative.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise DeliveryEnvelopeError(f"{label} path is invalid")
+    root = project_dir.resolve()
+    _safe_directory(root, create=False)
+    current = root
+    for part in parts[:-1]:
+        current = current / part
+        _safe_directory(current, create=False)
+    path = root / Path(*parts)
+    if path.resolve() != path:
+        raise DeliveryEnvelopeError(f"{label} path is aliased")
+    snapshot = _snapshot_regular_file(path, label=label, capture_bytes=True)
+    return _decode_json_snapshot(snapshot), snapshot
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -283,6 +513,21 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise DeliveryEnvelopeError(
+            f"delivery directory state could not be made durable: {path}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -321,12 +566,21 @@ def _project_relative(project_dir: Path, path: Path, *, label: str) -> str:
 
 
 def _destination_path(
-    project_dir: Path, relative: str, *, allow_external: bool = False
+    project_dir: Path,
+    relative: str,
+    *,
+    allow_external: bool = False,
+    allow_leaf_conflict: bool = False,
 ) -> Path:
     if not isinstance(relative, str) or not relative or "\\" in relative:
         raise DeliveryEnvelopeError("artifact path must be a project-relative POSIX path")
     if allow_external and relative.startswith("/"):
         entry = Path(relative).expanduser()
+        if allow_leaf_conflict:
+            if not entry.is_absolute():
+                raise DeliveryEnvelopeError("external artifact path must be absolute")
+            _safe_directory(entry.parent, create=False)
+            return entry
         if entry.is_symlink():
             raise DeliveryEnvelopeError(f"artifact destination must not be a symlink: {relative}")
         destination = entry.resolve()
@@ -338,6 +592,12 @@ def _destination_path(
         raise DeliveryEnvelopeError("artifact path must be normalized")
     root = project_dir.resolve()
     entry = root / Path(*parts)
+    if allow_leaf_conflict:
+        current = root
+        for part in parts[:-1]:
+            current = current / part
+            _safe_directory(current, create=False)
+        return entry
     if entry.is_symlink():
         raise DeliveryEnvelopeError(f"artifact destination must not be a symlink: {relative}")
     destination = entry.resolve()
@@ -398,12 +658,8 @@ def _validate_artifact_bytes(
             )
 
 
-def validate_envelope(
-    project_dir: Path,
-    envelope: dict[str, Any],
-    *,
-    sources: Mapping[str, Path] | None = None,
-    expected_state: str | None = None,
+def _validate_envelope_structure(
+    envelope: dict[str, Any], *, expected_state: str | None = None
 ) -> None:
     errors = contract_registry.validate_artifact("delivery_envelope", envelope)
     if errors:
@@ -421,21 +677,64 @@ def validate_envelope(
             raise DeliveryEnvelopeError(
                 "finalized delivery prepared envelope hash does not match its canonical lineage"
             )
+
+
+def validate_envelope(
+    project_dir: Path,
+    envelope: dict[str, Any],
+    *,
+    sources: Mapping[str, Path] | None = None,
+    expected_state: str | None = None,
+) -> None:
+    _validate_envelope_structure(envelope, expected_state=expected_state)
     _validate_artifact_bytes(project_dir, envelope, sources)
 
 
-def _profile_binding(state: dict[str, Any]) -> tuple[str, str]:
+def _profile_binding(
+    project_dir: Path, state: dict[str, Any]
+) -> tuple[str, str, FileSnapshot | None]:
     import director_resolver
 
     director_id = str(state.get("director_style") or "teacher-punch")
+    persisted_path = project_dir.resolve() / "working/resolved_director_profile.json"
     try:
-        resolved = director_resolver.resolve_director_profile(director_id)
+        persisted_path.lstat()
+    except FileNotFoundError:
+        persisted = None
+        persisted_snapshot = None
+    else:
+        persisted, persisted_snapshot = snapshot_owned_json(
+            project_dir,
+            "working/resolved_director_profile.json",
+            label="resolved director profile",
+        )
+    try:
+        if persisted is None:
+            resolved = director_resolver.resolve_director_profile(director_id)
+        else:
+            if persisted.get("profile_id") != director_id:
+                raise DeliveryEnvelopeError(
+                    "persisted director profile does not match editor state"
+                )
+            overrides = persisted.get("overrides")
+            if not isinstance(overrides, dict):
+                raise DeliveryEnvelopeError("persisted director profile overrides are invalid")
+            resolved = director_resolver.resolve_director_profile(
+                director_id,
+                overrides=overrides,
+            )
+            if resolved != persisted:
+                raise DeliveryEnvelopeError(
+                    "persisted director profile is stale or not canonical"
+                )
     except Exception as exc:
+        if isinstance(exc, DeliveryEnvelopeError):
+            raise
         raise DeliveryEnvelopeError(f"director profile could not be resolved: {director_id}") from exc
     profile_hash = resolved.get("resolved_hash")
     if not isinstance(profile_hash, str):
         raise DeliveryEnvelopeError("director profile has no resolved hash")
-    return director_id, profile_hash
+    return director_id, profile_hash, persisted_snapshot
 
 
 def _renderer_identity(renderer_script: Path, ffmpeg_executable: Path) -> dict[str, Any]:
@@ -481,7 +780,7 @@ def build_prepared_envelope(
     included_sfx = [name for name in sfx_names if staged_sources.get(name) is not None]
     if included_sfx and len(included_sfx) != len(sfx_names):
         raise DeliveryEnvelopeError("SFX delivery artifacts must be all-or-none")
-    profile_id, profile_hash = _profile_binding(state)
+    profile_id, profile_hash, _profile_snapshot = _profile_binding(root, state)
     import editor_server
 
     cut_map = root / "working/cut_map.json"
@@ -586,7 +885,7 @@ def _observed_destination_sha(path: Path, *, label: str) -> str | None:
         return None
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise DeliveryEnvelopeError(f"destination is not an owned regular file: {label}")
-    return _sha256(path)
+    return _snapshot_regular_file(path, label=f"destination {label}").sha256
 
 
 def _copy_atomic(source: Path, destination: Path) -> None:
@@ -607,8 +906,15 @@ def _journal_path(stage_dir: Path) -> Path:
     return stage_dir / JOURNAL_NAME
 
 
-def _canonical_expected_output(expected_output: Path) -> Path:
+def _canonical_expected_output(
+    expected_output: Path, *, allow_leaf_conflict: bool = False
+) -> Path:
     entry = Path(expected_output).expanduser()
+    if allow_leaf_conflict:
+        if not entry.is_absolute():
+            raise DeliveryEnvelopeError("expected output must be absolute")
+        _safe_directory(entry.parent, create=False)
+        return entry
     if entry.is_symlink():
         raise DeliveryEnvelopeError("expected output must not be a symlink")
     return entry.resolve()
@@ -621,9 +927,13 @@ def _phase0b_destinations(
     *,
     include_caption_v2: bool = False,
     include_sfx: bool = False,
+    allow_leaf_conflicts: bool = False,
 ) -> dict[str, tuple[str, bool]]:
     root = project_dir.resolve()
-    output = _canonical_expected_output(expected_output)
+    output = _canonical_expected_output(
+        expected_output,
+        allow_leaf_conflict=allow_leaf_conflicts,
+    )
     destinations = {
         "output": (str(output), True),
         "qa_report": (f"qa/{render_id}.json", False),
@@ -646,7 +956,12 @@ def _phase0b_destinations(
             "sfx_stem": (f"working/sfx_stems/{render_id}.wav", False),
         })
     for relative, external in destinations.values():
-        destination = _destination_path(root, relative, allow_external=external)
+        destination = _destination_path(
+            root,
+            relative,
+            allow_external=external,
+            allow_leaf_conflict=allow_leaf_conflicts,
+        )
         if external:
             if destination != output or relative != str(output):
                 raise DeliveryEnvelopeError("expected output path is not canonical")
@@ -664,6 +979,8 @@ def _validate_phase0b_artifact_destinations(
     envelope: dict[str, Any],
     render_id: str,
     expected_output: Path,
+    *,
+    allow_leaf_conflicts: bool = False,
 ) -> dict[str, tuple[str, bool]]:
     if envelope.get("render_id") != render_id:
         raise DeliveryEnvelopeError("delivery envelope render_id does not match recovery target")
@@ -680,6 +997,7 @@ def _validate_phase0b_artifact_destinations(
         expected_output,
         include_caption_v2=artifacts.get("caption_v2") is not None,
         include_sfx=bool(present_sfx),
+        allow_leaf_conflicts=allow_leaf_conflicts,
     )
     for name, (expected_path, _external) in destinations.items():
         item = artifacts.get(name)
@@ -702,15 +1020,238 @@ def _validate_phase0b_artifact_destinations(
     return destinations
 
 
+def snapshot_finalized_delivery(
+    project_dir: Path,
+    expected_output: Path,
+    *,
+    expected_profile_id: str | None = None,
+    expected_profile_hash: str | None = None,
+    required_artifacts: tuple[str, ...] = (),
+) -> FinalizedDeliverySnapshot:
+    """Accept one current direct delivery from stable, context-bound file snapshots."""
+    root = _ensure_staging_trust_chain(project_dir, create=False)
+    state, state_snapshot = snapshot_owned_json(
+        root,
+        "working/editor_state.json",
+        label="current editor state",
+    )
+    from editor_server import editor_state_revision
+    from render_editor_timeline import direct_final_render_id
+
+    output = _canonical_expected_output(expected_output)
+    render_id = direct_final_render_id(state, output)
+    envelope_path = finalized_path(root, render_id)
+    if envelope_path.resolve() != envelope_path:
+        raise DeliveryEnvelopeError("finalized envelope path is aliased")
+    envelope_snapshot = _snapshot_regular_file(
+        envelope_path,
+        label="finalized envelope",
+        capture_bytes=True,
+    )
+    envelope = _decode_json_snapshot(envelope_snapshot)
+    _validate_envelope_structure(envelope, expected_state="finalized")
+    if envelope.get("render_id") != render_id:
+        raise DeliveryEnvelopeError(
+            "finalized envelope render_id does not match the current direct render"
+        )
+
+    profile_id, profile_hash, profile_snapshot = _profile_binding(root, state)
+    if expected_profile_id is not None and profile_id != expected_profile_id:
+        raise DeliveryEnvelopeError(
+            "current director profile does not match the requested cut profile"
+        )
+    if expected_profile_hash is not None and profile_hash != expected_profile_hash:
+        raise DeliveryEnvelopeError(
+            "current resolved director profile hash changed after cut selection"
+        )
+    if envelope.get("profile") != {
+        "id": profile_id,
+        "resolved_profile_hash": profile_hash,
+    }:
+        raise DeliveryEnvelopeError(
+            "finalized envelope profile does not match the current resolved profile"
+        )
+
+    timeline_revision = editor_state_revision(state)
+    timeline = envelope.get("timeline")
+    if not isinstance(timeline, dict) or timeline.get("editor_state_revision") != timeline_revision:
+        raise DeliveryEnvelopeError(
+            "finalized envelope timeline does not match the current editor state"
+        )
+    destinations = _validate_phase0b_artifact_destinations(
+        root,
+        envelope,
+        render_id,
+        output,
+    )
+    artifacts = envelope.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise DeliveryEnvelopeError("finalized envelope artifacts are invalid")
+    for name in required_artifacts:
+        if name not in ARTIFACT_NAMES or not isinstance(artifacts.get(name), dict):
+            raise DeliveryEnvelopeError(
+                f"finalized delivery artifact is required: {name}"
+            )
+
+    cut_map_path = root / "working/cut_map.json"
+    cut_snapshot: FileSnapshot | None = None
+    try:
+        cut_map_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        cut_snapshot = _snapshot_regular_file(
+            cut_map_path,
+            label="current cut map",
+        )
+    sfx_names = ("audio_event_plan", "audio_catalog", "sfx_stem")
+    has_sfx = all(isinstance(artifacts.get(name), dict) for name in sfx_names)
+    if cut_snapshot is not None:
+        cut_map_sha256: str | None = cut_snapshot.sha256
+    elif has_sfx:
+        segments = state.get("segments") if isinstance(state.get("segments"), list) else []
+        cut_map_sha256 = contract_registry.canonical_hash({"segments": segments})
+    else:
+        cut_map_sha256 = None
+    if timeline.get("cut_map_sha256") != cut_map_sha256:
+        raise DeliveryEnvelopeError(
+            "finalized envelope cut map does not match the current timeline"
+        )
+
+    captured_by_path: dict[Path, FileSnapshot] = {}
+    artifact_snapshots: dict[str, FileSnapshot] = {}
+    for name in ARTIFACT_NAMES:
+        item = artifacts.get(name)
+        if item is None:
+            continue
+        if not isinstance(item, dict):
+            raise DeliveryEnvelopeError(f"artifact {name} is invalid")
+        relative, external = destinations.get(name, (None, None))
+        if relative is None or type(external) is not bool:
+            raise DeliveryEnvelopeError(
+                f"delivery artifact {name} has no canonical destination"
+            )
+        path = _destination_path(root, relative, allow_external=external)
+        snapshot = captured_by_path.get(path)
+        if snapshot is None:
+            snapshot = _snapshot_regular_file(
+                path,
+                label=f"artifact {name}",
+                capture_bytes=(name == "qa_report"),
+            )
+            captured_by_path[path] = snapshot
+        artifact_snapshots[name] = snapshot
+        if snapshot.sha256 != item.get("sha256") or snapshot.size != item.get("bytes"):
+            raise DeliveryEnvelopeError(
+                f"artifact {name} hash/size mismatch for {relative}"
+            )
+    output_snapshot = artifact_snapshots.get("output")
+    qa_snapshot = artifact_snapshots.get("qa_report")
+    if output_snapshot is None or qa_snapshot is None:
+        raise DeliveryEnvelopeError("finalized delivery output or QA artifact is missing")
+    qa_report = _decode_json_snapshot(qa_snapshot)
+    if qa_report.get("status") != "pass":
+        raise DeliveryEnvelopeError(
+            f"finalized delivery QA said {qa_report.get('status')}"
+        )
+
+    files: list[FileSnapshot] = [envelope_snapshot, state_snapshot]
+    if profile_snapshot is not None:
+        files.append(profile_snapshot)
+    if cut_snapshot is not None:
+        files.append(cut_snapshot)
+    files.extend(captured_by_path.values())
+    snapshot = FinalizedDeliverySnapshot(
+        project_dir=root,
+        expected_output=output,
+        envelope_path=envelope_path,
+        render_id=render_id,
+        envelope=envelope,
+        envelope_sha256=envelope_snapshot.sha256,
+        output_sha256=output_snapshot.sha256,
+        state_revision=timeline_revision,
+        profile_id=profile_id,
+        resolved_profile_hash=profile_hash,
+        cut_map_sha256=cut_map_sha256,
+        files=tuple(files),
+        editor_state=state,
+    )
+    revalidate_finalized_delivery(snapshot)
+    return snapshot
+
+
+def revalidate_finalized_delivery(snapshot: FinalizedDeliverySnapshot) -> None:
+    """Fail if any accepted pathname or current profile changed before handoff."""
+    if not isinstance(snapshot, FinalizedDeliverySnapshot):
+        raise DeliveryEnvelopeError("finalized delivery snapshot authority is required")
+    for file_snapshot in snapshot.files:
+        revalidate_file_snapshot(file_snapshot)
+    if not any(item.label == "current cut map" for item in snapshot.files):
+        cut_map = snapshot.project_dir / "working/cut_map.json"
+        try:
+            cut_map.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise DeliveryEnvelopeError(
+                "current cut map changed after finalized delivery verification"
+            )
+    profile_id, profile_hash, _profile_snapshot = _profile_binding(
+        snapshot.project_dir,
+        snapshot.editor_state,
+    )
+    if (
+        profile_id != snapshot.profile_id
+        or profile_hash != snapshot.resolved_profile_hash
+    ):
+        raise DeliveryEnvelopeError(
+            "resolved director profile changed after finalized delivery verification"
+        )
+
+
+@contextmanager
+def finalized_delivery_handoff(
+    snapshot: FinalizedDeliverySnapshot,
+) -> Iterator[None]:
+    """Hold the render publisher lease across final validation and handoff.
+
+    Repo-owned publication and recovery for this render use the same flock and
+    therefore cannot overlap the yielded section.  The lease is cooperative;
+    it does not constrain arbitrary same-user filesystem writers.
+    """
+    owner_token = _acquire_staging_lease(snapshot.project_dir, snapshot.render_id)
+    try:
+        revalidate_finalized_delivery(snapshot)
+        yield
+    finally:
+        _release_staging_lease(
+            snapshot.project_dir,
+            snapshot.render_id,
+            owner_token,
+        )
+
+
 def _recovery_expected_entries(
     project_dir: Path,
     stage_dir: Path,
     render_id: str,
     expected_output: Path,
+    *,
+    allow_leaf_conflicts: bool = False,
 ) -> list[dict[str, Any]]:
-    prepared = _read_json(stage_dir / PREPARED_NAME)
+    prepared = _decode_json_snapshot(
+        _snapshot_regular_file(
+            stage_dir / PREPARED_NAME,
+            label=f"prepared delivery envelope {render_id}",
+            capture_bytes=True,
+        )
+    )
     destinations = _validate_phase0b_artifact_destinations(
-        project_dir, prepared, render_id, expected_output
+        project_dir,
+        prepared,
+        render_id,
+        expected_output,
+        allow_leaf_conflicts=allow_leaf_conflicts,
     )
     sources = _stage_sources(stage_dir, prepared)
     validate_envelope(
@@ -733,9 +1274,12 @@ def _recovery_expected_entries(
     expected: list[dict[str, Any]] = []
     seen: set[str] = set()
     artifacts = prepared["artifacts"]
-    recovery_names = [name for name in RECOVERY_ARTIFACT_NAMES if artifacts.get(name) is not None]
-    if artifacts.get("caption_v2") is not None:
-        recovery_names.append("caption_v2")
+    recovery_allowlist = set(RECOVERY_ARTIFACT_NAMES) | {"caption_v2"}
+    recovery_names = [
+        name
+        for name in ARTIFACT_NAMES
+        if name in recovery_allowlist and artifacts.get(name) is not None
+    ]
     for name in recovery_names:
         destination, external = destinations[name]
         if destination in seen:
@@ -786,6 +1330,7 @@ def _validate_restore_plan(
     *,
     render_id: str,
     expected_output: Path,
+    allow_external_conflicts: bool = False,
 ) -> list[dict[str, Any]]:
     if set(journal) != JOURNAL_KEYS or type(journal.get("schema_version")) is not int:
         raise DeliveryEnvelopeError("publication journal shape is invalid")
@@ -795,7 +1340,11 @@ def _validate_restore_plan(
     if not isinstance(entries, list):
         raise DeliveryEnvelopeError("publication journal entries are invalid")
     expected_entries = _recovery_expected_entries(
-        project_dir, stage_dir, render_id, expected_output
+        project_dir,
+        stage_dir,
+        render_id,
+        expected_output,
+        allow_leaf_conflicts=allow_external_conflicts,
     )
     if len(entries) != len(expected_entries):
         raise DeliveryEnvelopeError("publication journal destination set is incomplete")
@@ -844,11 +1393,24 @@ def _validate_restore_plan(
             raise DeliveryEnvelopeError("publication journal absent prior has backup data")
 
         destination = _destination_path(
-            project_dir, relative, allow_external=external
+            project_dir,
+            relative,
+            allow_external=external,
+            allow_leaf_conflict=allow_external_conflicts,
         )
-        current_sha = _observed_destination_sha(destination, label=relative)
+        current_conflict = False
+        try:
+            current_sha = _observed_destination_sha(destination, label=relative)
+        except DeliveryEnvelopeError:
+            if not allow_external_conflicts:
+                raise
+            current_sha = None
+            current_conflict = True
         permitted = {new_sha, prior_sha} if prior_exists else {new_sha, None}
-        if current_sha not in permitted:
+        if (
+            (current_conflict or current_sha not in permitted)
+            and not allow_external_conflicts
+        ):
             raise DeliveryEnvelopeError(
                 f"journal destination was externally changed; refusing overwrite: {relative}"
             )
@@ -857,6 +1419,7 @@ def _validate_restore_plan(
                 "relative": relative,
                 "destination": destination,
                 "current_sha256": current_sha,
+                "current_conflict": current_conflict,
                 "prior_exists": prior_exists,
                 "prior_sha256": prior_sha,
                 "backup": backup,
@@ -866,6 +1429,367 @@ def _validate_restore_plan(
             }
         )
     return plan
+
+
+def _deferred_publication_binding(
+    project_dir: Path,
+    stage_dir: Path,
+    render_id: str,
+    *,
+    expected_output: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    root = project_dir.resolve()
+    output_entry = Path(expected_output).expanduser()
+    allow_external_conflicts = output_entry.is_absolute() and output_entry.parent.is_dir()
+    if allow_external_conflicts:
+        canonical_parent = output_entry.parent.resolve()
+        _safe_directory(canonical_parent, create=False)
+        output = canonical_parent / output_entry.name
+    else:
+        output = _canonical_expected_output(output_entry)
+    journal_snapshot = _snapshot_regular_file(
+        _journal_path(stage_dir),
+        label=f"deferred publication journal {render_id}",
+        capture_bytes=True,
+    )
+    journal = _decode_json_snapshot(journal_snapshot)
+    plan = _validate_restore_plan(
+        root,
+        stage_dir,
+        journal,
+        render_id=render_id,
+        expected_output=output,
+        allow_external_conflicts=allow_external_conflicts,
+    )
+    output_entries = [item for item in plan if item["destination"] == output]
+    final_destination = finalized_path(root, render_id)
+    finalized_entries = [
+        item for item in plan if item["destination"] == final_destination
+    ]
+    if len(output_entries) != 1 or len(finalized_entries) != 1:
+        raise DeliveryEnvelopeError(
+            f"deferred publication binding is incomplete: {render_id}"
+        )
+    binding = {
+        "render_id": render_id,
+        "expected_output": str(output),
+        "journal_sha256": journal_snapshot.sha256,
+        "output_sha256": output_entries[0]["new_sha256"],
+        "finalized_sha256": finalized_entries[0]["new_sha256"],
+    }
+    return binding, plan
+
+
+def _deferred_marker_payload(
+    binding: dict[str, Any],
+    *,
+    state: str,
+    transaction_id: str,
+) -> dict[str, Any]:
+    """Bind repo-owned recovery state; this checksum is not same-user authentication.
+
+    The live owner token controls repo-writer state transitions.  The persisted,
+    unkeyed binding detects stale, mismatched, and partially edited markers, but
+    cannot authenticate against an OS principal able to rewrite the whole stage.
+    """
+    if state not in DEFERRED_MARKER_STATES:
+        raise DeliveryEnvelopeError("deferred publication marker state is invalid")
+    if not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
+        raise DeliveryEnvelopeError("deferred publication transaction id is invalid")
+    payload = {
+        "schema_version": 2,
+        "state": state,
+        "transaction_id": transaction_id,
+        **binding,
+    }
+    payload["binding_sha256"] = contract_registry.canonical_hash(payload)
+    return payload
+
+
+def _validated_deferred_marker(
+    project_dir: Path,
+    stage_dir: Path,
+    render_id: str,
+    *,
+    expected_output: Path,
+    expected_state: str | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    marker = _decode_json_snapshot(
+        _snapshot_regular_file(
+            stage_dir / DEFERRED_NAME,
+            label=f"deferred publication marker {render_id}",
+            capture_bytes=True,
+        )
+    )
+    if (
+        set(marker) != DEFERRED_MARKER_KEYS
+        or type(marker.get("schema_version")) is not int
+        or marker.get("schema_version") != 2
+        or marker.get("state") not in DEFERRED_MARKER_STATES
+        or not isinstance(marker.get("transaction_id"), str)
+    ):
+        raise DeliveryEnvelopeError(
+            f"deferred publication marker is invalid: {render_id}"
+        )
+    if expected_state is not None and marker["state"] != expected_state:
+        raise DeliveryEnvelopeError(
+            f"deferred publication marker state is not {expected_state}: {render_id}"
+        )
+    binding, plan = _deferred_publication_binding(
+        project_dir,
+        stage_dir,
+        render_id,
+        expected_output=expected_output,
+    )
+    expected = _deferred_marker_payload(
+        binding,
+        state=marker["state"],
+        transaction_id=marker["transaction_id"],
+    )
+    if marker != expected:
+        raise DeliveryEnvelopeError(
+            f"deferred publication marker binding is invalid: {render_id}"
+        )
+    return marker, plan
+
+
+def _write_deferred_marker(
+    project_dir: Path,
+    stage_dir: Path,
+    render_id: str,
+    *,
+    expected_output: Path,
+    state: str,
+    transaction_id: str,
+) -> dict[str, Any]:
+    binding, plan = _deferred_publication_binding(
+        project_dir,
+        stage_dir,
+        render_id,
+        expected_output=expected_output,
+    )
+    if state == "committed" and any(
+        item["current_conflict"] or item["current_sha256"] != item["new_sha256"]
+        for item in plan
+    ):
+        raise DeliveryEnvelopeError(
+            f"committed publication changed before marker transition: {render_id}"
+        )
+    marker = _deferred_marker_payload(
+        binding,
+        state=state,
+        transaction_id=transaction_id,
+    )
+    marker_path = stage_dir / DEFERRED_NAME
+    _atomic_write_json(marker_path, marker)
+    _fsync_directory(stage_dir)
+    written, written_plan = _validated_deferred_marker(
+        project_dir,
+        stage_dir,
+        render_id,
+        expected_output=expected_output,
+        expected_state=state,
+    )
+    if written != marker:
+        raise DeliveryEnvelopeError(
+            f"deferred publication marker changed during write: {render_id}"
+        )
+    if state == "committed" and any(
+        item["current_conflict"] or item["current_sha256"] != item["new_sha256"]
+        for item in written_plan
+    ):
+        raise DeliveryEnvelopeError(
+            f"committed publication changed during marker transition: {render_id}"
+        )
+    return marker
+
+
+def _deferred_restore_plan(authority: DeferredPublication) -> list[dict[str, Any]]:
+    validated = _validate_deferred_publication(authority)
+    journal = _decode_json_snapshot(
+        _snapshot_regular_file(
+            _journal_path(validated.stage_dir),
+            label=f"deferred publication journal {validated.render_id}",
+            capture_bytes=True,
+        )
+    )
+    return _validate_restore_plan(
+        validated.project_dir,
+        validated.stage_dir,
+        journal,
+        render_id=validated.render_id,
+        expected_output=validated.expected_output,
+        allow_external_conflicts=True,
+    )
+
+
+def validate_deferred_publication(authority: DeferredPublication) -> None:
+    """Require every pending destination to still be this attempt's bytes."""
+    for item in _deferred_restore_plan(authority):
+        if item["current_sha256"] != item["new_sha256"]:
+            raise DeliveryEnvelopeError(
+                "deferred publication changed before handoff: "
+                f"{item['relative']}"
+            )
+
+
+def _quarantine_conflicting_destination(
+    authority: DeferredPublication,
+    item: dict[str, Any],
+    *,
+    index: int,
+    quarantine_dir: Path,
+) -> None:
+    destination = item["destination"]
+    relative = item["relative"]
+    expected_sha = item["current_sha256"]
+    try:
+        before = destination.lstat()
+    except FileNotFoundError as exc:
+        raise DeliveryEnvelopeError(
+            f"deferred publication conflict disappeared before quarantine: {relative}"
+        ) from exc
+    current: FileSnapshot | None = None
+    if stat.S_ISREG(before.st_mode):
+        current = _snapshot_regular_file(
+            destination,
+            label=f"deferred publication conflict {relative}",
+        )
+        if current.sha256 != expected_sha:
+            raise DeliveryEnvelopeError(
+                f"deferred publication conflict changed before quarantine: {relative}"
+            )
+    quarantine_path = quarantine_dir / f"{index:03d}.conflict"
+    os.replace(destination, quarantine_path)
+    moved_metadata = quarantine_path.lstat()
+    if (
+        moved_metadata.st_dev != before.st_dev
+        or moved_metadata.st_ino != before.st_ino
+        or stat.S_IFMT(moved_metadata.st_mode) != stat.S_IFMT(before.st_mode)
+    ):
+        raise DeliveryEnvelopeError(
+            f"deferred publication conflict quarantine changed identity: {relative}"
+        )
+    if current is not None:
+        moved = _snapshot_regular_file(
+            quarantine_path,
+            label=f"quarantined deferred publication conflict {relative}",
+        )
+        if moved.sha256 != current.sha256 or moved.size != current.size:
+            raise DeliveryEnvelopeError(
+                f"deferred publication conflict quarantine changed bytes: {relative}"
+            )
+
+
+def abort_deferred_publication(authority: DeferredPublication) -> None:
+    """Restore exact prior destinations, quarantining conflicting current bytes."""
+    validated = _validate_deferred_publication(authority)
+    try:
+        plan = _deferred_restore_plan(validated)
+        conflicts = [
+            item
+            for item in plan
+            if item["current_conflict"]
+            or item["current_sha256"]
+            not in {
+                    item["new_sha256"],
+                    item["prior_sha256"] if item["prior_exists"] else None,
+                }
+        ]
+        quarantine_dir: Path | None = None
+        if conflicts:
+            quarantine_root = validated.project_dir / QUARANTINE_REL
+            quarantine_root.parent.mkdir(parents=True, exist_ok=True)
+            _safe_directory(quarantine_root, create=True)
+            quarantine_dir = quarantine_root / (
+                f"{validated.render_id}-{uuid.uuid4().hex}"
+            )
+            quarantine_dir.mkdir(mode=0o700)
+            _safe_directory(quarantine_dir, create=False)
+
+        for index, item in enumerate(plan):
+            destination = item["destination"]
+            relative = item["relative"]
+            if item["current_conflict"]:
+                current_sha = None
+            else:
+                current_sha = _observed_destination_sha(destination, label=relative)
+                if current_sha != item["current_sha256"]:
+                    raise DeliveryEnvelopeError(
+                        f"deferred publication changed during abort: {relative}"
+                    )
+            permitted = {
+                item["new_sha256"],
+                item["prior_sha256"] if item["prior_exists"] else None,
+            }
+            if item["current_conflict"] or current_sha not in permitted:
+                if quarantine_dir is None:
+                    raise DeliveryEnvelopeError(
+                        f"deferred publication conflict has no quarantine: {relative}"
+                    )
+                _quarantine_conflicting_destination(
+                    validated,
+                    item,
+                    index=index,
+                    quarantine_dir=quarantine_dir,
+                )
+                current_sha = None
+            if item["prior_exists"]:
+                if current_sha != item["prior_sha256"]:
+                    backup = item["backup"]
+                    if not isinstance(backup, Path) or _sha256(backup) != item["prior_sha256"]:
+                        raise DeliveryEnvelopeError(
+                            f"deferred publication backup changed: {relative}"
+                        )
+                    _copy_atomic(backup, destination)
+                expected_after = item["prior_sha256"]
+            else:
+                if current_sha is not None:
+                    destination.unlink(missing_ok=True)
+                expected_after = None
+            if _observed_destination_sha(destination, label=relative) != expected_after:
+                raise DeliveryEnvelopeError(
+                    f"deferred publication abort verification failed: {relative}"
+                )
+        _remove_stage(validated.stage_dir)
+    finally:
+        _release_staging_lease(
+            validated.project_dir,
+            validated.render_id,
+            validated._owner_token,
+        )
+
+
+def commit_deferred_publication(authority: DeferredPublication) -> None:
+    """Persist a process-recoverable commit, then best-effort discard rollback data.
+
+    This protocol covers process death.  It does not claim host/power-loss
+    ordering for every destination-directory rename.
+    """
+    validated = _validate_deferred_publication(authority, expected_state="pending")
+    try:
+        validate_deferred_publication(validated)
+        _write_deferred_marker(
+            validated.project_dir,
+            validated.stage_dir,
+            validated.render_id,
+            expected_output=validated.expected_output,
+            state="committed",
+            transaction_id=validated._transaction_id,
+        )
+        try:
+            _remove_stage(validated.stage_dir)
+        except (OSError, DeliveryEnvelopeError):
+            # The persisted committed marker makes cleanup retryable after
+            # process death. Publication is already public and must not be
+            # reclassified as rollback-only.
+            pass
+    finally:
+        _release_staging_lease(
+            validated.project_dir,
+            validated.render_id,
+            validated._owner_token,
+        )
 
 
 def _compensate_restore_attempt(applied: list[dict[str, Any]]) -> None:
@@ -986,6 +1910,51 @@ def _matching_finalized_envelope(
     return True
 
 
+def _has_deferred_marker(stage_dir: Path) -> bool:
+    marker_path = stage_dir / DEFERRED_NAME
+    try:
+        marker_path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _rollback_pending_publication_locked(
+    project_dir: Path,
+    render_id: str,
+    *,
+    expected_output: Path,
+    owner_token: object,
+) -> None:
+    """Rollback an acquisition-gap publication without a public authority."""
+    root = _ensure_staging_trust_chain(project_dir, create=False)
+    _require_staging_lease(root, render_id, owner_token)
+    stage = staging_path(root, render_id)
+    _stage_identity(stage)
+    _validated_deferred_marker(
+        root,
+        stage,
+        render_id,
+        expected_output=expected_output,
+        expected_state="pending",
+    )
+    journal = _decode_json_snapshot(
+        _snapshot_regular_file(
+            _journal_path(stage),
+            label=f"deferred publication journal {render_id}",
+            capture_bytes=True,
+        )
+    )
+    _restore_journal(
+        root,
+        stage,
+        journal,
+        render_id=render_id,
+        expected_output=expected_output,
+    )
+    _remove_stage(stage)
+
+
 def _recover_stale_staging_locked(
     project_dir: Path,
     render_id: str,
@@ -1002,6 +1971,39 @@ def _recover_stale_staging_locked(
     except FileNotFoundError:
         return
     _stage_identity(stage)
+    if _has_deferred_marker(stage):
+        marker, plan = _validated_deferred_marker(
+            root,
+            stage,
+            render_id,
+            expected_output=expected_output,
+        )
+        if marker["state"] == "committed":
+            for item in plan:
+                if item["current_conflict"] or item["current_sha256"] != item["new_sha256"]:
+                    raise DeliveryEnvelopeError(
+                        "committed publication changed; refusing cleanup or overwrite: "
+                        f"{item['relative']}"
+                    )
+            _remove_stage(stage)
+            return
+        journal_file = _journal_path(stage)
+        journal = _decode_json_snapshot(
+            _snapshot_regular_file(
+                journal_file,
+                label=f"deferred publication journal {render_id}",
+                capture_bytes=True,
+            )
+        )
+        _restore_journal(
+            root,
+            stage,
+            journal,
+            render_id=render_id,
+            expected_output=expected_output,
+        )
+        _remove_stage(stage)
+        return
     if _matching_finalized_envelope(root, render_id, expected_output):
         _remove_stage(stage)
         return
@@ -1150,7 +2152,10 @@ def _sha256_bytes(data: bytes) -> str:
 
 
 def _journal_entry_destination(
-    project_dir: Path, entry: dict[str, Any]
+    project_dir: Path,
+    entry: dict[str, Any],
+    *,
+    allow_leaf_conflict: bool = False,
 ) -> Path:
     external = entry.get("external")
     if type(external) is not bool:
@@ -1158,7 +2163,12 @@ def _journal_entry_destination(
     relative = entry.get("destination")
     if not isinstance(relative, str):
         raise DeliveryEnvelopeError("publication journal destination is invalid")
-    return _destination_path(project_dir, relative, allow_external=external)
+    return _destination_path(
+        project_dir,
+        relative,
+        allow_external=external,
+        allow_leaf_conflict=allow_leaf_conflict,
+    )
 
 
 def _assert_publication_prior_state(
@@ -1303,6 +2313,8 @@ def _publish_direct_delivery_locked(
     owner_token: object,
     staged_sources: Mapping[str, Path] | None = None,
     expected_output: Path | None = None,
+    defer_commit: bool = False,
+    deferred_transaction_id: str | None = None,
 ) -> dict[str, Any]:
     """Publish one prepared direct envelope and return its finalized payload."""
     root = _ensure_staging_trust_chain(project_dir, create=False)
@@ -1337,11 +2349,51 @@ def _publish_direct_delivery_locked(
     }
     journal_file = _journal_path(stage)
     _atomic_write_json(journal_file, journal)
+    if defer_commit:
+        if not isinstance(output_item, dict) or not isinstance(output_item.get("path"), str):
+            raise DeliveryEnvelopeError("deferred publication output binding is invalid")
+        if deferred_transaction_id is None:
+            raise DeliveryEnvelopeError("deferred publication transaction id is missing")
+        journal_snapshot = _snapshot_regular_file(
+            journal_file,
+            label=f"deferred publication journal {prepared['render_id']}",
+        )
+        pending_binding = {
+            "render_id": prepared["render_id"],
+            "expected_output": str(
+                _canonical_expected_output(Path(output_item["path"]))
+            ),
+            "journal_sha256": journal_snapshot.sha256,
+            "output_sha256": output_item["sha256"],
+            "finalized_sha256": _sha256_bytes(_json_bytes(finalized)),
+        }
+        pending_marker = _deferred_marker_payload(
+            pending_binding,
+            state="pending",
+            transaction_id=deferred_transaction_id,
+        )
+        marker_path = stage / DEFERRED_NAME
+        _atomic_write_json(marker_path, pending_marker)
+        _fsync_directory(stage)
+        written_marker = _decode_json_snapshot(
+            _snapshot_regular_file(
+                marker_path,
+                label=f"deferred publication marker {prepared['render_id']}",
+                capture_bytes=True,
+            )
+        )
+        if written_marker != pending_marker:
+            raise DeliveryEnvelopeError(
+                "deferred publication marker changed during pending write"
+            )
+    elif deferred_transaction_id is not None:
+        raise DeliveryEnvelopeError("immediate publication has a deferred transaction id")
     published_entries: list[dict[str, Any]] = []
     attempted_entry: dict[str, Any] | None = None
     try:
-        # The journal is durable before publication.  Re-check the entire
-        # recorded prior state so an edit in that gap stops with zero writes.
+        # The journal is persisted for process-level recovery before publication.
+        # Re-check the recorded prior state so an edit in that gap stops with
+        # zero writes. Host/power-loss directory ordering is not claimed here.
         _validate_publication_prior_states(root, entries)
         entries_by_destination = {entry["destination"]: entry for entry in entries}
         artifacts = prepared["artifacts"]
@@ -1425,13 +2477,14 @@ def _publish_direct_delivery_locked(
         if isinstance(exc, DeliveryEnvelopeError):
             raise
         raise DeliveryEnvelopeError(f"direct publication failed: {exc}") from exc
-    try:
-        _remove_stage(stage)
-    except (OSError, DeliveryEnvelopeError):
-        # The finalized envelope is already durable and validated.  Leaving the
-        # journaled staging directory lets the next matching run retry cleanup
-        # without falsely reporting that publication itself failed.
-        pass
+    if not defer_commit:
+        try:
+            _remove_stage(stage)
+        except (OSError, DeliveryEnvelopeError):
+            # The finalized envelope is already published and validated. Leaving
+            # the journaled staging directory lets the next matching process retry
+            # cleanup without falsely reporting that publication itself failed.
+            pass
     return finalized
 
 
@@ -1441,27 +2494,75 @@ def publish_direct_delivery(
     *,
     staged_sources: Mapping[str, Path] | None = None,
     expected_output: Path | None = None,
-) -> dict[str, Any]:
+    defer_commit: bool = False,
+) -> dict[str, Any] | DeferredPublication:
     root = project_dir.resolve()
     if not isinstance(authority, StagingAttempt):
         raise DeliveryEnvelopeError("staging attempt authority is required for publication")
     render_id = authority.render_id
     attempt = _validate_staging_attempt(root, render_id, authority)
+    deferred_transaction_id = uuid.uuid4().hex if defer_commit else None
+    release_lease = True
     try:
-        return _publish_direct_delivery_locked(
+        finalized = _publish_direct_delivery_locked(
             root,
             attempt.stage_dir,
             owner_token=attempt._owner_token,
             staged_sources=staged_sources,
             expected_output=expected_output,
+            defer_commit=defer_commit,
+            deferred_transaction_id=deferred_transaction_id,
         )
-    except Exception:
+        if not defer_commit:
+            return finalized
+        output_item = (finalized.get("artifacts") or {}).get("output")
+        if not isinstance(output_item, dict) or not isinstance(output_item.get("path"), str):
+            raise DeliveryEnvelopeError("deferred publication output binding is invalid")
+        authority = DeferredPublication(
+            project_dir=root,
+            render_id=render_id,
+            stage_dir=attempt.stage_dir,
+            expected_output=_canonical_expected_output(Path(output_item["path"])),
+            finalized=finalized,
+            _transaction_id=str(deferred_transaction_id),
+            _owner_token=attempt._owner_token,
+        )
+        _validate_deferred_publication(authority)
+        release_lease = False
+        return authority
+    except Exception as exc:
         try:
             stage = attempt.stage_dir
-            if stage.is_dir() and not _journal_path(stage).exists():
+            journal_exists = stage.is_dir() and _journal_path(stage).exists()
+            if defer_commit and journal_exists:
+                recovery_output = expected_output
+                if recovery_output is None:
+                    prepared = _read_json(stage / PREPARED_NAME)
+                    prepared_output = (prepared.get("artifacts") or {}).get("output")
+                    if not isinstance(prepared_output, dict) or not isinstance(
+                        prepared_output.get("path"), str
+                    ):
+                        raise DeliveryEnvelopeError(
+                            "deferred publication recovery output binding is invalid"
+                        )
+                    recovery_output = Path(prepared_output["path"])
+                # No DeferredPublication authority exists yet.  Recover under
+                # the still-live staging lease so post-publication validation
+                # failures cannot orphan public bytes or rollback authority.
+                _rollback_pending_publication_locked(
+                    root,
+                    render_id,
+                    expected_output=Path(recovery_output),
+                    owner_token=attempt._owner_token,
+                )
+            elif stage.is_dir() and not journal_exists:
                 _remove_stage(stage)
-        except DeliveryEnvelopeError:
-            pass
+        except (OSError, DeliveryEnvelopeError) as recovery_exc:
+            raise DeliveryEnvelopeError(
+                "deferred publication acquisition failed and locked rollback is "
+                f"blocked; recovery state kept: {recovery_exc}"
+            ) from exc
         raise
     finally:
-        _release_staging_lease(root, render_id, attempt._owner_token)
+        if release_lease:
+            _release_staging_lease(root, render_id, attempt._owner_token)

@@ -41,6 +41,97 @@ class PublicCaptionDeliveryParserTests(unittest.TestCase):
         self.assertTrue(args.required)
 
 
+class _FakePopenStdout:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = iter(chunks)
+        self.close_calls = 0
+
+    def read(self, _size: int) -> bytes:
+        return next(self._chunks)
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FakePopen:
+    def __init__(self, *, returncode: int = 0, timeout: bool = False) -> None:
+        self.stdout = _FakePopenStdout([b"decoded pcm", b""])
+        self._returncode = returncode
+        self._timeout = timeout
+        self._running = True
+        self.wait_calls: list[int | None] = []
+        self.kill_calls = 0
+
+    def poll(self) -> int | None:
+        return None if self._running else self._returncode
+
+    def wait(self, timeout: int | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if timeout is not None and self._timeout:
+            raise subprocess.TimeoutExpired(["ffmpeg"], timeout)
+        self._running = False
+        return self._returncode
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._returncode = -9
+
+
+class CaptionDeliveryPcmProcessCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        self.source = self.project / "source.media"
+        self.source.write_bytes(b"source media")
+        self.manifest = {
+            "source": {
+                "staged_path": self.source.name,
+                "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            }
+        }
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _decode(self, process: _FakePopen) -> str:
+        with patch.object(caption_delivery.shutil, "which", return_value="ffmpeg"), patch.object(
+            caption_delivery.subprocess, "Popen", return_value=process
+        ):
+            return caption_delivery.decoded_pcm_sha256(self.project, self.manifest)
+
+    def test_success_closes_stdout_after_reaping_process(self) -> None:
+        process = _FakePopen()
+
+        digest = self._decode(process)
+
+        self.assertEqual(digest, hashlib.sha256(b"decoded pcm").hexdigest())
+        self.assertEqual(process.stdout.close_calls, 1)
+        self.assertEqual(process.wait_calls, [3600])
+        self.assertEqual(process.kill_calls, 0)
+
+    def test_nonzero_exit_closes_stdout_and_preserves_error(self) -> None:
+        process = _FakePopen(returncode=1)
+
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as raised:
+            self._decode(process)
+
+        self.assertEqual(raised.exception.code, "pcm_decode_failed")
+        self.assertEqual(process.stdout.close_calls, 1)
+        self.assertEqual(process.wait_calls, [3600])
+        self.assertEqual(process.kill_calls, 0)
+
+    def test_timeout_kills_reaps_and_closes_stdout(self) -> None:
+        process = _FakePopen(timeout=True)
+
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as raised:
+            self._decode(process)
+
+        self.assertEqual(raised.exception.code, "pcm_decode_failed")
+        self.assertEqual(process.stdout.close_calls, 1)
+        self.assertEqual(process.wait_calls, [3600, None])
+        self.assertEqual(process.kill_calls, 1)
+
+
 class CaptionDeliveryContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

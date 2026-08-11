@@ -17,6 +17,7 @@ from render_editor_timeline import (  # noqa: E402
     build_render_command,
     font_path,
     project_font_binding,
+    render_project,
 )
 
 
@@ -325,3 +326,152 @@ class Phase0dRenderCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--sfx-stem") + 1], str(self.stem))
         self.assertEqual(command[command.index("--expected-timeline-revision") + 1], "timeline-revision")
         self.assertEqual(command[command.index("--expected-cut-map-sha256") + 1], "a" * 64)
+
+
+class DirectActiveHighlightRenderTests(unittest.TestCase):
+    """A direct render must carry the selected highlight into the renderer."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="renderer-active-highlight-")
+        self.project = Path(self.temp.name)
+        (self.project / "source").mkdir()
+        (self.project / "working").mkdir()
+        (self.project / "source/source.mp4").write_bytes(b"source")
+        self.manifest = {
+            "project_id": "project-active-highlight",
+            "source": {
+                "staged_path": "source/source.mp4",
+                "duration_s": 10.0,
+                "has_audio": False,
+            },
+        }
+        self.state = {
+            "schema_version": 2,
+            "canvas": {
+                "platform_id": "instagram-reels",
+                "width": 1080,
+                "height": 1920,
+                "fps": 30,
+                "fit": "contain",
+            },
+            "subject_tracking": False,
+            "segments": [{"source_start": 0.0, "source_end": 10.0}],
+            "highlights": [{
+                "id": "highlight-active",
+                "start": 2.0,
+                "end": 6.0,
+                "title": "Active title",
+                "review_status": "approved",
+            }],
+            "active_highlight_id": "highlight-active",
+            "overlays": [{
+                "id": "scoped-title",
+                "type": "title",
+                "start": 2.0,
+                "end": 4.0,
+                "text": "Scoped title",
+                "visible": True,
+                "highlight_id": "highlight-active",
+                "style": {"font_size": 52, "x": 50, "y": 40},
+            }],
+        }
+        (self.project / "project.json").write_text(
+            json.dumps(self.manifest), encoding="utf-8"
+        )
+        (self.project / "working/editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _render_preview(self, output: Path) -> object:
+        from types import SimpleNamespace
+
+        self.render_commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            self.render_commands.append(command)
+            Path(command[-1]).write_bytes(b"rendered")
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with (
+            patch("render_editor_timeline.font_path", return_value=Path("font.ttf")),
+            patch("render_editor_timeline.source_has_audible_signal", return_value=False),
+            patch("render_editor_timeline.ffprobe_has_visual_stream", return_value=True),
+            patch("render_editor_timeline.subprocess.run", side_effect=fake_run),
+            patch("render_editor_timeline.build_render_command", wraps=build_render_command) as build,
+        ):
+            render_project(self.project, output, "preview")
+        return build
+
+    def test_direct_render_passes_active_clip_and_keeps_scoped_title(self) -> None:
+        output = self.project / "preview.mp4"
+        build = self._render_preview(output)
+
+        self.assertTrue(output.is_file())
+        clip = build.call_args.args[5]  # type: ignore[union-attr]
+        self.assertEqual(clip["id"], "highlight-active")
+        command = self.render_commands[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("drawtext=", graph)
+        self.assertIn("scoped-title.txt", graph)
+
+    def test_direct_render_without_active_id_keeps_full_timeline_behavior(self) -> None:
+        self.state["active_highlight_id"] = None
+        (self.project / "working/editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+        build = self._render_preview(self.project / "preview.mp4")
+
+        self.assertIsNone(build.call_args.args[5])  # type: ignore[union-attr]
+        graph = self.render_commands[0][self.render_commands[0].index("-filter_complex") + 1]
+        self.assertNotIn("scoped-title.txt", graph)
+
+    def _assert_active_id_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        def fake_build(
+            _project_dir: Path,
+            _state: dict,
+            _manifest: dict,
+            output: Path,
+            *_args: object,
+            **_kwargs: object,
+        ) -> list[str]:
+            return ["fake-render", str(output)]
+
+        def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            Path(command[-1]).write_bytes(b"rendered")
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with (
+            patch("render_editor_timeline.build_render_command", side_effect=fake_build),
+            patch("render_editor_timeline.subprocess.run", side_effect=fake_run),
+            patch("render_editor_timeline.ffprobe_has_visual_stream", return_value=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "active_highlight_id"):
+                render_project(self.project, self.project / "preview.mp4", "preview")
+
+    def test_direct_render_rejects_dangling_active_highlight(self) -> None:
+        self.state["active_highlight_id"] = "missing-highlight"
+        (self.project / "working/editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+        self._assert_active_id_rejected()
+
+    def test_direct_render_rejects_ambiguous_active_highlight(self) -> None:
+        self.state["highlights"].append(dict(self.state["highlights"][0]))
+        (self.project / "working/editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+        self._assert_active_id_rejected()
+
+    def test_direct_render_rejects_malformed_active_identity(self) -> None:
+        for identity in (0, False, "", "   "):
+            with self.subTest(identity=identity):
+                self.state["active_highlight_id"] = identity
+                (self.project / "working/editor_state.json").write_text(
+                    json.dumps(self.state), encoding="utf-8"
+                )
+                self._assert_active_id_rejected()

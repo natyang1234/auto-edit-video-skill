@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +18,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import contract_registry  # noqa: E402
 import delivery_envelope  # noqa: E402
+import auto_edit  # noqa: E402
+from render_editor_timeline import direct_final_render_id  # noqa: E402
 
 
 class DeliveryEnvelopeTests(unittest.TestCase):
@@ -110,6 +114,612 @@ class DeliveryEnvelopeTests(unittest.TestCase):
         )
         delivery_envelope.write_prepared_envelope(stage, prepared)
         return stage, sources, prepared
+
+    def _publish_contextual_delivery(
+        self, *, defer_commit: bool = False
+    ) -> tuple[Path, Path, dict]:
+        self.state = {
+            "schema_version": 2,
+            "project_id": "snapshot-test",
+            "director_style": "kinetic-explainer",
+            "segments": [{"source_start": 0.0, "source_end": 1.0}],
+        }
+        working = self.project / "working"
+        working.mkdir(exist_ok=True)
+        (working / "editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+        self.render_id = direct_final_render_id(self.state, self.external_output)
+        stage = self._begin(self.render_id)
+        sources: dict[str, Path] = {}
+        payloads = {
+            "output": b"contextual-output",
+            "qa_report": b'{"status":"pass"}\n',
+            "contact_sheet": b"contextual-contact",
+            "visual_evidence": b'{"items":[]}\n',
+            "caption_v2": b'{"required":true}\n',
+            "audio_event_plan": b'{"events":[]}\n',
+            "audio_catalog": b'{"items":[]}\n',
+            "sfx_stem": b"contextual-sfx",
+        }
+        for name, payload in payloads.items():
+            path = stage / delivery_envelope.STAGE_FILENAMES[name]
+            path.write_bytes(payload)
+            sources[name] = path
+        sources["motion_evidence"] = sources["visual_evidence"]
+        prepared = delivery_envelope.build_prepared_envelope(
+            self.project,
+            self.render_id,
+            self.external_output,
+            self.state,
+            sources,
+            renderer_script=Path(__file__).resolve(),
+            ffmpeg_executable=self.ffmpeg,
+        )
+        delivery_envelope.write_prepared_envelope(stage, prepared)
+        publication = delivery_envelope.publish_direct_delivery(
+            self.project,
+            stage,
+            staged_sources=sources,
+            expected_output=self.external_output,
+            defer_commit=defer_commit,
+        )
+        self._last_publication = publication
+        finalized = publication.finalized if defer_commit else publication
+        return (
+            delivery_envelope.finalized_path(self.project, self.render_id),
+            self.project / finalized["artifacts"]["qa_report"]["path"],
+            finalized,
+        )
+
+    def _deferred_contextual_delivery(self):
+        finalized_path, qa_path, finalized = self._publish_contextual_delivery(
+            defer_commit=True
+        )
+        return self._last_publication, finalized_path, qa_path, finalized
+
+    def _snapshot(self):
+        return delivery_envelope.snapshot_finalized_delivery(
+            self.project,
+            self.external_output,
+            expected_profile_id="kinetic-explainer",
+            required_artifacts=(
+                "caption_v2",
+                "audio_event_plan",
+                "audio_catalog",
+                "sfx_stem",
+                "visual_evidence",
+                "motion_evidence",
+            ),
+        )
+
+    def test_contextual_snapshot_rejects_symlinked_finalized_envelope(self) -> None:
+        finalized_path, _qa_path, _finalized = self._publish_contextual_delivery()
+        outside = self.project.parent / "outside-envelope.json"
+        outside.write_bytes(finalized_path.read_bytes())
+        finalized_path.unlink()
+        finalized_path.symlink_to(outside)
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "finalized envelope"
+        ):
+            self._snapshot()
+
+    def test_contextual_snapshot_rejects_self_consistent_wrong_profile(self) -> None:
+        finalized_path, _qa_path, finalized = self._publish_contextual_delivery()
+        forged = json.loads(json.dumps(finalized))
+        forged["profile"] = {
+            "id": "teacher-punch",
+            "resolved_profile_hash": "a" * 64,
+        }
+        prepared = json.loads(json.dumps(forged))
+        prepared["state"] = "prepared"
+        prepared["prepared_envelope_hash"] = None
+        forged["prepared_envelope_hash"] = contract_registry.canonical_hash(prepared)
+        delivery_envelope._atomic_write_json(finalized_path, forged)
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "profile"
+        ):
+            self._snapshot()
+
+    def test_contextual_snapshot_rejects_initial_resolved_hash_drift(self) -> None:
+        self._publish_contextual_delivery()
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "hash changed"
+        ):
+            delivery_envelope.snapshot_finalized_delivery(
+                self.project,
+                self.external_output,
+                expected_profile_id="kinetic-explainer",
+                expected_profile_hash="f" * 64,
+            )
+
+    def test_finalized_handoff_excludes_repo_publisher_for_same_render(self) -> None:
+        self._publish_contextual_delivery()
+        snapshot = self._snapshot()
+
+        with delivery_envelope.finalized_delivery_handoff(snapshot):
+            with self.assertRaisesRegex(
+                delivery_envelope.DeliveryEnvelopeError,
+                "already active",
+            ):
+                delivery_envelope.begin_staging(
+                    self.project,
+                    self.render_id,
+                    expected_output=self.external_output,
+                )
+
+    def test_deferred_commit_keeps_publication_and_cleans_transaction(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        self.assertTrue(stage.is_dir())
+        self.assertTrue((stage / delivery_envelope.JOURNAL_NAME).is_file())
+
+        delivery_envelope.commit_deferred_publication(authority)
+
+        self.assertEqual(self.external_output.read_bytes(), b"contextual-output")
+        self.assertTrue(finalized_path.is_file())
+        self.assertFalse(stage.exists())
+
+    def test_stdout_success_commits_before_best_effort_stage_cleanup(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        snapshot = self._snapshot()
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        writes = []
+        payload = {
+            "ok": True,
+            "clips": [{"file": str(self.external_output)}],
+            "problems": [],
+        }
+
+        with (
+            patch.object(auto_edit, "_prepare_stdout_writer", return_value=writes.append),
+            patch.object(
+                delivery_envelope,
+                "_remove_stage",
+                side_effect=OSError("simulated committed cleanup failure"),
+            ),
+        ):
+            committed = auto_edit._emit_final_delivery_handoff(
+                payload,
+                [snapshot],
+                [authority],
+            )
+
+        self.assertTrue(committed)
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(json.loads(writes[0])["ok"])
+        self.assertEqual(self.external_output.read_bytes(), b"contextual-output")
+        self.assertTrue(finalized_path.is_file())
+        self.assertTrue(stage.is_dir())
+        marker = json.loads(
+            (stage / delivery_envelope.DEFERRED_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(marker["state"], "committed")
+        self.assertNotIn(
+            delivery_envelope._lease_key(self.project, self.render_id),
+            delivery_envelope._ACTIVE_STAGING_LEASES,
+        )
+
+        delivery_envelope.recover_stale_staging(
+            self.project,
+            self.render_id,
+            expected_output=self.external_output,
+        )
+        self.assertEqual(self.external_output.read_bytes(), b"contextual-output")
+        self.assertTrue(finalized_path.is_file())
+        self.assertFalse(stage.exists())
+
+    def test_committed_recovery_refuses_changed_current_publication(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        with patch.object(
+            delivery_envelope,
+            "_remove_stage",
+            side_effect=OSError("simulated committed cleanup failure"),
+        ):
+            delivery_envelope.commit_deferred_publication(authority)
+
+        replacement = self.external_output.with_name(".committed-external-change.mp4")
+        replacement.write_bytes(b"external-change-after-commit")
+        os.replace(replacement, self.external_output)
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError,
+            "committed publication changed",
+        ):
+            delivery_envelope.recover_stale_staging(
+                self.project,
+                self.render_id,
+                expected_output=self.external_output,
+            )
+
+        self.assertEqual(
+            self.external_output.read_bytes(), b"external-change-after-commit"
+        )
+        self.assertTrue(finalized_path.is_file())
+        self.assertTrue(stage.is_dir())
+
+    def test_committed_recovery_rejects_mismatched_marker_binding(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        with patch.object(
+            delivery_envelope,
+            "_remove_stage",
+            side_effect=OSError("simulated committed cleanup failure"),
+        ):
+            delivery_envelope.commit_deferred_publication(authority)
+        marker_path = stage / delivery_envelope.DEFERRED_NAME
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["journal_sha256"] = "f" * 64
+        delivery_envelope._atomic_write_json(marker_path, marker)
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError,
+            "marker.*binding|marker.*invalid",
+        ):
+            delivery_envelope.recover_stale_staging(
+                self.project,
+                self.render_id,
+                expected_output=self.external_output,
+            )
+
+        self.assertEqual(self.external_output.read_bytes(), b"contextual-output")
+        self.assertTrue(finalized_path.is_file())
+        self.assertTrue(stage.is_dir())
+
+    def test_pending_marker_state_flip_without_rebinding_is_rejected(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        marker_path = stage / delivery_envelope.DEFERRED_NAME
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["state"] = "committed"
+        delivery_envelope._atomic_write_json(marker_path, marker)
+        delivery_envelope._release_staging_lease(
+            self.project,
+            self.render_id,
+            authority._owner_token,
+        )
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError,
+            "marker binding is invalid",
+        ):
+            delivery_envelope.recover_stale_staging(
+                self.project,
+                self.render_id,
+                expected_output=self.external_output,
+            )
+
+        self.assertEqual(self.external_output.read_bytes(), b"contextual-output")
+        self.assertTrue(finalized_path.is_file())
+        self.assertTrue(stage.is_dir())
+
+    def test_post_publication_authority_validation_failure_removes_new_delivery(
+        self,
+    ) -> None:
+        with patch.object(
+            delivery_envelope,
+            "_validate_deferred_publication",
+            side_effect=delivery_envelope.DeliveryEnvelopeError(
+                "forced post-publication authority validation failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                delivery_envelope.DeliveryEnvelopeError,
+                "forced post-publication authority validation failure",
+            ):
+                self._publish_contextual_delivery(defer_commit=True)
+
+        final_path = delivery_envelope.finalized_path(
+            self.project,
+            self.render_id,
+        )
+        self.assertFalse(self.external_output.exists())
+        self.assertFalse(final_path.exists())
+        self.assertFalse(
+            delivery_envelope.staging_path(self.project, self.render_id).exists()
+        )
+        self.assertNotIn(
+            delivery_envelope._lease_key(self.project, self.render_id),
+            delivery_envelope._ACTIVE_STAGING_LEASES,
+        )
+
+    def test_post_publication_authority_validation_failure_restores_exact_prior(
+        self,
+    ) -> None:
+        prior_output = b"prior-output-before-authority-validation"
+        prior_envelope = b"prior-envelope-before-authority-validation\n"
+        self.state = {
+            "schema_version": 2,
+            "project_id": "snapshot-test",
+            "director_style": "kinetic-explainer",
+            "segments": [{"source_start": 0.0, "source_end": 1.0}],
+        }
+        working = self.project / "working"
+        working.mkdir(exist_ok=True)
+        (working / "editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+        self.render_id = direct_final_render_id(self.state, self.external_output)
+        final_path = delivery_envelope.finalized_path(self.project, self.render_id)
+        self.external_output.parent.mkdir(parents=True)
+        self.external_output.write_bytes(prior_output)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path.write_bytes(prior_envelope)
+
+        with patch.object(
+            delivery_envelope,
+            "_validate_deferred_publication",
+            side_effect=delivery_envelope.DeliveryEnvelopeError(
+                "forced post-publication authority validation failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                delivery_envelope.DeliveryEnvelopeError,
+                "forced post-publication authority validation failure",
+            ):
+                self._publish_contextual_delivery(defer_commit=True)
+
+        self.assertEqual(self.external_output.read_bytes(), prior_output)
+        self.assertEqual(final_path.read_bytes(), prior_envelope)
+        self.assertFalse(
+            delivery_envelope.staging_path(self.project, self.render_id).exists()
+        )
+        self.assertNotIn(
+            delivery_envelope._lease_key(self.project, self.render_id),
+            delivery_envelope._ACTIVE_STAGING_LEASES,
+        )
+
+    def test_post_publication_acquisition_rollback_preserves_external_conflict(
+        self,
+    ) -> None:
+        def replace_output_then_fail(_authority) -> None:
+            replacement = self.external_output.with_name(
+                ".authority-gap-external-conflict.mp4"
+            )
+            replacement.write_bytes(b"external-conflict-in-authority-gap")
+            os.replace(replacement, self.external_output)
+            raise delivery_envelope.DeliveryEnvelopeError(
+                "forced post-publication authority validation failure"
+            )
+
+        with patch.object(
+            delivery_envelope,
+            "_validate_deferred_publication",
+            side_effect=replace_output_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                delivery_envelope.DeliveryEnvelopeError,
+                "locked rollback is blocked; recovery state kept",
+            ):
+                self._publish_contextual_delivery(defer_commit=True)
+
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        self.assertEqual(
+            self.external_output.read_bytes(),
+            b"external-conflict-in-authority-gap",
+        )
+        self.assertTrue(stage.is_dir())
+        self.assertTrue((stage / delivery_envelope.JOURNAL_NAME).is_file())
+        self.assertTrue((stage / delivery_envelope.DEFERRED_NAME).is_file())
+        self.assertNotIn(
+            delivery_envelope._lease_key(self.project, self.render_id),
+            delivery_envelope._ACTIVE_STAGING_LEASES,
+        )
+
+    def test_deferred_abort_quarantines_conflict_and_removes_new_publication(self) -> None:
+        authority, finalized_path, qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        replacement = self.external_output.with_name(".handoff-conflict.mp4")
+        replacement.write_bytes(b"changed-before-handoff")
+        replacement.replace(self.external_output)
+
+        delivery_envelope.abort_deferred_publication(authority)
+
+        self.assertFalse(self.external_output.exists())
+        self.assertFalse(finalized_path.exists())
+        self.assertFalse(qa_path.exists())
+        self.assertFalse(delivery_envelope.staging_path(self.project, self.render_id).exists())
+        quarantined = list(
+            (self.project / delivery_envelope.QUARANTINE_REL).glob("*/*.conflict")
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in quarantined],
+            [b"changed-before-handoff"],
+        )
+
+    def test_deferred_abort_quarantines_symlink_without_touching_target(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        outside = self.project.parent / "outside-handoff-conflict.mp4"
+        outside.write_bytes(b"outside-must-survive")
+        self.external_output.unlink()
+        self.external_output.symlink_to(outside)
+
+        delivery_envelope.abort_deferred_publication(authority)
+
+        self.assertFalse(self.external_output.exists())
+        self.assertFalse(self.external_output.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside-must-survive")
+        self.assertFalse(finalized_path.exists())
+        quarantined = list(
+            (self.project / delivery_envelope.QUARANTINE_REL).glob("*/*.conflict")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertTrue(quarantined[0].is_symlink())
+
+    def test_deferred_abort_restores_prior_output_and_envelope_exactly(self) -> None:
+        prior_output = b"prior-output-sentinel"
+        prior_envelope = b"prior-envelope-sentinel\n"
+        self.state = {
+            "schema_version": 2,
+            "project_id": "snapshot-test",
+            "director_style": "kinetic-explainer",
+            "segments": [{"source_start": 0.0, "source_end": 1.0}],
+        }
+        working = self.project / "working"
+        working.mkdir(exist_ok=True)
+        (working / "editor_state.json").write_text(
+            json.dumps(self.state), encoding="utf-8"
+        )
+        self.render_id = direct_final_render_id(self.state, self.external_output)
+        prior_finalized_path = delivery_envelope.finalized_path(
+            self.project, self.render_id
+        )
+        self.external_output.parent.mkdir(parents=True)
+        self.external_output.write_bytes(prior_output)
+        prior_finalized_path.parent.mkdir(parents=True, exist_ok=True)
+        prior_finalized_path.write_bytes(prior_envelope)
+
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        delivery_envelope.abort_deferred_publication(authority)
+
+        self.assertEqual(self.external_output.read_bytes(), prior_output)
+        self.assertEqual(finalized_path.read_bytes(), prior_envelope)
+        self.assertFalse(delivery_envelope.staging_path(self.project, self.render_id).exists())
+
+    def test_deferred_abort_restores_prior_after_same_bytes_atomic_replace(self) -> None:
+        prior_output = b"prior-output-before-same-bytes-replace"
+        self.external_output.parent.mkdir(parents=True)
+        self.external_output.write_bytes(prior_output)
+        authority, _finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        replacement = self.external_output.with_name(".same-bytes-replacement.mp4")
+        replacement.write_bytes(self.external_output.read_bytes())
+        replacement.replace(self.external_output)
+
+        delivery_envelope.abort_deferred_publication(authority)
+
+        self.assertEqual(self.external_output.read_bytes(), prior_output)
+        self.assertFalse(delivery_envelope.staging_path(self.project, self.render_id).exists())
+
+    def test_wrong_and_stale_deferred_authority_cannot_change_new_attempt(self) -> None:
+        authority, _finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        forged = replace(authority, _owner_token=object())
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "stale or invalid"
+        ):
+            delivery_envelope.abort_deferred_publication(forged)
+        self.assertTrue(self.external_output.is_file())
+
+        delivery_envelope.commit_deferred_publication(authority)
+        next_authority, _finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "stale or invalid"
+        ):
+            delivery_envelope.abort_deferred_publication(authority)
+        self.assertTrue(self.external_output.is_file())
+        delivery_envelope.abort_deferred_publication(next_authority)
+
+    def test_stdout_body_failure_aborts_deferred_publication(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        snapshot = self._snapshot()
+
+        def fail_writer(_payload: bytes) -> None:
+            raise OSError("simulated stdout failure")
+
+        payload = {
+            "ok": True,
+            "clips": [{"file": str(self.external_output)}],
+            "problems": [],
+        }
+        with patch.object(
+            auto_edit, "_prepare_stdout_writer", return_value=fail_writer
+        ):
+            with self.assertRaisesRegex(OSError, "stdout failure"):
+                auto_edit._emit_final_delivery_handoff(
+                    payload,
+                    [snapshot],
+                    [authority],
+                )
+
+        self.assertFalse(self.external_output.exists())
+        self.assertFalse(finalized_path.exists())
+        self.assertFalse(delivery_envelope.staging_path(self.project, self.render_id).exists())
+
+    def test_process_death_recovery_aborts_deferred_publication(self) -> None:
+        authority, finalized_path, _qa_path, _finalized = (
+            self._deferred_contextual_delivery()
+        )
+        stage = delivery_envelope.staging_path(self.project, self.render_id)
+        self.assertTrue((stage / delivery_envelope.DEFERRED_NAME).is_file())
+        delivery_envelope._release_staging_lease(
+            self.project,
+            self.render_id,
+            authority._owner_token,
+        )
+
+        delivery_envelope.recover_stale_staging(
+            self.project,
+            self.render_id,
+            expected_output=self.external_output,
+        )
+
+        self.assertFalse(self.external_output.exists())
+        self.assertFalse(finalized_path.exists())
+        self.assertFalse(stage.exists())
+
+    def _assert_snapshot_race_rejected(self, target: str) -> None:
+        finalized_path, qa_path, _finalized = self._publish_contextual_delivery()
+        real_snapshot = delivery_envelope._snapshot_regular_file
+        changed = False
+
+        def mutate_after_snapshot(path: Path, *, label: str, capture_bytes: bool = False):
+            nonlocal changed
+            snapshot = real_snapshot(path, label=label, capture_bytes=capture_bytes)
+            if not changed and label == target:
+                changed = True
+                if label == "artifact output":
+                    path.write_bytes(b"changed-output")
+                elif label == "artifact qa_report":
+                    qa_path.write_text('{"status":"fail"}\n', encoding="utf-8")
+                else:
+                    finalized_path.write_text("{}\n", encoding="utf-8")
+            return snapshot
+
+        with patch.object(
+            delivery_envelope,
+            "_snapshot_regular_file",
+            side_effect=mutate_after_snapshot,
+        ):
+            with self.assertRaisesRegex(
+                delivery_envelope.DeliveryEnvelopeError, "changed"
+            ):
+                self._snapshot()
+        self.assertTrue(changed)
+
+    def test_contextual_snapshot_rejects_output_single_hook_race(self) -> None:
+        self._assert_snapshot_race_rejected("artifact output")
+
+    def test_contextual_snapshot_rejects_qa_single_hook_race(self) -> None:
+        self._assert_snapshot_race_rejected("artifact qa_report")
+
+    def test_contextual_snapshot_rejects_envelope_single_hook_race(self) -> None:
+        self._assert_snapshot_race_rejected("finalized envelope")
 
     def test_publish_binds_all_core_artifacts_and_cleans_staging(self) -> None:
         stage, sources, prepared = self._stage()
@@ -666,7 +1276,7 @@ class DeliveryEnvelopeTests(unittest.TestCase):
             authority=replacement,
         )
 
-    def test_publish_rechecks_all_prior_state_after_journal_is_durable(self) -> None:
+    def test_publish_rechecks_all_prior_state_after_journal_is_persisted(self) -> None:
         self.external_output.parent.mkdir(parents=True)
         self.external_output.write_bytes(b"prior-output")
         stage, sources, _prepared = self._stage()

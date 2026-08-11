@@ -17,7 +17,18 @@ SCHEMA_VERSION = 1
 RESOLVER_VERSION = 1
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DIRECTOR_REGISTRY_PATH = SKILL_DIR / "contracts/instances/director_mode__registry.json"
-IMPLEMENTED_CAPABILITIES = frozenset({"caption-delivery-v2"})
+# These capabilities have concrete, local P0 implementations.  Keep this
+# declaration patchable: public entrypoints use it for their zero-mutation
+# preflight and tests deliberately remove a capability to exercise that path.
+IMPLEMENTED_CAPABILITIES = frozenset(
+    {
+        "approved-translation-provider",
+        "audio-event-mixer-v1",
+        "caption-delivery-v2",
+        "kinetic-scene-director-v1",
+        "unified-delivery-envelope-v1",
+    }
+)
 SELECTION_SCHEMA_VERSION = 1
 SELECTION_REASONS = frozenset(
     {

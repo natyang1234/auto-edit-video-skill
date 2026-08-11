@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +15,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 import auto_edit  # noqa: E402
+import director_resolver  # noqa: E402
 
 
 class ArgumentSourcingTests(unittest.TestCase):
@@ -67,33 +70,21 @@ class EntryPointTests(unittest.TestCase):
         self.assertNotEqual(auto_edit.cmd_cut(args), 0)
 
     def test_kinetic_cut_fails_capability_preflight_before_project_mutation(self) -> None:
-        cli = SKILL_DIR / "scripts/auto_edit.py"
         with tempfile.TemporaryDirectory(prefix="kinetic-cut-preflight-") as directory:
             root = Path(directory)
             source = root / "source.mp4"
             out = root / "out"
             project = root / "project"
             source.write_bytes(b"existing input")
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(cli),
-                    "cut",
-                    "--input",
-                    str(source),
-                    "--out",
-                    str(out),
-                    "--project-dir",
-                    str(project),
-                    "--director",
-                    "kinetic-explainer",
-                ],
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(result.returncode, 2)
-            self.assertEqual(result.stderr, "")
-            payload = json.loads(result.stdout)
+            args = self.parser().parse_args([
+                "cut", "--input", str(source), "--out", str(out),
+                "--project-dir", str(project), "--director", "kinetic-explainer",
+            ])
+            stdout = io.StringIO()
+            with patch.object(director_resolver, "IMPLEMENTED_CAPABILITIES", frozenset()), redirect_stdout(stdout):
+                code = auto_edit.cmd_cut(args)
+            self.assertEqual(code, 2)
+            payload = json.loads(stdout.getvalue())
             self.assertEqual(payload["error_code"], "capability_missing")
             self.assertEqual(payload["missing_capabilities"], sorted(payload["missing_capabilities"]))
             self.assertFalse(out.exists())
@@ -369,6 +360,126 @@ class DeliveryGateCallTests(unittest.TestCase):
         )
 
 
+class KineticTimelineApprovalIntegrityTests(unittest.TestCase):
+    def project(self, *, profile: str = "kinetic-explainer") -> tuple[Path, dict, dict]:
+        tmp = tempfile.TemporaryDirectory(prefix="kinetic-approval-integrity-")
+        self.addCleanup(tmp.cleanup)
+        project = Path(tmp.name)
+        (project / "working").mkdir()
+        state = {
+            "schema_version": 2,
+            "director_style": profile,
+            "segments": [{"source_start": 0.0, "source_end": 1.0}],
+            "caption_delivery": {
+                "artifact": "working/caption_delivery_v2.json",
+                "artifact_sha256": "a" * 64,
+            },
+            "overlays": [],
+        }
+        manifest = {
+            "approvals": {
+                "timeline": {"approved": False, "note": "not yet approved"}
+            },
+            "subtitles": {
+                "translation": {
+                    "required": True,
+                    "target_language": "en",
+                    "provider": "ollama",
+                    "model": "qwen2.5:7b",
+                }
+            },
+        }
+        (project / "working/editor_state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        resolved = director_resolver.resolve_director_profile("kinetic-explainer")
+        (project / "working/resolved_director_profile.json").write_text(
+            json.dumps(resolved), encoding="utf-8"
+        )
+        (project / "project.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return project, state, manifest
+
+    def assert_unapproved(self, project: Path) -> None:
+        manifest = json.loads((project / "project.json").read_text(encoding="utf-8"))
+        self.assertFalse(manifest["approvals"]["timeline"]["approved"])
+
+    def test_wrong_profile_is_rejected_before_approval_write(self) -> None:
+        project, _state, _manifest = self.project(profile="teacher-punch")
+        before_manifest = (project / "project.json").read_bytes()
+        before_state = (project / "working/editor_state.json").read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "kinetic-explainer"):
+            auto_edit.approve_kinetic_timeline(project)
+
+        self.assert_unapproved(project)
+        self.assertEqual((project / "project.json").read_bytes(), before_manifest)
+        self.assertEqual((project / "working/editor_state.json").read_bytes(), before_state)
+
+    def test_missing_required_caption_is_rejected_before_approval_write(self) -> None:
+        import caption_delivery
+
+        project, _state, _manifest = self.project()
+        before_manifest = (project / "project.json").read_bytes()
+        before_state = (project / "working/editor_state.json").read_bytes()
+
+        with self.assertRaises(caption_delivery.CaptionDeliveryError):
+            auto_edit.approve_kinetic_timeline(project)
+
+        self.assert_unapproved(project)
+        self.assertEqual((project / "project.json").read_bytes(), before_manifest)
+        self.assertEqual((project / "working/editor_state.json").read_bytes(), before_state)
+
+    def test_caption_hash_mismatch_is_rejected_before_approval_write(self) -> None:
+        import caption_delivery
+
+        project, state, _manifest = self.project()
+        before_manifest = (project / "project.json").read_bytes()
+        before_state = (project / "working/editor_state.json").read_bytes()
+        bound_state = dict(state)
+        bound_state["_caption_delivery_v2"] = {
+            "artifact_sha256": "b" * 64,
+            "items": [],
+        }
+        with patch.object(
+            caption_delivery,
+            "validate_for_render",
+            return_value=({"required": True}, bound_state),
+        ):
+            with self.assertRaisesRegex(ValueError, "caption.*hash"):
+                auto_edit.approve_kinetic_timeline(project)
+
+        self.assert_unapproved(project)
+        self.assertEqual((project / "project.json").read_bytes(), before_manifest)
+        self.assertEqual((project / "working/editor_state.json").read_bytes(), before_state)
+
+    def test_state_change_during_caption_validation_fails_cas(self) -> None:
+        import caption_delivery
+
+        project, state, _manifest = self.project()
+        state_path = project / "working/editor_state.json"
+
+        def mutate_then_validate(_project, current_state, _manifest):
+            changed = dict(current_state)
+            changed["segments"] = [{"source_start": 0.0, "source_end": 0.5}]
+            state_path.write_text(json.dumps(changed), encoding="utf-8")
+            bound_state = dict(current_state)
+            bound_state["_caption_delivery_v2"] = {
+                "artifact_sha256": "a" * 64,
+                "items": [],
+            }
+            return {"required": True}, bound_state
+
+        with patch.object(
+            caption_delivery,
+            "validate_for_render",
+            side_effect=mutate_then_validate,
+        ):
+            with self.assertRaisesRegex((ValueError, RuntimeError), "changed"):
+                auto_edit.approve_kinetic_timeline(project)
+
+        self.assert_unapproved(project)
+
+
 class ClipLengthTargetTests(unittest.TestCase):
     """A length to aim for only means something on a source longer than it.
 
@@ -501,6 +612,54 @@ class PlanningWindowsTests(unittest.TestCase):
 
 
 class MaterialiseClipVisualDensityTests(unittest.TestCase):
+    def test_materialised_active_highlight_uses_the_rendered_span(self) -> None:
+        import editor_server
+        import video_analyzer
+
+        state = {
+            "segments": [{"id": "base", "source_start": 0.0, "source_end": 16.0}],
+            "canvas": {},
+            "director_style": "kinetic-explainer",
+            "highlights": [{
+                "id": "highlight-aaaa1111",
+                "start": 4.3,
+                "end": 15.0,
+                "title": "Chosen title",
+                "review_status": "pending",
+                "source": "working/highlight_plan.json",
+            }],
+        }
+        materialised = {
+            "id": "highlight-aaaa1111",
+            "start": 0.0,
+            "end": 16.0,
+            "title": "Chosen title",
+            "review_status": "pending",
+        }
+        with (
+            patch.object(editor_server, "default_editor_state", return_value=state),
+            patch.object(editor_server, "read_json", return_value={"items": []}),
+            patch.object(video_analyzer, "atomic_write_json"),
+        ):
+            result = auto_edit.materialise_clip(
+                Path("/tmp/auto-edit-materialised-span-test"),
+                {},
+                materialised,
+                fit="contain",
+                cards=False,
+                trim_pauses=False,
+            )
+
+        self.assertEqual(result["active_highlight_id"], "highlight-aaaa1111")
+        active = [
+            item
+            for item in result["highlights"]
+            if item["id"] == result["active_highlight_id"]
+        ]
+        self.assertEqual(len(active), 1)
+        self.assertEqual((active[0]["start"], active[0]["end"]), (0.0, 16.0))
+        self.assertEqual(active[0]["source"], "working/highlight_plan.json")
+
     def test_director_density_reaches_visual_planner(self) -> None:
         from unittest.mock import patch
 
@@ -663,7 +822,6 @@ class SavedTermsTests(unittest.TestCase):
     """
 
     def write(self, payload) -> Path:
-        import json
         import tempfile
 
         tmp = tempfile.TemporaryDirectory(prefix="auto-edit-terms-")
