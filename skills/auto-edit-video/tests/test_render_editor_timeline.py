@@ -13,11 +13,16 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 import asset_registry  # noqa: E402
+import contract_registry  # noqa: E402
+import editor_server  # noqa: E402
+import sfx_delivery  # noqa: E402
 from render_editor_timeline import (  # noqa: E402
     build_render_command,
     font_path,
+    fresh_sfx_bindings,
     project_font_binding,
     render_project,
+    stage_phase0d_sfx,
 )
 
 
@@ -253,9 +258,13 @@ class Phase0dRenderCommandTests(unittest.TestCase):
 
     @patch("render_editor_timeline.source_has_audible_signal", return_value=True)
     def test_sfx_input_follows_image_assets_and_graph_normalizes_once(self, _audible: object) -> None:
+        dialogue_evidence = self.project / "working/dialogue-priority-dialogue.wav"
+        sfx_evidence = self.project / "working/dialogue-priority-sfx.wav"
         command = build_render_command(
             self.project, self.state, self.manifest, self.project / "out.mp4", "final",
             sfx_stem=self.stem,
+            dialogue_priority_dialogue=dialogue_evidence,
+            dialogue_priority_sfx=sfx_evidence,
         )
         inputs = [command[index + 1] for index, item in enumerate(command) if item == "-i"]
         self.assertEqual(inputs, [
@@ -266,9 +275,42 @@ class Phase0dRenderCommandTests(unittest.TestCase):
         graph = command[command.index("-filter_complex") + 1]
         self.assertIn("[2:a]", graph)
         self.assertIn("atrim=0:2.000000", graph)
+        self.assertIn(
+            "[adialogue]asplit=3[adialogue_mix][adialogue_key][adialogue_evidence_raw]",
+            graph,
+        )
+        self.assertIn(
+            "[adialogue_evidence_raw]apad=whole_len=96000,atrim=end_sample=96000"
+            "[adialogue_evidence]",
+            graph,
+        )
+        self.assertIn(
+            "[asfx][adialogue_key]sidechaincompress="
+            "threshold=0.2:ratio=1.2:attack=5:release=250:makeup=1:"
+            "link=maximum:detection=rms[asfx_ducked]",
+            graph,
+        )
+        self.assertIn(
+            "[asfx_ducked]apad=whole_len=96000,atrim=end_sample=96000"
+            "[asfx_ducked_bounded]",
+            graph,
+        )
+        self.assertIn(
+            "[asfx_ducked_bounded]asplit=2"
+            "[asfx_ducked_mix][asfx_ducked_evidence]",
+            graph,
+        )
+        self.assertIn("[adialogue_mix][asfx_ducked_mix]amix=inputs=2:normalize=0", graph)
+        self.assertEqual(graph.count("sidechaincompress="), 1)
         self.assertEqual(graph.count("loudnorm="), 1)
         self.assertIn("LRA=11,aresample=48000[aout]", graph)
         self.assertEqual(" ".join(command).count("loudnorm="), 1)
+        self.assertEqual(command[-1], str(self.project / "out.mp4"))
+        self.assertLess(command.index(str(dialogue_evidence)), command.index(str(sfx_evidence)))
+        self.assertLess(command.index(str(sfx_evidence)), len(command) - 1)
+        self.assertEqual(command.count("pcm_s24le"), 2)
+        self.assertIn("[adialogue_evidence]", command)
+        self.assertIn("[asfx_ducked_evidence]", command)
 
     def test_sfx_rejects_multi_cut_timeline(self) -> None:
         self.state["segments"] = [
@@ -287,6 +329,21 @@ class Phase0dRenderCommandTests(unittest.TestCase):
             build_render_command(
                 self.project, self.state, self.manifest, self.project / "out.mp4", "final",
                 sfx_stem=self.stem,
+            )
+
+    @patch("render_editor_timeline.source_has_audible_signal", return_value=True)
+    def test_private_dialogue_priority_outputs_are_all_or_none(self, _audible: object) -> None:
+        with self.assertRaisesRegex(ValueError, "all-or-none"):
+            build_render_command(
+                self.project, self.state, self.manifest, self.project / "out.mp4", "final",
+                sfx_stem=self.stem,
+                dialogue_priority_dialogue=self.project / "working/dialogue_priority_dialogue.wav",
+            )
+        with self.assertRaisesRegex(ValueError, "requires an SFX stem"):
+            build_render_command(
+                self.project, self.state, self.manifest, self.project / "out.mp4", "final",
+                dialogue_priority_dialogue=self.project / "working/dialogue_priority_dialogue.wav",
+                dialogue_priority_sfx=self.project / "working/dialogue_priority_sfx.wav",
             )
 
     @patch("render_editor_timeline.subprocess.run")
@@ -326,6 +383,105 @@ class Phase0dRenderCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--sfx-stem") + 1], str(self.stem))
         self.assertEqual(command[command.index("--expected-timeline-revision") + 1], "timeline-revision")
         self.assertEqual(command[command.index("--expected-cut-map-sha256") + 1], "a" * 64)
+
+    def test_stage_uses_base_authority_and_bakes_current_studio_edits(self) -> None:
+        evidence = {
+            "schema_version": 1,
+            "duration_s": 6.0,
+            "items": [
+                {
+                    "id": "title-1",
+                    "start": "0.20",
+                    "end": "0.50",
+                    "kind": "title",
+                    "component_id": "title-lockup",
+                    "motion": {
+                        "requested": "slide-up",
+                        "delivered": "slide-up",
+                        "faithful": True,
+                        "status": "native",
+                    },
+                }
+            ],
+        }
+        self.state.update({"schema_version": 2, "project_id": "renderer-studio"})
+        base_revision = editor_server.editor_base_state_revision(self.state)
+        cut_hash = sfx_delivery.effective_cut_map_sha256(self.project, self.state)
+        source_dir = self.project / "source-plan"
+        source_plan_path, _catalog, _stem = sfx_delivery.stage_multi_event_delivery(
+            source_dir, evidence, base_revision, cut_hash
+        )
+        source_plan = json.loads(source_plan_path.read_text(encoding="utf-8"))
+        source_event = source_plan["events"][0]
+        edits = {
+            "schema_version": 1,
+            "source_render_id": "source-render",
+            "source_plan_sha256": hashlib.sha256(source_plan_path.read_bytes()).hexdigest(),
+            "source_timeline_revision": base_revision,
+            "events": [
+                {
+                    "id": source_event["id"],
+                    "source_event_sha256": contract_registry.canonical_hash(source_event),
+                    "event_start_sample": source_event["event_start_sample"],
+                    "gain_db": -18,
+                }
+            ],
+        }
+        self.state["audio_event_edits"] = edits
+        stage = self.project / "render-stage"
+        with patch(
+            "render_editor_timeline.resolve_audio_event_source",
+            return_value=("source-render", source_plan, edits["source_plan_sha256"]),
+        ):
+            plan_path, _catalog_path, stem_path = stage_phase0d_sfx(
+                self.project, self.state, "render-id", stage, evidence
+            )
+        resolved = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertEqual(resolved["timeline_revision"], base_revision)
+        self.assertEqual(resolved["events"][0]["gain_db"], -18)
+        self.assertEqual(
+            resolved["studio_edits_sha256"], contract_registry.canonical_hash(edits)
+        )
+        self.assertEqual(
+            resolved["sfx_stem_sha256"], hashlib.sha256(stem_path.read_bytes()).hexdigest()
+        )
+        changed_evidence = json.loads(json.dumps(evidence))
+        changed_evidence["items"][0]["start"] = "0.30"
+        with (
+            patch(
+                "render_editor_timeline.resolve_audio_event_source",
+                return_value=("source-render", source_plan, edits["source_plan_sha256"]),
+            ),
+            self.assertRaisesRegex(ValueError, "planning authority differs"),
+        ):
+            stage_phase0d_sfx(
+                self.project,
+                self.state,
+                "render-id-stale",
+                self.project / "render-stage-stale",
+                changed_evidence,
+            )
+
+        state_path = self.project / "working/editor_state.json"
+        state_path.write_text(json.dumps(self.state) + "\n", encoding="utf-8")
+        expected_full = editor_server.editor_state_revision(self.state)
+        expected_base = editor_server.editor_base_state_revision(self.state)
+        with patch(
+            "render_editor_timeline.resolve_audio_event_source",
+            return_value=("source-render", source_plan, edits["source_plan_sha256"]),
+        ):
+            fresh_sfx_bindings(self.project, expected_full, expected_base, cut_hash)
+        changed_state = json.loads(json.dumps(self.state))
+        changed_state["audio_event_edits"]["events"][0]["gain_db"] = -20
+        state_path.write_text(json.dumps(changed_state) + "\n", encoding="utf-8")
+        with (
+            patch(
+                "render_editor_timeline.resolve_audio_event_source",
+                return_value=("source-render", source_plan, edits["source_plan_sha256"]),
+            ),
+            self.assertRaisesRegex(ValueError, "editor state"),
+        ):
+            fresh_sfx_bindings(self.project, expected_full, expected_base, cut_hash)
 
 
 class DirectActiveHighlightRenderTests(unittest.TestCase):

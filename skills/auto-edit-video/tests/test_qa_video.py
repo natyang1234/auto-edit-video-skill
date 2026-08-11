@@ -63,7 +63,11 @@ class QaVideoGateTest(unittest.TestCase):
     def sfx_report(
         *, status: str = "pass", failures: list[str] | None = None
     ) -> dict[str, object]:
-        events = [{"id": "sfx-title-enter-0001", "status": "pass"}]
+        events = [{
+            "id": "sfx-title-enter-0001",
+            "expected_transient_sample": 12000,
+            "status": "pass",
+        }]
         return {
             "schema_version": 1,
             "source": "independent_sfx_evidence",
@@ -92,6 +96,61 @@ class QaVideoGateTest(unittest.TestCase):
                 "correlation": 0.99,
             }],
         }
+
+    @classmethod
+    def sfx_v2_report(
+        cls, *, dialogue_db: float = -38.0, sfx_db: float = -44.0,
+    ) -> dict[str, object]:
+        report = cls.sfx_report()
+        active = dialogue_db > -45.0
+        passed = not active or sfx_db <= dialogue_db - 6.0
+        event_status = "inactive" if not active else ("pass" if passed else "fail")
+        report["schema_version"] = 2
+        report["dialogue_priority_evidence"] = {
+            "authority": qa_video.sfx_delivery.DIALOGUE_PRIORITY_AUTHORITY,
+            "policy": {
+                "sample_rate": 48000,
+                "channels": 2,
+                "sample_width_bytes": 3,
+                "window_samples": 12000,
+                "window_alignment": "centered_on_expected_transient_zero_padded",
+                "channel_aggregation": "maximum_per_channel_rms",
+                "dialogue_active_strictly_above_dbfs": -45.0,
+                "required_sfx_reduction_db": 6.0,
+                "digital_silence_dbfs": -120.0,
+            },
+            "dialogue_stem": {
+                "role": "pre-final-loudnorm_dialogue",
+                "file_sha256": "c" * 64,
+                "decoded_pcm_sha256": "d" * 64,
+                "sample_rate": 48000,
+                "channels": 2,
+                "sample_width_bytes": 3,
+                "sample_count": 96000,
+            },
+            "sfx_stem": {
+                "role": "post-sidechain_pre-amix_sfx",
+                "file_sha256": "e" * 64,
+                "decoded_pcm_sha256": "f" * 64,
+                "sample_rate": 48000,
+                "channels": 2,
+                "sample_width_bytes": 3,
+                "sample_count": 96000,
+            },
+            "event_count": 1,
+            "active_event_count": int(active),
+            "passed_event_count": int(passed),
+            "events": [{
+                "event_id": "sfx-title-enter-0001",
+                "expected_transient_sample": 12000,
+                "dialogue_rms_dbfs": dialogue_db,
+                "sfx_rms_dbfs": sfx_db,
+                "sfx_relative_to_dialogue_db": sfx_db - dialogue_db,
+                "active": active,
+                "status": event_status,
+            }],
+        }
+        return report
 
     def test_reference_video_with_audio_passes(self) -> None:
         video = self.dir / "reference.mp4"
@@ -166,6 +225,63 @@ class QaVideoGateTest(unittest.TestCase):
         forged_delta["output_audio_evidence"]["sample_count_delta"] = 1
         with self.assertRaisesRegex(ValueError, "delta is inconsistent"):
             qa_video.validate_sfx_report(forged_delta)
+
+    def test_v2_dialogue_priority_thresholds_are_strict_and_inclusive(self) -> None:
+        exact_threshold = self.sfx_v2_report(dialogue_db=-45.0, sfx_db=-20.0)
+        qa_video.validate_sfx_report(exact_threshold)
+
+        exact_reduction = self.sfx_v2_report(dialogue_db=-38.0, sfx_db=-44.0)
+        qa_video.validate_sfx_report(exact_reduction)
+
+        insufficient = self.sfx_v2_report(dialogue_db=-38.0, sfx_db=-43.999999)
+        with self.assertRaisesRegex(ValueError, "all dialogue-priority events"):
+            qa_video.validate_sfx_report(insufficient)
+
+        just_active = self.sfx_v2_report(dialogue_db=-44.999999, sfx_db=-44.999999)
+        with self.assertRaisesRegex(ValueError, "all dialogue-priority events"):
+            qa_video.validate_sfx_report(just_active)
+
+        forged = self.sfx_v2_report()
+        forged["dialogue_priority_evidence"]["events"][0]["dialogue_rms_dbfs"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "finite"):
+            qa_video.validate_sfx_report(forged)
+
+        wrong_window = self.sfx_v2_report()
+        wrong_window["dialogue_priority_evidence"]["events"][0][
+            "expected_transient_sample"
+        ] += 1
+        with self.assertRaisesRegex(ValueError, "expected sample"):
+            qa_video.validate_sfx_report(wrong_window)
+
+        wrong_length = self.sfx_v2_report()
+        wrong_length["dialogue_priority_evidence"]["sfx_stem"]["sample_count"] += 1
+        with self.assertRaisesRegex(ValueError, "sample counts differ"):
+            qa_video.validate_sfx_report(wrong_length)
+
+        alias = self.sfx_v2_report()
+        alias["dialogue_priority_evidence"]["sfx_stem"]["file_sha256"] = (
+            alias["dialogue_priority_evidence"]["dialogue_stem"]["file_sha256"]
+        )
+        with self.assertRaisesRegex(ValueError, "must not alias"):
+            qa_video.validate_sfx_report(alias)
+
+        wrong_types = self.sfx_v2_report()
+        wrong_types["schema_version"] = 2.0
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            qa_video.validate_sfx_report(wrong_types)
+        wrong_types = self.sfx_v2_report()
+        wrong_types["dialogue_priority_evidence"]["policy"]["channels"] = 2.0
+        with self.assertRaisesRegex(ValueError, "policy"):
+            qa_video.validate_sfx_report(wrong_types)
+        wrong_types = self.sfx_v2_report()
+        wrong_types["dialogue_priority_evidence"]["dialogue_stem"]["channels"] = 2.0
+        with self.assertRaisesRegex(ValueError, "format"):
+            qa_video.validate_sfx_report(wrong_types)
+
+        legacy_forged = self.sfx_report()
+        legacy_forged["dialogue_priority_evidence"] = {}
+        with self.assertRaisesRegex(ValueError, "v1 cannot"):
+            qa_video.validate_sfx_report(legacy_forged)
 
     def test_failed_independent_sfx_evidence_fails_the_delivery(self) -> None:
         video = self.dir / "sfx-fail.mp4"

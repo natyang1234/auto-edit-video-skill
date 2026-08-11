@@ -22,6 +22,7 @@ from contract_registry import (  # noqa: E402
     run_fixture_suite,
     run_instance_suite,
     semantic_asset_provenance,
+    semantic_audio_event_plan,
     semantic_approval_receipt,
     semantic_evidence_references,
     semantic_master_timeline,
@@ -30,6 +31,7 @@ from contract_registry import (  # noqa: E402
     semantic_video_analysis,
     semantic_visual_plan,
     validate,
+    validate_artifact,
 )
 
 
@@ -62,6 +64,51 @@ class DialectTests(unittest.TestCase):
         self.assertTrue(validate({"kind": "a", "extra": 1}, schema))
         self.assertTrue(validate({}, schema))
 
+    def test_const_requires_exact_json_type_and_value_at_public_contract_seams(self) -> None:
+        fixture = load_artifact_text(
+            (
+                SKILL_DIR
+                / "contracts"
+                / "fixtures"
+                / "sfx_catalog"
+                / "valid_1.json"
+            ).read_text("utf-8")
+        )
+        self.assertEqual(validate_artifact("sfx_catalog", fixture), [])
+
+        for impostor in (True, 1.0):
+            with self.subTest(field="schema_version", impostor=impostor):
+                malformed = json.loads(json.dumps(fixture))
+                malformed["schema_version"] = impostor
+                self.assertTrue(validate_artifact("sfx_catalog", malformed))
+                self.assertIn(
+                    "$.schema_version: must be exact integer 1",
+                    contract_registry.semantic_sfx_catalog(malformed),
+                )
+            with self.subTest(field="generator.version", impostor=impostor):
+                malformed = json.loads(json.dumps(fixture))
+                malformed["assets"][0]["generator"]["version"] = impostor
+                self.assertTrue(validate_artifact("sfx_catalog", malformed))
+                self.assertIn(
+                    "$.assets[0].generator.version: must be exact integer 1",
+                    contract_registry.semantic_sfx_catalog(malformed),
+                )
+            with self.subTest(field="studio_edits.schema_version", impostor=impostor):
+                self.assertTrue(
+                    validate(
+                        {"studio_edits": {"schema_version": impostor}},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "studio_edits": {
+                                    "type": "object",
+                                    "properties": {"schema_version": {"const": 1}},
+                                }
+                            },
+                        },
+                    )
+                )
+
 
 class ArtifactParsingTests(unittest.TestCase):
     def test_duplicate_keys_rejected(self) -> None:
@@ -83,6 +130,41 @@ class ArtifactParsingTests(unittest.TestCase):
     def test_canonical_hash_rejects_nonfinite(self) -> None:
         with self.assertRaises(ContractError):
             canonical_hash({"a": float("inf")})
+
+    def test_audio_event_plan_version_is_an_exact_supported_integer(self) -> None:
+        fixture_dir = SKILL_DIR / "contracts" / "fixtures" / "audio_event_plan"
+        valid_v1 = load_artifact_text((fixture_dir / "valid_1.json").read_text("utf-8"))
+        valid_v2 = load_artifact_text((fixture_dir / "valid_v2.json").read_text("utf-8"))
+        self.assertEqual(validate_artifact("audio_event_plan", valid_v1), [])
+        self.assertEqual(validate_artifact("audio_event_plan", valid_v2), [])
+
+        for version in (True, 1.0, 2.0, "2", 3, None):
+            with self.subTest(version=version):
+                malformed = json.loads(json.dumps(valid_v1))
+                malformed["schema_version"] = version
+                self.assertTrue(validate_artifact("audio_event_plan", malformed))
+                self.assertEqual(
+                    semantic_audio_event_plan(malformed),
+                    ["$.schema_version: must be exact integer 1 or 2"],
+                )
+                self.assertEqual(
+                    semantic_audio_event_plan({"schema_version": version}),
+                    ["$.schema_version: must be exact integer 1 or 2"],
+                )
+
+        missing = json.loads(json.dumps(valid_v1))
+        missing.pop("schema_version")
+        self.assertTrue(validate_artifact("audio_event_plan", missing))
+        self.assertEqual(
+            semantic_audio_event_plan(missing),
+            ["$.schema_version: must be exact integer 1 or 2"],
+        )
+
+        float_fixture = load_artifact_text(
+            (fixture_dir / "invalid_schema_version_float.json").read_text("utf-8")
+        )
+        self.assertIs(type(float_fixture["schema_version"]), float)
+        self.assertTrue(validate_artifact("audio_event_plan", float_fixture))
 
 
 class StylePackRegistryTests(unittest.TestCase):

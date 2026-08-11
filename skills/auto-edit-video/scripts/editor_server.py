@@ -33,6 +33,8 @@ from typing import Any
 
 import caption_engine
 import asset_registry
+import contract_registry
+import delivery_envelope
 from asset_provider_service import AssetProviderError, AssetProviderService
 from local_http_security import (
     csrf_token_matches,
@@ -258,8 +260,10 @@ def atomic_write_json(path: Path, payload: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def editor_state_revision(state: dict[str, Any]) -> str:
-    """Hash only fields that can change the rendered video."""
+def _editor_render_revision_payload(
+    state: dict[str, Any], *, include_audio_event_edits: bool
+) -> dict[str, Any]:
+    """Return the closed render-authority projection of editor state."""
     canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
     raw_revision_overlays = state.get("overlays", [])
     if not isinstance(raw_revision_overlays, list):
@@ -274,7 +278,7 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         else overlay
         for overlay in raw_revision_overlays
     ]
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": state.get("schema_version"),
         "project_id": state.get("project_id"),
         "segments": state.get("segments"),
@@ -299,13 +303,45 @@ def editor_state_revision(state: dict[str, Any]) -> str:
         # must invalidate an approval given under stricter ones.
         "qa_policy": state.get("qa_policy"),
     }
+    if include_audio_event_edits and "audio_event_edits" in state:
+        payload["audio_event_edits"] = state.get("audio_event_edits")
+    return payload
+
+
+def _hash_editor_render_revision_payload(payload: dict[str, Any]) -> str:
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def editor_base_state_revision(state: dict[str, Any]) -> str:
+    """Render revision excluding Studio audio overrides.
+
+    A finalized base plan binds this value.  Keeping it separate prevents the
+    source-plan binding from becoming circular when only an audio edit changes.
+    """
+    return _hash_editor_render_revision_payload(
+        _editor_render_revision_payload(state, include_audio_event_edits=False)
+    )
+
+
+def editor_state_revision(state: dict[str, Any]) -> str:
+    """Hash all fields that can change the rendered video."""
+    return _hash_editor_render_revision_payload(
+        _editor_render_revision_payload(state, include_audio_event_edits=True)
+    )
+
+
+def audio_event_edits_hash(edits: dict[str, Any] | None) -> str | None:
+    """Canonical expected override identity supplied independently to QA."""
+    if edits is None:
+        return None
+    return contract_registry.canonical_hash(edits)
 
 
 EDITOR_STATE_SCHEMA_VERSION = 2
@@ -2606,6 +2642,273 @@ def qa_profile_binding_errors(
 qa_policy_args = qa_video.qa_policy_args
 
 
+_AUDIO_EDIT_KEYS = {
+    "schema_version",
+    "source_render_id",
+    "source_plan_sha256",
+    "source_timeline_revision",
+    "events",
+}
+_AUDIO_EDIT_EVENT_KEYS = {
+    "id",
+    "source_event_sha256",
+    "event_start_sample",
+    "gain_db",
+}
+_AUDIO_EDIT_RENDER_ID = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
+_AUDIO_EDIT_ID = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
+_AUDIO_EDIT_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_audio_event_edits(value: Any) -> list[str]:
+    """Validate the closed, sparse Studio audio override envelope."""
+    if value is None:
+        return []
+    if type(value) is not dict:
+        return ["audio_event_edits must be a built-in JSON object"]
+    errors: list[str] = []
+    unknown = sorted(set(value) - _AUDIO_EDIT_KEYS)
+    missing = sorted(_AUDIO_EDIT_KEYS - set(value))
+    if unknown:
+        errors.append(f"audio_event_edits has unsupported fields: {', '.join(unknown)}")
+    if missing:
+        errors.append(f"audio_event_edits is missing fields: {', '.join(missing)}")
+    if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
+        errors.append("audio_event_edits.schema_version must be the integer 1")
+    render_id = value.get("source_render_id")
+    if type(render_id) is not str or _AUDIO_EDIT_RENDER_ID.fullmatch(render_id) is None:
+        errors.append("audio_event_edits.source_render_id is invalid")
+    for field in ("source_plan_sha256", "source_timeline_revision"):
+        digest = value.get(field)
+        if type(digest) is not str or _AUDIO_EDIT_SHA256.fullmatch(digest) is None:
+            errors.append(f"audio_event_edits.{field} must be lowercase sha256")
+    events = value.get("events")
+    if type(events) is not list or not events:
+        errors.append("audio_event_edits.events must be a non-empty sparse list")
+        return errors
+    seen: set[str] = set()
+    previous_id = ""
+    for index, event in enumerate(events):
+        label = f"audio_event_edits.events[{index}]"
+        if type(event) is not dict:
+            errors.append(f"{label} must be a built-in JSON object")
+            continue
+        event_unknown = sorted(set(event) - _AUDIO_EDIT_EVENT_KEYS)
+        event_missing = sorted(_AUDIO_EDIT_EVENT_KEYS - set(event))
+        if event_unknown:
+            errors.append(f"{label} has unsupported fields: {', '.join(event_unknown)}")
+        if event_missing:
+            errors.append(f"{label} is missing fields: {', '.join(event_missing)}")
+        event_id = event.get("id")
+        if type(event_id) is not str or _AUDIO_EDIT_ID.fullmatch(event_id) is None:
+            errors.append(f"{label}.id is invalid")
+        elif event_id in seen:
+            errors.append(f"{label}.id is duplicated")
+        elif previous_id and event_id <= previous_id:
+            errors.append("audio_event_edits.events must be ordered by id")
+        if type(event_id) is str:
+            seen.add(event_id)
+            previous_id = event_id
+        digest = event.get("source_event_sha256")
+        if type(digest) is not str or _AUDIO_EDIT_SHA256.fullmatch(digest) is None:
+            errors.append(f"{label}.source_event_sha256 must be lowercase sha256")
+        start = event.get("event_start_sample")
+        if type(start) is not int or start < 0:
+            errors.append(f"{label}.event_start_sample must be a non-negative integer")
+        gain = event.get("gain_db")
+        if (
+            isinstance(gain, bool)
+            or not isinstance(gain, (int, float))
+            or not math.isfinite(float(gain))
+            or not -24.0 <= float(gain) <= -6.0
+        ):
+            errors.append(f"{label}.gain_db must be finite and between -24 and -6 dB")
+    return errors
+
+
+class AudioEventEditError(ValueError):
+    """A Studio audio source or override failed its trust contract."""
+
+
+class EditorRevisionConflict(ValueError):
+    """The editor-state compare-and-swap authority is stale."""
+
+
+def _finalized_audio_plan(
+    project_dir: Path, render_id: str
+) -> tuple[dict[str, Any], str]:
+    """Load exact plan bytes through their repo-owned finalized envelope."""
+    if _AUDIO_EDIT_RENDER_ID.fullmatch(render_id) is None:
+        raise AudioEventEditError("audio event source render id is invalid")
+    envelope_rel = f"working/delivery_envelopes/{render_id}.json"
+    try:
+        envelope, envelope_snapshot = delivery_envelope.snapshot_owned_json(
+            project_dir, envelope_rel, label="finalized audio delivery envelope"
+        )
+        if envelope_snapshot.path.name != f"{render_id}.json":
+            raise AudioEventEditError("audio event envelope path is aliased")
+        if envelope.get("render_id") != render_id:
+            raise AudioEventEditError("audio event envelope render id does not match")
+        delivery_envelope.validate_envelope(
+            project_dir, envelope, expected_state="finalized"
+        )
+        artifact = (envelope.get("artifacts") or {}).get("audio_event_plan")
+        if not isinstance(artifact, dict):
+            raise AudioEventEditError("finalized delivery has no audio event plan")
+        expected_rel = f"working/audio_event_plans/{render_id}.json"
+        if artifact.get("path") != expected_rel:
+            raise AudioEventEditError("audio event plan path is not canonical for render id")
+        plan, plan_snapshot = delivery_envelope.snapshot_owned_json(
+            project_dir, expected_rel, label="finalized audio event plan"
+        )
+    except (delivery_envelope.DeliveryEnvelopeError, OSError, ValueError) as exc:
+        if isinstance(exc, AudioEventEditError):
+            raise
+        raise AudioEventEditError(f"finalized audio source is invalid: {exc}") from exc
+    declared_hash = artifact.get("sha256")
+    if plan_snapshot.sha256 != declared_hash:
+        raise AudioEventEditError("finalized audio plan hash does not match envelope")
+    errors = contract_registry.validate_artifact("audio_event_plan", plan)
+    if errors:
+        raise AudioEventEditError(f"finalized audio plan is invalid: {errors[0]}")
+    if plan.get("schema_version") != 2:
+        raise AudioEventEditError("only finalized audio plan schema v2 is editable")
+    if plan.get("studio_edits") is not None:
+        raise AudioEventEditError("an already edited audio plan cannot become a new edit source")
+    try:
+        delivery_envelope.revalidate_file_snapshot(plan_snapshot)
+        delivery_envelope.revalidate_file_snapshot(envelope_snapshot)
+    except delivery_envelope.DeliveryEnvelopeError as exc:
+        raise AudioEventEditError("finalized audio source changed while being read") from exc
+    return plan, plan_snapshot.sha256
+
+
+def resolve_audio_event_source(
+    project_dir: Path, state: dict[str, Any]
+) -> tuple[str, dict[str, Any], str]:
+    """Resolve one unambiguous finalized base plan for current visual state."""
+    edits = state.get("audio_event_edits")
+    base_revision = editor_base_state_revision(state)
+    if isinstance(edits, dict):
+        render_id = str(edits.get("source_render_id") or "")
+        plan, plan_hash = _finalized_audio_plan(project_dir, render_id)
+        if plan_hash != edits.get("source_plan_sha256"):
+            raise AudioEventEditError("audio event source plan hash changed")
+        if plan.get("timeline_revision") != edits.get("source_timeline_revision"):
+            raise AudioEventEditError("audio event source timeline binding changed")
+        if edits.get("source_timeline_revision") != base_revision:
+            raise AudioEventEditError("audio event edits are stale for current visual state")
+        return render_id, plan, plan_hash
+
+    envelope_dir = project_dir / "working/delivery_envelopes"
+    try:
+        metadata = envelope_dir.lstat()
+    except FileNotFoundError as exc:
+        raise AudioEventEditError("no finalized audio plan exists for current timeline") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise AudioEventEditError("finalized delivery envelope directory is unsafe")
+    candidates: list[tuple[str, dict[str, Any], str]] = []
+    unsafe: list[str] = []
+    for entry in sorted(envelope_dir.iterdir(), key=lambda item: item.name):
+        if entry.name.startswith(".") or entry.suffix != ".json":
+            continue
+        render_id = entry.stem
+        try:
+            plan, plan_hash = _finalized_audio_plan(project_dir, render_id)
+        except AudioEventEditError as exc:
+            unsafe.append(str(exc))
+            continue
+        if plan.get("timeline_revision") == base_revision:
+            candidates.append((render_id, plan, plan_hash))
+    if not candidates:
+        reason = unsafe[0] if unsafe else "no finalized audio plan exists for current timeline"
+        raise AudioEventEditError(reason)
+    hashes = {item[2] for item in candidates}
+    if len(hashes) != 1:
+        raise AudioEventEditError("multiple distinct finalized audio plans match current timeline")
+    return candidates[0]
+
+
+def resolve_studio_audio_plan(
+    source_plan: dict[str, Any], edits: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply sparse edits and revalidate all final-domain invariants."""
+    structural_errors = validate_audio_event_edits(edits)
+    if structural_errors:
+        raise AudioEventEditError(structural_errors[0])
+    plan = json.loads(json.dumps(source_plan, allow_nan=False))
+    events = plan.get("events")
+    if not isinstance(events, list):
+        raise AudioEventEditError("audio event source has no events")
+    by_id = {
+        event.get("id"): event for event in events if isinstance(event, dict)
+    }
+    edit_ids = [event["id"] for event in edits["events"]]
+    source_order = [event.get("id") for event in events if event.get("id") in set(edit_ids)]
+    if edit_ids != source_order:
+        raise AudioEventEditError("audio event edits do not follow source event order")
+    for edit in edits["events"]:
+        event = by_id.get(edit["id"])
+        if not isinstance(event, dict):
+            raise AudioEventEditError(f"audio event source id is stale: {edit['id']}")
+        if contract_registry.canonical_hash(event) != edit["source_event_sha256"]:
+            raise AudioEventEditError(f"audio event source hash is stale: {edit['id']}")
+        if (
+            event.get("event_start_sample") == edit["event_start_sample"]
+            and event.get("gain_db") == edit["gain_db"]
+        ):
+            raise AudioEventEditError(f"audio event edit has no change: {edit['id']}")
+        event["event_start_sample"] = edit["event_start_sample"]
+        event["gain_db"] = edit["gain_db"]
+        event["expected_transient_sample"] = (
+            edit["event_start_sample"] + event["asset_transient_anchor_sample"]
+        )
+    plan["studio_edits"] = json.loads(json.dumps(edits, allow_nan=False))
+    plan["studio_edits_sha256"] = audio_event_edits_hash(edits)
+    errors = contract_registry.validate_artifact("audio_event_plan", plan)
+    if errors:
+        raise AudioEventEditError(
+            "resolved audio event plan is invalid: " + "; ".join(errors)
+        )
+    return plan
+
+
+def audio_event_timeline(project_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Build the read-only Studio audio timeline projection."""
+    try:
+        render_id, source, plan_hash = resolve_audio_event_source(project_dir, state)
+        edits = state.get("audio_event_edits")
+        resolved = resolve_studio_audio_plan(source, edits) if isinstance(edits, dict) else source
+    except AudioEventEditError as exc:
+        return {
+            "editable": False,
+            "status": "unavailable",
+            "reason": str(exc),
+            "events": [],
+        }
+    edit_by_id = {
+        item["id"]: item for item in (edits or {}).get("events", [])
+    }
+    source_by_id = {item["id"]: item for item in source["events"]}
+    return {
+        "editable": True,
+        "status": "edited" if edits else "ready",
+        "reason": None,
+        "source_render_id": render_id,
+        "source_plan_sha256": plan_hash,
+        "source_timeline_revision": source["timeline_revision"],
+        "studio_edits_sha256": audio_event_edits_hash(edits),
+        "events": [
+            {
+                **event,
+                "source_event_sha256": contract_registry.canonical_hash(source_by_id[event["id"]]),
+                "edited": event["id"] in edit_by_id,
+            }
+            for event in resolved["events"]
+        ],
+    }
+
+
 def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     errors: list[str] = []
     if not isinstance(state, dict):
@@ -2618,6 +2921,7 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
     if state.get("schema_version") != EDITOR_STATE_SCHEMA_VERSION:
         return [f"editor state schema_version must be {EDITOR_STATE_SCHEMA_VERSION}"]
     errors.extend(qa_policy_errors(state.get("qa_policy")))
+    errors.extend(validate_audio_event_edits(state.get("audio_event_edits")))
     segments = state.get("segments")
     if not isinstance(segments, list) or not segments:
         errors.append("segments must be a non-empty list (unified timeline contract)")
@@ -4167,6 +4471,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "caption_engine": caption_engine.engine_descriptor(),
                 "manifest": manifest,
                 "state": state,
+                "audio_event_timeline": audio_event_timeline(project, state),
                 "platform_presets": PLATFORM_PRESETS,
                 "director_presets": DIRECTOR_PRESETS,
                 "style_packs": public_style_pack_catalog(),
@@ -4449,20 +4754,20 @@ class EditorHandler(BaseHTTPRequestHandler):
             expected_revision = None
             if isinstance(state, dict):
                 expected_revision = state.pop("x_expected_revision", None)
-            if expected_revision:
-                with self.server.project_lock:
-                    on_disk = read_json(self.server.project_dir / STATE_REL, {}) or {}
-                if on_disk.get("revision") and on_disk["revision"] != expected_revision:
-                    self.send_json(
-                        {
-                            "ok": False,
-                            "error": "editor state changed on the server; reload before saving",
-                            "error_code": "revision_conflict",
-                        },
-                        status=409,
-                    )
-                    return
-            errors, response = self.persist_editor_state(state)
+            try:
+                errors, response = self.persist_editor_state(
+                    state, expected_revision=expected_revision
+                )
+            except EditorRevisionConflict:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "editor state changed on the server; reload before saving",
+                        "error_code": "revision_conflict",
+                    },
+                    status=409,
+                )
+                return
             if errors:
                 self.send_json({"ok": False, "errors": errors}, status=422)
                 return
@@ -4472,9 +4777,18 @@ class EditorHandler(BaseHTTPRequestHandler):
         self.server.schedule_caption_render()
         self.send_json(response)
 
-    def persist_editor_state(self, state: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    def persist_editor_state(
+        self,
+        state: dict[str, Any],
+        *,
+        expected_revision: str | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
         """Shared validated persistence for PUT and server-side style patches."""
         with self.server.project_lock:
+            if expected_revision:
+                on_disk = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                if on_disk.get("revision") and on_disk["revision"] != expected_revision:
+                    raise EditorRevisionConflict("editor state revision changed")
             manifest = read_json(self.server.project_dir / "project.json", {}) or {}
             duration = float(manifest.get("source", {}).get("duration_s", 0.0))
             plan = read_json(self.server.project_dir / "working/highlight_plan.json", {}) or {}
@@ -4484,6 +4798,14 @@ class EditorHandler(BaseHTTPRequestHandler):
             state["project_dir"] = str(self.server.project_dir)
             errors = validate_editor_state(state, duration)
             state.pop("project_dir", None)
+            if not errors and isinstance(state.get("audio_event_edits"), dict):
+                try:
+                    _render_id, source_plan, _source_hash = resolve_audio_event_source(
+                        self.server.project_dir, state
+                    )
+                    resolve_studio_audio_plan(source_plan, state["audio_event_edits"])
+                except AudioEventEditError as exc:
+                    errors.append(f"audio_event_edits: {exc}")
             try:
                 state["asset_digests"] = referenced_asset_digests(self.server.project_dir, state)
             except ValueError as exc:

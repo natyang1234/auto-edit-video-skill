@@ -94,6 +94,22 @@ def canonical_hash(value) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _json_exact_equal(value, expected) -> bool:
+    """Compare JSON values without Python's bool/int/float coercion."""
+    if type(value) is not type(expected):
+        return False
+    if isinstance(value, dict):
+        return value.keys() == expected.keys() and all(
+            _json_exact_equal(item, expected[key]) for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return len(value) == len(expected) and all(
+            _json_exact_equal(item, expected_item)
+            for item, expected_item in zip(value, expected)
+        )
+    return value == expected
+
+
 def check_schema_dialect(schema, path: str = "$") -> None:
     """Fail closed on any keyword this dialect does not implement."""
     if not isinstance(schema, dict):
@@ -114,7 +130,7 @@ def validate(value, schema, path: str = "$") -> list[str]:
     """Validate value against the strict dialect; returns error list."""
     errors: list[str] = []
     if "const" in schema:
-        if value != schema["const"]:
+        if not _json_exact_equal(value, schema["const"]):
             errors.append(f"{path}: expected const {schema['const']!r}")
         return errors
     expected = schema.get("type")
@@ -821,53 +837,182 @@ def semantic_delivery_envelope(artifact) -> list[str]:
 
 
 def semantic_sfx_catalog(artifact) -> list[str]:
-    """Validate generated-asset measurements and transient identity."""
+    """Validate generated-asset measurements, identity and role mapping."""
     errors: list[str] = []
-    assets = artifact.get("assets") if isinstance(artifact, dict) else None
-    if not isinstance(assets, list) or len(assets) != 1:
+    if not isinstance(artifact, dict):
         return errors
-    asset = assets[0]
-    if not isinstance(asset, dict):
+    if type(artifact.get("schema_version")) is not int or artifact.get("schema_version") != 1:
+        errors.append("$.schema_version: must be exact integer 1")
+    assets = artifact.get("assets")
+    if not isinstance(assets, list):
         return errors
-    duration = asset.get("duration_samples")
-    anchor = asset.get("transient_anchor_sample")
-    if type(duration) is int and type(anchor) is int and not 0 <= anchor < duration:
-        errors.append("$.assets[0].transient_anchor_sample: must be below duration_samples")
-    rms = asset.get("rms_dbfs")
-    if isinstance(rms, (int, float)) and not isinstance(rms, bool) and rms <= -45:
-        errors.append("$.assets[0].rms_dbfs: must be above -45 dBFS")
-    peak = asset.get("peak_dbfs")
-    if isinstance(peak, (int, float)) and not isinstance(peak, bool) and not -12 <= peak <= -1:
-        errors.append("$.assets[0].peak_dbfs: must be between -12 and -1 dBFS")
-    provenance = asset.get("provenance")
-    if not isinstance(provenance, str) or not provenance.strip():
-        errors.append("$.assets[0].provenance: must be non-empty")
-    if asset.get("review_state") != "approved_generated":
-        errors.append("$.assets[0].review_state: generated asset must be approved_generated")
+    expected_roles = {
+        "soft-ui-tick-v1": "title_enter",
+        "short-pop-v1": "row_reveal",
+        "short-whoosh-v1": "transition",
+        "soft-impact-v1": "grid_fill",
+        "short-riser-v1": "count_tick",
+        "typing-tick-v1": "typing",
+        "completion-chime-v1": "complete",
+    }
+    expected_generators = {
+        "soft-ui-tick-v1": ("soft_ui_tick", "two_sine_exponential_decay"),
+        "short-pop-v1": ("short_pop", "sine_pop_exponential_decay"),
+        "short-whoosh-v1": ("short_whoosh", "swept_sine_fade"),
+        "soft-impact-v1": ("soft_impact", "low_tone_exponential_decay"),
+        "short-riser-v1": ("short_riser", "swept_sine_rise"),
+        "typing-tick-v1": ("typing_tick", "short_sine_exponential_decay"),
+        "completion-chime-v1": ("completion_chime", "two_note_exponential_decay"),
+    }
+    if len(assets) not in (1, len(expected_roles)):
+        errors.append("$.assets: must contain one legacy asset or the complete seven-asset starter pack")
+    seen_ids: set[str] = set()
+    seen_roles: set[str] = set()
+    for index, asset in enumerate(assets):
+        path = f"$.assets[{index}]"
+        if not isinstance(asset, dict):
+            continue
+        asset_id = asset.get("asset_id")
+        role = asset.get("role")
+        if asset_id in seen_ids:
+            errors.append(f"{path}.asset_id: duplicate asset id")
+        seen_ids.add(asset_id)
+        if role in seen_roles:
+            errors.append(f"{path}.role: duplicate role")
+        seen_roles.add(role)
+        expected_role = expected_roles.get(asset_id)
+        if expected_role is None:
+            errors.append(f"{path}.asset_id: unknown starter asset id")
+        elif role != expected_role:
+            errors.append(f"{path}.role: must map {asset_id} to {expected_role}")
+        generator = asset.get("generator")
+        expected_generator = expected_generators.get(asset_id)
+        if expected_generator is not None and isinstance(generator, dict):
+            if type(generator.get("version")) is not int or generator.get("version") != 1:
+                errors.append(f"{path}.generator.version: must be exact integer 1")
+            if generator.get("name") != expected_generator[0]:
+                errors.append(f"{path}.generator.name: does not match asset id")
+            if generator.get("recipe") != expected_generator[1]:
+                errors.append(f"{path}.generator.recipe: does not match asset id")
+        duration = asset.get("duration_samples")
+        anchor = asset.get("transient_anchor_sample")
+        if type(duration) is int and type(anchor) is int and not 0 <= anchor < duration:
+            errors.append(f"{path}.transient_anchor_sample: must be below duration_samples")
+        rms = asset.get("rms_dbfs")
+        if isinstance(rms, (int, float)) and not isinstance(rms, bool) and rms <= -45:
+            errors.append(f"{path}.rms_dbfs: must be above -45 dBFS")
+        peak = asset.get("peak_dbfs")
+        if isinstance(peak, (int, float)) and not isinstance(peak, bool) and not -12 <= peak <= -1:
+            errors.append(f"{path}.peak_dbfs: must be between -12 and -1 dBFS")
+        provenance = asset.get("provenance")
+        if not isinstance(provenance, str) or not provenance.strip():
+            errors.append(f"{path}.provenance: must be non-empty")
+        if asset.get("review_state") != "approved_generated":
+            errors.append(f"{path}.review_state: generated asset must be approved_generated")
+        pack = asset.get("pack")
+        if len(assets) == len(expected_roles) and pack != "phase1-local-procedural":
+            errors.append(f"{path}.pack: complete starter catalog must use phase1-local-procedural")
+        elif len(assets) == 1 and pack != "phase0d-local-procedural":
+            errors.append(f"{path}.pack: legacy catalog must use phase0d-local-procedural")
+    if len(assets) == len(expected_roles):
+        if seen_ids != set(expected_roles):
+            errors.append("$.assets: complete starter catalog must contain every expected asset id")
+        if seen_roles != set(expected_roles.values()):
+            errors.append("$.assets: complete starter catalog must contain every expected role")
+    elif len(assets) == 1 and seen_ids != {"soft-ui-tick-v1"}:
+        errors.append("$.assets: legacy single-asset catalog must contain soft-ui-tick-v1")
     return errors
 
 
 def semantic_audio_event_plan(artifact) -> list[str]:
     """Validate final-domain event arithmetic and renderer evidence binding."""
     errors: list[str] = []
-    events = artifact.get("events") if isinstance(artifact, dict) else None
+    if not isinstance(artifact, dict):
+        return errors
+    version = artifact.get("schema_version")
+    if type(version) is not int or version not in {1, 2}:
+        errors.append("$.schema_version: must be exact integer 1 or 2")
+        return errors
+    events = artifact.get("events")
     if not isinstance(events, list):
         return errors
-    seen_ids: set[str] = set()
-    seen_triggers: set[str] = set()
-    stem_count = artifact.get("sfx_stem_sample_count")
-    for index, event in enumerate(events):
-        path = f"$.events[{index}]"
+    if version == 1:
+        if len(events) != 1:
+            errors.append("$.events: schema v1 requires exactly one event")
+        if any(field in artifact for field in ("mix_mode", "density", "studio_edits", "studio_edits_sha256")):
+            errors.append("$: schema v1 must not contain schema-v2 fields")
+    elif "mix_mode" not in artifact or "density" not in artifact:
+        errors.append("$: schema v2 requires mix_mode and density evidence")
+
+    role_priority = {
+        "title_enter": 0,
+        "grid_fill": 1,
+        "count_tick": 1,
+        "row_reveal": 2,
+        "typing": 3,
+    }
+    trigger_role = {
+        ("title", "prompt-card", "word-cascade"): ("typing", "typing-tick-v1"),
+        ("title", None, "pop"): ("title_enter", "soft-ui-tick-v1"),
+        ("title", None, "pop-in"): ("title_enter", "soft-ui-tick-v1"),
+        ("title", None, "slide-up"): ("title_enter", "soft-ui-tick-v1"),
+        ("title", None, "slide-in"): ("title_enter", "soft-ui-tick-v1"),
+    }
+
+    def role_for_trigger(trigger):
+        if not isinstance(trigger, dict):
+            return None
+        motion = trigger.get("motion")
+        if not isinstance(motion, dict):
+            return None
+        kind = trigger.get("kind")
+        component = trigger.get("component_id")
+        requested = motion.get("requested")
+        direct = trigger_role.get((kind, component, requested))
+        if direct is not None:
+            return direct
+        if kind == "title" and component in {None, "kinetic-title", "title-lockup"} and requested in {
+            "pop", "pop-in", "slide-up", "slide-in"
+        }:
+            return ("title_enter", "soft-ui-tick-v1")
+        if kind == "dynamic_list" and component in {"dynamic-list", "warning-checklist"} and requested in {
+            "staggered-reveal", "check-pop"
+        }:
+            return ("row_reveal", "short-pop-v1")
+        if kind == "stat" and component in {"hero-stat", "progress"} and requested in {"count-up", "fill"}:
+            return ("count_tick", "short-riser-v1")
+        if kind == "chart" and component == "dashboard" and requested in {"pan", "fill"}:
+            return ("grid_fill", "soft-impact-v1")
+        return None
+
+    def validate_event(event, path: str, *, is_v2: bool) -> tuple[dict | None, tuple[int, int, str] | None]:
         if not isinstance(event, dict):
-            continue
-        event_id = event.get("id")
+            return None, None
         trigger_id = event.get("trigger_id")
-        if event_id in seen_ids:
-            errors.append(f"{path}.id: duplicate event id")
-        seen_ids.add(event_id)
-        if trigger_id in seen_triggers:
-            errors.append(f"{path}.trigger_id: duplicate trigger id")
-        seen_triggers.add(trigger_id)
+        if is_v2:
+            gain = event.get("gain_db")
+            if (
+                isinstance(gain, bool)
+                or not isinstance(gain, (int, float))
+                or not math.isfinite(float(gain))
+                or not -24 <= float(gain) <= -6
+            ):
+                errors.append(f"{path}.gain_db: schema v2 requires finite -24..-6 dB")
+            elif "studio_edits" not in artifact and float(gain) != -12.0:
+                errors.append(f"{path}.gain_db: schema v2 without studio edits requires -12")
+            if event.get("duck_group") != "dialogue_priority":
+                errors.append(f"{path}.duck_group: schema v2 requires dialogue_priority")
+            if event.get("fades") != {"in_samples": 0, "out_samples": 0}:
+                errors.append(f"{path}.fades: schema v2 requires zero fades")
+        else:
+            if event.get("asset_id") != "soft-ui-tick-v1":
+                errors.append(f"{path}.asset_id: schema v1 requires soft-ui-tick-v1")
+            if event.get("role") != "title_enter":
+                errors.append(f"{path}.role: schema v1 requires title_enter")
+            if event.get("gain_db") != -12:
+                errors.append(f"{path}.gain_db: schema v1 requires -12")
+            if event.get("duck_group") != "dialogue_priority":
+                errors.append(f"{path}.duck_group: schema v1 requires dialogue_priority")
         start = event.get("event_start_sample")
         anchor = event.get("asset_transient_anchor_sample")
         expected = event.get("expected_transient_sample")
@@ -879,9 +1024,12 @@ def semantic_audio_event_plan(artifact) -> list[str]:
             if abs(expected - trigger_onset) > 3840:
                 errors.append(f"{path}: expected transient is outside 3840-sample trigger tolerance")
         duration = event.get("duration_samples")
+        stem_count = artifact.get("sfx_stem_sample_count")
         if all(type(value) is int for value in (start, duration, stem_count)):
             if start < 0 or duration <= 0 or start + duration > stem_count:
                 errors.append(f"{path}: event is outside sfx stem bounds")
+        if is_v2 and all(type(value) is int for value in (anchor, duration)) and not 0 <= anchor < duration:
+            errors.append(f"{path}.asset_transient_anchor_sample: must be below duration_samples")
         fades = event.get("fades")
         if isinstance(fades, dict) and isinstance(duration, int):
             fade_in = fades.get("in_samples")
@@ -891,7 +1039,7 @@ def semantic_audio_event_plan(artifact) -> list[str]:
         evidence = event.get("evidence")
         trigger = evidence.get("trigger") if isinstance(evidence, dict) else None
         if not isinstance(trigger, dict):
-            continue
+            return None, None
         if trigger.get("id") != trigger_id:
             errors.append(f"{path}.evidence.trigger.id: does not match trigger_id")
         if trigger.get("onset_sample") != trigger_onset:
@@ -900,17 +1048,227 @@ def semantic_audio_event_plan(artifact) -> list[str]:
         requested = motion.get("requested") if isinstance(motion, dict) else None
         delivered = motion.get("delivered") if isinstance(motion, dict) else None
         status = motion.get("status") if isinstance(motion, dict) else None
-        if trigger.get("kind") != "title":
-            errors.append(f"{path}.evidence.trigger.kind: must be title")
+        if not is_v2:
+            if "component_id" in trigger:
+                errors.append(f"{path}.evidence.trigger.component_id: v1 field is not allowed")
+            if isinstance(evidence, dict) and "renderer_trigger_sha256" in evidence:
+                errors.append(f"{path}.evidence.renderer_trigger_sha256: v1 field is not allowed")
+            if trigger.get("kind") != "title":
+                errors.append(f"{path}.evidence.trigger.kind: must be title")
+            if not (requested == "pop" or (isinstance(requested, str) and requested.startswith("slide"))):
+                errors.append(f"{path}.evidence.trigger.motion.requested: unsupported trigger motion")
+            if not isinstance(delivered, str) or not delivered.strip() or delivered.lower() in {"none", "static"}:
+                errors.append(f"{path}.evidence.trigger.motion.delivered: motion was not delivered")
+            if not isinstance(motion, dict) or status == "fallback" or motion.get("faithful") is not True:
+                errors.append(f"{path}.evidence.trigger.motion: trigger is not faithful")
+            return trigger, None
         if not (
-            requested == "pop"
-            or (isinstance(requested, str) and requested.startswith("slide"))
+            isinstance(requested, str)
+            and isinstance(delivered, str)
+            and requested
+            and delivered == requested
+            and delivered.lower() not in {"none", "static"}
         ):
-            errors.append(f"{path}.evidence.trigger.motion.requested: unsupported trigger motion")
-        if not isinstance(delivered, str) or not delivered.strip() or delivered.lower() in {"none", "static"}:
-            errors.append(f"{path}.evidence.trigger.motion.delivered: motion was not delivered")
-        if status == "fallback" or motion.get("faithful") is not True:
+            errors.append(f"{path}.evidence.trigger.motion: motion was not faithfully delivered")
+        if status not in {"native", "rendered"} or not isinstance(motion, dict) or motion.get("faithful") is not True:
             errors.append(f"{path}.evidence.trigger.motion: trigger is not faithful")
+        if set(trigger) != {"id", "onset_sample", "kind", "component_id", "motion"}:
+            errors.append(f"{path}.evidence.trigger: schema v2 normalized trigger fields are required")
+        if not isinstance(evidence, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("renderer_trigger_sha256", ""))):
+            errors.append(f"{path}.evidence.renderer_trigger_sha256: canonical renderer hash is required")
+        expected_role_asset = role_for_trigger(trigger)
+        if expected_role_asset is None:
+            errors.append(f"{path}.evidence.trigger: no approved role mapping")
+        elif (event.get("role"), event.get("asset_id")) != expected_role_asset:
+            errors.append(f"{path}: role/asset does not match normalized renderer evidence")
+        return trigger, (start, start + duration, trigger_id) if type(start) is int and type(duration) is int else None
+
+    seen_ids: set[str] = set()
+    seen_triggers: set[str] = set()
+    intervals: list[tuple[int, int, str]] = []
+    for index, event in enumerate(events):
+        path = f"$.events[{index}]"
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("id")
+        trigger_id = event.get("trigger_id")
+        if version == 2 and event.get("id") != f"sfx-event-{index + 1:04d}":
+            errors.append(f"{path}.id: schema v2 event id must be canonical sequence")
+        if event_id in seen_ids:
+            errors.append(f"{path}.id: duplicate event id")
+        seen_ids.add(event_id)
+        if trigger_id in seen_triggers:
+            errors.append(f"{path}.trigger_id: duplicate trigger id")
+        seen_triggers.add(trigger_id)
+        _, interval = validate_event(event, path, is_v2=version == 2)
+        if interval is not None:
+            intervals.append(interval)
+
+    if version != 2:
+        return errors
+
+    studio_edits = artifact.get("studio_edits")
+    studio_hash = artifact.get("studio_edits_sha256")
+    if (studio_edits is None) != (studio_hash is None):
+        errors.append("$: studio_edits and studio_edits_sha256 must be all-or-none")
+    elif isinstance(studio_edits, dict):
+        if studio_hash != canonical_hash(studio_edits):
+            errors.append("$.studio_edits_sha256: does not match canonical studio edits")
+        if studio_edits.get("source_timeline_revision") != artifact.get("timeline_revision"):
+            errors.append("$.studio_edits.source_timeline_revision: does not match plan timeline")
+        edits = studio_edits.get("events")
+        edits = edits if isinstance(edits, list) else []
+        edit_by_id = {
+            item.get("id"): item for item in edits if isinstance(item, dict)
+        }
+        if len(edit_by_id) != len(edits):
+            errors.append("$.studio_edits.events: event ids must be unique")
+        if [item.get("id") for item in edits if isinstance(item, dict)] != sorted(edit_by_id):
+            errors.append("$.studio_edits.events: event ids must be ordered")
+        plan_by_id = {
+            item.get("id"): item for item in events if isinstance(item, dict)
+        }
+        if not edit_by_id or not set(edit_by_id).issubset(plan_by_id):
+            errors.append("$.studio_edits.events: must be a non-empty subset of plan events")
+        for event_id, edit in edit_by_id.items():
+            event = plan_by_id.get(event_id)
+            if not isinstance(event, dict):
+                continue
+            if (
+                event.get("event_start_sample") != edit.get("event_start_sample")
+                or event.get("gain_db") != edit.get("gain_db")
+            ):
+                errors.append(f"$.studio_edits.events[{event_id!r}]: does not match resolved event")
+
+    trigger_order = [
+        (event.get("trigger_onset_sample"), event.get("trigger_id"))
+        for event in events
+        if isinstance(event, dict)
+    ]
+    if trigger_order != sorted(trigger_order):
+        errors.append("$.events: trigger order must be sorted by onset and id")
+    event_ids = [event.get("id") for event in events if isinstance(event, dict)]
+    if event_ids != sorted(event_ids):
+        errors.append("$.events: event ids must be sorted")
+    expected_samples = [event.get("expected_transient_sample") for event in events if isinstance(event, dict)]
+    if all(type(value) is int for value in expected_samples):
+        for previous, current in zip(expected_samples, expected_samples[1:]):
+            if current - previous < 5760:
+                errors.append("$.events: expected transient adjacency is below 120 ms")
+                break
+    points = []
+    for start, end, _ in intervals:
+        points.extend(((start, 1), (end, -1)))
+    active = 0
+    for _, delta in sorted(points, key=lambda point: (point[0], point[1])):
+        active += delta
+        if active > 2:
+            errors.append("$.events: half-open overlap exceeds two events")
+            break
+
+    density = artifact.get("density")
+    if not isinstance(density, dict):
+        return errors
+    stem_count = artifact.get("sfx_stem_sample_count")
+    if density.get("total_samples") != stem_count:
+        errors.append("$.density.total_samples: must match sfx_stem_sample_count")
+    for field, expected in (
+        ("sample_rate", 48000),
+        ("adjacent_onset_samples", 5760),
+        ("max_overlap", 2),
+        ("max_cues_per_minute", 40),
+    ):
+        if type(density.get(field)) is not int or density.get(field) != expected:
+            errors.append(f"$.density.{field}: does not match deterministic threshold")
+    expected_cap = (stem_count * 40) // (60 * 48000) if type(stem_count) is int else None
+    if expected_cap is not None and density.get("density_cap") != expected_cap:
+        errors.append("$.density.density_cap: does not match deterministic cap")
+    if density.get("priority_order") != ["title_enter", "grid_fill", "count_tick", "row_reveal", "typing"]:
+        errors.append("$.density.priority_order: does not match deterministic priority")
+    kept_ids = [event.get("trigger_id") for event in events if isinstance(event, dict)]
+    dropped = density.get("dropped") if isinstance(density.get("dropped"), list) else []
+    dropped_ids = [item.get("trigger_id") for item in dropped if isinstance(item, dict)]
+    if density.get("kept_trigger_ids") != kept_ids:
+        errors.append("$.density.kept_trigger_ids: does not match events")
+    if density.get("dropped_trigger_ids") != dropped_ids:
+        errors.append("$.density.dropped_trigger_ids: does not match dropped evidence")
+    candidate_ids = density.get("candidate_order")
+    if candidate_ids != [event_id for _, _, event_id in sorted(
+        [
+            (role_priority.get(event.get("role"), 99), event.get("trigger_onset_sample"), event.get("trigger_id"))
+            for event in events if isinstance(event, dict)
+        ] + [
+            (role_priority.get(item.get("role"), 99), item.get("trigger_onset_sample"), item.get("trigger_id"))
+            for item in dropped if isinstance(item, dict)
+        ]
+    )]:
+        errors.append("$.density.candidate_order: does not match deterministic candidate order")
+    reason_counts: dict[str, int] = {}
+    dropped_by_id: dict[str, dict] = {}
+    for item in dropped:
+        if not isinstance(item, dict):
+            continue
+        reason = item.get("reason")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if item.get("trigger_id") in dropped_by_id:
+            errors.append("$.density.dropped: duplicate trigger id")
+        dropped_by_id[item.get("trigger_id")] = item
+        _, _ = validate_event({**item, "id": f"dropped-{item.get('trigger_id')}", "gain_db": -12, "fades": {"in_samples": 0, "out_samples": 0}, "duck_group": "dialogue_priority", "review_state": "approved_generated", "reason": reason}, f"$.density.dropped[{dropped.index(item)}]", is_v2=True)
+    if density.get("dropped_reasons") != reason_counts:
+        errors.append("$.density.dropped_reasons: does not match dropped evidence")
+    if set(kept_ids) & set(dropped_ids):
+        errors.append("$.density: kept and dropped trigger ids must be disjoint")
+    candidate_records = [
+        event for event in events if isinstance(event, dict)
+    ] + [item for item in dropped if isinstance(item, dict)]
+    candidate_by_id = {
+        item.get("trigger_id"): item
+        for item in candidate_records
+        if isinstance(item.get("trigger_id"), str)
+    }
+    if len(candidate_by_id) != len(candidate_records):
+        errors.append("$.density: candidate trigger ids must be unique")
+    if set(candidate_by_id) != set(candidate_ids or []):
+        errors.append("$.density.candidate_order: must contain every kept and dropped trigger")
+    simulated_kept: list[dict] = []
+    for candidate_id in candidate_ids or []:
+        candidate = candidate_by_id.get(candidate_id)
+        if candidate is None:
+            continue
+        expected_reason = None
+        candidate_expected = candidate.get("expected_transient_sample")
+        if type(candidate_expected) is int and any(
+            type(item.get("expected_transient_sample")) is int
+            and abs(candidate_expected - item["expected_transient_sample"]) < 5760
+            for item in simulated_kept
+        ):
+            expected_reason = "adjacent_onset"
+        else:
+            points = []
+            for item in (*simulated_kept, candidate):
+                start = item.get("event_start_sample")
+                duration = item.get("duration_samples")
+                if type(start) is int and type(duration) is int:
+                    points.extend(((start, 1), (start + duration, -1)))
+            active = 0
+            for _, delta in sorted(points, key=lambda point: (point[0], point[1])):
+                active += delta
+                if active > 2:
+                    expected_reason = "overlap_limit"
+                    break
+        if expected_reason is None and len(simulated_kept) >= density.get("density_cap", 0):
+            expected_reason = "clip_density_limit"
+        if candidate_id in set(kept_ids):
+            if expected_reason is not None:
+                errors.append(f"$.density: kept candidate {candidate_id!r} should be dropped for {expected_reason}")
+            else:
+                simulated_kept.append(candidate)
+        else:
+            actual_reason = candidate.get("reason")
+            if expected_reason != actual_reason:
+                errors.append(
+                    f"$.density.dropped[{candidate_id!r}].reason: expected {expected_reason!r}"
+                )
     return errors
 
 

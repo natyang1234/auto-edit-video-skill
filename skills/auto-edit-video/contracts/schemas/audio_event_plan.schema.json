@@ -1,7 +1,7 @@
 {
   "$id": "audio_event_plan",
-  "title": "Phase 0d final-domain audio event plan",
-  "x_schema_version": 1,
+  "title": "Phase 0d/Phase 1 final-domain audio event plan",
+  "x_schema_version": 2,
   "type": "object",
   "required": [
     "schema_version",
@@ -18,7 +18,7 @@
     "events"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"type": "integer", "enum": [1, 2]},
     "timeline_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "cut_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "resolved_motion_plan_hash": {
@@ -38,10 +38,174 @@
       "pattern": "^[0-9a-f]{64}$"
     },
     "sfx_stem_sample_count": {"type": "integer", "minimum": 1},
+    "mix_mode": {"const": "deterministic_s24_saturating_sum_v1"},
+    "density": {
+      "type": "object",
+      "required": [
+        "total_samples",
+        "sample_rate",
+        "adjacent_onset_samples",
+        "adjacent_onset_authority",
+        "max_overlap",
+        "max_cues_per_minute",
+        "density_cap",
+        "priority_order",
+        "candidate_order",
+        "kept_trigger_ids",
+        "dropped_trigger_ids",
+        "dropped_reasons",
+        "dropped"
+      ],
+      "properties": {
+        "total_samples": {"type": "integer", "minimum": 1},
+        "sample_rate": {"const": 48000},
+        "adjacent_onset_samples": {"const": 5760},
+        "adjacent_onset_authority": {"const": "expected_transient_sample"},
+        "max_overlap": {"const": 2},
+        "max_cues_per_minute": {"const": 40},
+        "density_cap": {"type": "integer", "minimum": 0},
+        "priority_order": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "title_enter",
+              "grid_fill",
+              "count_tick",
+              "row_reveal",
+              "typing"
+            ]
+          }
+        },
+        "candidate_order": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "kept_trigger_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "dropped_trigger_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "dropped_reasons": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        },
+        "dropped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "trigger_id",
+              "trigger_onset_sample",
+              "event_start_sample",
+              "duration_samples",
+              "asset_transient_anchor_sample",
+              "expected_transient_sample",
+              "role",
+              "asset_id",
+              "evidence",
+              "reason"
+            ],
+            "properties": {
+              "trigger_id": {"type": "string", "minLength": 1},
+              "trigger_onset_sample": {"type": "integer", "minimum": 0},
+              "event_start_sample": {"type": "integer", "minimum": 0},
+              "duration_samples": {"type": "integer", "minimum": 1},
+              "asset_transient_anchor_sample": {"type": "integer", "minimum": 0},
+              "expected_transient_sample": {"type": "integer", "minimum": 0},
+              "role": {
+                "enum": ["title_enter", "row_reveal", "count_tick", "grid_fill", "typing"]
+              },
+              "asset_id": {
+                "enum": [
+                  "soft-ui-tick-v1",
+                  "short-pop-v1",
+                  "short-riser-v1",
+                  "soft-impact-v1",
+                  "typing-tick-v1"
+                ]
+              },
+              "evidence": {
+                "type": "object",
+                "required": ["trigger", "renderer_trigger_sha256"],
+                "properties": {
+                  "trigger": {
+                    "type": "object",
+                    "required": ["id", "onset_sample", "kind", "component_id", "motion"],
+                    "properties": {
+                      "id": {"type": "string", "minLength": 1},
+                      "onset_sample": {"type": "integer", "minimum": 0},
+                      "kind": {"enum": ["title", "dynamic_list", "stat", "chart"]},
+                      "component_id": {"type": ["string", "null"]},
+                      "motion": {
+                        "type": "object",
+                        "required": ["requested", "delivered", "faithful", "status"],
+                        "properties": {
+                          "requested": {"type": "string", "minLength": 1},
+                          "delivered": {"type": "string", "minLength": 1},
+                          "faithful": {"type": "boolean"},
+                          "status": {"type": "string", "minLength": 1}
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "renderer_trigger_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "reason": {
+                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit"]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "studio_edits": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "source_render_id",
+        "source_plan_sha256",
+        "source_timeline_revision",
+        "events"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "source_render_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,120}$"},
+        "source_plan_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_timeline_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "source_event_sha256", "event_start_sample", "gain_db"],
+            "properties": {
+              "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,120}$"},
+              "source_event_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "event_start_sample": {"type": "integer", "minimum": 0},
+              "gain_db": {"type": "number", "minimum": -24, "maximum": -6}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "studio_edits_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "events": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 1,
       "items": {
         "type": "object",
         "required": [
@@ -67,7 +231,17 @@
           "trigger_onset_sample": {"type": "integer", "minimum": 0},
           "event_start_sample": {"type": "integer", "minimum": 0},
           "duration_samples": {"type": "integer", "minimum": 1},
-          "asset_id": {"const": "soft-ui-tick-v1"},
+          "asset_id": {
+            "enum": [
+              "soft-ui-tick-v1",
+              "short-pop-v1",
+              "short-whoosh-v1",
+              "soft-impact-v1",
+              "short-riser-v1",
+              "typing-tick-v1",
+              "completion-chime-v1"
+            ]
+          },
           "asset_transient_anchor_sample": {
             "type": "integer",
             "minimum": 0
@@ -76,8 +250,18 @@
             "type": "integer",
             "minimum": 0
           },
-          "role": {"const": "title_enter"},
-          "gain_db": {"const": -12},
+          "role": {
+            "enum": [
+              "title_enter",
+              "row_reveal",
+              "transition",
+              "grid_fill",
+              "count_tick",
+              "typing",
+              "complete"
+            ]
+          },
+          "gain_db": {"type": "number", "minimum": -24, "maximum": -6},
           "fades": {
             "type": "object",
             "required": ["in_samples", "out_samples"],
@@ -98,15 +282,11 @@
                 "properties": {
                   "id": {"type": "string", "minLength": 1},
                   "onset_sample": {"type": "integer", "minimum": 0},
-                  "kind": {"const": "title"},
+                  "kind": {"enum": ["title", "dynamic_list", "stat", "chart"]},
+                  "component_id": {"type": ["string", "null"]},
                   "motion": {
                     "type": "object",
-                    "required": [
-                      "requested",
-                      "delivered",
-                      "faithful",
-                      "status"
-                    ],
+                    "required": ["requested", "delivered", "faithful", "status"],
                     "properties": {
                       "requested": {"type": "string", "minLength": 1},
                       "delivered": {"type": "string", "minLength": 1},
@@ -117,6 +297,10 @@
                   }
                 },
                 "additionalProperties": false
+              },
+              "renderer_trigger_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
               }
             },
             "additionalProperties": false

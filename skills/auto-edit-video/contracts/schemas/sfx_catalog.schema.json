@@ -1,6 +1,6 @@
 {
   "$id": "sfx_catalog",
-  "title": "Phase 0d generated SFX catalog",
+  "title": "Phase 1 deterministic local SFX starter catalog",
   "x_schema_version": 1,
   "type": "object",
   "required": [
@@ -18,7 +18,7 @@
     "assets": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 1,
+      "maxItems": 7,
       "items": {
         "type": "object",
         "required": [
@@ -37,16 +37,58 @@
           "review_state"
         ],
         "properties": {
-          "asset_id": {"const": "soft-ui-tick-v1"},
-          "pack": {"const": "phase0d-local-procedural"},
-          "role": {"const": "title_enter"},
+          "asset_id": {
+            "enum": [
+              "soft-ui-tick-v1",
+              "short-pop-v1",
+              "short-whoosh-v1",
+              "soft-impact-v1",
+              "short-riser-v1",
+              "typing-tick-v1",
+              "completion-chime-v1"
+            ]
+          },
+          "pack": {
+            "enum": ["phase0d-local-procedural", "phase1-local-procedural"]
+          },
+          "role": {
+            "enum": [
+              "title_enter",
+              "row_reveal",
+              "transition",
+              "grid_fill",
+              "count_tick",
+              "typing",
+              "complete"
+            ]
+          },
           "generator": {
             "type": "object",
             "required": ["name", "version", "recipe"],
             "properties": {
-              "name": {"const": "soft_ui_tick"},
+              "name": {
+                "enum": [
+                  "soft_ui_tick",
+                  "short_pop",
+                  "short_whoosh",
+                  "soft_impact",
+                  "short_riser",
+                  "typing_tick",
+                  "completion_chime"
+                ]
+              },
               "version": {"const": 1},
-              "recipe": {"const": "two_sine_exponential_decay"}
+              "recipe": {
+                "enum": [
+                  "two_sine_exponential_decay",
+                  "sine_pop_exponential_decay",
+                  "swept_sine_fade",
+                  "low_tone_exponential_decay",
+                  "swept_sine_rise",
+                  "short_sine_exponential_decay",
+                  "two_note_exponential_decay"
+                ]
+              }
             },
             "additionalProperties": false
           },

@@ -218,6 +218,350 @@ class EditorBrowserSmokeTests(unittest.TestCase):
             self.assertEqual(state["video_template"]["background"]["color"], "#2557a7")
         self.assertEqual(console_errors, [])
 
+    def test_audio_event_timeline_renders_and_round_trips_sparse_edits(self) -> None:
+        host, port = self.server.server_address
+        source_revision = "b" * 64
+        timeline = {
+            "editable": True,
+            "status": "ready",
+            "reason": None,
+            "source_render_id": "studio-audio-source",
+            "source_plan_sha256": "a" * 64,
+            "source_timeline_revision": source_revision,
+            "studio_edits_sha256": None,
+            "events": [
+                {
+                    "id": "sfx-event-0001",
+                    "trigger_id": "title-1",
+                    "trigger_onset_sample": 24000,
+                    "event_start_sample": 24000,
+                    "duration_samples": 9600,
+                    "asset_id": "short-pop-v1",
+                    "asset_transient_anchor_sample": 960,
+                    "expected_transient_sample": 24960,
+                    "role": "title_enter",
+                    "gain_db": -12,
+                    "fades": {"in_samples": 0, "out_samples": 0},
+                    "duck_group": "dialogue_priority",
+                    "evidence": {"trigger": {"id": "title-1"}},
+                    "reason": "adjacent_onset",
+                    "review_state": "approved",
+                    "source_event_sha256": "c" * 64,
+                    "edited": False,
+                },
+                {
+                    "id": "sfx-event-0002",
+                    "trigger_id": "list-1",
+                    "trigger_onset_sample": 48000,
+                    "event_start_sample": 48000,
+                    "duration_samples": 19200,
+                    "asset_id": "soft-ui-tick-v1",
+                    "asset_transient_anchor_sample": 480,
+                    "expected_transient_sample": 48480,
+                    "role": "row_reveal",
+                    "gain_db": -12,
+                    "fades": {"in_samples": 0, "out_samples": 0},
+                    "duck_group": "dialogue_priority",
+                    "evidence": {"trigger": {"id": "list-1"}},
+                    "reason": "adjacent_onset",
+                    "review_state": "approved",
+                    "source_event_sha256": "d" * 64,
+                    "edited": False,
+                },
+            ],
+        }
+        submitted: list[dict[str, object]] = []
+        saved: list[dict[str, object]] = []
+        current_project: dict[str, object] = {}
+
+        def project_route(route: object) -> None:
+            response = route.fetch()
+            payload = response.json()
+            current_project.clear()
+            current_project.update(payload)
+            payload["state"]["active_highlight_id"] = "highlight-browser"
+            payload["state"]["highlights"][0]["start"] = 0.4
+            payload["state"]["highlights"][0]["end"] = 2.0
+            payload["audio_event_timeline"] = timeline
+            if saved:
+                latest = saved[-1]
+                payload["state"] = latest
+                edited_by_id = {
+                    item["id"]: item for item in latest["audio_event_edits"]["events"]
+                }
+                payload["audio_event_timeline"] = json.loads(json.dumps(timeline))
+                payload["audio_event_timeline"]["status"] = "edited"
+                for event in payload["audio_event_timeline"]["events"]:
+                    edit = edited_by_id.get(event["id"])
+                    if edit:
+                        event["event_start_sample"] = edit["event_start_sample"]
+                        event["gain_db"] = edit["gain_db"]
+                        event["edited"] = True
+            route.fulfill(
+                status=response.status,
+                content_type="application/json",
+                body=json.dumps(payload, ensure_ascii=False),
+            )
+
+        def state_route(route: object) -> None:
+            payload = route.request.post_data_json
+            submitted.append(json.loads(json.dumps(payload)))
+            response_state = json.loads(json.dumps(payload))
+            response_state.pop("x_expected_revision", None)
+            response_state["revision"] = "e" * 64
+            saved.append(response_state)
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "ok": True,
+                        "updated_at": "now",
+                        "revision": "e" * 64,
+                        "invalidated_gates": ["timeline", "final"],
+                        "approval_revisions": {},
+                    }
+                ),
+            )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            page.route("**/api/project", project_route)
+            page.route("**/api/editor-state", state_route)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+
+            events = page.locator(".timeline-audio-event")
+            self.assertEqual(events.count(), 2)
+            self.assertGreaterEqual(
+                events.nth(0).evaluate("el => parseFloat(getComputedStyle(el).fontSize)"),
+                11.2,
+            )
+            first_title = events.nth(0).get_attribute("title") or ""
+            self.assertIn("sfx-event-0001", first_title)
+            self.assertIn("short-pop-v1", first_title)
+            self.assertIn("起始 sample 24000", first_title)
+            self.assertIn("-12 dB", first_title)
+            first_geometry = events.nth(0).evaluate(
+                "el => ({left: parseFloat(el.style.left), width: parseFloat(el.style.width)})"
+            )
+            self.assertAlmostEqual(first_geometry["left"], (0.5 / 1.6) * 100, places=2)
+            self.assertAlmostEqual(first_geometry["width"], (0.2 / 1.6) * 100, places=2)
+            self.assertTrue(page.locator("#audio-event-form").is_hidden())
+            events.nth(0).click()
+            self.assertTrue(page.locator("#audio-event-form").is_visible())
+            self.assertTrue(page.locator("#layer-form").is_hidden())
+            self.assertAlmostEqual(
+                page.locator("#preview-video").evaluate("el => el.currentTime"),
+                0.9,
+                delta=0.08,
+            )
+            self.assertEqual(page.locator("#audio-event-id").input_value(), "sfx-event-0001")
+            self.assertEqual(page.locator("#audio-event-role").input_value(), "標題入場")
+            self.assertIn("48000", page.locator("#audio-event-start-seconds").inner_text())
+            self.assertIn("不可刪除", page.locator("#audio-event-policy").inner_text())
+
+            page.locator("#audio-event-start-sample").fill("36000")
+            page.locator("#audio-event-gain-db").fill("-9")
+            events.nth(1).click()
+            page.locator("#audio-event-start-sample").fill("60000")
+            page.wait_for_timeout(900)
+            self.assertTrue(saved)
+            edits = saved[-1]["audio_event_edits"]
+            self.assertEqual(
+                edits,
+                {
+                    "schema_version": 1,
+                    "source_render_id": "studio-audio-source",
+                    "source_plan_sha256": "a" * 64,
+                    "source_timeline_revision": source_revision,
+                    "events": [
+                        {
+                            "id": "sfx-event-0001",
+                            "source_event_sha256": "c" * 64,
+                            "event_start_sample": 36000,
+                            "gain_db": -9,
+                        },
+                        {
+                            "id": "sfx-event-0002",
+                            "source_event_sha256": "d" * 64,
+                            "event_start_sample": 60000,
+                            "gain_db": -12,
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(submitted[-1]["x_expected_revision"], current_project["state"]["revision"])
+            self.assertIn("時間軸內容已變更", page.locator("#toast").inner_text())
+
+            saved_request_count = len(submitted)
+            page.locator("#audio-event-start-sample").evaluate(
+                "el => { el.value = '1.5'; el.dispatchEvent(new Event('input', {bubbles: true})); }"
+            )
+            self.assertTrue(page.locator("#audio-event-error").is_visible())
+            page.locator("#audio-event-gain-db").fill("-5")
+            self.assertTrue(page.locator("#audio-event-error").is_visible())
+            page.locator("#audio-event-gain-db").evaluate(
+                "el => { el.value = 'NaN'; el.dispatchEvent(new Event('input', {bubbles: true})); }"
+            )
+            self.assertTrue(page.locator("#audio-event-error").is_visible())
+            page.wait_for_timeout(900)
+            self.assertEqual(len(submitted), saved_request_count)
+
+            page.reload(wait_until="networkidle")
+            page.locator("#timeline-audio-event-sfx-event-0001").click()
+            self.assertEqual(page.locator("#audio-event-start-sample").input_value(), "36000")
+            self.assertIn("起始 sample 36000", page.locator("#timeline-audio-event-sfx-event-0001").get_attribute("title") or "")
+            self.assertIn("已調整", page.locator("#timeline-audio-event-sfx-event-0001").inner_text())
+            page.screenshot(path="/private/tmp/auto-edit-gui-phase1-audio.png", full_page=True)
+            page.locator('.layer-row:has-text("標題卡 · It 作虛主詞")').click()
+            self.assertTrue(page.locator("#layer-form").is_visible())
+            self.assertTrue(page.locator("#audio-event-form").is_hidden())
+            browser.close()
+
+    def test_unavailable_audio_event_timeline_is_safe_and_not_editable(self) -> None:
+        host, port = self.server.server_address
+
+        def project_route(route: object) -> None:
+            response = route.fetch()
+            payload = response.json()
+            payload["audio_event_timeline"] = {
+                "editable": False,
+                "status": "unavailable",
+                "reason": "finalized audio source invalid: test reason",
+                "events": [],
+            }
+            route.fulfill(
+                status=response.status,
+                content_type="application/json",
+                body=json.dumps(payload, ensure_ascii=False),
+            )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            page.route("**/api/project", project_route)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.assertEqual(page.locator(".timeline-audio-event").count(), 0)
+            audio_lane = page.locator('.timeline-track[aria-label="音訊"] .timeline-audio-item')
+            self.assertIn("原始音訊", audio_lane.inner_text())
+            self.assertIn("不可編輯", audio_lane.inner_text())
+            self.assertIn("test reason", audio_lane.inner_text())
+            self.assertTrue(page.locator("#audio-event-form").is_hidden())
+            browser.close()
+
+    def test_malformed_audio_event_timeline_fails_closed_without_page_errors(self) -> None:
+        host, port = self.server.server_address
+        source_revision = "b" * 64
+        base_event = {
+            "id": "sfx-event-0001",
+            "trigger_id": "title-1",
+            "trigger_onset_sample": 24000,
+            "event_start_sample": 24000,
+            "duration_samples": 9600,
+            "asset_id": "short-pop-v1",
+            "asset_transient_anchor_sample": 960,
+            "expected_transient_sample": 24960,
+            "role": "title_enter",
+            "gain_db": -12,
+            "fades": {"in_samples": 0, "out_samples": 0},
+            "duck_group": "dialogue_priority",
+            "evidence": {"trigger": {"id": "title-1"}},
+            "reason": "adjacent_onset",
+            "review_state": "approved",
+            "source_event_sha256": "c" * 64,
+            "edited": False,
+        }
+        base_timeline = {
+            "editable": True,
+            "status": "ready",
+            "reason": None,
+            "source_render_id": "studio-audio-source",
+            "source_plan_sha256": "a" * 64,
+            "source_timeline_revision": source_revision,
+            "studio_edits_sha256": None,
+            "events": [base_event],
+        }
+
+        def timeline_with(**changes: object) -> dict[str, object]:
+            timeline = json.loads(json.dumps(base_timeline))
+            timeline.update(changes)
+            return timeline
+
+        malformed_cases: list[tuple[str, object]] = [
+            ("missing", None),
+            ("empty-object", {}),
+            ("primitive-timeline", "not-an-object"),
+            ("array-timeline", []),
+            ("empty-events", timeline_with(events=[])),
+            ("null-event", timeline_with(events=[None])),
+            ("primitive-event", timeline_with(events=["event"])),
+            ("mixed-valid-invalid", timeline_with(events=[base_event, None])),
+            ("missing-event-fields", timeline_with(events=[{"id": "sfx-event-0001"}])),
+            ("empty-id", timeline_with(events=[{**base_event, "id": ""}])),
+            ("invalid-role", timeline_with(events=[{**base_event, "role": None}])),
+            ("invalid-asset", timeline_with(events=[{**base_event, "asset_id": []}])),
+            ("invalid-event-hash", timeline_with(events=[{**base_event, "source_event_sha256": "nope"}])),
+            ("float-start", timeline_with(events=[{**base_event, "event_start_sample": 1.5}])),
+            ("negative-start", timeline_with(events=[{**base_event, "event_start_sample": -1}])),
+            ("unsafe-start", timeline_with(events=[{**base_event, "event_start_sample": 9007199254740992}])),
+            ("zero-duration", timeline_with(events=[{**base_event, "duration_samples": 0}])),
+            ("float-duration", timeline_with(events=[{**base_event, "duration_samples": 1.5}])),
+            ("null-gain", timeline_with(events=[{**base_event, "gain_db": None}])),
+            ("low-gain", timeline_with(events=[{**base_event, "gain_db": -25}])),
+            ("high-gain", timeline_with(events=[{**base_event, "gain_db": -5}])),
+            ("invalid-source-render", timeline_with(source_render_id="")),
+            ("invalid-source-plan", timeline_with(source_plan_sha256="not-a-sha")),
+            ("invalid-source-revision", timeline_with(source_timeline_revision="not-a-sha")),
+            (
+                "long-internal-reason",
+                timeline_with(
+                    reason="/private/internal/" + ("secret-" * 80),
+                    events=[None],
+                ),
+            ),
+        ]
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True)
+            for case_name, injected_timeline in malformed_cases:
+                with self.subTest(case=case_name):
+                    def make_project_route(injected: object, missing: bool):
+                        def project_route(route: object) -> None:
+                            response = route.fetch()
+                            payload = response.json()
+                            if missing:
+                                payload.pop("audio_event_timeline", None)
+                            else:
+                                payload["audio_event_timeline"] = injected
+                            route.fulfill(
+                                status=response.status,
+                                content_type="application/json",
+                                body=json.dumps(payload, ensure_ascii=False),
+                            )
+                        return project_route
+
+                    page = browser.new_page(viewport={"width": 1440, "height": 1100})
+                    page_errors: list[str] = []
+                    page.on("pageerror", lambda error: page_errors.append(str(error)))
+                    page.route(
+                        "**/api/project",
+                        make_project_route(injected_timeline, case_name == "missing"),
+                    )
+                    page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+                    self.assertEqual(page.locator(".timeline-audio-event").count(), 0)
+                    self.assertIn(
+                        "原始音訊",
+                        page.locator('.timeline-track[aria-label="音訊"] .timeline-audio-item').inner_text(),
+                    )
+                    self.assertEqual(page_errors, [])
+                    if case_name == "long-internal-reason":
+                        lane_text = page.locator('.timeline-track[aria-label="音訊"] .timeline-audio-item').inner_text()
+                        self.assertNotIn("/private/internal/", lane_text)
+                        page.screenshot(path="/private/tmp/auto-edit-gui-phase1-audio-malformed.png", full_page=True)
+                    page.close()
+            browser.close()
+
     def test_batch_render_shows_per_clip_qa_and_gates_all_downloads(self) -> None:
         host, port = self.server.server_address
         submitted: dict[str, object] = {}

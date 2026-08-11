@@ -217,6 +217,20 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
         catalog_path = self.project / artifacts["audio_catalog"]["path"]
         stem_path = self.project / artifacts["sfx_stem"]["path"]
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        # Recreate well-formed private-role fixtures solely to keep this test
+        # focused on candidate duration binding after public delivery has
+        # correctly cleaned the genuine same-render private WAVs.
+        dialogue_priority = self.project / "working/dialogue_priority_dialogue.wav"
+        sfx_priority = self.project / "working/dialogue_priority_sfx.wav"
+        for path, source_filter in (
+            (dialogue_priority, "sine=f=160:r=48000:d=2.4,volume=0.0125"),
+            (sfx_priority, "anullsrc=r=48000:cl=stereo:d=2.4"),
+        ):
+            fixture = subprocess.run([
+                renderer.ffmpeg_path(), "-y", "-f", "lavfi", "-i", source_filter,
+                "-ac", "2", "-ar", "48000", "-c:a", "pcm_s24le", str(path),
+            ], text=True, capture_output=True, timeout=30)
+            self.assertEqual(fixture.returncode, 0, fixture.stderr)
         for duration in (0.9, 1.0, 1.5):
             with self.subTest(duration=duration):
                 candidate = self.project / "renders" / f"candidate-{duration:.1f}.mp4"
@@ -234,6 +248,8 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
                     "--audio-event-plan", str(plan_path),
                     "--audio-catalog", str(catalog_path),
                     "--sfx-stem", str(stem_path),
+                    "--dialogue-priority-dialogue", str(dialogue_priority),
+                    "--dialogue-priority-sfx", str(sfx_priority),
                     "--expected-timeline-revision", plan["timeline_revision"],
                     "--expected-cut-map-sha256", plan["cut_map_sha256"],
                 ], text=True, capture_output=True, timeout=55)

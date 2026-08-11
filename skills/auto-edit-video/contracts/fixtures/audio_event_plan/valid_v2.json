@@ -1,0 +1,93 @@
+{
+  "schema_version": 2,
+  "timeline_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "cut_map_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "resolved_motion_plan_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_width_bytes": 3,
+  "alignment_tolerance_samples": 3840,
+  "sfx_stem_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "sfx_stem_decoded_pcm_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "sfx_stem_sample_count": 180000,
+  "mix_mode": "deterministic_s24_saturating_sum_v1",
+  "density": {
+    "total_samples": 180000,
+    "sample_rate": 48000,
+    "adjacent_onset_samples": 5760,
+    "adjacent_onset_authority": "expected_transient_sample",
+    "max_overlap": 2,
+    "max_cues_per_minute": 40,
+    "density_cap": 2,
+    "priority_order": ["title_enter", "grid_fill", "count_tick", "row_reveal", "typing"],
+    "candidate_order": ["title-1", "row-1"],
+    "kept_trigger_ids": ["title-1", "row-1"],
+    "dropped_trigger_ids": [],
+    "dropped_reasons": {},
+    "dropped": []
+  },
+  "events": [
+    {
+      "id": "sfx-event-0001",
+      "trigger_id": "title-1",
+      "trigger_onset_sample": 12000,
+      "event_start_sample": 11760,
+      "duration_samples": 7200,
+      "asset_id": "soft-ui-tick-v1",
+      "asset_transient_anchor_sample": 240,
+      "expected_transient_sample": 12000,
+      "role": "title_enter",
+      "gain_db": -12,
+      "fades": {"in_samples": 0, "out_samples": 0},
+      "duck_group": "dialogue_priority",
+      "evidence": {
+        "trigger": {
+          "id": "title-1",
+          "onset_sample": 12000,
+          "kind": "title",
+          "component_id": "title-lockup",
+          "motion": {
+            "requested": "slide-up",
+            "delivered": "slide-up",
+            "faithful": true,
+            "status": "native"
+          }
+        },
+        "renderer_trigger_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reason": "faithful title_enter",
+      "review_state": "approved_generated"
+    },
+    {
+      "id": "sfx-event-0002",
+      "trigger_id": "row-1",
+      "trigger_onset_sample": 72000,
+      "event_start_sample": 71760,
+      "duration_samples": 6240,
+      "asset_id": "short-pop-v1",
+      "asset_transient_anchor_sample": 240,
+      "expected_transient_sample": 72000,
+      "role": "row_reveal",
+      "gain_db": -12,
+      "fades": {"in_samples": 0, "out_samples": 0},
+      "duck_group": "dialogue_priority",
+      "evidence": {
+        "trigger": {
+          "id": "row-1",
+          "onset_sample": 72000,
+          "kind": "dynamic_list",
+          "component_id": "dynamic-list",
+          "motion": {
+            "requested": "staggered-reveal",
+            "delivered": "staggered-reveal",
+            "faithful": true,
+            "status": "rendered"
+          }
+        },
+        "renderer_trigger_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "reason": "faithful row_reveal",
+      "review_state": "approved_generated"
+    }
+  ]
+}

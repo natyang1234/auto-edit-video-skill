@@ -655,6 +655,176 @@ def _non_negative_int(value: Any, field: str) -> int:
     return value
 
 
+def _finite_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"SFX report {field} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"SFX report {field} must be a finite number")
+    return number
+
+
+def _validate_dialogue_priority_evidence(
+    evidence: Any,
+    expected_count: int,
+    delivered_items: list[dict[str, Any]],
+    status: str,
+    output_audio_evidence: Any,
+) -> None:
+    if not isinstance(evidence, dict):
+        raise ValueError("SFX report v2 requires dialogue_priority_evidence")
+    expected_keys = {
+        "authority", "policy", "dialogue_stem", "sfx_stem", "event_count",
+        "active_event_count", "passed_event_count", "events",
+    }
+    if set(evidence) != expected_keys:
+        raise ValueError("SFX report dialogue_priority_evidence shape is invalid")
+    if evidence["authority"] != sfx_delivery.DIALOGUE_PRIORITY_AUTHORITY:
+        raise ValueError("SFX report dialogue-priority authority is invalid")
+    expected_policy = {
+        "sample_rate": sfx_delivery.SAMPLE_RATE,
+        "channels": sfx_delivery.CHANNELS,
+        "sample_width_bytes": sfx_delivery.SAMPLE_WIDTH,
+        "window_samples": sfx_delivery.DIALOGUE_PRIORITY_WINDOW_SAMPLES,
+        "window_alignment": "centered_on_expected_transient_zero_padded",
+        "channel_aggregation": "maximum_per_channel_rms",
+        "dialogue_active_strictly_above_dbfs": sfx_delivery.DIALOGUE_PRIORITY_THRESHOLD_DBFS,
+        "required_sfx_reduction_db": sfx_delivery.DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB,
+        "digital_silence_dbfs": sfx_delivery.DIALOGUE_PRIORITY_SILENCE_DBFS,
+    }
+    policy = evidence["policy"]
+    if (
+        not isinstance(policy, dict)
+        or policy != expected_policy
+        or any(
+            type(policy.get(key)) is not int
+            for key in ("sample_rate", "channels", "sample_width_bytes", "window_samples")
+        )
+        or any(
+            type(policy.get(key)) is not float
+            for key in (
+                "dialogue_active_strictly_above_dbfs",
+                "required_sfx_reduction_db",
+                "digital_silence_dbfs",
+            )
+        )
+    ):
+        raise ValueError("SFX report dialogue-priority policy is invalid")
+
+    stem_keys = {
+        "role", "file_sha256", "decoded_pcm_sha256", "sample_rate", "channels",
+        "sample_width_bytes", "sample_count",
+    }
+    stems = (
+        (evidence["dialogue_stem"], "pre-final-loudnorm_dialogue"),
+        (evidence["sfx_stem"], "post-sidechain_pre-amix_sfx"),
+    )
+    expected_sample_count: int | None = None
+    for stem, role in stems:
+        if not isinstance(stem, dict) or set(stem) != stem_keys or stem.get("role") != role:
+            raise ValueError("SFX report dialogue-priority stem shape or role is invalid")
+        if (
+            type(stem.get("sample_rate")) is not int
+            or stem.get("sample_rate") != sfx_delivery.SAMPLE_RATE
+            or type(stem.get("channels")) is not int
+            or stem.get("channels") != sfx_delivery.CHANNELS
+            or type(stem.get("sample_width_bytes")) is not int
+            or stem.get("sample_width_bytes") != sfx_delivery.SAMPLE_WIDTH
+        ):
+            raise ValueError("SFX report dialogue-priority stem format is invalid")
+        sample_count = _non_negative_int(stem.get("sample_count"), "dialogue-priority sample_count")
+        if expected_sample_count is None:
+            expected_sample_count = sample_count
+        elif sample_count != expected_sample_count:
+            raise ValueError(
+                "SFX report dialogue-priority stem sample counts differ: "
+                f"{expected_sample_count} != {sample_count}"
+            )
+        for key in ("file_sha256", "decoded_pcm_sha256"):
+            digest = stem.get(key)
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("SFX report dialogue-priority hashes must be lowercase 64-hex")
+    if stems[0][0]["file_sha256"] == stems[1][0]["file_sha256"]:
+        raise ValueError("SFX report dialogue-priority stems must not alias")
+    if not isinstance(output_audio_evidence, dict):
+        raise ValueError("SFX report v2 requires output audio sample-count authority")
+    output_expected_count = _non_negative_int(
+        output_audio_evidence.get("expected_sample_count"),
+        "output_audio_evidence.expected_sample_count",
+    )
+    if expected_sample_count != output_expected_count:
+        raise ValueError(
+            "SFX report dialogue-priority sample count does not match output plan authority"
+        )
+
+    event_count = _non_negative_int(evidence["event_count"], "dialogue-priority event_count")
+    active_count = _non_negative_int(
+        evidence["active_event_count"], "dialogue-priority active_event_count"
+    )
+    passed_count = _non_negative_int(
+        evidence["passed_event_count"], "dialogue-priority passed_event_count"
+    )
+    events = evidence["events"]
+    if not isinstance(events, list) or event_count != len(events) or event_count != expected_count:
+        raise ValueError("SFX report dialogue-priority event count is inconsistent")
+    event_keys = {
+        "event_id", "expected_transient_sample", "dialogue_rms_dbfs", "sfx_rms_dbfs",
+        "sfx_relative_to_dialogue_db", "active", "status",
+    }
+    ids: list[str] = []
+    recomputed_active = 0
+    recomputed_passed = 0
+    for event in events:
+        if not isinstance(event, dict) or set(event) != event_keys:
+            raise ValueError("SFX report dialogue-priority event shape is invalid")
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("SFX report dialogue-priority event ID is invalid")
+        ids.append(event_id)
+        _non_negative_int(
+            event.get("expected_transient_sample"),
+            "dialogue-priority expected_transient_sample",
+        )
+        dialogue_db = _finite_number(event.get("dialogue_rms_dbfs"), "dialogue_rms_dbfs")
+        sfx_db = _finite_number(event.get("sfx_rms_dbfs"), "sfx_rms_dbfs")
+        relative_db = _finite_number(
+            event.get("sfx_relative_to_dialogue_db"), "sfx_relative_to_dialogue_db"
+        )
+        if not math.isclose(relative_db, sfx_db - dialogue_db, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("SFX report dialogue-priority relative dB is inconsistent")
+        active = dialogue_db > sfx_delivery.DIALOGUE_PRIORITY_THRESHOLD_DBFS
+        if type(event.get("active")) is not bool or event["active"] is not active:
+            raise ValueError("SFX report dialogue-priority active state is inconsistent")
+        passed = not active or sfx_db <= (
+            dialogue_db - sfx_delivery.DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB
+        )
+        expected_status = "inactive" if not active else ("pass" if passed else "fail")
+        if event.get("status") != expected_status:
+            raise ValueError("SFX report dialogue-priority event status is inconsistent")
+        recomputed_active += int(active)
+        recomputed_passed += int(passed)
+    if len(set(ids)) != len(ids):
+        raise ValueError("SFX report dialogue-priority event IDs must be unique")
+    delivered_by_id = {item.get("id"): item for item in delivered_items}
+    if status == "pass":
+        if set(ids) != set(delivered_by_id):
+            raise ValueError("SFX report dialogue-priority event IDs do not match delivered events")
+        for event in events:
+            delivered = delivered_by_id[event["event_id"]]
+            if (
+                type(delivered.get("expected_transient_sample")) is not int
+                or delivered["expected_transient_sample"]
+                != event["expected_transient_sample"]
+            ):
+                raise ValueError(
+                    "SFX report dialogue-priority expected sample does not match delivered event"
+                )
+    if active_count != recomputed_active or passed_count != recomputed_passed:
+        raise ValueError("SFX report dialogue-priority counts are inconsistent")
+    if status == "pass" and passed_count != expected_count:
+        raise ValueError("SFX report pass requires all dialogue-priority events to pass")
+
+
 def validate_sfx_report(sfx_report: Any) -> dict[str, Any]:
     """Validate independent SFX evidence before it enters the schema-3 report.
 
@@ -665,8 +835,9 @@ def validate_sfx_report(sfx_report: Any) -> dict[str, Any]:
     """
     if not isinstance(sfx_report, dict):
         raise ValueError("SFX report must be a JSON object")
-    if sfx_report.get("schema_version") != 1:
-        raise ValueError("SFX report schema_version must be 1")
+    schema_version = sfx_report.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise ValueError("SFX report schema_version must be 1 or 2")
     if sfx_report.get("source") != "independent_sfx_evidence":
         raise ValueError("SFX report source must be independent_sfx_evidence")
     status = sfx_report.get("status")
@@ -718,6 +889,17 @@ def validate_sfx_report(sfx_report: Any) -> dict[str, Any]:
     # legitimately have fewer delivered cues, provided its failures explain it.
     if status == "pass" and expected_count != delivered_count:
         raise ValueError("SFX report pass status requires matching event counts")
+    if schema_version == 1:
+        if "dialogue_priority_evidence" in sfx_report:
+            raise ValueError("SFX report v1 cannot carry v2 dialogue-priority evidence")
+    else:
+        _validate_dialogue_priority_evidence(
+            sfx_report.get("dialogue_priority_evidence"),
+            expected_count,
+            delivered_items,
+            status,
+            sfx_report.get("output_audio_evidence"),
+        )
 
     # A passing independent SFX receipt is valid only when it also binds the
     # exact final candidate audio.  Sidecar cue evidence by itself is not
@@ -1089,12 +1271,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="hash-bound 48kHz SFX stem to verify independently",
     )
     parser.add_argument(
+        "--dialogue-priority-dialogue",
+        help="private same-render pre-final-loudnorm dialogue evidence WAV",
+    )
+    parser.add_argument(
+        "--dialogue-priority-sfx",
+        help="private same-render post-sidechain pre-amix SFX evidence WAV",
+    )
+    parser.add_argument(
         "--expected-timeline-revision",
         help="timeline revision bound to the SFX event plan",
     )
     parser.add_argument(
         "--expected-cut-map-sha256",
         help="cut-map SHA-256 bound to the SFX event plan",
+    )
+    parser.add_argument(
+        "--expected-studio-edits-sha256",
+        help="canonical Studio audio override hash authorized by current editor state",
     )
     parser.add_argument(
         "--max-black-segment-seconds",
@@ -1204,6 +1398,25 @@ def main() -> int:
         args.expected_timeline_revision,
         args.expected_cut_map_sha256,
     )
+    priority_values = (
+        args.dialogue_priority_dialogue,
+        args.dialogue_priority_sfx,
+    )
+    if any(value is not None for value in priority_values) and not all(
+        value is not None for value in priority_values
+    ):
+        print("dialogue-priority evidence arguments are all-or-none", file=sys.stderr)
+        return 2
+    if args.expected_studio_edits_sha256 is not None and not all(
+        value is not None for value in sfx_values
+    ):
+        print("expected Studio edit hash requires complete SFX arguments", file=sys.stderr)
+        return 2
+    if any(value is not None for value in priority_values) and not all(
+        value is not None for value in sfx_values
+    ):
+        print("dialogue-priority evidence requires complete SFX arguments", file=sys.stderr)
+        return 2
     if any(value is not None for value in sfx_values) and not all(
         value is not None for value in sfx_values
     ):
@@ -1244,6 +1457,21 @@ def main() -> int:
             ):
                 if not artifact_path.is_file():
                     raise ValueError(f"{label} not found: {artifact_path}")
+            priority_kwargs: dict[str, Path] = {}
+            if args.dialogue_priority_dialogue and args.dialogue_priority_sfx:
+                priority_kwargs = {
+                    "dialogue_priority_dialogue_path": Path(
+                        args.dialogue_priority_dialogue
+                    ).expanduser(),
+                    "dialogue_priority_sfx_path": Path(
+                        args.dialogue_priority_sfx
+                    ).expanduser(),
+                }
+            studio_kwargs = (
+                {"expected_studio_edits_sha256": args.expected_studio_edits_sha256}
+                if args.expected_studio_edits_sha256 is not None
+                else {}
+            )
             sfx_report = sfx_delivery.verify_delivery(
                 plan_path,
                 catalog_path,
@@ -1252,6 +1480,8 @@ def main() -> int:
                 expected_timeline_revision=args.expected_timeline_revision,
                 expected_cut_map_sha256=args.expected_cut_map_sha256,
                 candidate_path=video,
+                **studio_kwargs,
+                **priority_kwargs,
             )
         payload, ok = inspect(
             video,

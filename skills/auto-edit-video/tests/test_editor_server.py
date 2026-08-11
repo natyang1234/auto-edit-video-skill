@@ -31,8 +31,10 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import editor_server  # noqa: E402
 import caption_delivery  # noqa: E402
 import contract_registry  # noqa: E402
+import delivery_envelope  # noqa: E402
 import render_editor_timeline  # noqa: E402
 import qa_video  # noqa: E402
+import sfx_delivery  # noqa: E402
 from editor_server import (  # noqa: E402
     EditorServer,
     caption_effect_spans,
@@ -109,6 +111,35 @@ class FakeAssetProviderService:
 
 
 class CaptionEffectModelTests(unittest.TestCase):
+    def test_audio_event_edits_are_revision_bound_and_strictly_validated(self) -> None:
+        state = {
+            "schema_version": 2,
+            "project_id": "revision-test",
+            "audio_event_edits": {
+                "schema_version": 1,
+                "source_render_id": "direct-final-0123456789abcdef",
+                "source_plan_sha256": "a" * 64,
+                "source_timeline_revision": "b" * 64,
+                "events": [
+                    {
+                        "id": "sfx-event-0001",
+                        "source_event_sha256": "c" * 64,
+                        "event_start_sample": 1200,
+                        "gain_db": -18,
+                    }
+                ],
+            },
+            "overlays": [],
+        }
+        without_edits = {key: value for key, value in state.items() if key != "audio_event_edits"}
+        self.assertNotEqual(editor_state_revision(state), editor_state_revision(without_edits))
+
+        malformed = json.loads(json.dumps(state))
+        malformed["audio_event_edits"]["events"][0]["event_start_sample"] = True
+        self.assertTrue(
+            any("audio_event_edits" in error for error in validate_editor_state(malformed, 1.0))
+        )
+
     def test_font_asset_id_requires_a_safe_string_and_changes_revision(self) -> None:
         state = {
             "schema_version": 2,
@@ -434,6 +465,244 @@ class EditorServerTests(unittest.TestCase):
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def publish_editable_audio_source(
+        self, state: dict[str, object], render_id: str = "studio-audio-source"
+    ) -> dict[str, object]:
+        output = self.project / f"renders/{render_id}.mp4"
+        stage = delivery_envelope.begin_staging(
+            self.project, render_id, expected_output=output
+        )
+        evidence = {
+            "schema_version": 1,
+            "duration_s": 6.0,
+            "items": [
+                {
+                    "id": "title-1",
+                    "start": "0.20",
+                    "end": "0.50",
+                    "kind": "title",
+                    "component_id": "title-lockup",
+                    "motion": {
+                        "requested": "slide-up",
+                        "delivered": "slide-up",
+                        "faithful": True,
+                        "status": "native",
+                    },
+                },
+                {
+                    "id": "row-1",
+                    "start": "0.70",
+                    "end": "1.10",
+                    "kind": "dynamic_list",
+                    "component_id": "dynamic-list",
+                    "motion": {
+                        "requested": "staggered-reveal",
+                        "delivered": "staggered-reveal",
+                        "faithful": True,
+                        "status": "rendered",
+                    },
+                },
+            ],
+        }
+        timeline_revision = editor_server.editor_base_state_revision(state)
+        cut_hash = sfx_delivery.effective_cut_map_sha256(self.project, state)
+        sfx_delivery.stage_multi_event_delivery(
+            Path(stage), evidence, timeline_revision, cut_hash
+        )
+        staged = Path(stage)
+        (staged / "candidate.mp4").write_bytes(b"synthetic-final")
+        (staged / "qa_report.json").write_text('{"status":"pass"}\n', encoding="utf-8")
+        (staged / "contact_sheet.png").write_bytes(b"synthetic-contact")
+        (staged / "visual_evidence.json").write_text(
+            json.dumps(evidence) + "\n", encoding="utf-8"
+        )
+        sources = {
+            "output": staged / "candidate.mp4",
+            "qa_report": staged / "qa_report.json",
+            "contact_sheet": staged / "contact_sheet.png",
+            "visual_evidence": staged / "visual_evidence.json",
+            "motion_evidence": staged / "visual_evidence.json",
+            "audio_event_plan": staged / "audio_event_plan.json",
+            "audio_catalog": staged / "audio_catalog.json",
+            "sfx_stem": staged / "sfx_stem.wav",
+        }
+        prepared = delivery_envelope.build_prepared_envelope(
+            self.project,
+            render_id,
+            output,
+            state,
+            sources,
+            renderer_script=Path(render_editor_timeline.__file__).resolve(),
+            ffmpeg_executable=Path(render_editor_timeline.ffmpeg_path()).resolve(),
+        )
+        delivery_envelope.write_prepared_envelope(stage, prepared)
+        delivery_envelope.publish_direct_delivery(
+            self.project, stage, staged_sources=sources, expected_output=output
+        )
+        return json.loads(
+            (self.project / f"working/audio_event_plans/{render_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_audio_event_edits_put_get_exact_round_trip_from_finalized_source(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body)["state"]
+        source_plan = self.publish_editable_audio_source(state)
+
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        project = json.loads(body)
+        timeline = project["audio_event_timeline"]
+        self.assertTrue(timeline["editable"], timeline)
+        source_event = source_plan["events"][0]
+        edits = {
+            "schema_version": 1,
+            "source_render_id": "studio-audio-source",
+            "source_plan_sha256": timeline["source_plan_sha256"],
+            "source_timeline_revision": timeline["source_timeline_revision"],
+            "events": [
+                {
+                    "id": source_event["id"],
+                    "source_event_sha256": contract_registry.canonical_hash(source_event),
+                    "event_start_sample": source_event["event_start_sample"],
+                    "gain_db": -18,
+                }
+            ],
+        }
+        state = project["state"]
+        state["audio_event_edits"] = edits
+        state["x_expected_revision"] = state["revision"]
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        for gate in ("timeline", "final"):
+            manifest.setdefault("approvals", {})[gate] = {
+                "approved": True,
+                "state_revision": "0" * 64,
+            }
+        self.write_json("project.json", manifest)
+
+        status, saved = self.json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+        self.assertEqual(set(saved["invalidated_gates"]), {"timeline", "final"})
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        persisted = json.loads(body)
+        self.assertEqual(persisted["state"]["audio_event_edits"], edits)
+        self.assertEqual(persisted["audio_event_timeline"]["events"][0]["gain_db"], -18)
+        self.assertEqual(
+            persisted["audio_event_timeline"]["studio_edits_sha256"],
+            contract_registry.canonical_hash(edits),
+        )
+
+    def test_audio_event_edit_boundaries_and_stale_source_fail_closed(self) -> None:
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        state = json.loads(body)["state"]
+        source = self.publish_editable_audio_source(state)
+        event = source["events"][0]
+        base = {
+            "schema_version": 1,
+            "source_render_id": "studio-audio-source",
+            "source_plan_sha256": "a" * 64,
+            "source_timeline_revision": source["timeline_revision"],
+            "events": [
+                {
+                    "id": event["id"],
+                    "source_event_sha256": contract_registry.canonical_hash(event),
+                    "event_start_sample": event["event_start_sample"],
+                    "gain_db": -24,
+                }
+            ],
+        }
+        for gain in (-24, -6):
+            candidate = json.loads(json.dumps(base))
+            candidate["events"][0]["gain_db"] = gain
+            resolved = editor_server.resolve_studio_audio_plan(source, candidate)
+            self.assertEqual(resolved["events"][0]["gain_db"], gain)
+
+        malformed_cases = []
+        for bad_value in (True, 1.5):
+            candidate = json.loads(json.dumps(base))
+            candidate["events"][0]["event_start_sample"] = bad_value
+            malformed_cases.append(candidate)
+        for bad_gain in (True, float("nan"), -24.01, -5.99):
+            candidate = json.loads(json.dumps(base))
+            candidate["events"][0]["gain_db"] = bad_gain
+            malformed_cases.append(candidate)
+        duplicate = json.loads(json.dumps(base))
+        duplicate["events"].append(json.loads(json.dumps(duplicate["events"][0])))
+        malformed_cases.append(duplicate)
+        for candidate in malformed_cases:
+            with self.subTest(candidate=str(candidate)), self.assertRaises(
+                editor_server.AudioEventEditError
+            ):
+                editor_server.resolve_studio_audio_plan(source, candidate)
+
+        for label, mutate, pattern in (
+            (
+                "event_hash",
+                lambda item: item["events"][0].update(source_event_sha256="f" * 64),
+                "hash is stale",
+            ),
+            (
+                "no_change",
+                lambda item: item["events"][0].update(gain_db=-12),
+                "has no change",
+            ),
+            (
+                "bounds",
+                lambda item: item["events"][0].update(
+                    event_start_sample=source["sfx_stem_sample_count"]
+                ),
+                "outside sfx stem bounds",
+            ),
+            (
+                "alignment",
+                lambda item: item["events"][0].update(
+                    event_start_sample=event["event_start_sample"] + 3841
+                ),
+                "3840-sample trigger tolerance",
+            ),
+        ):
+            candidate = json.loads(json.dumps(base))
+            mutate(candidate)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                editor_server.AudioEventEditError, pattern
+            ):
+                editor_server.resolve_studio_audio_plan(source, candidate)
+
+        status, _headers, body = self.request("GET", "/api/project")
+        project = json.loads(body)
+        stale = project["state"]
+        stale["audio_event_edits"] = {
+            **base,
+            "source_render_id": "source-swapped-without-envelope",
+            "source_plan_sha256": project["audio_event_timeline"]["source_plan_sha256"],
+        }
+        stale["x_expected_revision"] = stale["revision"]
+        status, rejected = self.json_request("PUT", "/api/editor-state", stale)
+        self.assertEqual(status, 422, rejected)
+        self.assertIn("audio_event_edits", str(rejected))
+
+        plan_path = self.project / "working/audio_event_plans/studio-audio-source.json"
+        backup = self.project / "working/audio_event_plans/source-backup.json"
+        backup.write_bytes(plan_path.read_bytes())
+        plan_path.write_bytes(plan_path.read_bytes() + b" ")
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        mismatch = json.loads(body)["audio_event_timeline"]
+        self.assertFalse(mismatch["editable"])
+        self.assertIn("invalid", mismatch["reason"])
+        plan_path.write_bytes(backup.read_bytes())
+        plan_path.unlink()
+        plan_path.symlink_to(backup)
+        status, _headers, body = self.request("GET", "/api/project")
+        self.assertEqual(status, 200)
+        unavailable = json.loads(body)["audio_event_timeline"]
+        self.assertFalse(unavailable["editable"])
+        self.assertIn("invalid", unavailable["reason"])
 
     def test_fonts_endpoint_projects_only_safe_metadata(self) -> None:
         asset_id = "font-google-fonts-0123456789abcdef-0123456789abcdef"

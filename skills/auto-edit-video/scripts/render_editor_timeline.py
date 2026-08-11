@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import qa_video
+import contract_registry
 import delivery_envelope
 import sfx_delivery
 from typing import Any
@@ -25,12 +26,16 @@ from editor_server import (
     DIRECTOR_PRESETS,
     PLATFORM_PRESETS,
     atomic_write_json,
+    audio_event_edits_hash,
+    editor_base_state_revision,
     editor_state_revision,
     ffprobe_has_visual_stream,
     file_sha256,
     platform_safe_area,
     read_json,
     referenced_asset_digests,
+    resolve_audio_event_source,
+    resolve_studio_audio_plan,
 )
 from graphic_package import ensure_graphic_package
 from visual_quality import (
@@ -821,6 +826,8 @@ def build_render_command(
     visual_source: Path | None = None,
     visual_evidence: dict[str, Any] | None = None,
     sfx_stem: Path | None = None,
+    dialogue_priority_dialogue: Path | None = None,
+    dialogue_priority_sfx: Path | None = None,
 ) -> list[str]:
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -1228,6 +1235,17 @@ def build_render_command(
         asset_inputs[key] = len(asset_inputs) + (2 if visual_input_index is not None else 1)
 
     sfx_input_index: int | None = None
+    dialogue_priority_paths = (
+        dialogue_priority_dialogue,
+        dialogue_priority_sfx,
+    )
+    if any(path is not None for path in dialogue_priority_paths) and not all(
+        path is not None for path in dialogue_priority_paths
+    ):
+        raise ValueError("dialogue-priority evidence paths must be all-or-none")
+    if any(path is not None for path in dialogue_priority_paths) and sfx_stem is None:
+        raise ValueError("dialogue-priority evidence requires an SFX stem")
+    evidence_mode = all(path is not None for path in dialogue_priority_paths)
     if sfx_stem is not None:
         if not sfx_stem.is_file():
             raise ValueError("staged SFX stem is missing")
@@ -1315,10 +1333,50 @@ def build_render_command(
                        f"atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[adialogue]")
         filters.append(f"[{sfx_input_index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[asfx]")
         filters.append(
-            "[adialogue][asfx]amix=inputs=2:normalize=0,"
+            "[adialogue]asplit=3[adialogue_mix][adialogue_key][adialogue_evidence_raw]"
+            if evidence_mode else
+            "[adialogue]asplit=2[adialogue_mix][adialogue_key]"
+        )
+        filters.append(
+            "[asfx][adialogue_key]sidechaincompress="
+            "threshold=0.2:ratio=1.2:attack=5:release=250:makeup=1:"
+            "link=maximum:detection=rms[asfx_ducked]"
+        )
+        if evidence_mode:
+            evidence_sample_count = sfx_delivery.seconds_to_samples(f"{duration:.3f}")
+            filters.append(
+                f"[adialogue_evidence_raw]apad=whole_len={evidence_sample_count},"
+                f"atrim=end_sample={evidence_sample_count}[adialogue_evidence]"
+            )
+            filters.append(
+                f"[asfx_ducked]apad=whole_len={evidence_sample_count},"
+                f"atrim=end_sample={evidence_sample_count}[asfx_ducked_bounded]"
+            )
+            filters.append(
+                "[asfx_ducked_bounded]asplit=2"
+                "[asfx_ducked_mix][asfx_ducked_evidence]"
+            )
+        filters.append(
+            "[adialogue_mix]"
+            + ("[asfx_ducked_mix]" if evidence_mode else "[asfx_ducked]")
+            + "amix=inputs=2:normalize=0,"
             "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[aout]"
         )
-        command.extend(["-filter_complex", ";".join(filters), "-map", f"[{current}]", "-map", "[aout]", "-t", f"{duration:.3f}"])
+        command.extend(["-filter_complex", ";".join(filters)])
+        if evidence_mode:
+            for label, evidence_path in (
+                ("adialogue_evidence", dialogue_priority_dialogue),
+                ("asfx_ducked_evidence", dialogue_priority_sfx),
+            ):
+                assert evidence_path is not None
+                evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                command.extend([
+                    "-map", f"[{label}]", "-c:a", "pcm_s24le", "-ar", "48000",
+                    "-ac", "2", "-f", "wav", str(evidence_path),
+                ])
+        command.extend([
+            "-map", f"[{current}]", "-map", "[aout]", "-t", f"{duration:.3f}"
+        ])
     elif multi_segment:
         if has_audio_stream:
             segment_count = len(segments)
@@ -1560,6 +1618,7 @@ def render_project(
     caption_v2_artifact: dict[str, Any] | None = None
     staged_sfx: tuple[Path, Path, Path] | None = None
     sfx_bindings: tuple[str, str] | None = None
+    dialogue_priority_paths: tuple[Path, Path] | None = None
     if direct_final:
         if render_id is None:
             raise RuntimeError("direct final render has no delivery identity")
@@ -1650,13 +1709,20 @@ def render_project(
             staged_sfx = stage_phase0d_sfx(
                 project_dir, state, render_id, direct_stage, raw_visual_evidence
             )
+            dialogue_priority_paths = (
+                direct_stage / "dialogue_priority_dialogue.wav",
+                direct_stage / "dialogue_priority_sfx.wav",
+            )
             sfx_bindings = (
                 editor_state_revision(state),
+                editor_base_state_revision(state),
                 sfx_delivery.effective_cut_map_sha256(project_dir, state),
             )
             command = build_render_command(
                 project_dir, state, manifest, temporary, quality, clip, visual_source,
                 visual_evidence=raw_visual_evidence, sfx_stem=staged_sfx[2],
+                dialogue_priority_dialogue=dialogue_priority_paths[0],
+                dialogue_priority_sfx=dialogue_priority_paths[1],
             )
         try:
             result = subprocess.run(
@@ -1700,11 +1766,17 @@ def render_project(
             if staged_sfx is not None:
                 if sfx_bindings is None:
                     raise RuntimeError("kinetic SFX has no freshness bindings")
-                _current, timeline_revision, cut_hash = fresh_sfx_bindings(
+                current_sfx_state, timeline_revision, cut_hash = fresh_sfx_bindings(
                     project_dir, *sfx_bindings,
+                )
+                expected_studio_edits_hash = audio_event_edits_hash(
+                    current_sfx_state.get("audio_event_edits")
+                    if isinstance(current_sfx_state.get("audio_event_edits"), dict)
+                    else None
                 )
             else:
                 timeline_revision = cut_hash = None
+                expected_studio_edits_hash = None
             qa_direct_final_output(
                 project_dir,
                 temporary,
@@ -1716,8 +1788,15 @@ def render_project(
                 audio_event_plan=staged_sfx[0] if staged_sfx else None,
                 audio_catalog=staged_sfx[1] if staged_sfx else None,
                 sfx_stem=staged_sfx[2] if staged_sfx else None,
+                dialogue_priority_dialogue=(
+                    dialogue_priority_paths[0] if dialogue_priority_paths else None
+                ),
+                dialogue_priority_sfx=(
+                    dialogue_priority_paths[1] if dialogue_priority_paths else None
+                ),
                 expected_timeline_revision=timeline_revision,
                 expected_cut_map_sha256=cut_hash,
+                expected_studio_edits_sha256=expected_studio_edits_hash,
             )
             staged_report = direct_stage / delivery_envelope.STAGE_FILENAMES["qa_report"]
             report_payload = read_json(staged_report, {}) or {}
@@ -1733,8 +1812,13 @@ def render_project(
             if staged_sfx is not None:
                 if sfx_bindings is None:
                     raise RuntimeError("kinetic SFX has no freshness bindings")
-                _current, timeline_revision, cut_hash = fresh_sfx_bindings(
+                current_sfx_state, timeline_revision, cut_hash = fresh_sfx_bindings(
                     project_dir, *sfx_bindings,
+                )
+                expected_studio_edits_hash = audio_event_edits_hash(
+                    current_sfx_state.get("audio_event_edits")
+                    if isinstance(current_sfx_state.get("audio_event_edits"), dict)
+                    else None
                 )
                 verification = sfx_delivery.verify_delivery(
                     staged_sfx[0], staged_sfx[1], staged_sfx[2],
@@ -1742,6 +1826,9 @@ def render_project(
                     expected_timeline_revision=timeline_revision,
                     expected_cut_map_sha256=cut_hash,
                     candidate_path=temporary,
+                    dialogue_priority_dialogue_path=dialogue_priority_paths[0],
+                    dialogue_priority_sfx_path=dialogue_priority_paths[1],
+                    expected_studio_edits_sha256=expected_studio_edits_hash,
                 )
                 if verification.get("source") != "independent_sfx_evidence" or verification.get("status") != "pass":
                     raise RuntimeError("staged SFX verification did not pass before publication")
@@ -1805,8 +1892,13 @@ def render_project(
             if staged_sfx is not None:
                 if sfx_bindings is None:
                     raise RuntimeError("kinetic SFX has no freshness bindings")
-                _current, timeline_revision, cut_hash = fresh_sfx_bindings(
+                current_sfx_state, timeline_revision, cut_hash = fresh_sfx_bindings(
                     project_dir, *sfx_bindings,
+                )
+                expected_studio_edits_hash = audio_event_edits_hash(
+                    current_sfx_state.get("audio_event_edits")
+                    if isinstance(current_sfx_state.get("audio_event_edits"), dict)
+                    else None
                 )
                 verification = sfx_delivery.verify_delivery(
                     staged_sfx[0], staged_sfx[1], staged_sfx[2],
@@ -1814,10 +1906,31 @@ def render_project(
                     expected_timeline_revision=timeline_revision,
                     expected_cut_map_sha256=cut_hash,
                     candidate_path=temporary,
+                    dialogue_priority_dialogue_path=dialogue_priority_paths[0],
+                    dialogue_priority_sfx_path=dialogue_priority_paths[1],
+                    expected_studio_edits_sha256=expected_studio_edits_hash,
                 )
                 if verification.get("source") != "independent_sfx_evidence" or verification.get("status") != "pass":
                     raise RuntimeError("staged SFX verification did not pass before publication")
                 assert_sfx_candidate_binding(verification, report_payload, temporary)
+                # Verification can be expensive.  Re-read the independent
+                # editor authority after it completes so a state/edit change
+                # during QA cannot ride the already-passing receipt into the
+                # publication call.
+                final_sfx_state, final_timeline_revision, final_cut_hash = (
+                    fresh_sfx_bindings(project_dir, *sfx_bindings)
+                )
+                if (
+                    final_timeline_revision != timeline_revision
+                    or final_cut_hash != cut_hash
+                    or audio_event_edits_hash(
+                        final_sfx_state.get("audio_event_edits")
+                        if isinstance(final_sfx_state.get("audio_event_edits"), dict)
+                        else None
+                    )
+                    != expected_studio_edits_hash
+                ):
+                    raise RuntimeError("Studio SFX authority changed after final verification")
             publication_attempted = True
             publication = delivery_envelope.publish_direct_delivery(
                 project_dir,
@@ -1868,10 +1981,10 @@ def stage_phase0d_sfx(
     stage: delivery_envelope.StagingAttempt,
     visual_evidence: dict[str, Any],
 ) -> tuple[Path, Path, Path]:
-    """Stage the core-owned one-cue artifacts against live final bindings."""
-    timeline_revision = editor_state_revision(state)
+    """Stage core-owned multi-event artifacts against live final bindings."""
+    timeline_revision = editor_base_state_revision(state)
     cut_hash = sfx_delivery.effective_cut_map_sha256(project_dir, state)
-    staged = sfx_delivery.stage_one_cue_delivery(
+    staged = sfx_delivery.stage_multi_event_delivery(
         Path(stage), visual_evidence, timeline_revision, cut_hash,
     )
     if not isinstance(staged, tuple) or len(staged) != 3:
@@ -1884,11 +1997,54 @@ def stage_phase0d_sfx(
     )
     if (plan_path, catalog_path, stem) != expected or not all(path.is_file() for path in expected):
         raise ValueError("core SFX staging did not produce canonical private artifacts")
+    edits = state.get("audio_event_edits")
+    if isinstance(edits, dict):
+        _source_render_id, source_plan, _source_hash = resolve_audio_event_source(
+            project_dir, state
+        )
+        base_plan = read_json(plan_path, None)
+        if not isinstance(base_plan, dict):
+            raise ValueError("core SFX base plan is unreadable")
+
+        def planning_authority(plan: dict[str, Any]) -> dict[str, Any]:
+            excluded = {
+                "timeline_revision",
+                "sfx_stem_sha256",
+                "sfx_stem_decoded_pcm_sha256",
+                "studio_edits",
+                "studio_edits_sha256",
+            }
+            return {key: value for key, value in plan.items() if key not in excluded}
+
+        if (
+            sfx_delivery._canonical_hash(planning_authority(base_plan))
+            != sfx_delivery._canonical_hash(planning_authority(source_plan))
+        ):
+            raise ValueError("current renderer audio planning authority differs from Studio source")
+        resolved = resolve_studio_audio_plan(base_plan, edits)
+        asset_paths = {
+            asset_id: Path(stage) / sfx_delivery.STARTER_ASSET_FILENAMES[asset_id]
+            for asset_id in sfx_delivery.STARTER_ASSET_IDS
+        }
+        decoded = sfx_delivery._write_multi_event_stem(
+            stem,
+            total_samples=resolved["sfx_stem_sample_count"],
+            events=resolved["events"],
+            asset_paths=asset_paths,
+        )
+        stem_bytes = stem.read_bytes()
+        resolved["sfx_stem_sha256"] = sfx_delivery.sha256_bytes(stem_bytes)
+        resolved["sfx_stem_decoded_pcm_sha256"] = sfx_delivery.sha256_bytes(decoded.pcm)
+        plan_errors = contract_registry.validate_artifact("audio_event_plan", resolved)
+        if plan_errors:
+            raise ValueError(f"Studio-resolved SFX plan is invalid: {plan_errors[0]}")
+        atomic_write_json(plan_path, resolved)
     return expected
 
 
 def fresh_sfx_bindings(
     project_dir: Path,
+    expected_editor_state_revision: str,
     expected_timeline_revision: str,
     expected_cut_map_sha256: str,
 ) -> tuple[dict[str, Any], str, str]:
@@ -1896,10 +2052,20 @@ def fresh_sfx_bindings(
     current = read_json(project_dir / "working/editor_state.json", {}) or {}
     if not isinstance(current, dict):
         raise ValueError("editor state is unreadable before SFX publication")
-    timeline_revision = editor_state_revision(current)
+    state_revision = editor_state_revision(current)
+    timeline_revision = editor_base_state_revision(current)
     cut_hash = sfx_delivery.effective_cut_map_sha256(project_dir, current)
-    if timeline_revision != expected_timeline_revision or cut_hash != expected_cut_map_sha256:
-        raise ValueError("timeline or cut map changed after SFX staging")
+    if (
+        state_revision != expected_editor_state_revision
+        or timeline_revision != expected_timeline_revision
+        or cut_hash != expected_cut_map_sha256
+    ):
+        raise ValueError("editor state, base timeline, or cut map changed after SFX staging")
+    if isinstance(current.get("audio_event_edits"), dict):
+        _render_id, source_plan, _source_hash = resolve_audio_event_source(
+            project_dir, current
+        )
+        resolve_studio_audio_plan(source_plan, current["audio_event_edits"])
     return current, timeline_revision, cut_hash
 
 
@@ -1913,6 +2079,12 @@ def assert_sfx_candidate_binding(
     report_sfx = report_payload.get("sfx_delivery")
     if not isinstance(report_sfx, dict) or report_sfx.get("candidate_output_sha256") != candidate_hash:
         raise RuntimeError("SFX QA report candidate output hash does not match live candidate")
+    try:
+        qa_video.validate_sfx_report(report_sfx)
+    except ValueError as exc:
+        raise RuntimeError("SFX QA report shape is invalid at publication") from exc
+    if report_sfx != verification:
+        raise RuntimeError("SFX QA report does not match fresh private evidence verification")
 
 
 def qa_unpublished_output(
@@ -1929,6 +2101,9 @@ def qa_unpublished_output(
     sfx_stem: Path | None = None,
     expected_timeline_revision: str | None = None,
     expected_cut_map_sha256: str | None = None,
+    expected_studio_edits_sha256: str | None = None,
+    dialogue_priority_dialogue: Path | None = None,
+    dialogue_priority_sfx: Path | None = None,
 ) -> dict[str, Any]:
     """Run QA on a still-unpublished final; raise before anything lands."""
     qa_dir = project_dir / "qa"
@@ -1951,6 +2126,21 @@ def qa_unpublished_output(
             "--expected-timeline-revision", expected_timeline_revision,
             "--expected-cut-map-sha256", expected_cut_map_sha256,
         ]
+        if expected_studio_edits_sha256 is not None:
+            sfx_args.extend([
+                "--expected-studio-edits-sha256",
+                expected_studio_edits_sha256,
+            ])
+        priority_paths = (dialogue_priority_dialogue, dialogue_priority_sfx)
+        if any(path is not None for path in priority_paths) and not all(
+            path is not None for path in priority_paths
+        ):
+            raise ValueError("dialogue-priority QA evidence must be all-or-none")
+        if all(path is not None for path in priority_paths):
+            sfx_args.extend([
+                "--dialogue-priority-dialogue", str(dialogue_priority_dialogue),
+                "--dialogue-priority-sfx", str(dialogue_priority_sfx),
+            ])
     qa_result = subprocess.run(
         [
             sys.executable,
@@ -2040,6 +2230,9 @@ def qa_direct_final_output(
     sfx_stem: Path | None = None,
     expected_timeline_revision: str | None = None,
     expected_cut_map_sha256: str | None = None,
+    expected_studio_edits_sha256: str | None = None,
+    dialogue_priority_dialogue: Path | None = None,
+    dialogue_priority_sfx: Path | None = None,
 ) -> dict[str, Any]:
     return qa_unpublished_output(
         project_dir,
@@ -2053,8 +2246,11 @@ def qa_direct_final_output(
         audio_event_plan=audio_event_plan,
         audio_catalog=audio_catalog,
         sfx_stem=sfx_stem,
+        dialogue_priority_dialogue=dialogue_priority_dialogue,
+        dialogue_priority_sfx=dialogue_priority_sfx,
         expected_timeline_revision=expected_timeline_revision,
         expected_cut_map_sha256=expected_cut_map_sha256,
+        expected_studio_edits_sha256=expected_studio_edits_sha256,
     )
 
 

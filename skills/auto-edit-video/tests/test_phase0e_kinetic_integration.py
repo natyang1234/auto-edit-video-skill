@@ -6,13 +6,16 @@ import hashlib
 import http.server
 import io
 import json
+import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -144,6 +147,27 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _make_source(self) -> None:
+        # Cross-platform active-window graph regression.  Event-bound voiced
+        # pulses sit inside each 250 ms dialogue-policy window but outside the
+        # cue's primary active samples.  This isolates sidechain release/ratio
+        # behavior without pretending a pure tone is representative speech.
+        dialogue = self.root / "active-dialogue.wav"
+        pcm = bytearray()
+        pulse_ranges = ((200640, 202080), (388320, 389760))
+        for index in range(16 * 48000):
+            active = any(
+                start <= index < end
+                for start, end in pulse_ranges
+            )
+            carrier = math.sin(2.0 * math.pi * 160.0 * index / 48000.0)
+            sample = (0.8 if active else 0.01) * carrier
+            pcm.extend(struct.pack("<h", round(sample * 32767.0)))
+        with wave.open(str(dialogue), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(48000)
+            wav.writeframes(bytes(pcm))
+
         result = subprocess.run(
             [
                 renderer.ffmpeg_path(),
@@ -152,12 +176,8 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
                 "lavfi",
                 "-i",
                 "testsrc2=s=360x640:r=30:d=16",
-                "-f",
-                "lavfi",
                 "-i",
-                "sine=f=160:r=48000:d=16",
-                "-filter:a",
-                "volume=0.025",
+                str(dialogue),
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -365,6 +385,22 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["sfx_delivery"]["status"], "pass")
+        self.assertEqual(report["sfx_delivery"]["schema_version"], 2)
+        self.assertEqual(
+            report["sfx_delivery"]["expected_event_count"],
+            report["sfx_delivery"]["delivered_event_count"],
+        )
+        priority = report["sfx_delivery"]["dialogue_priority_evidence"]
+        self.assertEqual(
+            priority["event_count"], report["sfx_delivery"]["expected_event_count"]
+        )
+        self.assertEqual(priority["passed_event_count"], priority["event_count"])
+        self.assertGreater(priority["active_event_count"], 0)
+        self.assertTrue(all(item["status"] in {"pass", "inactive"} for item in priority["events"]))
+        self.assertRegex(priority["dialogue_stem"]["file_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(priority["sfx_stem"]["decoded_pcm_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("dialogue_priority_dialogue", artifacts)
+        self.assertNotIn("dialogue_priority_sfx", artifacts)
         visual = json.loads(
             (self.project / artifacts["visual_evidence"]["path"]).read_text("utf-8")
         )
@@ -383,7 +419,33 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         plan = json.loads(
             (self.project / artifacts["audio_event_plan"]["path"]).read_text("utf-8")
         )
-        self.assertEqual(len(plan["events"]), 1)
+        self.assertEqual(plan["schema_version"], 2)
+        events = plan["events"]
+        self.assertGreaterEqual(len(events), 2)
+        trigger_ids = [event["trigger_id"] for event in events]
+        self.assertEqual(len(trigger_ids), len(set(trigger_ids)))
+        roles = [event["role"] for event in events]
+        self.assertEqual(len(roles), len(set(roles)))
+        visual_ids = {item["id"] for item in items if isinstance(item.get("id"), str)}
+        self.assertTrue(set(trigger_ids).issubset(visual_ids))
+        self.assertEqual(
+            report["sfx_delivery"]["expected_event_count"],
+            len(events),
+        )
+        candidate_cues = [
+            cue
+            for cue in report["sfx_delivery"]["observed_cue_evidence"]
+            if cue.get("evidence_source") == "candidate_output_audio"
+        ]
+        self.assertEqual(len(candidate_cues), len(events))
+        self.assertEqual(
+            {cue["event_id"] for cue in candidate_cues},
+            {event["id"] for event in events},
+        )
+        self.assertTrue(all(cue["status"] == "pass" for cue in candidate_cues))
+        self.assertTrue(all(
+            cue["correlation"] >= 0.30 for cue in candidate_cues
+        ))
         resolved = json.loads(
             (self.project / "working/resolved_director_profile.json").read_text("utf-8")
         )

@@ -364,6 +364,35 @@
               <span>在畫面與輸出中顯示</span>
             </label>
           </form>
+
+          <form id="audio-event-form" class="layer-form audio-event-form" hidden>
+            <div class="form-heading">
+              <div>
+                <p class="eyebrow">AUDIO EVENT</p>
+                <h2>音效事件</h2>
+              </div>
+              <span class="audio-event-edited-label">可調 final timing / gain</span>
+            </div>
+
+            <div class="field-pair">
+              <label class="field"><span>ID（唯讀）</span><input id="audio-event-id" type="text" readonly></label>
+              <label class="field"><span>角色（唯讀）</span><input id="audio-event-role" type="text" readonly></label>
+            </div>
+            <label class="field field-full"><span>素材（唯讀）</span><input id="audio-event-asset" type="text" readonly></label>
+            <label class="field field-full">
+              <span>起始 sample（final domain）</span>
+              <input id="audio-event-start-sample" type="number" min="0" step="1" inputmode="numeric">
+            </label>
+            <p class="audio-event-conversion" id="audio-event-start-seconds" role="status"></p>
+            <label class="field field-full">
+              <span>增益（dB）</span>
+              <input id="audio-event-gain-db" type="number" min="-24" max="-6" step="0.5" inputmode="decimal">
+            </label>
+            <p class="audio-event-policy" id="audio-event-policy">
+              政策：只可調整 final-domain 起始 sample 與增益；sample 必須是安全整數，增益限於 -24 至 -6 dB。不可刪除事件或修改 asset、role、fade、duck。
+            </p>
+            <p class="audio-event-error" id="audio-event-error" role="alert" aria-live="polite" hidden></p>
+          </form>
         </section>
 
         <section class="inspector-panel publish-panel" id="publish-panel" role="tabpanel" aria-labelledby="publish-tab" hidden>

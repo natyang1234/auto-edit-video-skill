@@ -2,6 +2,7 @@ const elements = {};
 let projectPayload = null;
 let state = null;
 let selectedOverlayId = null;
+let selectedAudioEventId = null;
 let saveTimer = null;
 let toastTimer = null;
 let renderPollTimer = null;
@@ -109,6 +110,8 @@ function cacheElements() {
     "batch-downloads", "download-batch-archive", "batch-output-list",
     "voice-enabled", "voice-language", "voice-gender", "voice-id", "voice-mode",
     "voice-speed", "save-voice", "voice-status",
+    "audio-event-form", "audio-event-id", "audio-event-role", "audio-event-asset", "audio-event-start-sample",
+    "audio-event-gain-db", "audio-event-start-seconds", "audio-event-policy", "audio-event-error",
     "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output"
   ].forEach((id) => { elements[id] = byId(id); });
 }
@@ -282,6 +285,243 @@ function sourcePathToUrl(source) {
   return `/${source.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+const AUDIO_SAMPLE_RATE = 48000;
+const AUDIO_IDENTIFIER_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+const AUDIO_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const AUDIO_TIMELINE_INVALID_REASON = "音效時間軸資料格式無法使用";
+const AUDIO_ROLE_LABELS = Object.freeze({
+  title_enter: "標題入場",
+  row_reveal: "列揭示",
+  transition: "轉場",
+  grid_fill: "網格填入",
+  count_tick: "數字跳動",
+  typing: "打字",
+  complete: "完成",
+});
+
+function audioEventTimeline() {
+  const timeline = projectPayload?.audio_event_timeline;
+  return timeline && typeof timeline === "object" ? timeline : null;
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isSafeAudioIdentifier(value) {
+  return typeof value === "string" && AUDIO_IDENTIFIER_PATTERN.test(value);
+}
+
+function isAudioSha256(value) {
+  return typeof value === "string" && AUDIO_SHA256_PATTERN.test(value);
+}
+
+function safeAudioReason(reason) {
+  const compact = String(reason || "").replace(/\s+/g, " ").trim();
+  if (!compact || compact.length > 120 || /[\\/]|[0-9a-f]{64}/i.test(compact)) {
+    return AUDIO_TIMELINE_INVALID_REASON;
+  }
+  return compact;
+}
+
+function validateAudioEventTimeline(timeline = audioEventTimeline()) {
+  if (!isPlainObject(timeline)) {
+    return { valid: false, reason: AUDIO_TIMELINE_INVALID_REASON };
+  }
+  if (timeline.editable !== true || timeline.status === "unavailable") {
+    return {
+      valid: false,
+      reason: safeAudioReason(timeline.reason) || "音效時間軸不可編輯",
+    };
+  }
+  if (!["ready", "edited"].includes(timeline.status)) {
+    return { valid: false, reason: AUDIO_TIMELINE_INVALID_REASON };
+  }
+  if (!isSafeAudioIdentifier(timeline.source_render_id)
+    || !isAudioSha256(timeline.source_plan_sha256)
+    || !isAudioSha256(timeline.source_timeline_revision)
+    || !Array.isArray(timeline.events)) {
+    return { valid: false, reason: AUDIO_TIMELINE_INVALID_REASON };
+  }
+  const ids = new Set();
+  for (const event of timeline.events) {
+    if (!isPlainObject(event)
+      || !isSafeAudioIdentifier(event.id)
+      || !isSafeAudioIdentifier(event.role)
+      || !isSafeAudioIdentifier(event.asset_id)
+      || !isAudioSha256(event.source_event_sha256)
+      || !Number.isSafeInteger(event.event_start_sample)
+      || event.event_start_sample < 0
+      || !Number.isSafeInteger(event.duration_samples)
+      || event.duration_samples <= 0
+      || typeof event.gain_db !== "number"
+      || !Number.isFinite(event.gain_db)
+      || event.gain_db < -24
+      || event.gain_db > -6
+      || ids.has(event.id)) {
+      return { valid: false, reason: AUDIO_TIMELINE_INVALID_REASON };
+    }
+    ids.add(event.id);
+  }
+  return { valid: true, reason: "" };
+}
+
+function audioTimelineEvents() {
+  const timeline = audioEventTimeline();
+  return validateAudioEventTimeline(timeline).valid ? timeline.events : [];
+}
+
+function currentAudioEvent() {
+  return audioTimelineEvents().find((event) => String(event.id) === String(selectedAudioEventId)) || null;
+}
+
+function audioEventRoleLabel(event) {
+  return AUDIO_ROLE_LABELS[event?.role] || String(event?.role || "音效");
+}
+
+function audioEventEdited(event) {
+  const edits = state?.audio_event_edits?.events;
+  return Boolean(event?.edited)
+    || Boolean(Array.isArray(edits) && edits.some((item) => String(item.id) === String(event?.id)));
+}
+
+function audioEventDomId(eventId) {
+  return `timeline-audio-event-${String(eventId || "event").replace(/[^A-Za-z0-9_-]+/g, "-")}`;
+}
+
+function audioEventTitle(event) {
+  const gain = Number(event?.gain_db);
+  const gainLabel = Number.isFinite(gain) ? `${gain} dB` : "未知";
+  return `ID ${event?.id || "未知"} · 素材 ${event?.asset_id || "未知"} · 起始 sample ${event?.event_start_sample ?? "未知"} · 增益 ${gainLabel}`;
+}
+
+function audioTimelineReasonSummary() {
+  return validateAudioEventTimeline(audioEventTimeline()).reason || AUDIO_TIMELINE_INVALID_REASON;
+}
+
+function audioEventStartSeconds(event) {
+  return Number(event?.event_start_sample) / AUDIO_SAMPLE_RATE;
+}
+
+function audioEventEditFor(event) {
+  return state?.audio_event_edits?.events?.find(
+    (item) => String(item.id) === String(event?.id),
+  ) || null;
+}
+
+function orderedAudioEventEdits(edits) {
+  const sourceOrder = new Map(audioTimelineEvents().map((event, index) => [String(event.id), index]));
+  return [...edits].sort((left, right) => {
+    const leftIndex = sourceOrder.get(String(left.id));
+    const rightIndex = sourceOrder.get(String(right.id));
+    if (leftIndex !== undefined && rightIndex !== undefined && leftIndex !== rightIndex) {
+      return leftIndex - rightIndex;
+    }
+    return String(left.id).localeCompare(String(right.id));
+  });
+}
+
+function upsertAudioEventEdit(event, eventStartSample, gainDb) {
+  const timeline = audioEventTimeline();
+  if (!timeline?.source_render_id || !timeline.source_plan_sha256 || !timeline.source_timeline_revision) {
+    return false;
+  }
+  const existingEnvelope = state.audio_event_edits;
+  const existingEvents = Array.isArray(existingEnvelope?.events)
+    ? existingEnvelope.events
+      .filter((item) => item && item.id !== undefined)
+      .map((item) => ({
+        id: item.id,
+        source_event_sha256: item.source_event_sha256,
+        event_start_sample: item.event_start_sample,
+        gain_db: item.gain_db,
+      }))
+    : [];
+  const nextEvent = {
+    id: event.id,
+    source_event_sha256: event.source_event_sha256,
+    event_start_sample: eventStartSample,
+    gain_db: gainDb,
+  };
+  const index = existingEvents.findIndex((item) => String(item.id) === String(event.id));
+  if (index >= 0) existingEvents[index] = nextEvent;
+  else existingEvents.push(nextEvent);
+  state.audio_event_edits = {
+    schema_version: 1,
+    source_render_id: timeline.source_render_id,
+    source_plan_sha256: timeline.source_plan_sha256,
+    source_timeline_revision: timeline.source_timeline_revision,
+    events: orderedAudioEventEdits(existingEvents),
+  };
+  return true;
+}
+
+function setAudioEventError(message = "") {
+  if (!elements["audio-event-error"]) return;
+  elements["audio-event-error"].textContent = message;
+  elements["audio-event-error"].hidden = !message;
+}
+
+function renderAudioEventInspectorMeta(event) {
+  if (!event || !elements["audio-event-form"]) return;
+  elements["audio-event-id"].value = event.id || "";
+  elements["audio-event-role"].value = audioEventRoleLabel(event);
+  elements["audio-event-asset"].value = event.asset_id || "";
+  elements["audio-event-start-seconds"].textContent =
+    `換算：${audioEventStartSeconds(event).toFixed(3)} 秒（${AUDIO_SAMPLE_RATE} samples/秒）`;
+}
+
+function renderAudioEventInspector(event) {
+  if (!event || !elements["audio-event-form"]) return;
+  elements["audio-event-form"].hidden = false;
+  elements["audio-event-id"].value = event.id || "";
+  elements["audio-event-role"].value = audioEventRoleLabel(event);
+  elements["audio-event-asset"].value = event.asset_id || "";
+  elements["audio-event-start-sample"].value = String(event.event_start_sample ?? "");
+  elements["audio-event-gain-db"].value = String(event.gain_db ?? -12);
+  renderAudioEventInspectorMeta(event);
+  setAudioEventError("");
+}
+
+function handleAudioEventInput() {
+  const event = currentAudioEvent();
+  if (!event || !audioEventTimeline()?.editable) return;
+  const sampleRaw = String(elements["audio-event-start-sample"].value || "").trim();
+  const gainRaw = String(elements["audio-event-gain-db"].value || "").trim();
+  const sample = Number(sampleRaw);
+  const gain = Number(gainRaw);
+  const errors = [];
+  if (!sampleRaw || !Number.isSafeInteger(sample) || sample < 0) {
+    errors.push("起始 sample 必須是大於等於 0 的安全整數。 ");
+  }
+  if (!gainRaw || !Number.isFinite(gain) || gain < -24 || gain > -6) {
+    errors.push("增益必須是 -24 至 -6 dB 的有限數值。");
+  }
+  if (errors.length) {
+    setAudioEventError(errors.join(""));
+    return;
+  }
+  setAudioEventError("");
+  const changed = Number(event.event_start_sample) !== sample || Number(event.gain_db) !== gain;
+  if (!changed) {
+    renderAudioEventInspectorMeta(event);
+    return;
+  }
+  if (!upsertAudioEventEdit(event, sample, gain)) {
+    setAudioEventError("音效時間軸來源不足，這次調整未套用。");
+    return;
+  }
+  event.event_start_sample = sample;
+  event.gain_db = gain;
+  event.edited = true;
+  const timeline = audioEventTimeline();
+  if (timeline) timeline.status = "edited";
+  renderAudioEventInspectorMeta(event);
+  markDirty("音效變更，儲存中…");
+}
+
 function currentOverlay() {
   return state?.overlays?.find((overlay) => overlay.id === selectedOverlayId) || null;
 }
@@ -408,7 +648,7 @@ async function saveState(showConfirmation = true) {
         projectPayload.manifest.approvals.timeline.approved = false;
       }
       elements["approve-timeline"].textContent = "核可時間軸";
-      showToast("畫面內容已變更，時間軸核可已失效", "info");
+      showToast("時間軸內容已變更，時間軸核可已失效", "info");
     }
     if ((payload.invalidated_gates || []).includes("final")) {
       if (projectPayload?.manifest?.approvals?.final) {
@@ -1514,6 +1754,14 @@ function enableOverlayDrag(node, overlay) {
 }
 
 function renderInspector() {
+  const audioEvent = currentAudioEvent();
+  if (audioEvent) {
+    elements["inspector-empty"].hidden = true;
+    elements["layer-form"].hidden = true;
+    renderAudioEventInspector(audioEvent);
+    return;
+  }
+  elements["audio-event-form"].hidden = true;
   const overlay = currentOverlay();
   if (!overlay) {
     elements["inspector-empty"].hidden = false;
@@ -1563,6 +1811,7 @@ function renderInspector() {
 }
 
 function selectOverlay(id, seek = false) {
+  selectedAudioEventId = null;
   selectedOverlayId = id;
   selectedEffectSpanId = null;
   effectCreationMode = false;
@@ -1570,6 +1819,18 @@ function selectOverlay(id, seek = false) {
   state.review.selected_overlay_id = id;
   const overlay = currentOverlay();
   if (seek && overlay) elements["preview-video"].currentTime = overlay.start;
+  renderInspector();
+  renderLayerList();
+  renderTimeline();
+  renderPreviewOverlays(true);
+}
+
+function selectAudioEvent(id, seek = false) {
+  const event = audioTimelineEvents().find((item) => String(item.id) === String(id));
+  if (!event) return;
+  selectedAudioEventId = event.id;
+  selectedOverlayId = null;
+  if (seek) elements["preview-video"].currentTime = timelineBounds().start + audioEventStartSeconds(event);
   renderInspector();
   renderLayerList();
   renderTimeline();
@@ -1765,6 +2026,33 @@ function renderTimeline() {
       audio.className = "timeline-audio-item";
       audio.textContent = "原始音訊";
       lane.append(audio);
+      const timeline = audioEventTimeline();
+      const events = audioTimelineEvents();
+      const timelineValidation = validateAudioEventTimeline(timeline);
+      if (timelineValidation.valid && events.length) {
+        events.forEach((event) => {
+          const start = bounds.start + audioEventStartSeconds(event);
+          const end = start + Math.max(0, Number(event.duration_samples || 0)) / AUDIO_SAMPLE_RATE;
+          const visibleStart = Math.max(start, bounds.start);
+          const visibleEnd = Math.min(end, bounds.end);
+          if (!(visibleEnd > visibleStart)) return;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.id = audioEventDomId(event.id);
+          button.dataset.eventId = String(event.id);
+          button.className = `timeline-audio-event${audioEventEdited(event) ? " is-edited" : ""}${String(event.id) === String(selectedAudioEventId) ? " is-selected" : ""}`;
+          button.style.left = `${Math.max(0, timelinePercent(visibleStart))}%`;
+          button.style.width = `${Math.max(0.15, ((visibleEnd - visibleStart) / span) * 100)}%`;
+          button.textContent = `${audioEventRoleLabel(event)}${audioEventEdited(event) ? " · 已調整" : ""}`;
+          button.title = audioEventTitle(event);
+          button.setAttribute("aria-label", `${audioEventRoleLabel(event)}音效：${audioEventTitle(event)}`);
+          button.addEventListener("click", () => selectAudioEvent(event.id, true));
+          lane.append(button);
+        });
+      } else if (timeline && !timelineValidation.valid) {
+        audio.classList.add("is-unavailable");
+        audio.textContent = `原始音訊 · 音效時間軸不可編輯：${audioTimelineReasonSummary()}`;
+      }
     } else {
       state.overlays.filter((overlay) =>
         group.types.includes(overlay.type)
@@ -2658,6 +2946,7 @@ function bindEvents() {
   elements["asset-input"].addEventListener("change", () => uploadAsset(elements["asset-input"].files[0]));
   elements["delete-layer"].addEventListener("click", deleteSelectedOverlay);
   elements["layer-form"].addEventListener("input", updateOverlayFromForm);
+  elements["audio-event-form"].addEventListener("input", handleAudioEventInput);
   // Native selects dispatch ``change`` reliably, while ``input`` propagation
   // varies across browser automation and embedded WebKit. Font selection is a
   // render-affecting edit in its own right, so make that path explicit.

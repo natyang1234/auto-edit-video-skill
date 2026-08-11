@@ -3035,6 +3035,7 @@ body {
 
 .timeline-audio-item {
   position: absolute;
+  z-index: 1;
   top: 9px;
   right: 0;
   bottom: 9px;
@@ -3048,6 +3049,84 @@ body {
   border-bottom: 1px solid oklch(60% 0.11 145);
   font-size: 0.55rem;
   font-weight: 730;
+}
+
+.timeline-audio-item.is-unavailable {
+  padding-right: 8px;
+  color: var(--stage-muted);
+  background: oklch(31% 0.02 55);
+  border-color: var(--stage-line);
+  font-weight: 650;
+}
+
+.timeline-audio-event {
+  position: absolute;
+  z-index: 2;
+  top: 3px;
+  bottom: 3px;
+  min-width: 8px;
+  overflow: hidden;
+  padding: 2px 6px;
+  color: var(--stage-copy);
+  background: oklch(53% 0.11 145);
+  border: 1px solid oklch(76% 0.12 145);
+  border-radius: 2px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.70rem;
+  font-weight: 760;
+}
+
+.timeline-audio-event:hover,
+.timeline-audio-event:focus-visible {
+  background: oklch(61% 0.13 145);
+}
+
+.timeline-audio-event.is-edited {
+  color: #171713;
+  background: var(--amber);
+  border-color: #ffe99a;
+}
+
+.timeline-audio-event.is-selected {
+  box-shadow: inset 0 0 0 2px var(--vermilion), 0 0 0 1px var(--stage-copy);
+}
+
+.audio-event-form {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.audio-event-edited-label {
+  color: var(--ink-2);
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.audio-event-form input[readonly] {
+  color: var(--ink-2);
+  background: var(--paper-2);
+}
+
+.audio-event-conversion,
+.audio-event-policy,
+.audio-event-error {
+  margin: 4px 0 12px;
+  color: var(--ink-2);
+  font-size: 0.69rem;
+  line-height: 1.45;
+}
+
+.audio-event-policy {
+  padding: 9px 10px;
+  background: var(--paper-2);
+  border-left: 2px solid var(--amber);
+}
+
+.audio-event-error {
+  color: var(--danger);
+  font-weight: 700;
 }
 
 .cut-item {
