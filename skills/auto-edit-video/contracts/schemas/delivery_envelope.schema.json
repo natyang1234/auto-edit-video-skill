@@ -54,6 +54,28 @@
       },
       "additionalProperties": false
     },
+    "visual_authority": {
+      "type": ["object", "null"],
+      "required": [
+        "schema_version",
+        "source",
+        "visual_plan_revision",
+        "visual_plan_sha256",
+        "structured_layers_sha256",
+        "artifact_index_sha256",
+        "authority_hash"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "source": {"const": "frozen_visual_authority"},
+        "visual_plan_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "visual_plan_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "structured_layers_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "artifact_index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "authority_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "artifacts": {
       "type": "object",
       "required": [

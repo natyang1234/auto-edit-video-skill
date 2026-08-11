@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import binascii
 import hashlib
 import json
@@ -29,6 +30,22 @@ from svg_security import (  # noqa: E402
 OFL_LICENSE = (SKILL_DIR / "contracts/licenses/OFL-1.1.txt").read_bytes()
 APACHE_LICENSE = (SKILL_DIR / "contracts/licenses/Apache-2.0.txt").read_bytes()
 UBUNTU_FONT_LICENSE = (SKILL_DIR / "contracts/licenses/Ubuntu-font-1.0.txt").read_bytes()
+JPEG_2X1 = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoH"
+    "BwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQME"
+    "BAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+    "FBQUFBQUFBQUFBQUFBT/wAARCAABAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEA"
+    "AAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIh"
+    "MUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6"
+    "Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZ"
+    "mqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx"
+    "8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA"
+    "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAV"
+    "YnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hp"
+    "anN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPE"
+    "xcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD5"
+    "0ooor8MP9Uz/2Q=="
+)
 
 
 def strict_png(width: int = 24, height: int = 24) -> bytes:
@@ -452,6 +469,247 @@ class AssetRegistryTests(unittest.TestCase):
         self.assertIsNone(
             asset_registry.current_item(self.project, "assets/other.png", item["sha256"])
         )
+
+    def test_resolve_approved_image_snapshot_returns_approved_png(self) -> None:
+        payload = strict_png()
+        item = self.item()
+        item["sha256"] = hashlib.sha256(payload).hexdigest()
+        path = self.project / item["path"]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        self.save_items(item)
+
+        resolved = asset_registry.resolve_approved_image_snapshot(
+            self.project,
+            {
+                "asset_id": item["asset_id"],
+                "path": item["path"],
+                "sha256": item["sha256"],
+            },
+        )
+
+        self.assertEqual(resolved["item"], item)
+        self.assertIsNot(resolved["item"], item)
+        self.assertEqual(resolved["bytes"], payload)
+        self.assertEqual(resolved["format"], "png")
+
+    def test_resolve_approved_image_snapshot_returns_approved_jpeg(self) -> None:
+        item = self.item(path="assets/photo.jpeg")
+        item["sha256"] = hashlib.sha256(JPEG_2X1).hexdigest()
+        path = self.project / item["path"]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(JPEG_2X1)
+        self.save_items(item)
+
+        resolved = asset_registry.resolve_approved_image_snapshot(
+            self.project,
+            {
+                "asset_id": item["asset_id"],
+                "path": item["path"],
+                "sha256": item["sha256"],
+            },
+        )
+
+        self.assertEqual(resolved["bytes"], JPEG_2X1)
+        self.assertEqual(resolved["format"], "jpeg")
+
+    def test_resolve_approved_image_snapshot_requires_frozen_registry_identity(self) -> None:
+        payload = strict_png()
+        item = self.item()
+        item["sha256"] = hashlib.sha256(payload).hexdigest()
+        path = self.project / item["path"]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        self.save_items(item)
+        descriptor = {
+            "asset_id": item["asset_id"],
+            "path": item["path"],
+            "sha256": item["sha256"],
+        }
+
+        cases = (
+            {**descriptor, "asset_id": "asset-other"},
+            {**descriptor, "path": "assets/other.png"},
+            {**descriptor, "sha256": "0" * 64},
+            {**descriptor, "path": "../outside.png"},
+            {**descriptor, "path": str(path)},
+            {**descriptor, "path": "assets\\a.png"},
+        )
+        for candidate in cases:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(asset_registry.AssetRegistryError):
+                    asset_registry.resolve_approved_image_snapshot(
+                        self.project, candidate
+                    )
+
+        path.write_bytes(strict_png(width=25))
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_approved_image_snapshot(self.project, descriptor)
+
+    def test_resolve_approved_image_snapshot_rejects_pending_or_bad_license(self) -> None:
+        payload = strict_png()
+        path = self.project / "assets/a.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        pending = self.item(review_status="pending")
+        pending["sha256"] = digest
+        self.save_items(pending)
+        descriptor = {
+            "asset_id": pending["asset_id"],
+            "path": pending["path"],
+            "sha256": pending["sha256"],
+        }
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_approved_image_snapshot(self.project, descriptor)
+
+        approved = dict(pending, review_status="approved")
+        self.save_items(approved)
+        with patch.object(
+            asset_registry,
+            "auto_license_errors",
+            return_value=["simulated final-license rejection"],
+        ):
+            with self.assertRaises(asset_registry.AssetRegistryError):
+                asset_registry.resolve_approved_image_snapshot(
+                    self.project, descriptor
+                )
+
+        bad_license = self.item(spdx="GPL-3.0")
+        bad_license["sha256"] = digest
+        (self.project / asset_registry.PROVENANCE_REL).write_text(
+            json.dumps({"schema_version": 1, "items": [bad_license]}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_approved_image_snapshot(self.project, descriptor)
+
+    def test_resolve_approved_image_snapshot_rejects_leaf_and_parent_symlinks(self) -> None:
+        payload = strict_png()
+        digest = hashlib.sha256(payload).hexdigest()
+
+        leaf_item = self.item(path="assets/leaf.png")
+        leaf_item["sha256"] = digest
+        self.save_items(leaf_item)
+        outside = self.project / "outside.png"
+        outside.write_bytes(payload)
+        leaf = self.project / leaf_item["path"]
+        leaf.symlink_to(outside)
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_approved_image_snapshot(
+                self.project,
+                {
+                    "asset_id": leaf_item["asset_id"],
+                    "path": leaf_item["path"],
+                    "sha256": digest,
+                },
+            )
+
+        real_project = self.project / "real-project"
+        alias_project = self.project / "alias-project"
+        real_target = real_project / "assets/a.png"
+        real_target.parent.mkdir(parents=True)
+        real_target.write_bytes(payload)
+        root_item = self.item()
+        root_item["sha256"] = digest
+        asset_registry.save_registry(
+            real_project, {"schema_version": 1, "items": [root_item]}
+        )
+        alias_project.symlink_to(real_project)
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_approved_image_snapshot(
+                alias_project,
+                {
+                    "asset_id": root_item["asset_id"],
+                    "path": root_item["path"],
+                    "sha256": digest,
+                },
+            )
+
+        parent_item = self.item(asset_id="asset-b", path="assets/nested/a.png")
+        parent_item["sha256"] = digest
+        self.save_items(parent_item)
+        nested_target = self.project / "nested-target"
+        nested_target.mkdir()
+        (nested_target / "a.png").write_bytes(payload)
+        (self.project / "assets/nested").symlink_to(nested_target)
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_approved_image_snapshot(
+                self.project,
+                {
+                    "asset_id": parent_item["asset_id"],
+                    "path": parent_item["path"],
+                    "sha256": digest,
+                },
+            )
+
+    def test_resolve_approved_image_snapshot_reads_one_fd_across_atomic_replace(self) -> None:
+        payload = strict_png()
+        replacement = strict_png(width=25)
+        item = self.item()
+        item["sha256"] = hashlib.sha256(payload).hexdigest()
+        path = self.project / item["path"]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        self.save_items(item)
+        staged = self.project / "replacement.png"
+        staged.write_bytes(replacement)
+        real_read = asset_registry.os.read
+        replaced = False
+
+        def replace_after_image_read(file_descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            chunk = real_read(file_descriptor, size)
+            if not replaced and chunk.startswith(b"\x89PNG\r\n\x1a\n"):
+                replaced = True
+                asset_registry.os.replace(staged, path)
+            return chunk
+
+        with patch.object(asset_registry.os, "read", replace_after_image_read):
+            resolved = asset_registry.resolve_approved_image_snapshot(
+                self.project,
+                {
+                    "asset_id": item["asset_id"],
+                    "path": item["path"],
+                    "sha256": item["sha256"],
+                },
+            )
+
+        self.assertTrue(replaced)
+        self.assertEqual(resolved["bytes"], payload)
+        self.assertEqual(path.read_bytes(), replacement)
+
+    def test_resolve_approved_image_snapshot_rejects_nonregular_and_nonimage(self) -> None:
+        cases = ("fifo", "directory", "non-image")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                project = Path(temporary)
+                target = project / "assets/a.png"
+                target.parent.mkdir(parents=True)
+                if case == "fifo":
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    asset_registry.os.mkfifo(target)
+                    payload = b"fifo-placeholder"
+                elif case == "directory":
+                    target.mkdir()
+                    payload = b"directory-placeholder"
+                else:
+                    payload = b"not an image"
+                    target.write_bytes(payload)
+                item = self.item()
+                item["sha256"] = hashlib.sha256(payload).hexdigest()
+                asset_registry.save_registry(
+                    project, {"schema_version": 1, "items": [item]}
+                )
+                with self.assertRaises(asset_registry.AssetRegistryError):
+                    asset_registry.resolve_approved_image_snapshot(
+                        project,
+                        {
+                            "asset_id": item["asset_id"],
+                            "path": item["path"],
+                            "sha256": item["sha256"],
+                        },
+                    )
 
     def test_provider_license_allowlist_and_attribution_requirements(self) -> None:
         allowed = self.item(

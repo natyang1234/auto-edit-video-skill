@@ -33,7 +33,8 @@
               "quote",
               "question",
               "comparison",
-              "term"
+              "term",
+              "mosaic"
             ]
           },
           "revision": {

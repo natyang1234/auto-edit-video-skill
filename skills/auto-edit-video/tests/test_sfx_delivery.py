@@ -817,6 +817,102 @@ class SfxDeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(sfx_delivery.SfxDeliveryError, "start"):
             sfx_delivery.plan_role_events(negative_start)
 
+    def test_section_title_uses_the_transition_role_only(self) -> None:
+        section = {
+            "id": "section-delivery",
+            "start": "1.5",
+            "end": "4.5",
+            "kind": "title",
+            "component_id": "kinetic-title",
+            "title_kind": "section",
+            "evidence_id": "evidence-5ec75ec7",
+            "source_literal": "接下來談交付流程",
+            "motion": {
+                "requested": "slide-up",
+                "delivered": "slide-up",
+                "faithful": True,
+                "status": "native",
+            },
+        }
+
+        proposals = sfx_delivery.plan_role_events({"items": [section]})
+        self.assertEqual(
+            [(item["role"], item["asset_id"]) for item in proposals],
+            [("transition", "short-whoosh-v1")],
+        )
+
+        opening = json.loads(json.dumps(section))
+        opening["title_kind"] = "full-screen-hook"
+        self.assertEqual(
+            sfx_delivery.plan_role_events({"items": [opening]})[0]["role"],
+            "title_enter",
+        )
+        wrong_component = json.loads(json.dumps(section))
+        wrong_component["component_id"] = "prompt-card"
+        with self.assertRaisesRegex(sfx_delivery.SfxDeliveryError, "eligible"):
+            sfx_delivery.plan_role_events({"items": [wrong_component]})
+
+    def test_grid_progress_completion_uses_the_completion_chime_only(self) -> None:
+        progress = {
+            "id": "grid-progress-delivery",
+            "start": "2.5",
+            "end": "7.5",
+            "kind": "stat",
+            "component_id": "progress",
+            "family": "grid_progress",
+            "trigger_role": "grid_complete",
+            "motion": {
+                "requested": "fill",
+                "delivered": "fill",
+                "faithful": True,
+                "status": "rendered",
+            },
+        }
+
+        proposals = sfx_delivery.plan_role_events({"items": [progress]})
+        self.assertEqual(
+            [(item["role"], item["asset_id"]) for item in proposals],
+            [("complete", "completion-chime-v1")],
+        )
+
+        generic = json.loads(json.dumps(progress))
+        generic.pop("family")
+        generic.pop("trigger_role")
+        self.assertEqual(
+            [(item["role"], item["asset_id"]) for item in sfx_delivery.plan_role_events({"items": [generic]})],
+            [("count_tick", "short-riser-v1")],
+        )
+
+    def test_asset_mosaic_pan_uses_the_transition_whoosh(self) -> None:
+        mosaic = {
+            "id": "asset-mosaic-delivery",
+            "start": "3.0",
+            "end": "8.0",
+            "kind": "mosaic",
+            "component_id": "asset-mosaic",
+            "family": "asset_mosaic",
+            "trigger_role": "scene_transition",
+            "motion": {
+                "requested": "pan",
+                "delivered": "pan",
+                "faithful": True,
+                "status": "native",
+            },
+        }
+        self.assertEqual(
+            [
+                (item["role"], item["asset_id"])
+                for item in sfx_delivery.plan_role_events({"items": [mosaic]})
+            ],
+            [("transition", "short-whoosh-v1")],
+        )
+
+        unbound = json.loads(json.dumps(mosaic))
+        unbound.pop("family")
+        unbound.pop("trigger_role")
+        with self.assertRaisesRegex(sfx_delivery.SfxDeliveryError, "eligible"):
+            sfx_delivery.plan_role_events({"items": [unbound]})
+
     def test_apply_density_policy_is_deterministic_and_fails_closed(self) -> None:
         evidence = self.visual_evidence()
         evidence["duration_s"] = 15.0

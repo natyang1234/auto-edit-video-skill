@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html
 import sys
 import unittest
@@ -10,6 +11,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import contract_registry  # noqa: E402
 from graphic_package import (  # noqa: E402
     build_composition_html,
     package_captions,
@@ -62,6 +64,141 @@ class RenderedVisualQualityReportTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "fail")
         self.assertTrue(any("expected" in item for item in report["failures"]))
+
+    def test_frozen_authority_rejects_layer_literal_and_mosaic_asset_mutations(self) -> None:
+        literal = "接下來看看這兩張範例圖片"
+        assets = [
+            {
+                "asset_id": f"asset-{index}",
+                "path": f"assets/{index}.png",
+                "sha256": str(index) * 64,
+                "evidence_id": "evidence-a1a1a1a1",
+                "source_literal": literal,
+            }
+            for index in (1, 2)
+        ]
+        scene = {
+            "id": "visual-beat-a1a1a1a1",
+            "start": 1.0,
+            "end": 4.0,
+            "kind": "mosaic",
+            "component_id": "asset-mosaic",
+            "style_pack_id": "kinetic-social",
+            "font_evidence_required": True,
+            "minimum_primary_font_px": 36.0,
+            "structured_layer_id": "layer-mosaic-a1a1a1a1",
+            "structured_layer_hash": "a" * 64,
+            "artifact_hash": "b" * 64,
+            "evidence_id": "evidence-a1a1a1a1",
+            "source_literal": literal,
+            "assets": assets,
+            "motion": {
+                "requested": "pan",
+                "delivered": "pan",
+                "faithful": True,
+                "status": "native",
+            },
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "asset_mosaic",
+            "role": "asset_showcase",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "scene_transition",
+            "motion_window_start_sample": 48000,
+            "motion_window_end_sample": 192000,
+            "graphic_roi": {"x": 0.08, "y": 0.1, "width": 0.84, "height": 0.3},
+            "presenter_roi": {"x": 0.0, "y": 0.42, "width": 1.0, "height": 0.58},
+            "static_fallback": False,
+        }
+        motion_probe = {
+            "sample_positions": [62400, 120000, 177600],
+            "graphic_roi": copy.deepcopy(scene["graphic_roi"]),
+            "candidate_matches": [
+                {"sample": sample, "ssim": 0.99, "matched": True}
+                for sample in (62400, 120000, 177600)
+            ],
+            "pairs": [
+                {
+                    "left_sample": left,
+                    "right_sample": right,
+                    "ssim": 0.8,
+                    "changed_pixel_fraction": 0.2,
+                    "detected": True,
+                }
+                for left, right in (
+                    (62400, 120000),
+                    (120000, 177600),
+                    (62400, 177600),
+                )
+            ],
+            "detected": True,
+        }
+        authority = {
+            "schema_version": 1,
+            "source": "frozen_visual_authority",
+            "visual_plan_revision": "c" * 64,
+            "visual_plan_sha256": "d" * 64,
+            "structured_layers_sha256": "e" * 64,
+            "artifact_index_sha256": "f" * 64,
+            "a_roll_breathing_intervals": [],
+            "items": [
+                {
+                    field: copy.deepcopy(scene[field])
+                    for field in (
+                        "id", "start", "end", "kind", "family", "role",
+                        "structured_layer_id", "structured_layer_hash", "artifact_hash",
+                        "evidence_id", "source_literal", "assets", "graphic_roi",
+                        "presenter_roi", "motion_window_start_sample",
+                        "motion_window_end_sample",
+                    )
+                }
+            ],
+            "motion_input": {"fps": 30},
+        }
+        authority["items"][0]["motion_attribution"] = {
+            "artifact_sha256": scene["artifact_hash"]
+        }
+        authority["authority_hash"] = contract_registry.canonical_hash(authority)
+        evidence = self._evidence(motion_intensity="high", items=[scene])
+        evidence["a_roll_breathing_intervals"] = []
+        evidence["motion_input"] = {"fps": 30}
+        evidence["motion_attribution"] = {
+            scene["id"]: copy.deepcopy(
+                authority["items"][0]["motion_attribution"]
+            )
+        }
+        evidence["motion_probes"] = {
+            scene["id"]: copy.deepcopy(motion_probe)
+        }
+        passing = rendered_visual_quality_report(evidence, authority)
+        self.assertEqual(passing["status"], "pass", passing["failures"])
+
+        mutations = []
+        wrong_layer = copy.deepcopy(evidence)
+        wrong_layer["items"][0]["structured_layer_hash"] = "0" * 64
+        mutations.append(wrong_layer)
+        wrong_asset = copy.deepcopy(evidence)
+        wrong_asset["items"][0]["assets"][0]["sha256"] = "0" * 64
+        mutations.append(wrong_asset)
+        wrong_parent_literal = copy.deepcopy(evidence)
+        wrong_parent_literal["items"][0]["source_literal"] = "被換掉的句子"
+        mutations.append(wrong_parent_literal)
+        wrong_asset_literal = copy.deepcopy(evidence)
+        wrong_asset_literal["items"][0]["assets"][0]["source_literal"] = "被換掉的句子"
+        mutations.append(wrong_asset_literal)
+        false_motion = copy.deepcopy(evidence)
+        false_motion["motion_probes"][scene["id"]]["detected"] = False
+        mutations.append(false_motion)
+        for mutated in mutations:
+            with self.subTest(mutated=mutated["items"][0]):
+                try:
+                    rejected = rendered_visual_quality_report(mutated, authority)
+                except ValueError:
+                    continue
+                self.assertEqual(rejected["status"], "fail")
 
     def test_expected_visual_count_is_required_and_must_be_an_integer(self) -> None:
         for bad_value in (None, True, -1):
@@ -165,6 +302,57 @@ class RenderedVisualQualityReportTests(unittest.TestCase):
         )
         self.assertEqual(report["failures"], [])
         self.assertEqual(report["warnings"], [])
+
+    def test_section_scene_contract_rejects_a_non_major_graphic_roi(self) -> None:
+        scene = {
+            "id": "section-1",
+            "start": 1.5,
+            "end": 4.5,
+            "kind": "title",
+            "component_id": "kinetic-title",
+            "style_pack_id": "kinetic-social",
+            "font_evidence_required": True,
+            "minimum_primary_font_px": 42.0,
+            "motion": {
+                "requested": "slide-up",
+                "delivered": "slide-up",
+                "faithful": True,
+                "status": "native",
+            },
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "title_reveal",
+            "role": "section_title",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "scene_transition",
+            "motion_window_start_sample": 72000,
+            "motion_window_end_sample": 82560,
+            "graphic_roi": {"x": 0.08, "y": 0.1, "width": 0.84, "height": 0.3},
+            "presenter_roi": {"x": 0.0, "y": 0.42, "width": 1.0, "height": 0.58},
+            "static_fallback": False,
+        }
+        report = rendered_visual_quality_report(
+            self._evidence(motion_intensity="high", items=[scene])
+        )
+        self.assertEqual(report["status"], "pass", report["failures"])
+
+        scene["graphic_roi"] = {
+            "x": 0.08,
+            "y": 0.1,
+            "width": 0.2,
+            "height": 0.2,
+        }
+        rejected = rendered_visual_quality_report(
+            self._evidence(motion_intensity="high", items=[scene])
+        )
+        self.assertEqual(rejected["status"], "fail")
+        self.assertTrue(
+            any("15%" in failure for failure in rejected["failures"]),
+            rejected["failures"],
+        )
 
     def test_high_motion_missing_evidence_fails_and_counts_as_fallback(self) -> None:
         evidence = self._evidence(

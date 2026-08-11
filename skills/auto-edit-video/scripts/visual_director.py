@@ -43,11 +43,38 @@ CARD_DWELL_SECONDS = {
     "question": 3.5,
     "comparison": 5.0,
     "term": 4.5,
+    "typed_prompt": 4.5,
+    "grid_progress": 5.0,
 }
 # Enumeration in speech, in the languages this tool is used in.
 LIST_MARKERS = re.compile(
     r"(第[一二三四五六七八九十]+|首先|其次|再來|最後|然後|另外"
     r"|\bfirst\b|\bsecond\b|\bthird\b|\bnext\b|\bfinally\b|\balso\b)",
+    re.IGNORECASE,
+)
+# A section card needs an explicit spoken transition, not merely the next
+# fixed-duration planning window.  Keep this deliberately narrow: one
+# transcript-backed line that says the topic is changing.  Ordinary uses of
+# 「最後」 inside a list remain the list planner's job.
+SECTION_TRANSITION = re.compile(
+    r"^\s*(?:接下來(?:我們)?(?:來)?(?:談|看|說|介紹)|下一(?:個|段|部分|章)"
+    r"|最後(?:我們)?(?:來)?(?:談|看|說)"
+    r"|\b(?:next|now)[,:]?\s+(?:we\s+|let'?s\s+)?"
+    r"(?:discuss|look at|cover)\b)",
+    re.IGNORECASE,
+)
+TYPED_PROMPT = re.compile(
+    r"^\s*(?:輸入|指令|命令|prompt|command)\s*[：:]\s*(?P<command>\S.*)$",
+    re.IGNORECASE,
+)
+MOSAIC_MARKER = re.compile(
+    r"(?:接下來|現在|以下|這裡)?(?:來)?(?:看看|看|展示|瀏覽).{0,12}"
+    r"(?:圖片|照片|素材|範例|作品)"
+    r"|\b(?:show|look at|browse)\b.{0,24}\b(?:images?|photos?|examples?|assets?)\b",
+    re.IGNORECASE,
+)
+PROGRESS_MARKER = re.compile(
+    r"(?:進度|完成|達成|完成度|progress|complete(?:d|ion)?)",
     re.IGNORECASE,
 )
 NUMBER_VALUE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -307,20 +334,356 @@ def _label_for(literal: str) -> str:
 
 
 def _title_payload(
-    layer_id: str, quotes: list[dict[str, Any]], editorial_title: str = ""
+    layer_id: str,
+    quotes: list[dict[str, Any]],
+    editorial_title: str = "",
+    transcript_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # An editorial title says what the cut is about; the first quote only says
     # how it happens to open. Same preference as the highlight design cards.
     headline = editorial_title.strip()[:40] or _label_for(quotes[0]["literal"])[:40]
+    payload = {
+        "title": headline,
+        # The opening card names what the piece is about, which is the
+        # hook rather than a section marker or a pulled quote.
+        "title_kind": "full-screen-hook",
+    }
+    layer = {
+        "id": layer_id,
+        "type": "title",
+        "payload": payload,
+    }
+    if transcript_evidence is not None:
+        evidence_id = str(transcript_evidence.get("id") or "")
+        source_literal = str(transcript_evidence.get("literal") or "").strip()
+        if not evidence_id or not source_literal:
+            raise ValueError("kinetic opening evidence must bind id and source literal")
+        layer["component_id"] = "kinetic-title"
+        payload["evidence_id"] = evidence_id
+        payload["source_literal"] = source_literal
+    return layer
+
+
+def _section_title_payload(
+    layer_id: str, quotes: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Build one section marker from one unambiguous spoken transition."""
+    if len(quotes) != 1:
+        return None
+    quote = quotes[0]
+    literal = str(quote.get("literal") or "").strip()
+    evidence_id = str(quote.get("id") or "")
+    if (
+        not literal
+        or len(literal) > 40
+        or not SECTION_TRANSITION.search(literal)
+        or not evidence_id
+    ):
+        return None
     return {
         "id": layer_id,
         "type": "title",
+        "component_id": "kinetic-title",
         "payload": {
-            "title": headline,
-            # The opening card names what the piece is about, which is the
-            # hook rather than a section marker or a pulled quote.
-            "title_kind": "full-screen-hook",
+            "title": literal,
+            "title_kind": "section",
+            "evidence_id": evidence_id,
+            "source_literal": literal,
         },
+    }
+
+
+def _typed_prompt_payload(
+    layer_id: str, quotes: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    if len(quotes) != 1:
+        return None
+    quote = quotes[0]
+    literal = str(quote.get("literal") or "").strip()
+    match = TYPED_PROMPT.search(literal)
+    evidence_id = str(quote.get("id") or "")
+    if match is None or not evidence_id:
+        return None
+    command = match.group("command").strip()
+    if not command or len(command) > 80:
+        return None
+    return {
+        "id": layer_id,
+        "type": "title",
+        "component_id": "prompt-card",
+        "payload": {
+            "title": command,
+            "title_kind": "prompt",
+            "evidence_id": evidence_id,
+            "source_literal": literal,
+        },
+    }
+
+
+def _progress_pair(
+    found: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return one transcript-bound percentage and its progress statement."""
+    numbers = [
+        item
+        for item in found
+        if item.get("kind") == "number"
+        and "%" in str(item.get("literal", "")).replace("％", "%")
+    ]
+    quotes = [
+        item
+        for item in found
+        if item.get("kind") == "quote"
+        and PROGRESS_MARKER.search(str(item.get("literal", "")))
+    ]
+    if len(numbers) != 1 or len(quotes) != 1:
+        return None
+    value = _numeric_value(str(numbers[0].get("literal", "")))
+    if value is None or not 0.0 <= value <= 100.0:
+        return None
+    quote_text = str(quotes[0].get("literal", ""))
+    if str(numbers[0].get("literal", "")).strip() not in quote_text:
+        normalized_number = str(numbers[0].get("literal", "")).replace("％", "%").strip()
+        if normalized_number not in quote_text.replace("％", "%"):
+            return None
+    return numbers[0], quotes[0]
+
+
+def _progress_payload(
+    layer_id: str, number: dict[str, Any], quote: dict[str, Any]
+) -> dict[str, Any]:
+    value = _numeric_value(str(number["literal"]))
+    if value is None:
+        raise ValueError("progress payload requires a numeric percentage")
+    return {
+        "id": layer_id,
+        "type": "stat",
+        "component_id": "progress",
+        "payload": {
+            "value": str(number["literal"]).strip(),
+            "label": str(quote["literal"]).strip(),
+            "ratio": round(value / 100.0, 6),
+            "evidence_id": number["id"],
+            "context_evidence_id": quote["id"],
+            "source_literal": str(number["literal"]).strip(),
+            "context_source_literal": str(quote["literal"]).strip(),
+        },
+    }
+
+
+def _mosaic_selection(
+    found: list[dict[str, Any]], project_assets: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, str]]] | None:
+    quotes = [
+        item
+        for item in found
+        if item.get("kind") == "quote"
+        and MOSAIC_MARKER.search(str(item.get("literal", "")))
+    ]
+    if len(quotes) != 1:
+        return None
+    approved: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    seen_paths: set[str] = set()
+    for item in project_assets:
+        if not isinstance(item, dict) or item.get("review_status") != "approved":
+            continue
+        asset_id = item.get("asset_id")
+        path = item.get("path")
+        digest = item.get("sha256")
+        if (
+            not isinstance(asset_id, str)
+            or not asset_id.strip()
+            or not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or not path.lower().endswith((".png", ".jpg", ".jpeg"))
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            continue
+        if asset_id in seen_ids or path in seen_paths:
+            return None
+        seen_ids.add(asset_id)
+        seen_paths.add(path)
+        approved.append({"asset_id": asset_id, "path": path, "sha256": digest})
+    approved.sort(key=lambda item: (item["asset_id"], item["path"]))
+    if len(approved) < 2:
+        return None
+    return quotes[0], approved[:4]
+
+
+def _mosaic_payload(
+    layer_id: str, quote: dict[str, Any], assets: list[dict[str, str]]
+) -> dict[str, Any]:
+    literal = str(quote["literal"]).strip()
+    evidence_id = str(quote["id"])
+    return {
+        "id": layer_id,
+        "type": "mosaic",
+        "component_id": "asset-mosaic",
+        "payload": {
+            "title": literal,
+            "evidence_id": evidence_id,
+            "source_literal": literal,
+            "assets": [
+                {
+                    **item,
+                    "evidence_id": evidence_id,
+                    "source_literal": literal,
+                }
+                for item in assets
+            ],
+        },
+    }
+
+
+def _semantic_windows(
+    segments: list[dict[str, Any]], evidence: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Split fixed planning windows at explicit transcript topic transitions.
+
+    The renderer timeline is unchanged.  These derived windows only let the
+    director make one decision before a spoken chapter boundary and another
+    after it, so a statistic immediately before a new section is not erased
+    merely because both landed inside the same eight-second planning bucket.
+    """
+    boundaries = sorted(
+        {
+            float(item.get("start", 0.0))
+            for item in evidence
+            if item.get("kind") == "quote"
+            and _section_title_payload("probe", [item]) is not None
+        }
+    )
+    if not boundaries:
+        return segments
+
+    windows: list[dict[str, Any]] = []
+    for segment in segments:
+        start = float(segment.get("source_start", segment.get("start", 0.0)))
+        end = float(segment.get("source_end", segment.get("end", 0.0)))
+        cuts = [point for point in boundaries if start + 0.001 < point < end - 0.001]
+        if not cuts:
+            windows.append(segment)
+            continue
+        cursor = start
+        for boundary in (*cuts, end):
+            derived = dict(segment)
+            derived["id"] = _identifier(
+                "highlight", segment.get("id"), round(cursor, 3), round(boundary, 3)
+            )
+            derived["source_start"] = round(cursor, 3)
+            derived["source_end"] = round(boundary, 3)
+            windows.append(derived)
+            cursor = boundary
+    return windows
+
+
+def _scene_contract(
+    beat: str,
+    index: int,
+    evidence_ids: list[str],
+    kinetic_scene_vocabulary: bool,
+) -> dict[str, Any]:
+    if kinetic_scene_vocabulary and beat == "stat" and evidence_ids:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "count_stat",
+            "role": "metric_emphasis",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "count_complete",
+        }
+    if kinetic_scene_vocabulary and beat == "dynamic_list" and evidence_ids:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "staggered_list",
+            "role": "list_explanation",
+            "importance": "medium",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "row_reveal",
+        }
+    if kinetic_scene_vocabulary and beat == "chart" and evidence_ids:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "analytics_dashboard",
+            "role": "data_explanation",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "chart_complete",
+        }
+    if kinetic_scene_vocabulary and beat == "typed_prompt" and evidence_ids:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "typed_prompt",
+            "role": "prompt_command",
+            "importance": "medium",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "typing",
+        }
+    if kinetic_scene_vocabulary and beat == "grid_progress" and evidence_ids:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "grid_progress",
+            "role": "workflow_progress",
+            "importance": "medium",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "grid_complete",
+        }
+    if kinetic_scene_vocabulary and beat == "asset_mosaic" and evidence_ids:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "asset_mosaic",
+            "role": "asset_showcase",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "scene_transition",
+        }
+    if beat != "title" or not evidence_ids:
+        return {}
+    if index == 0:
+        return {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "title_reveal",
+            "role": "opening_title",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "full_screen_graphic",
+            "trigger_role": "title_enter",
+        }
+    return {
+        "eligibility": "eligible",
+        "eligibility_reason": None,
+        "family": "title_reveal",
+        "role": "section_title",
+        "importance": "high",
+        "major_graphic": True,
+        "micro_silent": False,
+        "stage": "split_graphic_presenter",
+        "trigger_role": "scene_transition",
     }
 
 
@@ -379,7 +742,11 @@ def _list_payload(layer_id: str, quotes: list[dict[str, Any]]) -> dict[str, Any]
 
 
 def _classify(
-    found: list[dict[str, Any]], is_opening: bool, has_editorial: bool = False
+    found: list[dict[str, Any]],
+    is_opening: bool,
+    has_editorial: bool = False,
+    has_transcript_title: bool = False,
+    kinetic_scene_vocabulary: bool = False,
 ) -> str:
     """What this segment is carrying, or PLAIN_BEAT when it is carrying prose."""
     numbers = [
@@ -388,6 +755,8 @@ def _classify(
         if item.get("kind") == "number" and is_measurement(item.get("literal", ""))
     ]
     quotes = [item for item in found if item.get("kind") == "quote"]
+    if kinetic_scene_vocabulary and _progress_pair(found) is not None:
+        return "grid_progress"
     if len(numbers) >= CHART_MIN_DATUMS:
         return "chart"
     if numbers:
@@ -399,8 +768,16 @@ def _classify(
     # already on screen as captions; a card repeating them adds nothing and
     # amplifies whatever the recogniser got wrong. Without a name the
     # opening window is read like any other.
-    if is_opening and quotes and has_editorial:
+    if is_opening and quotes and (has_editorial or has_transcript_title):
         return "title"
+    if not is_opening and _section_title_payload("probe", quotes) is not None:
+        return "title"
+    if (
+        kinetic_scene_vocabulary
+        and not is_opening
+        and _typed_prompt_payload("probe", quotes) is not None
+    ):
+        return "typed_prompt"
     if len(enumerated_quotes(quotes)) >= LIST_MIN_ITEMS:
         return "dynamic_list"
     # Most specific first: a definition and a contrast are recognised by a
@@ -428,6 +805,8 @@ def plan_visuals(
     max_decorated_share: float | None = None,
     editorial_title: str = "",
     visual_density: str = "balanced",
+    kinetic_scene_vocabulary: bool = False,
+    project_assets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Decide a beat for every segment, and build the cards those beats need.
 
@@ -440,6 +819,7 @@ def plan_visuals(
     except (KeyError, TypeError):
         raise ValueError(f"unsupported visual density: {visual_density}") from None
 
+    scene_segments = _semantic_windows(segments, evidence)
     plan_items: list[dict[str, Any]] = []
     layers: list[dict[str, Any]] = []
     # At least one card is allowed, or a timeline that is still one long
@@ -455,9 +835,10 @@ def plan_visuals(
         if max_decorated_share is None
         else max_decorated_share
     )
-    budget = max(1, round(len(segments) * share)) if segments else 0
+    budget = max(1, round(len(scene_segments) * share)) if scene_segments else 0
     decorated = 0
     consecutive_decorated = 0
+    available_assets = project_assets if isinstance(project_assets, list) else []
 
     # An enumeration is a clip-level structure. 「...更多的錢。第二個願望...
     # 第三個願望...」 spreads its items across ten seconds, so no single
@@ -473,7 +854,7 @@ def plan_visuals(
             + float(clip_list[-1].get("end", 0.0))
         ) / 2.0
 
-    for index, segment in enumerate(segments):
+    for index, segment in enumerate(scene_segments):
         # Timeline segments carry source_start/source_end; callers holding a
         # plain window use start/end.
         start = float(segment.get("source_start", segment.get("start", 0.0)))
@@ -485,10 +866,27 @@ def plan_visuals(
             highlight_id = _identifier("highlight", segment.get("id"), start, end)
         item_id = _identifier("visual-beat", highlight_id, index)
         found = _within(evidence, start, end)
+        approved_opening_quotes = [
+            item
+            for item in found
+            if item.get("kind") == "quote"
+            and item.get("review_status") == "approved"
+        ]
         beat = _classify(
             found, is_opening=index == 0,
             has_editorial=bool(editorial_title.strip()),
+            has_transcript_title=(
+                kinetic_scene_vocabulary and bool(approved_opening_quotes)
+            ),
+            kinetic_scene_vocabulary=kinetic_scene_vocabulary,
         )
+        mosaic = (
+            _mosaic_selection(found, available_assets)
+            if kinetic_scene_vocabulary and index > 0
+            else None
+        )
+        if mosaic is not None:
+            beat = "asset_mosaic"
         # The clip-wide list lands in the first plain window at or after its
         # middle. The middle itself often falls in the opening window, which
         # the title already holds — the next window is still inside the
@@ -505,8 +903,10 @@ def plan_visuals(
 
         # Consecutive-card limits keep a decorated run from becoming a
         # slideshow, while a decorated cut costs more attention than a plain one.
+        is_section_title = beat == "title" and index > 0
         if (
             beat != PLAIN_BEAT
+            and not is_section_title
             and (consecutive_decorated >= density_policy["max_consecutive_cards"]
                  or decorated >= budget)
         ):
@@ -537,6 +937,27 @@ def plan_visuals(
                     clip_list if uses_clip_list else enumerated_quotes(quotes),
                 )
                 evidence_ids = [entry["evidence_id"] for entry in layer["payload"]["items"]]
+            elif beat == "typed_prompt":
+                layer = _typed_prompt_payload(layer_id, quotes)
+                if layer is None:
+                    beat, layer_id = PLAIN_BEAT, None
+                else:
+                    evidence_ids = [layer["payload"]["evidence_id"]]
+            elif beat == "grid_progress":
+                progress = _progress_pair(found)
+                if progress is None:
+                    beat, layer_id = PLAIN_BEAT, None
+                else:
+                    number, quote = progress
+                    layer = _progress_payload(layer_id, number, quote)
+                    evidence_ids = [number["id"], quote["id"]]
+            elif beat == "asset_mosaic":
+                if mosaic is None:
+                    beat, layer_id = PLAIN_BEAT, None
+                else:
+                    quote, assets = mosaic
+                    layer = _mosaic_payload(layer_id, quote, assets)
+                    evidence_ids = [quote["id"]]
             elif beat in {"term", "comparison", "quote", "question"}:
                 builder = {
                     "term": _term_payload,
@@ -570,8 +991,29 @@ def plan_visuals(
                 else:
                     evidence_ids = [layer["payload"]["evidence_id"]]
             else:
-                layer = _title_payload(layer_id, quotes, editorial_title)
-                evidence_ids = []
+                if index == 0:
+                    transcript_evidence = (
+                        approved_opening_quotes[0]
+                        if kinetic_scene_vocabulary and approved_opening_quotes
+                        else None
+                    )
+                    layer = _title_payload(
+                        layer_id,
+                        quotes,
+                        editorial_title,
+                        transcript_evidence=transcript_evidence,
+                    )
+                    evidence_ids = (
+                        [str(transcript_evidence["id"])]
+                        if transcript_evidence is not None
+                        else []
+                    )
+                else:
+                    layer = _section_title_payload(layer_id, quotes)
+                    if layer is None:
+                        beat, layer_id = PLAIN_BEAT, None
+                    else:
+                        evidence_ids = [layer["payload"]["evidence_id"]]
             if layer_id is not None:
                 layer["visual_plan_item_id"] = item_id
                 layer["revision"] = 1
@@ -590,20 +1032,28 @@ def plan_visuals(
         if dwell is not None:
             display_end = min(end, start + dwell)
 
+        delivered_beat = (
+            "a_roll_breathing"
+            if kinetic_scene_vocabulary and beat == PLAIN_BEAT
+            else beat
+        )
         plan_items.append(
             {
                 "id": item_id,
                 "highlight_id": highlight_id,
                 "start": round(start, 3),
                 "end": round(display_end, 3),
-                "beat": beat,
+                "beat": delivered_beat,
                 "structured_layer_id": layer_id,
                 "selected_asset": None,
                 # A title states what the segment is about rather than citing
                 # a figure, so it carries no evidence and says so.
-                "conceptual_only": beat == "title",
+                "conceptual_only": beat == "title" and not evidence_ids,
                 "evidence_ids": evidence_ids,
                 "review_status": "pending",
+                **_scene_contract(
+                    beat, index, evidence_ids, kinetic_scene_vocabulary
+                ),
             }
         )
         if beat != PLAIN_BEAT:
@@ -613,7 +1063,7 @@ def plan_visuals(
             # three planning windows — spent its whole allowance on the
             # title, and a list or a question later in the same clip could
             # never be drawn no matter what was said.
-            if not (index == 0 and beat == "title"):
+            if beat != "title":
                 decorated += 1
                 consecutive_decorated += 1
             else:

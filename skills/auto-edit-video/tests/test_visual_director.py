@@ -38,11 +38,57 @@ class VisualDirectorTests(unittest.TestCase):
     def beats(self, result: dict) -> list[str]:
         return [item["beat"] for item in result["visual_plan"]["items"]]
 
+    def test_kinetic_plain_windows_are_explicit_aroll_breathing_intervals(self) -> None:
+        timeline = segments(12, length=5.0)
+
+        kinetic = vd.plan_visuals(
+            timeline,
+            [],
+            kinetic_scene_vocabulary=True,
+        )
+        breathing = [
+            item
+            for item in kinetic["visual_plan"]["items"]
+            if item["beat"] == "a_roll_breathing"
+        ]
+        self.assertGreaterEqual(len(breathing), 2)
+        self.assertTrue(
+            all(item["end"] - item["start"] >= 2.0 for item in breathing)
+        )
+        self.assertEqual(vd.validate(kinetic), [])
+
+        legacy = vd.plan_visuals(timeline, [])
+        self.assertEqual(
+            {item["beat"] for item in legacy["visual_plan"]["items"]},
+            {"keep_aroll"},
+        )
+
     def test_a_spoken_number_becomes_a_stat(self) -> None:
         result = vd.plan_visuals(
-            segments(2), [evidence("number", "87%", 5.0, 5.5, "ab12")]
+            segments(2),
+            [evidence("number", "87%", 5.0, 5.5, "ab12")],
+            kinetic_scene_vocabulary=True,
         )
-        self.assertEqual(self.beats(result)[1], "stat")
+        stat = result["visual_plan"]["items"][1]
+        self.assertEqual(stat["beat"], "stat")
+        self.assertEqual(
+            {field: stat[field] for field in (
+                "eligibility", "eligibility_reason", "family", "role",
+                "importance", "major_graphic", "micro_silent", "stage",
+                "trigger_role",
+            )},
+            {
+                "eligibility": "eligible",
+                "eligibility_reason": None,
+                "family": "count_stat",
+                "role": "metric_emphasis",
+                "importance": "high",
+                "major_graphic": True,
+                "micro_silent": False,
+                "stage": "split_graphic_presenter",
+                "trigger_role": "count_complete",
+            },
+        )
         self.assertEqual(vd.validate(result), [])
         layer = result["structured_layers"]["items"][0]
         self.assertEqual(layer["payload"]["source_literal"], "87%")
@@ -71,6 +117,152 @@ class VisualDirectorTests(unittest.TestCase):
         self.assertEqual([datum["value"] for datum in datums], [12.0, 34.0, 56.0])
         self.assertEqual(vd.validate(result), [])
 
+    def test_kinetic_measurements_have_an_analytics_dashboard_contract(self) -> None:
+        result = vd.plan_visuals(
+            segments(2),
+            [
+                evidence("number", "12%", 4.2, 4.4, "1a11"),
+                evidence("number", "34%", 5.2, 5.4, "2b22"),
+                evidence("number", "56%", 6.2, 6.4, "3c33"),
+            ],
+            kinetic_scene_vocabulary=True,
+        )
+        scene = next(
+            item
+            for item in result["visual_plan"]["items"]
+            if item["beat"] == "chart"
+        )
+        self.assertEqual(scene["family"], "analytics_dashboard")
+        self.assertEqual(scene["role"], "data_explanation")
+        self.assertEqual(scene["importance"], "high")
+        self.assertTrue(scene["major_graphic"])
+        self.assertFalse(scene["micro_silent"])
+        self.assertEqual(scene["stage"], "split_graphic_presenter")
+        self.assertEqual(scene["trigger_role"], "chart_complete")
+        self.assertEqual(vd.validate(result), [])
+
+    def test_kinetic_spoken_command_becomes_a_typed_prompt_scene(self) -> None:
+        command = evidence(
+            "quote", "輸入：npm run build", 5.0, 5.8, "c0de"
+        )
+        result = vd.plan_visuals(
+            segments(2),
+            [command],
+            kinetic_scene_vocabulary=True,
+        )
+        scene = next(
+            item
+            for item in result["visual_plan"]["items"]
+            if item["beat"] == "typed_prompt"
+        )
+        self.assertEqual(scene["family"], "typed_prompt")
+        self.assertEqual(scene["role"], "prompt_command")
+        self.assertEqual(scene["trigger_role"], "typing")
+        self.assertEqual(scene["stage"], "split_graphic_presenter")
+        layer = next(
+            item
+            for item in result["structured_layers"]["items"]
+            if item["id"] == scene["structured_layer_id"]
+        )
+        self.assertEqual(layer["type"], "title")
+        self.assertEqual(layer["component_id"], "prompt-card")
+        self.assertEqual(
+            layer["payload"],
+            {
+                "title": "npm run build",
+                "title_kind": "prompt",
+                "evidence_id": command["id"],
+                "source_literal": command["literal"],
+            },
+        )
+        self.assertEqual(vd.validate(result), [])
+
+    def test_kinetic_progress_statement_becomes_a_grid_fill_scene(self) -> None:
+        number = evidence("number", "75%", 5.2, 5.4, "7511")
+        statement = evidence(
+            "quote", "目前已完成 75% 進度", 5.0, 5.8, "9a11"
+        )
+        result = vd.plan_visuals(
+            segments(2),
+            [number, statement],
+            kinetic_scene_vocabulary=True,
+        )
+        scene = next(
+            item
+            for item in result["visual_plan"]["items"]
+            if item["beat"] == "grid_progress"
+        )
+        self.assertEqual(scene["family"], "grid_progress")
+        self.assertEqual(scene["role"], "workflow_progress")
+        self.assertEqual(scene["trigger_role"], "grid_complete")
+        layer = next(
+            item
+            for item in result["structured_layers"]["items"]
+            if item["id"] == scene["structured_layer_id"]
+        )
+        self.assertEqual(layer["type"], "stat")
+        self.assertEqual(layer["component_id"], "progress")
+        self.assertEqual(layer["payload"]["ratio"], 0.75)
+        self.assertEqual(set(scene["evidence_ids"]), {number["id"], statement["id"]})
+        self.assertEqual(vd.validate(result), [])
+
+    def test_kinetic_showcase_statement_becomes_an_approved_asset_mosaic(self) -> None:
+        statement = evidence(
+            "quote", "接下來看看這三張範例圖片", 5.0, 5.8, "b711"
+        )
+        assets = [
+            {
+                "asset_id": f"asset-{index}",
+                "path": f"assets/example-{index}.png",
+                "sha256": str(index) * 64,
+                "review_status": "approved",
+            }
+            for index in (3, 1, 2)
+        ]
+        result = vd.plan_visuals(
+            segments(2),
+            [statement],
+            kinetic_scene_vocabulary=True,
+            project_assets=assets,
+        )
+        scene = next(
+            item
+            for item in result["visual_plan"]["items"]
+            if item["beat"] == "asset_mosaic"
+        )
+        self.assertEqual(scene["family"], "asset_mosaic")
+        self.assertEqual(scene["role"], "asset_showcase")
+        self.assertEqual(scene["trigger_role"], "scene_transition")
+        layer = next(
+            item
+            for item in result["structured_layers"]["items"]
+            if item["id"] == scene["structured_layer_id"]
+        )
+        self.assertEqual(layer["type"], "mosaic")
+        self.assertEqual(layer["component_id"], "asset-mosaic")
+        self.assertEqual(
+            [item["asset_id"] for item in layer["payload"]["assets"]],
+            ["asset-1", "asset-2", "asset-3"],
+        )
+        self.assertTrue(
+            all(
+                item["evidence_id"] == statement["id"]
+                and item["source_literal"] == statement["literal"]
+                for item in layer["payload"]["assets"]
+            )
+        )
+        self.assertEqual(scene["evidence_ids"], [statement["id"]])
+        self.assertEqual(vd.validate(result), [])
+
+        pending = [dict(item, review_status="pending") for item in assets]
+        without_approved_assets = vd.plan_visuals(
+            segments(2),
+            [statement],
+            kinetic_scene_vocabulary=True,
+            project_assets=pending,
+        )
+        self.assertNotIn("asset_mosaic", self.beats(without_approved_assets))
+
     def test_enumeration_becomes_a_list(self) -> None:
         result = vd.plan_visuals(
             segments(2),
@@ -84,6 +276,30 @@ class VisualDirectorTests(unittest.TestCase):
         items = result["structured_layers"]["items"][0]["payload"]["items"]
         self.assertEqual(len(items), 3)
         self.assertTrue(all(entry["evidence_id"] for entry in items))
+
+    def test_kinetic_enumeration_has_a_staggered_list_scene_contract(self) -> None:
+        result = vd.plan_visuals(
+            segments(2),
+            [
+                evidence("quote", "首先是成本", 4.1, 4.5, "1a11"),
+                evidence("quote", "其次是時間", 5.1, 5.5, "2b22"),
+                evidence("quote", "最後是品質", 6.1, 6.5, "3c33"),
+            ],
+            kinetic_scene_vocabulary=True,
+        )
+        scene = next(
+            item
+            for item in result["visual_plan"]["items"]
+            if item["beat"] == "dynamic_list"
+        )
+        self.assertEqual(scene["family"], "staggered_list")
+        self.assertEqual(scene["role"], "list_explanation")
+        self.assertEqual(scene["importance"], "medium")
+        self.assertTrue(scene["major_graphic"])
+        self.assertFalse(scene["micro_silent"])
+        self.assertEqual(scene["stage"], "split_graphic_presenter")
+        self.assertEqual(scene["trigger_role"], "row_reveal")
+        self.assertEqual(vd.validate(result), [])
 
     def test_cards_do_not_run_back_to_back(self) -> None:
         # Two adjacent segments both carrying figures: the second waits.
@@ -246,11 +462,123 @@ class VisualDirectorTests(unittest.TestCase):
             "台北今晚約會路線",
         )
 
+    def test_kinetic_opening_requires_approved_transcript_evidence(self) -> None:
+        one_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.0}]
+        opening = evidence("quote", "先把資料整理成完整方法", 0.2, 2.6, "0a11")
+        approved = {**opening, "review_status": "approved"}
+
+        result = vd.plan_visuals(
+            one_take,
+            [approved],
+            kinetic_scene_vocabulary=True,
+        )
+        item = result["visual_plan"]["items"][0]
+        self.assertEqual(item["beat"], "title")
+        self.assertEqual(item["evidence_ids"], [approved["id"]])
+        self.assertEqual(item["role"], "opening_title")
+        self.assertEqual(item["family"], "title_reveal")
+        layer = result["structured_layers"]["items"][0]
+        self.assertEqual(layer["payload"]["title"], opening["literal"])
+        self.assertEqual(layer["payload"]["evidence_id"], opening["id"])
+        self.assertEqual(layer["payload"]["source_literal"], opening["literal"])
+
+        unreviewed = vd.plan_visuals(
+            one_take,
+            [opening],
+            kinetic_scene_vocabulary=True,
+        )
+        self.assertNotIn("title", self.beats(unreviewed))
+
     def test_a_blank_editorial_title_is_no_title_at_all(self) -> None:
         one_take = [{"id": "h0", "source_start": 0.0, "source_end": 17.0}]
         found = [evidence("quote", "週末別窩在家跟我走", 0.2, 2.6, "aa11")]
         result = vd.plan_visuals(one_take, found, editorial_title="   ")
         self.assertNotIn("title", [i["beat"] for i in result["visual_plan"]["items"]])
+
+    def test_a_spoken_topic_transition_becomes_a_section_title(self) -> None:
+        result = vd.plan_visuals(
+            segments(3),
+            [
+                evidence(
+                    "quote",
+                    "接下來談交付流程",
+                    8.2,
+                    9.2,
+                    "5ec7",
+                )
+            ],
+        )
+
+        section_items = [
+            item
+            for item in result["visual_plan"]["items"]
+            if item["beat"] == "title"
+        ]
+        self.assertEqual(len(section_items), 1)
+        section = section_items[0]
+        self.assertEqual(section["evidence_ids"], ["evidence-5ec75ec75ec75ec7"])
+        self.assertEqual(
+            {
+                field: section[field]
+                for field in (
+                    "eligibility",
+                    "eligibility_reason",
+                    "family",
+                    "role",
+                    "importance",
+                    "major_graphic",
+                    "micro_silent",
+                    "stage",
+                    "trigger_role",
+                )
+            },
+            {
+                "eligibility": "eligible",
+                "eligibility_reason": None,
+                "family": "title_reveal",
+                "role": "section_title",
+                "importance": "high",
+                "major_graphic": True,
+                "micro_silent": False,
+                "stage": "split_graphic_presenter",
+                "trigger_role": "scene_transition",
+            },
+        )
+        layer = next(
+            item
+            for item in result["structured_layers"]["items"]
+            if item["id"] == section["structured_layer_id"]
+        )
+        self.assertEqual(
+            layer["payload"],
+            {
+                "title": "接下來談交付流程",
+                "title_kind": "section",
+                "evidence_id": "evidence-5ec75ec75ec75ec7",
+                "source_literal": "接下來談交付流程",
+            },
+        )
+        self.assertEqual(vd.validate(result), [])
+
+    def test_ordinary_next_and_final_words_do_not_create_sections(self) -> None:
+        for literal in (
+            "接下來的三個選項都很重要",
+            "最後品質最重要",
+            "next week we ship the update",
+        ):
+            with self.subTest(literal=literal):
+                result = vd.plan_visuals(
+                    segments(3),
+                    [evidence("quote", literal, 8.2, 9.2, "fa15")],
+                )
+                self.assertNotIn(
+                    "section",
+                    [
+                        layer["payload"].get("title_kind")
+                        for layer in result["structured_layers"]["items"]
+                        if layer["type"] == "title"
+                    ],
+                )
 
     def test_a_short_segment_is_never_stretched_to_the_dwell(self) -> None:
         brief = [{"id": "h0", "source_start": 0.0, "source_end": 1.2}]

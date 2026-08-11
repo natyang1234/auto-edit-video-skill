@@ -10,11 +10,13 @@ an empty one.
 
 from __future__ import annotations
 
-import json
+import copy
 import hashlib
+import json
 import math
 import os
 import re
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -142,6 +144,10 @@ _FONT_CAPABILITY_KEYS = frozenset(
     {"fonttools_version", "validator_version", "policy_version", "limits_sha256"}
 )
 _MISSING = object()
+_REGISTRY_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+_STILL_IMAGE_MAX_BYTES = 64 * 1024 * 1024
+_STILL_IMAGE_MAX_DIMENSION = 8192
+_STILL_IMAGE_MAX_PIXELS = 32_000_000
 
 # The first two lines are intentionally fixed.  Keep this string private so
 # callers cannot accidentally alter the format and make attribution drift.
@@ -594,6 +600,216 @@ def current_item(project_dir: Path, path: str, sha256: str) -> dict | None:
         if item.get("path") == path and item.get("sha256") == sha256:
             return item
     return None
+
+
+def _read_project_file_snapshot(
+    project_dir: Path, relative: str, *, label: str, max_bytes: int
+) -> bytes:
+    """Read one regular project file through no-follow directory descriptors."""
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or relative.startswith("/")
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        raise AssetRegistryError(f"{label} path is invalid")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise AssetRegistryError("secure no-follow file access is unavailable")
+
+    opened: list[int] = []
+    try:
+        directory_fd = os.open(
+            os.fspath(project_dir),
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened.append(directory_fd)
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            directory_fd = os.open(
+                part,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            opened.append(directory_fd)
+        file_fd = os.open(
+            parts[-1],
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        opened.append(file_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise AssetRegistryError(f"{label} must be a regular file")
+        if before.st_size < 1 or before.st_size > max_bytes:
+            raise AssetRegistryError(f"{label} exceeds size policy")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(file_fd)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if identity_after != identity_before or len(payload) != before.st_size:
+            raise AssetRegistryError(f"{label} changed while being read")
+        return payload
+    except AssetRegistryError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise AssetRegistryError(f"cannot securely read {label}") from exc
+    finally:
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _still_image_format(payload: bytes, relative: str) -> str:
+    """Verify that ImageIO can fully decode one bounded PNG/JPEG still."""
+    suffix = Path(relative).suffix.casefold()
+    if suffix == ".png" and payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        image_format = "png"
+        expected_type = "public.png"
+    elif (
+        suffix in {".jpg", ".jpeg"}
+        and payload.startswith(b"\xff\xd8\xff")
+        and payload.endswith(b"\xff\xd9")
+    ):
+        image_format = "jpeg"
+        expected_type = "public.jpeg"
+    else:
+        raise AssetRegistryError("still image must be a supported PNG or JPEG")
+
+    try:
+        from Foundation import NSData
+        import Quartz
+
+        data = NSData.dataWithBytes_length_(payload, len(payload))
+        source = Quartz.CGImageSourceCreateWithData(data, None)
+        if (
+            source is None
+            or Quartz.CGImageSourceGetCount(source) != 1
+            or str(Quartz.CGImageSourceGetType(source)) != expected_type
+        ):
+            raise AssetRegistryError("still image bytes are not one supported image")
+        properties = Quartz.CGImageSourceCopyPropertiesAtIndex(source, 0, None)
+        width = properties.get(Quartz.kCGImagePropertyPixelWidth) if properties else None
+        height = properties.get(Quartz.kCGImagePropertyPixelHeight) if properties else None
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, (int, float))
+            or isinstance(height, bool)
+            or not isinstance(height, (int, float))
+            or int(width) != width
+            or int(height) != height
+            or not 0 < int(width) <= _STILL_IMAGE_MAX_DIMENSION
+            or not 0 < int(height) <= _STILL_IMAGE_MAX_DIMENSION
+            or int(width) * int(height) > _STILL_IMAGE_MAX_PIXELS
+        ):
+            raise AssetRegistryError("still image dimensions exceed policy")
+        image = Quartz.CGImageSourceCreateImageAtIndex(
+            source,
+            0,
+            {Quartz.kCGImageSourceShouldCacheImmediately: True},
+        )
+        if (
+            image is None
+            or Quartz.CGImageGetWidth(image) != int(width)
+            or Quartz.CGImageGetHeight(image) != int(height)
+        ):
+            raise AssetRegistryError("still image bytes cannot be fully decoded")
+    except AssetRegistryError:
+        raise
+    except Exception as exc:
+        raise AssetRegistryError("secure still-image decoding is unavailable") from exc
+    return image_format
+
+
+def _load_registry_snapshot(project_dir: Path) -> dict:
+    """Load the registry from one no-follow regular-file snapshot."""
+    raw = _read_project_file_snapshot(
+        project_dir,
+        PROVENANCE_REL.as_posix(),
+        label="provenance registry",
+        max_bytes=_REGISTRY_SNAPSHOT_MAX_BYTES,
+    )
+    try:
+        artifact = contract_registry.load_artifact_text(
+            raw.decode("utf-8", errors="strict")
+        )
+    except Exception as exc:
+        raise AssetRegistryError("invalid provenance registry snapshot") from exc
+    return _validate_artifact(artifact)
+
+
+def resolve_approved_image_snapshot(
+    project_dir: Path, descriptor: dict[str, Any]
+) -> dict[str, Any]:
+    """Return approved still-image bytes from one no-follow file snapshot."""
+    if not isinstance(descriptor, dict):
+        raise AssetRegistryError("still image descriptor must be an object")
+    asset_id = descriptor.get("asset_id")
+    relative = descriptor.get("path")
+    expected_hash = descriptor.get("sha256")
+    if (
+        not isinstance(asset_id, str)
+        or not asset_id
+        or not isinstance(relative, str)
+        or not isinstance(expected_hash, str)
+        or _HASH_RE.fullmatch(expected_hash) is None
+        or not contract_registry._safe_asset_path(relative)
+    ):
+        raise AssetRegistryError("still image descriptor identity is invalid")
+
+    project = Path(project_dir)
+    artifact = _load_registry_snapshot(project)
+    matches = [item for item in artifact["items"] if item.get("asset_id") == asset_id]
+    if len(matches) != 1:
+        raise AssetRegistryError("still image asset is not registered")
+    item = matches[0]
+    if item.get("path") != relative or item.get("sha256") != expected_hash:
+        raise AssetRegistryError("still image descriptor does not match registry identity")
+    license_errors = auto_license_errors(item)
+    if license_errors:
+        raise AssetRegistryError(
+            "still image asset is not approved: " + "; ".join(license_errors)
+        )
+
+    payload = _read_project_file_snapshot(
+        project,
+        relative,
+        label="still image asset",
+        max_bytes=_STILL_IMAGE_MAX_BYTES,
+    )
+    if hashlib.sha256(payload).hexdigest() != expected_hash:
+        raise AssetRegistryError("still image bytes do not match approved sha256")
+    image_format = _still_image_format(payload, relative)
+    return {"item": copy.deepcopy(item), "bytes": payload, "format": image_format}
 
 
 def auto_license_errors(item: dict) -> list[str]:

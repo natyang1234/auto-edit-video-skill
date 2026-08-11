@@ -35,8 +35,9 @@
           "beat": {
             "type": "string",
             "enum": [
-              "keep_aroll",
-              "broll",
+            "keep_aroll",
+            "a_roll_breathing",
+            "broll",
               "image",
               "svg",
               "title",
@@ -47,7 +48,10 @@
               "quote",
               "question",
               "comparison",
-              "term"
+              "term",
+              "typed_prompt",
+              "grid_progress",
+              "asset_mosaic"
             ]
           },
           "structured_layer_id": {
@@ -78,6 +82,68 @@
               "pending",
               "approved",
               "rejected"
+            ]
+          },
+          "eligibility": {
+            "enum": ["eligible", "ineligible"]
+          },
+          "eligibility_reason": {
+            "type": ["string", "null"],
+            "enum": [
+              null,
+              "missing_transcript_evidence",
+              "unsupported_payload",
+              "missing_licensed_asset",
+              "density_budget",
+              "layout_collision"
+            ]
+          },
+          "family": {
+            "enum": [
+              "title_reveal",
+              "staggered_list",
+              "analytics_dashboard",
+              "count_stat",
+              "asset_mosaic",
+              "grid_progress",
+              "typed_prompt"
+            ]
+          },
+          "role": {
+            "enum": [
+              "opening_title",
+              "section_title",
+              "list_explanation",
+              "data_explanation",
+              "metric_emphasis",
+              "asset_showcase",
+              "workflow_progress",
+              "prompt_command"
+            ]
+          },
+          "importance": {
+            "enum": ["low", "medium", "high"]
+          },
+          "major_graphic": {
+            "type": "boolean"
+          },
+          "micro_silent": {
+            "type": "boolean"
+          },
+          "stage": {
+            "enum": ["full_screen_graphic", "split_graphic_presenter"]
+          },
+          "trigger_role": {
+            "type": ["string", "null"],
+            "enum": [
+              null,
+              "title_enter",
+              "scene_transition",
+              "row_reveal",
+              "count_complete",
+              "chart_complete",
+              "grid_complete",
+              "typing"
             ]
           }
         },

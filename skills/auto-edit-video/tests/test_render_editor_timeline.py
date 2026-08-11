@@ -17,11 +17,13 @@ import contract_registry  # noqa: E402
 import editor_server  # noqa: E402
 import sfx_delivery  # noqa: E402
 from render_editor_timeline import (  # noqa: E402
+    adopt_fresh_motion_receipt,
     build_render_command,
     font_path,
     fresh_sfx_bindings,
     project_font_binding,
     render_project,
+    sanitize_private_motion_receipts,
     stage_phase0d_sfx,
 )
 
@@ -226,6 +228,171 @@ class CardMotionTests(unittest.TestCase):
         self.assertTrue(evidence["motion"]["faithful"])
         self.assertEqual(evidence["motion"]["status"], "native")
 
+    def test_mosaic_renderer_evidence_binds_assets_and_transition_motion(self) -> None:
+        from render_editor_timeline import card_visual_evidence
+
+        source = "接下來看看這兩張範例圖片"
+        assets = [
+            {
+                "asset_id": f"asset-{index}",
+                "path": f"assets/{index}.png",
+                "sha256": str(index) * 64,
+                "evidence_id": "evidence-a1a1a1a1",
+                "source_literal": source,
+            }
+            for index in (1, 2)
+        ]
+        layers = {
+            "items": [
+                {
+                    "id": "L-mosaic",
+                    "type": "mosaic",
+                    "component_id": "asset-mosaic",
+                    "payload": {
+                        "title": source,
+                        "evidence_id": "evidence-a1a1a1a1",
+                        "source_literal": source,
+                        "assets": assets,
+                    },
+                }
+            ]
+        }
+        evidence = card_visual_evidence(
+            self.pack, layers, "L-mosaic", 1.0, None
+        )
+        evidence.update(
+            {
+                "id": "mosaic-rendered",
+                "start": 2.0,
+                "end": 7.0,
+                "family": "asset_mosaic",
+                "trigger_role": "scene_transition",
+            }
+        )
+
+        self.assertEqual(evidence["assets"], assets)
+        self.assertEqual(evidence["motion"]["requested"], "pan")
+        self.assertTrue(evidence["motion"]["faithful"])
+        proposals = sfx_delivery.plan_role_events({"items": [evidence]})
+        self.assertEqual(
+            [(item["role"], item["asset_id"]) for item in proposals],
+            [("transition", "short-whoosh-v1")],
+        )
+
+    def test_private_motion_sidecars_do_not_change_sfx_proposals_or_trigger_hash(
+        self,
+    ) -> None:
+        item = {
+            "id": "mosaic-rendered",
+            "start": 2.0,
+            "end": 7.0,
+            "kind": "mosaic",
+            "component_id": "asset-mosaic",
+            "family": "asset_mosaic",
+            "trigger_role": "scene_transition",
+            "motion": {
+                "requested": "pan",
+                "delivered": "pan",
+                "faithful": True,
+                "status": "native",
+            },
+        }
+        original = {"duration_s": 8.0, "items": [item]}
+        with_sidecars = json.loads(json.dumps(original))
+        full_binding = {
+            "artifact_sha256": "a" * 64,
+            "source_path": "/private/render-stage/motion-card.mov",
+            "source_sha256": "b" * 64,
+            "source_kind": "video",
+            "canvas_width": 1080,
+            "canvas_height": 1920,
+            "source_start_sample": 96_000,
+            "source_end_sample": 336_000,
+            "placement": {
+                "width_percent": 84.0,
+                "x_percent": 50.0,
+                "y_percent": 50.0,
+                "animation": "pan",
+            },
+        }
+        with_sidecars.update(
+            {
+                "motion_input": {
+                    "base_path": "/private/render-stage/motion-base.mkv",
+                    "base_sha256": "c" * 64,
+                    "canvas_width": 1080,
+                    "canvas_height": 1920,
+                },
+                "frozen_graphics": {"mosaic-rendered": full_binding},
+                "motion_attribution": {
+                    "mosaic-rendered": {
+                        key: value
+                        for key, value in full_binding.items()
+                        if key != "source_path"
+                    }
+                },
+            }
+        )
+
+        original_proposals = sfx_delivery.plan_role_events(original)
+        sidecar_proposals = sfx_delivery.plan_role_events(with_sidecars)
+
+        self.assertEqual(with_sidecars["items"], original["items"])
+        self.assertEqual(sidecar_proposals, original_proposals)
+        self.assertEqual(
+            sfx_delivery.canonical_motion_plan_hash(with_sidecars),
+            sfx_delivery.canonical_motion_plan_hash(original),
+        )
+        self.assertEqual(
+            contract_registry.canonical_hash(
+                sidecar_proposals[0]["evidence"]["trigger"]
+            ),
+            contract_registry.canonical_hash(
+                original_proposals[0]["evidence"]["trigger"]
+            ),
+        )
+
+    def test_section_scene_is_resolved_in_final_samples_and_split_stage_rois(self) -> None:
+        from render_editor_timeline import resolved_scene_evidence
+
+        plan_item = {
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "title_reveal",
+            "role": "section_title",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "split_graphic_presenter",
+            "trigger_role": "scene_transition",
+        }
+        resolved = resolved_scene_evidence(
+            plan_item,
+            {
+                "motion": {
+                    "requested": "slide-up",
+                    "delivered": "slide-up",
+                    "faithful": True,
+                    "status": "native",
+                }
+            },
+            1.5,
+            4.5,
+        )
+
+        self.assertEqual(resolved["motion_window_start_sample"], 72000)
+        self.assertEqual(resolved["motion_window_end_sample"], 82560)
+        self.assertEqual(
+            resolved["graphic_roi"],
+            {"x": 0.08, "y": 0.1, "width": 0.84, "height": 0.3},
+        )
+        self.assertEqual(
+            resolved["presenter_roi"],
+            {"x": 0.0, "y": 0.42, "width": 1.0, "height": 0.58},
+        )
+        self.assertFalse(resolved["static_fallback"])
+        self.assertEqual(resolved["role"], "section_title")
+
 
 class Phase0dRenderCommandTests(unittest.TestCase):
     """The mixed SFX route must have one unambiguous audio graph."""
@@ -321,6 +488,112 @@ class Phase0dRenderCommandTests(unittest.TestCase):
             build_render_command(
                 self.project, self.state, self.manifest, self.project / "out.mp4", "final",
                 sfx_stem=self.stem,
+            )
+
+    def test_private_motion_receipt_sanitize_rejects_either_side_replacement(
+        self,
+    ) -> None:
+        evidence_path = self.project / "working/visual-evidence.json"
+        report_path = self.project / "working/qa-report.json"
+        visual = {
+            "schema_version": 1,
+            "status": "pass",
+            "items": [{"id": "scene-1"}],
+            "authority": {"authority_hash": "a" * 64},
+            "motion_probes": {"scene-1": {"detected": True}},
+            "raw_evidence": {
+                "motion_input": {"base_path": "/private/stage/base.mkv"},
+                "frozen_graphics": {
+                    "scene-1": {"source_path": "/private/stage/card.png"}
+                },
+            },
+        }
+
+        def write_pair(
+            staged_visual: dict, embedded_visual: dict
+        ) -> tuple[bytes, bytes]:
+            evidence_path.write_text(json.dumps(staged_visual) + "\n", encoding="utf-8")
+            report_path.write_text(
+                json.dumps({"status": "pass", "visual_delivery": embedded_visual})
+                + "\n",
+                encoding="utf-8",
+            )
+            return evidence_path.read_bytes(), report_path.read_bytes()
+
+        for target in ("staged", "embedded"):
+            with self.subTest(target=target):
+                staged = json.loads(json.dumps(visual))
+                embedded = json.loads(json.dumps(visual))
+                if target == "staged":
+                    staged["schema_version"] = True
+                else:
+                    embedded["schema_version"] = 1.0
+                before = write_pair(staged, embedded)
+                with self.assertRaisesRegex(RuntimeError, "differs"):
+                    sanitize_private_motion_receipts(evidence_path, report_path)
+                self.assertEqual(
+                    (evidence_path.read_bytes(), report_path.read_bytes()), before
+                )
+
+        write_pair(visual, json.loads(json.dumps(visual)))
+        sanitized, report = sanitize_private_motion_receipts(
+            evidence_path, report_path
+        )
+        self.assertNotIn("raw_evidence", sanitized)
+        self.assertEqual(report["visual_delivery"], sanitized)
+        self.assertNotIn("base_path", report_path.read_text(encoding="utf-8"))
+        self.assertNotIn("source_path", evidence_path.read_text(encoding="utf-8"))
+
+    def test_fresh_qa_motion_receipt_uses_cas_and_preserves_stable_evidence(
+        self,
+    ) -> None:
+        evidence_path = self.project / "working/visual-evidence-fresh.json"
+        report_path = self.project / "working/qa-report-fresh.json"
+        supplied = {
+            "schema_version": 1,
+            "status": "pass",
+            "items": [{"id": "scene-1"}],
+            "motion_probes": {"scene-1": {"pairs": [{"ssim": 0.8}]}},
+            "raw_evidence": {
+                "items": [{"id": "scene-1"}],
+                "motion_probes": {"scene-1": {"pairs": [{"ssim": 0.8}]}},
+            },
+        }
+        fresh = json.loads(json.dumps(supplied))
+        fresh["motion_probes"]["scene-1"]["pairs"][0]["ssim"] = 0.80003
+        fresh["raw_evidence"]["motion_probes"] = json.loads(
+            json.dumps(fresh["motion_probes"])
+        )
+        evidence_path.write_text(json.dumps(supplied) + "\n", encoding="utf-8")
+        expected_sha = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        report_path.write_text(
+            json.dumps({"visual_delivery": fresh}) + "\n", encoding="utf-8"
+        )
+
+        adopt_fresh_motion_receipt(evidence_path, report_path, expected_sha)
+
+        self.assertEqual(json.loads(evidence_path.read_text()), fresh)
+
+        evidence_path.write_text(json.dumps(supplied) + "\n", encoding="utf-8")
+        replaced_sha = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        replacement = self.project / "working/.visual-replacement.json"
+        replacement.write_text(json.dumps(fresh) + "\n", encoding="utf-8")
+        replacement.replace(evidence_path)
+        with self.assertRaisesRegex(RuntimeError, "changed during QA"):
+            adopt_fresh_motion_receipt(evidence_path, report_path, replaced_sha)
+
+        evidence_path.write_text(json.dumps(supplied) + "\n", encoding="utf-8")
+        stable_mutation = json.loads(json.dumps(fresh))
+        stable_mutation["schema_version"] = True
+        report_path.write_text(
+            json.dumps({"visual_delivery": stable_mutation}) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "stable renderer evidence"):
+            adopt_fresh_motion_receipt(
+                evidence_path,
+                report_path,
+                hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
             )
 
     def test_sfx_rejects_missing_dialogue(self) -> None:

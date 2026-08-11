@@ -22,7 +22,7 @@ import stat
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import contract_registry
 
@@ -497,6 +497,66 @@ def snapshot_owned_json(
     return _decode_json_snapshot(snapshot), snapshot
 
 
+def snapshot_project_file(
+    project_dir: Path,
+    relative: str,
+    *,
+    label: str,
+    capture_bytes: bool = False,
+) -> FileSnapshot:
+    """Capture one project-relative regular file through the owned trust chain."""
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise DeliveryEnvelopeError(f"{label} path is invalid")
+    parts = relative.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise DeliveryEnvelopeError(f"{label} path is invalid")
+    root = project_dir.resolve()
+    _safe_directory(root, create=False)
+    current = root
+    for part in parts[:-1]:
+        current = current / part
+        _safe_directory(current, create=False)
+    path = root / Path(*parts)
+    if path.resolve() != path:
+        raise DeliveryEnvelopeError(f"{label} path is aliased")
+    return _snapshot_regular_file(path, label=label, capture_bytes=capture_bytes)
+
+
+def validate_mosaic_registry_snapshot(
+    registry: dict[str, Any], descriptors: list[dict[str, Any]]
+) -> None:
+    """Bind frozen mosaic descriptors to one valid, currently approved registry."""
+    errors = contract_registry.validate_artifact("asset_provenance", registry)
+    if errors:
+        raise DeliveryEnvelopeError(
+            "mosaic provenance registry failed validation: " + "; ".join(errors)
+        )
+    items = registry.get("items")
+    if not isinstance(items, list):
+        raise DeliveryEnvelopeError("mosaic provenance registry items are invalid")
+    import asset_registry
+
+    for descriptor in descriptors:
+        matches = [
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("asset_id") == descriptor.get("asset_id")
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].get("path") != descriptor.get("path")
+            or matches[0].get("sha256") != descriptor.get("sha256")
+        ):
+            raise DeliveryEnvelopeError(
+                "mosaic descriptor does not match the provenance registry"
+            )
+        license_errors = asset_registry.auto_license_errors(matches[0])
+        if license_errors:
+            raise DeliveryEnvelopeError(
+                "mosaic asset is not approved: " + "; ".join(license_errors)
+            )
+
+
 def _json_bytes(payload: Any) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode(
         "utf-8"
@@ -773,6 +833,7 @@ def build_prepared_envelope(
     renderer_script: Path,
     ffmpeg_executable: Path,
     destinations: Mapping[str, str] | None = None,
+    visual_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a prepared v1 payload from observed private artifact bytes."""
     root = project_dir.resolve()
@@ -794,6 +855,8 @@ def build_prepared_envelope(
     else:
         cut_map_hash = _sha256(cut_map) if cut_map.is_file() else None
     artifact_payload: dict[str, Any] = {}
+    source_snapshots: dict[Path, FileSnapshot] = {}
+    visual_evidence_snapshot: FileSnapshot | None = None
     destination_overrides = dict(destinations or {})
     stage_root = staging_path(root, render_id).resolve()
     for name in ARTIFACT_NAMES:
@@ -811,12 +874,58 @@ def build_prepared_envelope(
         destination = destination_overrides.get(name) or _default_destination(
             name, render_id, output, root
         )
-        artifact_payload[name] = _artifact_record(
-            root,
-            Path(source),
-            destination,
-            allow_external=(name == "output"),
-        )
+        _destination_path(root, destination, allow_external=(name == "output"))
+        source_snapshot = source_snapshots.get(source_path)
+        if source_snapshot is None:
+            source_snapshot = _snapshot_regular_file(
+                source_path,
+                label=f"staged artifact {name}",
+                capture_bytes=(name == "visual_evidence"),
+            )
+            source_snapshots[source_path] = source_snapshot
+        artifact_payload[name] = {
+            "path": destination,
+            "sha256": source_snapshot.sha256,
+            "bytes": source_snapshot.size,
+        }
+        if name == "visual_evidence":
+            visual_evidence_snapshot = source_snapshot
+
+    verified_visual_authority: dict[str, Any] | None = None
+    if visual_authority is not None:
+        if visual_evidence_snapshot is None:
+            raise DeliveryEnvelopeError(
+                "visual authority requires staged visual evidence"
+            )
+        visual_report = _decode_json_snapshot(visual_evidence_snapshot)
+        reported_authority = visual_report.get("authority")
+        if not isinstance(reported_authority, dict):
+            raise DeliveryEnvelopeError(
+                "staged visual authority is missing or malformed"
+            )
+        try:
+            supplied_authority = dict(visual_authority)
+        except (TypeError, ValueError) as exc:
+            raise DeliveryEnvelopeError("supplied visual authority is invalid") from exc
+        if _json_bytes(reported_authority) != _json_bytes(supplied_authority):
+            raise DeliveryEnvelopeError(
+                "staged visual authority differs from frozen render authority"
+            )
+        declared_authority_hash = reported_authority.get("authority_hash")
+        authority_material = {
+            key: value
+            for key, value in reported_authority.items()
+            if key != "authority_hash"
+        }
+        if (
+            not isinstance(declared_authority_hash, str)
+            or contract_registry.canonical_hash(authority_material)
+            != declared_authority_hash
+        ):
+            raise DeliveryEnvelopeError(
+                "staged visual authority canonical hash is invalid"
+            )
+        verified_visual_authority = reported_authority
 
     prepared = {
         "schema_version": 1,
@@ -833,6 +942,19 @@ def build_prepared_envelope(
         "renderer_identity": _renderer_identity(renderer_script, ffmpeg_executable),
         "prepared_envelope_hash": None,
     }
+    if verified_visual_authority is not None:
+        prepared["visual_authority"] = {
+            key: verified_visual_authority.get(key)
+            for key in (
+                "schema_version",
+                "source",
+                "visual_plan_revision",
+                "visual_plan_sha256",
+                "structured_layers_sha256",
+                "artifact_index_sha256",
+                "authority_hash",
+            )
+        }
     validate_envelope(root, prepared, sources=staged_sources, expected_state="prepared")
     return prepared
 
@@ -1137,7 +1259,7 @@ def snapshot_finalized_delivery(
             snapshot = _snapshot_regular_file(
                 path,
                 label=f"artifact {name}",
-                capture_bytes=(name == "qa_report"),
+                capture_bytes=(name in {"qa_report", "visual_evidence"}),
             )
             captured_by_path[path] = snapshot
         artifact_snapshots[name] = snapshot
@@ -1155,12 +1277,86 @@ def snapshot_finalized_delivery(
             f"finalized delivery QA said {qa_report.get('status')}"
         )
 
+    visual_source_snapshots: list[FileSnapshot] = []
+    visual_binding = envelope.get("visual_authority")
+    if visual_binding is not None:
+        visual_snapshot = artifact_snapshots.get("visual_evidence")
+        if visual_snapshot is None:
+            raise DeliveryEnvelopeError("visual authority has no delivered evidence")
+        visual_report = _decode_json_snapshot(visual_snapshot)
+        reported_authority = visual_report.get("authority")
+        if not isinstance(reported_authority, dict):
+            raise DeliveryEnvelopeError("delivered evidence has no visual authority")
+        binding_keys = set(visual_binding)
+        if {key: reported_authority.get(key) for key in binding_keys} != visual_binding:
+            raise DeliveryEnvelopeError("delivered visual authority differs from envelope")
+        plan, plan_snapshot = snapshot_owned_json(
+            root, "working/visual_plan_v2.json", label="current visual plan v2"
+        )
+        layers, layers_snapshot = snapshot_owned_json(
+            root, "working/structured_layers.json", label="current structured layers"
+        )
+        index, index_snapshot = snapshot_owned_json(
+            root,
+            "working/structured_layer_artifacts.json",
+            label="current structured artifact index",
+        )
+        if (
+            plan_snapshot.sha256 != visual_binding.get("visual_plan_sha256")
+            or layers_snapshot.sha256 != visual_binding.get("structured_layers_sha256")
+            or index_snapshot.sha256 != visual_binding.get("artifact_index_sha256")
+            or plan.get("revision") != visual_binding.get("visual_plan_revision")
+            or plan.get("revision")
+            != contract_registry.canonical_hash(plan.get("items"))
+        ):
+            raise DeliveryEnvelopeError("current visual authority differs from delivery")
+        visual_source_snapshots.extend((plan_snapshot, layers_snapshot, index_snapshot))
+        for item in index.get("items", []):
+            if not isinstance(item, dict) or not isinstance(item.get("artifact_id"), str):
+                raise DeliveryEnvelopeError("structured artifact index item is invalid")
+            artifact_snapshot = snapshot_project_file(
+                root,
+                item["artifact_id"],
+                label=f"current structured artifact {item.get('layer_id')}",
+            )
+            if artifact_snapshot.sha256 != item.get("artifact_hash"):
+                raise DeliveryEnvelopeError("current structured artifact hash changed")
+            visual_source_snapshots.append(artifact_snapshot)
+        mosaic_assets: list[dict[str, Any]] = []
+        for layer in layers.get("items", []):
+            if not isinstance(layer, dict) or layer.get("type") != "mosaic":
+                continue
+            payload = layer.get("payload")
+            assets = payload.get("assets") if isinstance(payload, dict) else None
+            if not isinstance(assets, list):
+                raise DeliveryEnvelopeError("current mosaic asset list is invalid")
+            mosaic_assets.extend(item for item in assets if isinstance(item, dict))
+        if mosaic_assets:
+            registry, registry_snapshot = snapshot_owned_json(
+                root, "assets/provenance.json", label="current mosaic provenance registry"
+            )
+            validate_mosaic_registry_snapshot(registry, mosaic_assets)
+            visual_source_snapshots.append(registry_snapshot)
+            for descriptor in mosaic_assets:
+                relative = descriptor.get("path")
+                if not isinstance(relative, str):
+                    raise DeliveryEnvelopeError("current mosaic asset path is invalid")
+                asset_snapshot = snapshot_project_file(
+                    root,
+                    relative,
+                    label=f"current mosaic asset {descriptor.get('asset_id')}",
+                )
+                if asset_snapshot.sha256 != descriptor.get("sha256"):
+                    raise DeliveryEnvelopeError("current mosaic asset hash changed")
+                visual_source_snapshots.append(asset_snapshot)
+
     files: list[FileSnapshot] = [envelope_snapshot, state_snapshot]
     if profile_snapshot is not None:
         files.append(profile_snapshot)
     if cut_snapshot is not None:
         files.append(cut_snapshot)
     files.extend(captured_by_path.values())
+    files.extend(visual_source_snapshots)
     snapshot = FinalizedDeliverySnapshot(
         project_dir=root,
         expected_output=output,
@@ -2315,6 +2511,7 @@ def _publish_direct_delivery_locked(
     expected_output: Path | None = None,
     defer_commit: bool = False,
     deferred_transaction_id: str | None = None,
+    revalidate_authority: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Publish one prepared direct envelope and return its finalized payload."""
     root = _ensure_staging_trust_chain(project_dir, create=False)
@@ -2395,6 +2592,8 @@ def _publish_direct_delivery_locked(
         # Re-check the recorded prior state so an edit in that gap stops with
         # zero writes. Host/power-loss directory ordering is not claimed here.
         _validate_publication_prior_states(root, entries)
+        if revalidate_authority is not None:
+            revalidate_authority()
         entries_by_destination = {entry["destination"]: entry for entry in entries}
         artifacts = prepared["artifacts"]
         published_destinations: set[str] = set()
@@ -2421,6 +2620,8 @@ def _publish_direct_delivery_locked(
             attempted_entry = None
         # Re-check every destination before exposing the finalized envelope.
         validate_envelope(root, prepared, expected_state="prepared")
+        if revalidate_authority is not None:
+            revalidate_authority()
         final_path = finalized_path(root, prepared["render_id"])
         final_relative = final_path.relative_to(root).as_posix()
         final_entry = entries_by_destination.get(final_relative)
@@ -2495,6 +2696,7 @@ def publish_direct_delivery(
     staged_sources: Mapping[str, Path] | None = None,
     expected_output: Path | None = None,
     defer_commit: bool = False,
+    revalidate_authority: Callable[[], None] | None = None,
 ) -> dict[str, Any] | DeferredPublication:
     root = project_dir.resolve()
     if not isinstance(authority, StagingAttempt):
@@ -2512,6 +2714,7 @@ def publish_direct_delivery(
             expected_output=expected_output,
             defer_commit=defer_commit,
             deferred_transaction_id=deferred_transaction_id,
+            revalidate_authority=revalidate_authority,
         )
         if not defer_commit:
             return finalized

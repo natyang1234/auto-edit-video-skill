@@ -17,6 +17,7 @@ SCRIPTS = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import delivery_envelope  # noqa: E402
+import contract_registry  # noqa: E402
 import render_editor_timeline as renderer  # noqa: E402
 import sfx_delivery  # noqa: E402
 import visual_quality  # noqa: E402
@@ -30,7 +31,7 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="phase0d-sfx-integration-")
-        self.project = Path(self.tmp.name) / "project"
+        self.project = (Path(self.tmp.name) / "project").resolve()
         for name in ("source", "working", "renders"):
             (self.project / name).mkdir(parents=True, exist_ok=True)
         self.source = self.project / "source" / "talking-head.mp4"
@@ -53,6 +54,10 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
                 "fps": 30, "fit": "cover",
             },
             "director_style": "kinetic-explainer",
+            "style_pack": {
+                "project_default": "kinetic-social",
+                "per_highlight": {},
+            },
             "qa_policy": {"profile": "strict"},
             "caption_defaults": {},
             "highlights": [],
@@ -60,6 +65,7 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
             "overlays": [{
                 "id": "phase0d-title", "type": "title", "text": "REAL MIX",
                 "start": 0.5, "end": 1.3, "visible": True,
+                "design_role": "hook",
                 "style": {
                     "font_size": 52, "color": "#FFFFFF", "stroke_width": 2,
                     "stroke_color": "#111111", "x": 50, "y": 45,
@@ -68,6 +74,49 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
             }],
         }
         self.write_json("working/editor_state.json", self.state)
+        self.write_json("working/structured_layers.json", {
+            "schema_version": 1,
+            "items": [{
+                "id": "structured-layer-0d0d0d01",
+                "visual_plan_item_id": "visual-beat-0d0d0d01",
+                "type": "title",
+                "revision": 1,
+                "evidence_revision": self.source_sha,
+                "payload": {
+                    "title_kind": "full-screen-hook",
+                    "title": "REAL MIX",
+                },
+                "review_status": "approved",
+                "component_id": "kinetic-title",
+            }],
+        })
+        visual_items = [{
+            "id": "visual-beat-0d0d0d01",
+            "highlight_id": "highlight-0d0d0d0d",
+            "start": 0.5,
+            "end": 1.3,
+            "beat": "title",
+            "structured_layer_id": "structured-layer-0d0d0d01",
+            "selected_asset": None,
+            "conceptual_only": False,
+            "evidence_ids": [],
+            "review_status": "approved",
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "title_reveal",
+            "role": "opening_title",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "full_screen_graphic",
+            "trigger_role": "title_enter",
+        }]
+        self.write_json("working/visual_plan_v2.json", {
+            "schema_version": 1,
+            "highlight_plan_revision": self.source_sha,
+            "items": visual_items,
+            "revision": contract_registry.canonical_hash(visual_items),
+        })
         manifest = {
             "schema_version": 1,
             "project_id": "phase0d-real",
@@ -217,6 +266,24 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
         catalog_path = self.project / artifacts["audio_catalog"]["path"]
         stem_path = self.project / artifacts["sfx_stem"]["path"]
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        published_visual = json.loads(visual_path.read_text(encoding="utf-8"))
+        reusable_visual = visual_quality.rendered_visual_quality_report({
+            "schema_version": 1,
+            "duration_s": published_visual["duration_s"],
+            "motion_intensity": "high",
+            "expected_visual_beat_count": published_visual["visual_beat_count"],
+            "items": published_visual["items"],
+        })
+        self.assertEqual(reusable_visual["status"], "pass")
+        self.assertEqual(
+            sfx_delivery.canonical_motion_plan_hash(reusable_visual),
+            plan["resolved_motion_plan_hash"],
+        )
+        reusable_visual_path = self.project / "working/duration-visual-evidence.json"
+        reusable_visual_path.write_text(
+            json.dumps(reusable_visual, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
         # Recreate well-formed private-role fixtures solely to keep this test
         # focused on candidate duration binding after public delivery has
         # correctly cleaned the genuine same-render private WAVs.
@@ -244,7 +311,7 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
                     "--video", str(candidate),
                     "--report", str(self.project / "working" / f"duration-{duration:.1f}.json"),
                     "--contact", str(self.project / "working" / f"duration-{duration:.1f}.png"),
-                    "--visual-evidence", str(visual_path),
+                    "--visual-evidence", str(reusable_visual_path),
                     "--audio-event-plan", str(plan_path),
                     "--audio-catalog", str(catalog_path),
                     "--sfx-stem", str(stem_path),
@@ -282,6 +349,32 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
         prior = b"prior bytes must survive failed atomic publication"
         output.write_bytes(prior)
         render_id = renderer.direct_final_render_id(self.state, output)
+        with patch.object(
+            renderer,
+            "freeze_visual_authority",
+            side_effect=RuntimeError("synthetic frozen-authority failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "frozen-authority failure"):
+                renderer.render_project(self.project, output, "final")
+        self.assertEqual(delivery_envelope._ACTIVE_STAGING_LEASES, {})
+        self.assert_no_staging_residue()
+
+        def fail_after_candidate_directory(*args, **_kwargs):
+            candidate = Path(args[3])
+            candidate.mkdir()
+            raise RuntimeError("synthetic render-build failure")
+
+        with patch.object(
+            renderer,
+            "build_render_command",
+            side_effect=fail_after_candidate_directory,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "render-build failure"):
+                renderer.render_project(self.project, output, "final")
+        self.assertEqual(output.read_bytes(), prior)
+        self.assertEqual(delivery_envelope._ACTIVE_STAGING_LEASES, {})
+        self.assert_no_staging_residue()
+
         original_stage = renderer.stage_phase0d_sfx
 
         def shifted_stage(*args, **kwargs):
@@ -310,6 +403,7 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
         self.assertFalse((self.project / "working/audio_event_plans" / f"{render_id}.json").exists())
         self.assertFalse((self.project / "working/audio_catalogs" / f"{render_id}.json").exists())
         self.assertFalse((self.project / "working/sfx_stems" / f"{render_id}.wav").exists())
+        self.assertEqual(delivery_envelope._ACTIVE_STAGING_LEASES, {})
         self.assert_no_staging_residue()
 
     def test_dialogue_only_candidate_cannot_reuse_passing_sfx_sidecars(self) -> None:

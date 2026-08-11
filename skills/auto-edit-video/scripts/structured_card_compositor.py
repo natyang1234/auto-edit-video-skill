@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static structured-card compositor — Phase 1c ``static_fallback`` capability.
 
-Renders title / stat / chart(bar,line) / dynamic_list layers into tight RGBA
+Renders title / stat / chart(bar,line) / dynamic_list / mosaic layers into tight RGBA
 PNGs with CoreText + CoreGraphics, driven by the style-pack tokens. Every
 render lands in the external receipt index ``structured_layer_artifacts.json``
 (Phase 0 contract) keyed by layer/pack/mode/canvas identities, so a change to
@@ -28,7 +28,7 @@ ARTIFACTS_REL = Path("working/structured_layer_artifacts.json")
 # captions beside it reads as fine print (nat, watching a delivery).
 # v3: the title refuses to shrink below its floor; a fallback title
 # holding a whole transcript sentence is trimmed instead.
-COMPILER_VERSION = "static-card-compositor-v6"
+COMPILER_VERSION = "static-card-compositor-v7"
 MIN_LABEL_PT = 11.0
 # Cards are watched at phone size beside 52--68px captions.  The old list
 # ramp started at 32 design pixels and could shrink to 11, which made a 540p
@@ -60,6 +60,7 @@ PRIMARY_FONT_FLOORS_PT = {
     "note": 32.0,
     "chip": 32.0,
     "statement": 32.0,
+    "mosaic": 32.0,
 }
 
 
@@ -253,6 +254,7 @@ COMPONENTS_BY_TYPE = {
     "question": ("question_card",),
     "comparison": ("versus",),
     "term": ("definition",),
+    "mosaic": ("asset_mosaic",),
 }
 DEFAULT_COMPONENT = {
     "title": "prompt_card",
@@ -266,7 +268,47 @@ DEFAULT_COMPONENT = {
     "question": "question_card",
     "comparison": "versus",
     "term": "definition",
+    "mosaic": "asset_mosaic",
 }
+
+
+def _decode_snapshot_image(foundation, quartz, snapshot: dict[str, Any]):
+    payload = snapshot.get("bytes") if isinstance(snapshot, dict) else None
+    image_format = snapshot.get("format") if isinstance(snapshot, dict) else None
+    if not isinstance(payload, bytes) or not payload or image_format not in {"png", "jpeg"}:
+        raise ValueError("approved image resolver returned an invalid snapshot")
+    data = foundation.NSData.dataWithBytes_length_(payload, len(payload))
+    source = quartz.CGImageSourceCreateWithData(data, None)
+    if source is None or quartz.CGImageSourceGetCount(source) != 1:
+        raise ValueError("approved still image could not be decoded exactly once")
+    image = quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
+    if image is None:
+        raise ValueError("approved still image decode failed")
+    return image
+
+
+def _draw_aspect_fill_image(quartz, context, image, x, y, width, height, radius):
+    image_width = float(quartz.CGImageGetWidth(image))
+    image_height = float(quartz.CGImageGetHeight(image))
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("approved still image dimensions are invalid")
+    scale = max(width / image_width, height / image_height)
+    drawn_width = image_width * scale
+    drawn_height = image_height * scale
+    drawn_x = x + (width - drawn_width) / 2
+    drawn_y = y + (height - drawn_height) / 2
+    quartz.CGContextSaveGState(context)
+    clip = quartz.CGPathCreateWithRoundedRect(
+        quartz.CGRectMake(x, y, width, height), radius, radius, None
+    )
+    quartz.CGContextAddPath(context, clip)
+    quartz.CGContextClip(context)
+    quartz.CGContextDrawImage(
+        context,
+        quartz.CGRectMake(drawn_x, drawn_y, drawn_width, drawn_height),
+        image,
+    )
+    quartz.CGContextRestoreGState(context)
 
 
 def resolve_component(pack: dict[str, Any], layer_type: str, component_id: str | None) -> dict[str, Any]:
@@ -320,6 +362,7 @@ def render_card(
     layout = str(component.get("layout") or "left-stack")
     scale = render_scale
     canvas_width = int(canvas.get("width", 1080)) * scale
+    canvas_height = int(canvas.get("height", 1920)) * scale
     card_width = int(canvas_width * 0.84)
     pad = int(28 * scale)
     ink = _pack_token(pack, "palette", "ink", "#E6EDF3")
@@ -463,6 +506,63 @@ def render_card(
         if source is not None:
             cursor -= source_size * 1.35
             _draw_line(ct, quartz, context, source, pad, cursor)
+    elif layer_type == "mosaic":
+        import asset_registry
+
+        title_text = str(payload.get("title") or "").strip()
+        assets = payload.get("assets")
+        if not title_text or not isinstance(assets, list) or not 2 <= len(assets) <= 4:
+            raise ValueError("mosaic requires a title and two to four frozen assets")
+        title, title_size = _fit_text(
+            foundation,
+            ct,
+            quartz,
+            title_text,
+            36 * scale,
+            ink,
+            card_width - pad * 2,
+            scale,
+            primary_font_floor("mosaic"),
+        )
+        gap = 12 * scale
+        rows = math.ceil(len(assets) / 2)
+        cell_width = (card_width - pad * 2 - gap) / 2
+        # Split-stage scenes declare the upper 10%--40% as their graphic ROI.
+        # Keep the complete card inside that same 30% band at every supported
+        # canvas size instead of letting fixed-height cells escape above it.
+        fixed_height = (
+            pad * 2 + title_size * 1.35 + 14 * scale + (rows - 1) * gap
+        )
+        available_cell_height = (canvas_height * 0.30 - fixed_height) / rows
+        cell_height = min(220 * scale, available_cell_height)
+        if cell_height < 48 * scale:
+            raise ValueError("mosaic cells cannot fit the declared graphic stage")
+        grid_height = rows * cell_height + (rows - 1) * gap
+        height = int(pad * 2 + title_size * 1.35 + 14 * scale + grid_height)
+        context = begin_card(card_width, height, panel)
+        title_y = height - pad - title_size
+        _draw_line(ct, quartz, context, title, pad, title_y)
+        grid_top = title_y - 14 * scale
+        for index, descriptor in enumerate(assets):
+            if not isinstance(descriptor, dict):
+                raise ValueError("mosaic asset descriptor must be an object")
+            snapshot = asset_registry.resolve_approved_image_snapshot(
+                project_dir, descriptor
+            )
+            image = _decode_snapshot_image(foundation, quartz, snapshot)
+            row, column = divmod(index, 2)
+            x = pad + column * (cell_width + gap)
+            y = grid_top - (row + 1) * cell_height - row * gap
+            _draw_aspect_fill_image(
+                quartz,
+                context,
+                image,
+                x,
+                y,
+                cell_width,
+                cell_height,
+                10 * scale,
+            )
     elif layer_type == "quote":
         # A pulled quote is the line, set large, with the marks that say it is
         # somebody's words. Sized to the text so a short line does not sit in

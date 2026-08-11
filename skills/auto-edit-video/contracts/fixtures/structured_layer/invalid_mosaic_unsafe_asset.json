@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "id": "structured-layer-a5a5a5a5",
+      "visual_plan_item_id": "visual-beat-b6b6b6b6",
+      "type": "mosaic",
+      "component_id": "asset-mosaic",
+      "revision": 1,
+      "evidence_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payload": {
+        "title": "接下來看看這兩張範例圖片",
+        "evidence_id": "evidence-c7c7c7c7",
+        "source_literal": "接下來看看這兩張範例圖片",
+        "assets": [
+          {
+            "asset_id": "asset-one",
+            "path": "../outside.png",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "evidence_id": "evidence-c7c7c7c7",
+            "source_literal": "接下來看看這兩張範例圖片"
+          },
+          {
+            "asset_id": "asset-two",
+            "path": "assets/two.jpg",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "evidence_id": "evidence-c7c7c7c7",
+            "source_literal": "接下來看看這兩張範例圖片"
+          }
+        ]
+      },
+      "review_status": "pending"
+    }
+  ]
+}

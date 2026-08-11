@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -19,6 +20,27 @@ sys.path.insert(0, str(SKILL_DIR / "scripts"))
 import card_animator  # noqa: E402
 import render_editor_timeline as renderer  # noqa: E402
 import structured_card_compositor as compositor  # noqa: E402
+
+
+class _TitleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_title = False
+        self.text: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag == "div" and ("class", "title") in attrs:
+            self.in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "div" and self.in_title:
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.text.append(data)
 
 
 class WhatAnimatesTests(unittest.TestCase):
@@ -36,6 +58,15 @@ class WhatAnimatesTests(unittest.TestCase):
         self.assertEqual(
             card_animator._chunks("賺更多 money"), ["賺", "更", "多", "money"]
         )
+
+    def test_word_cascade_preserves_spaces_in_the_rendered_title(self) -> None:
+        page = card_animator.build_card_html(
+            {"type": "title", "payload": {"title": "npm run build"}}, {},
+            "word-cascade", 907, 200, 5.5, 30,
+        )
+        parser = _TitleTextParser()
+        parser.feed(page)
+        self.assertEqual("".join(parser.text), "npm run build")
 
     def test_every_content_preset_builds_a_page(self) -> None:
         layers = {
@@ -210,7 +241,6 @@ class TitleFloorTests(unittest.TestCase):
     """
 
     def render(self, title: str):
-        import os
         import tempfile
 
         tmp = tempfile.TemporaryDirectory(prefix="auto-edit-title-floor-")

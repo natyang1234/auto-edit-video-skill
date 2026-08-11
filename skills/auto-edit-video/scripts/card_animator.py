@@ -31,7 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-ANIMATOR_VERSION = "hyperframes-card-animator-v3"
+ANIMATOR_VERSION = "hyperframes-card-animator-v4"
 ANIMATIONS_REL = Path("working/structured_cards")
 # The presets whose motion lives inside the card. `flip` stays approximated:
 # a page turn needs a second page to turn to, which these payloads carry no
@@ -74,9 +74,15 @@ def _chunks(text: str) -> list[str]:
 
 
 def _spans(text: str) -> str:
-    return "".join(
-        f'<span class="u">{html.escape(chunk)}</span>' for chunk in _chunks(text)
-    )
+    source = str(text)
+    pieces: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"[㐀-鿿]|[^㐀-鿿\s]+", source):
+        pieces.append(html.escape(source[cursor:match.start()]))
+        pieces.append(f'<span class="u">{html.escape(match.group(0))}</span>')
+        cursor = match.end()
+    pieces.append(html.escape(source[cursor:]))
+    return "".join(pieces)
 
 
 def _body_html(layer: dict[str, Any], preset: str) -> str:
@@ -173,7 +179,7 @@ html,body{{margin:0;background:transparent}}
 .card{{position:absolute;inset:0;background:{panel}{panel_alpha};border-radius:{surface['radius']:g}px;
   border:{surface['border_width']:g}px solid {surface['border']};
   padding:{px(28)};box-sizing:border-box;color:{ink};overflow:hidden}}
-.title{{font-size:{px(compositor.TITLE_PT)};font-weight:700;text-align:center}}
+.title{{font-size:{px(compositor.TITLE_PT)};font-weight:700;text-align:center;white-space:pre-wrap}}
 .u{{display:inline-block;white-space:pre}}
 .list{{font-size:{px(compositor.LIST_BODY_PT)};line-height:{px(compositor.LIST_ROW_PT)}}}
 .index{{color:{accent}}}

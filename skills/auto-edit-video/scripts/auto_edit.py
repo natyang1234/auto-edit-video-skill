@@ -4153,6 +4153,7 @@ def materialise_clip(
     twice.
     """
     import visual_director
+    import asset_registry
     from editor_server import (
         DIRECTOR_PRESETS,
         active_editorial_title,
@@ -4233,6 +4234,12 @@ def materialise_clip(
                 evidence["items"],
                 editorial_title=active_editorial_title(state),
                 visual_density=director["visual_density"],
+                kinetic_scene_vocabulary=director_id == "kinetic-explainer",
+                project_assets=(
+                    asset_registry.load_registry(project_dir)["items"]
+                    if director_id == "kinetic-explainer"
+                    else None
+                ),
             )
             errors = visual_director.validate(planned)
             if errors:

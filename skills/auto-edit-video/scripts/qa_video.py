@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -1026,7 +1027,37 @@ def inspect(
             "failures": [],
             "warnings": ["renderer visual evidence was not provided"],
         }
-    elif (
+    elif "authority" in visual_report or "raw_evidence" in visual_report:
+        authority = visual_report.get("authority")
+        raw_evidence = visual_report.get("raw_evidence")
+        if not isinstance(authority, dict) or not isinstance(raw_evidence, dict):
+            raise ValueError("authority-bound visual report needs raw evidence and authority")
+        from visual_motion_probe import measure_declared_motion
+        from visual_quality import rendered_visual_quality_report
+
+        fresh_raw_evidence = copy.deepcopy(raw_evidence)
+        fresh_motion_probes = measure_declared_motion(video, fresh_raw_evidence)
+        fresh_raw_evidence["motion_probes"] = fresh_motion_probes
+        fresh_visual_report = rendered_visual_quality_report(
+            fresh_raw_evidence, authority
+        )
+        supplied_stable = copy.deepcopy(visual_report)
+        fresh_stable = copy.deepcopy(fresh_visual_report)
+        for stable_report in (supplied_stable, fresh_stable):
+            stable_report.pop("motion_probes", None)
+            stable_raw = stable_report.get("raw_evidence")
+            if isinstance(stable_raw, dict):
+                stable_raw.pop("motion_probes", None)
+        import contract_registry
+
+        if contract_registry.canonical_hash(
+            supplied_stable
+        ) != contract_registry.canonical_hash(fresh_stable):
+            raise ValueError(
+                "fresh visual authority recomputation does not match the supplied report"
+            )
+        visual_report = fresh_visual_report
+    if visual_report.get("source") != "not_provided" and (
         visual_report.get("schema_version") != 1
         or visual_report.get("source") != "renderer_evidence"
         or visual_report.get("status") not in {"pass", "fail"}

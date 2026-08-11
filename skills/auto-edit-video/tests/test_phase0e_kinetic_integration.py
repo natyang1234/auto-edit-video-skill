@@ -29,6 +29,7 @@ import caption_delivery  # noqa: E402
 import contract_registry  # noqa: E402
 import delivery_envelope  # noqa: E402
 import render_editor_timeline as renderer  # noqa: E402
+import sfx_delivery  # noqa: E402
 
 
 class _OllamaHandler(http.server.BaseHTTPRequestHandler):
@@ -43,7 +44,7 @@ class _OllamaHandler(http.server.BaseHTTPRequestHandler):
             "First, organize the materials into a complete method.",
             "Second pass: organize the same materials into a repeatable method.",
             "The key is reaching an 87% completion rate for a steadier result.",
-            "Finally, remember the full process so you can repeat it every time.",
+            "Next, cover the complete process so you can repeat it every time.",
         ]
         content = {
             "items": [
@@ -127,6 +128,15 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
                         "confidence": 0.99,
                         "review_status": "approved",
                     },
+                    {
+                        "id": "evidence-5ec75ec7",
+                        "kind": "quote",
+                        "literal": "接下來談完整流程，因此每次都能重複成功。",
+                        "start": 11.6,
+                        "end": 15.0,
+                        "confidence": 0.99,
+                        "review_status": "approved",
+                    },
                 ],
         }
         evidence_map["revision"] = contract_registry.canonical_hash(evidence_map)
@@ -202,7 +212,7 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
             (0.5, 4.0, "第一步先整理資料，這是完整方法。"),
             (4.3, 7.5, "第一步先整理資料，這是完整方法。"),
             (7.8, 11.3, "關鍵是完成率達到 87%，所以結果更穩定。"),
-            (11.6, 15.0, "最後記住完整流程，因此每次都能重複成功。"),
+            (11.6, 15.0, "接下來談完整流程，因此每次都能重複成功。"),
         ]
         payload = {
             "text": "".join(text for _start, _end, text in segments),
@@ -404,8 +414,87 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         visual = json.loads(
             (self.project / artifacts["visual_evidence"]["path"]).read_text("utf-8")
         )
+        self.assertNotIn("raw_evidence", visual)
+        self.assertEqual(report["visual_delivery"], visual)
+        published_visual_text = json.dumps(
+            {"visual": visual, "qa_visual": report["visual_delivery"]},
+            ensure_ascii=False,
+        )
+        self.assertNotIn("base_path", published_visual_text)
+        self.assertNotIn("source_path", published_visual_text)
+        self.assertNotIn("motion_base_visual", published_visual_text)
+        self.assertNotIn("frozen_graphics", published_visual_text)
+        self.assertNotIn("motion_base_visual", artifacts)
+        self.assertNotIn("frozen_graphics", artifacts)
+        authority = visual["authority"]
+        self.assertEqual(authority["source"], "frozen_visual_authority")
+        self.assertEqual(
+            envelope["visual_authority"],
+            {
+                key: authority[key]
+                for key in (
+                    "schema_version",
+                    "source",
+                    "visual_plan_revision",
+                    "visual_plan_sha256",
+                    "structured_layers_sha256",
+                    "artifact_index_sha256",
+                    "authority_hash",
+                )
+            },
+        )
         items = visual.get("items", [])
+        self.assertFalse(
+            any(
+                item.get("source") == "graphic_package"
+                or str(item.get("id") or "").startswith("design-")
+                for item in items
+            ),
+            "Kinetic final must not route scene cards through graphic_package",
+        )
         self.assertTrue(any(item.get("kind") == "title" for item in items))
+        opening_items = [
+            item
+            for item in items
+            if item.get("title_kind") == "full-screen-hook"
+        ]
+        self.assertEqual(len(opening_items), 1)
+        opening = opening_items[0]
+        self.assertEqual(opening["role"], "opening_title")
+        self.assertEqual(opening["family"], "title_reveal")
+        self.assertEqual(opening["evidence_id"], "evidence-a1b2c3d4")
+        self.assertEqual(
+            opening["source_literal"], "第一步先整理資料，這是完整方法。"
+        )
+        stat_items = [item for item in items if item.get("kind") == "stat"]
+        self.assertEqual(len(stat_items), 1)
+        self.assertEqual(stat_items[0]["family"], "count_stat")
+        self.assertEqual(stat_items[0]["role"], "metric_emphasis")
+        self.assertEqual(stat_items[0]["trigger_role"], "count_complete")
+        self.assertTrue(
+            all(
+                all(
+                    field in item
+                    for field in (
+                        "eligibility",
+                        "eligibility_reason",
+                        "family",
+                        "role",
+                        "importance",
+                        "major_graphic",
+                        "micro_silent",
+                        "stage",
+                        "trigger_role",
+                        "motion_window_start_sample",
+                        "motion_window_end_sample",
+                        "graphic_roi",
+                        "presenter_roi",
+                        "static_fallback",
+                    )
+                )
+                for item in items
+            )
+        )
         self.assertTrue(
             any(item.get("kind") not in {"title", "caption"} for item in items)
         )
@@ -415,6 +504,61 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
                 and item["motion"].get("faithful") is True
                 for item in items
             )
+        )
+        section_items = [
+            item for item in items if item.get("title_kind") == "section"
+        ]
+        self.assertEqual(len(section_items), 1)
+        section = section_items[0]
+        self.assertEqual(section["evidence_id"], "evidence-5ec75ec7")
+        self.assertEqual(
+            section["source_literal"],
+            "接下來談完整流程，因此每次都能重複成功。",
+        )
+        self.assertTrue(section["motion"]["faithful"])
+        self.assertEqual(
+            {
+                field: section[field]
+                for field in (
+                    "eligibility",
+                    "eligibility_reason",
+                    "family",
+                    "role",
+                    "importance",
+                    "major_graphic",
+                    "micro_silent",
+                    "stage",
+                    "trigger_role",
+                )
+            },
+            {
+                "eligibility": "eligible",
+                "eligibility_reason": None,
+                "family": "title_reveal",
+                "role": "section_title",
+                "importance": "high",
+                "major_graphic": True,
+                "micro_silent": False,
+                "stage": "split_graphic_presenter",
+                "trigger_role": "scene_transition",
+            },
+        )
+        self.assertEqual(
+            section["graphic_roi"],
+            {"x": 0.08, "y": 0.1, "width": 0.84, "height": 0.3},
+        )
+        self.assertEqual(
+            section["presenter_roi"],
+            {"x": 0.0, "y": 0.42, "width": 1.0, "height": 0.58},
+        )
+        self.assertFalse(section["static_fallback"])
+        self.assertLess(
+            section["motion_window_start_sample"],
+            section["motion_window_end_sample"],
+        )
+        self.assertEqual(
+            section["motion_window_start_sample"],
+            sfx_delivery.seconds_to_samples(section["start"]),
         )
         plan = json.loads(
             (self.project / artifacts["audio_event_plan"]["path"]).read_text("utf-8")
@@ -426,6 +570,7 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         self.assertEqual(len(trigger_ids), len(set(trigger_ids)))
         roles = [event["role"] for event in events]
         self.assertEqual(len(roles), len(set(roles)))
+        self.assertIn("transition", roles)
         visual_ids = {item["id"] for item in items if isinstance(item.get("id"), str)}
         self.assertTrue(set(trigger_ids).issubset(visual_ids))
         self.assertEqual(
@@ -478,6 +623,120 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         if envelopes.exists():
             self.assertEqual(
                 [item for item in envelopes.glob("*.json") if item.is_file()], []
+            )
+        self._assert_no_staging_residue()
+
+    def test_live_visual_plan_mutation_fails_closed_before_public_handoff(self) -> None:
+        real_revalidate = renderer.FrozenVisualAuthority.revalidate
+        changed = False
+
+        def mutate_plan_then_revalidate(authority) -> None:
+            nonlocal changed
+            if not changed:
+                changed = True
+                path = self.project / "working/visual_plan_v2.json"
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["items"][0]["source_literal"] = "mutated after render start"
+                replacement = path.with_name(".visual_plan_v2.public-race.json")
+                replacement.write_text(
+                    json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+                )
+                os.replace(replacement, path)
+            real_revalidate(authority)
+
+        with patch.object(
+            renderer.FrozenVisualAuthority,
+            "revalidate",
+            autospec=True,
+            side_effect=mutate_plan_then_revalidate,
+        ):
+            code, payload, stderr = self._run_cut()
+
+        self.assertTrue(changed, stderr)
+        self.assertEqual(code, 2, stderr + json.dumps(payload, ensure_ascii=False))
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["clips"], [])
+        self.assertEqual(list(self.out.glob("*.mp4")) if self.out.exists() else [], [])
+        envelope_root = self.project / delivery_envelope.DELIVERY_REL
+        if envelope_root.exists():
+            self.assertEqual(
+                [item for item in envelope_root.glob("*.json") if item.is_file()], []
+            )
+        self._assert_no_staging_residue()
+
+    def test_post_publication_plan_mutation_rolls_back_direct_cut(self) -> None:
+        real_render = renderer.render_project
+        changed = False
+
+        def render_then_mutate(project_dir, output, quality, *args, **kwargs):
+            nonlocal changed
+            authority = real_render(project_dir, output, quality, *args, **kwargs)
+            path = self.project / "working/visual_plan_v2.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["items"][0]["source_literal"] = "mutated before handoff"
+            replacement = path.with_name(".visual_plan_v2.handoff-race.json")
+            replacement.write_text(
+                json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            os.replace(replacement, path)
+            changed = True
+            return authority
+
+        code, payload, stderr = self._run_cut(render_side_effect=render_then_mutate)
+        self.assertTrue(changed, stderr)
+        self.assertEqual(code, 2, stderr + json.dumps(payload, ensure_ascii=False))
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["clips"], [])
+        self.assertEqual(list(self.out.glob("*.mp4")) if self.out.exists() else [], [])
+        envelope_root = self.project / delivery_envelope.DELIVERY_REL
+        if envelope_root.exists():
+            self.assertEqual(
+                [item for item in envelope_root.glob("*.json") if item.is_file()], []
+            )
+        self._assert_no_staging_residue()
+
+    def test_staged_visual_authority_mismatch_never_publishes(self) -> None:
+        real_build = delivery_envelope.build_prepared_envelope
+        changed = False
+
+        def mutate_evidence_then_build(*args, **kwargs):
+            nonlocal changed
+            staged_sources = args[4]
+            evidence_path = Path(staged_sources["visual_evidence"])
+            report = json.loads(evidence_path.read_text(encoding="utf-8"))
+            authority = report["authority"]
+            authority["items"][0]["role"] = "mutated-staged-role"
+            authority["authority_hash"] = contract_registry.canonical_hash(
+                {
+                    key: value
+                    for key, value in authority.items()
+                    if key != "authority_hash"
+                }
+            )
+            replacement = evidence_path.with_name(".visual-evidence-authority-race.json")
+            replacement.write_text(
+                json.dumps(report, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            os.replace(replacement, evidence_path)
+            changed = True
+            return real_build(*args, **kwargs)
+
+        with patch.object(
+            delivery_envelope,
+            "build_prepared_envelope",
+            side_effect=mutate_evidence_then_build,
+        ):
+            code, payload, stderr = self._run_cut()
+
+        self.assertTrue(changed, stderr)
+        self.assertEqual(code, 2, stderr + json.dumps(payload, ensure_ascii=False))
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["clips"], [])
+        self.assertEqual(list(self.out.glob("*.mp4")) if self.out.exists() else [], [])
+        envelope_root = self.project / delivery_envelope.DELIVERY_REL
+        if envelope_root.exists():
+            self.assertEqual(
+                [item for item in envelope_root.glob("*.json") if item.is_file()], []
             )
         self._assert_no_staging_residue()
 

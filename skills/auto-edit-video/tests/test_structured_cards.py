@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 import contract_registry  # noqa: E402
+import asset_registry  # noqa: E402
 import structured_card_compositor as scc  # noqa: E402
 
 H = "a" * 64
@@ -67,6 +71,7 @@ class TypographyContractTests(unittest.TestCase):
         for layer_type in (
             "title", "stat", "chart", "dynamic_list", "quote", "question",
             "comparison", "term", "note", "chip", "statement",
+            "mosaic",
         ):
             with self.subTest(layer_type=layer_type):
                 self.assertGreaterEqual(scc.primary_font_floor(layer_type), 32.0)
@@ -143,6 +148,145 @@ class StructuredCardTests(unittest.TestCase):
             self.assertEqual(
                 len(rendered), len(group), f"{group} must not render identically"
             )
+
+    def test_asset_mosaic_draws_only_resolved_approved_image_snapshots(self) -> None:
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        descriptors = [
+            {
+                "asset_id": f"asset-{index}",
+                "path": f"assets/example-{index}.png",
+                "sha256": str(index) * 64,
+                "evidence_id": "evidence-b711b711b711b711",
+                "source_literal": "接下來看看這三張範例圖片",
+            }
+            for index in (1, 2, 3)
+        ]
+        layer = {
+            "id": "structured-layer-mosaic",
+            "type": "mosaic",
+            "component_id": "asset-mosaic",
+            "payload": {
+                "title": "接下來看看這三張範例圖片",
+                "assets": descriptors,
+            },
+        }
+
+        with patch(
+            "asset_registry.resolve_approved_image_snapshot",
+            side_effect=[
+                {"item": {"asset_id": item["asset_id"]}, "bytes": png, "format": "png"}
+                for item in descriptors
+            ],
+        ) as resolver:
+            rel_path, digest, width, height = scc.render_card(
+                self.project, layer, self.pack, self.state["canvas"], 1.0
+            )
+
+        self.assertEqual(resolver.call_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in resolver.call_args_list], descriptors
+        )
+        self.assertGreaterEqual(width, 800)
+        self.assertGreaterEqual(height, 500)
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual((self.project / rel_path).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_asset_mosaic_real_registry_snapshot_reaches_primary_card_artifact(self) -> None:
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        digest = hashlib.sha256(png).hexdigest()
+        assets_dir = self.project / "assets"
+        assets_dir.mkdir()
+        descriptors = []
+        registry_items = []
+        for index in (1, 2):
+            relative = f"assets/owned-{index}.png"
+            (self.project / relative).write_bytes(png)
+            descriptors.append(
+                {
+                    "asset_id": f"owned-{index}",
+                    "path": relative,
+                    "sha256": digest,
+                    "evidence_id": "evidence-c8c8c8c8",
+                    "source_literal": "接下來看看這兩張範例圖片",
+                }
+            )
+            registry_items.append(
+                {
+                    "asset_id": f"owned-{index}",
+                    "path": relative,
+                    "sha256": digest,
+                    "origin": "user-upload",
+                    "provider_id": None,
+                    "source_url": None,
+                    "license": {
+                        "spdx": "CC0-1.0",
+                        "attribution_required": False,
+                        "attribution_text": "",
+                        "verified_at": "2026-08-12T03:00:00+08:00",
+                    },
+                    "review_status": "approved",
+                }
+            )
+        asset_registry.save_registry(
+            self.project, {"schema_version": 1, "items": registry_items}
+        )
+        layer = {
+            "id": "structured-layer-real-mosaic",
+            "type": "mosaic",
+            "component_id": "asset-mosaic",
+            "payload": {
+                "title": "接下來看看這兩張範例圖片",
+                "assets": descriptors,
+            },
+        }
+
+        rel_path, _artifact_hash, _width, _height = scc.render_card(
+            self.project, layer, self.pack, self.state["canvas"], 1.0
+        )
+        self.assertEqual((self.project / rel_path).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_asset_mosaic_fits_the_declared_upper_thirty_percent_stage(self) -> None:
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        descriptors = [
+            {
+                "asset_id": f"asset-{index}",
+                "path": f"assets/example-{index}.png",
+                "sha256": str(index) * 64,
+                "evidence_id": "evidence-b711b711b711b711",
+                "source_literal": "接下來看看這三張範例圖片",
+            }
+            for index in (1, 2, 3)
+        ]
+        layer = {
+            "id": "structured-layer-responsive-mosaic",
+            "type": "mosaic",
+            "component_id": "asset-mosaic",
+            "payload": {
+                "title": "接下來看看這三張範例圖片",
+                "assets": descriptors,
+            },
+        }
+        with patch(
+            "asset_registry.resolve_approved_image_snapshot",
+            side_effect=[
+                {"item": {"asset_id": item["asset_id"]}, "bytes": png, "format": "png"}
+                for item in descriptors
+            ],
+        ):
+            _rel, _digest, _width, height = scc.render_card(
+                self.project,
+                layer,
+                self.pack,
+                {"width": 540, "height": 960},
+                1.0,
+            )
+        self.assertLessEqual(height, 288)
 
     def test_component_must_be_able_to_render_the_item(self) -> None:
         # The type says what the data is; a component that cannot draw that

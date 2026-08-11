@@ -70,15 +70,19 @@ STARTER_ASSET_ROLES = {
 }
 _DENSITY_ROLE_ASSETS = {
     "title_enter": "soft-ui-tick-v1",
+    "transition": "short-whoosh-v1",
     "row_reveal": "short-pop-v1",
     "count_tick": "short-riser-v1",
     "grid_fill": "soft-impact-v1",
     "typing": "typing-tick-v1",
+    "complete": "completion-chime-v1",
 }
 _DENSITY_PRIORITY = {
     "title_enter": 0,
+    "transition": 0,
     "grid_fill": 1,
     "count_tick": 1,
+    "complete": 1,
     "row_reveal": 2,
     "typing": 3,
 }
@@ -1072,7 +1076,14 @@ def plan_role_events(visual_evidence: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         role_asset: tuple[str, str] | None = None
         if kind == "title":
-            if component_id == "prompt-card" and requested == "word-cascade":
+            title_kind = item.get("title_kind")
+            if (
+                title_kind == "section"
+                and component_id in {None, "kinetic-title", "title-lockup"}
+                and requested in {"pop", "pop-in", "slide-up", "slide-in"}
+            ):
+                role_asset = ("transition", "short-whoosh-v1")
+            elif component_id == "prompt-card" and requested == "word-cascade":
                 role_asset = ("typing", "typing-tick-v1")
             elif (
                 component_id in {None, "kinetic-title", "title-lockup"}
@@ -1082,12 +1093,29 @@ def plan_role_events(visual_evidence: dict[str, Any]) -> list[dict[str, Any]]:
         elif kind == "dynamic_list" and component_id in {"dynamic-list", "warning-checklist"}:
             if requested in {"staggered-reveal", "check-pop"}:
                 role_asset = ("row_reveal", "short-pop-v1")
-        elif kind == "stat" and component_id in {"hero-stat", "progress"}:
-            if requested in {"count-up", "fill"}:
+        elif kind == "stat" and component_id == "progress":
+            if (
+                item.get("family") == "grid_progress"
+                and item.get("trigger_role") == "grid_complete"
+                and requested == "fill"
+            ):
+                role_asset = ("complete", "completion-chime-v1")
+            elif requested in {"count-up", "fill"}:
+                role_asset = ("count_tick", "short-riser-v1")
+        elif kind == "stat" and component_id == "hero-stat":
+            if requested == "count-up":
                 role_asset = ("count_tick", "short-riser-v1")
         elif kind == "chart" and component_id == "dashboard":
             if requested in {"pan", "fill"}:
                 role_asset = ("grid_fill", "soft-impact-v1")
+        elif (
+            kind == "mosaic"
+            and component_id == "asset-mosaic"
+            and item.get("family") == "asset_mosaic"
+            and item.get("trigger_role") == "scene_transition"
+            and requested == "pan"
+        ):
+            role_asset = ("transition", "short-whoosh-v1")
         if role_asset is None:
             continue
         trigger_id = item.get("id")
@@ -1373,7 +1401,9 @@ def apply_density_policy(
         "density_cap": density_cap,
         "priority_order": [
             "title_enter",
+            "transition",
             "grid_fill",
+            "complete",
             "count_tick",
             "row_reveal",
             "typing",
@@ -1472,6 +1502,15 @@ def _normalized_renderer_event_evidence(resolved_event: dict[str, Any]) -> dict[
             "status": motion.get("status"),
         },
     }
+    if raw_trigger.get("title_kind") == "section":
+        normalized_trigger["title_kind"] = "section"
+    scene_pair = (raw_trigger.get("family"), raw_trigger.get("trigger_role"))
+    if scene_pair in {
+        ("grid_progress", "grid_complete"),
+        ("asset_mosaic", "scene_transition"),
+    }:
+        normalized_trigger["family"] = scene_pair[0]
+        normalized_trigger["trigger_role"] = scene_pair[1]
     if not isinstance(normalized_trigger["id"], str) or not normalized_trigger["id"].strip():
         raise SfxDeliveryError("multi-event renderer evidence trigger id is required")
     if type(normalized_trigger["onset_sample"]) is not int or normalized_trigger["onset_sample"] < 0:

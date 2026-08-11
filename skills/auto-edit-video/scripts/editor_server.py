@@ -1115,10 +1115,20 @@ def referenced_render_inputs(
     background = template.get("background") or {}
     if isinstance(background, dict) and background.get("asset"):
         add(str(background["asset"]), "template-background")
-    _layers, visual_plan = load_layer_bundle(project_dir)
+    layers, visual_plan = load_layer_bundle(project_dir)
     for item in visual_plan.get("items", []):
         if item.get("selected_asset"):
             add(str(item["selected_asset"]), "visual-plan-asset")
+    for layer in layers.get("items", []):
+        if not isinstance(layer, dict) or layer.get("type") != "mosaic":
+            continue
+        payload = layer.get("payload")
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            if isinstance(asset, dict):
+                add(str(asset.get("path") or ""), "structured-mosaic-asset")
     # Project fonts are receipt-bound render inputs, never manual-assertion
     # assets. Resolve each selected id strictly so stale/tampered receipts
     # cannot be smuggled through the rights gate by a matching family name.
@@ -5265,6 +5275,14 @@ class EditorHandler(BaseHTTPRequestHandler):
             evidence["items"],
             editorial_title=active_editorial_title(state),
             visual_density=str(director.get("visual_density") or "balanced"),
+            kinetic_scene_vocabulary=(
+                str(state.get("director_style") or "") == "kinetic-explainer"
+            ),
+            project_assets=(
+                asset_registry.load_registry(project_dir)["items"]
+                if str(state.get("director_style") or "") == "kinetic-explainer"
+                else None
+            ),
         )
         errors = visual_director.validate(planned)
         if errors:

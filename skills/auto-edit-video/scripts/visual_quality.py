@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import math
 import re
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
+
+import contract_registry
 
 
 DESIGN_ROLES = ("hook", "concept", "rule", "memory", "recap")
@@ -413,7 +416,491 @@ def _renderer_longest_no_change_gap(
     return round(longest, 6)
 
 
-def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
+_SCENE_SEMANTIC_FIELDS = {
+    "eligibility",
+    "eligibility_reason",
+    "family",
+    "role",
+    "importance",
+    "major_graphic",
+    "micro_silent",
+    "stage",
+    "trigger_role",
+}
+_SCENE_RESOLVED_FIELDS = _SCENE_SEMANTIC_FIELDS | {
+    "motion_window_start_sample",
+    "motion_window_end_sample",
+    "graphic_roi",
+    "presenter_roi",
+    "static_fallback",
+}
+_SCENE_FAMILIES = {
+    "title_reveal",
+    "staggered_list",
+    "analytics_dashboard",
+    "count_stat",
+    "asset_mosaic",
+    "grid_progress",
+    "typed_prompt",
+}
+_INELIGIBLE_REASONS = {
+    "missing_transcript_evidence",
+    "unsupported_payload",
+    "missing_licensed_asset",
+    "density_budget",
+    "layout_collision",
+}
+_AUTHORITY_HASH_FIELDS = (
+    "visual_plan_revision",
+    "visual_plan_sha256",
+    "structured_layers_sha256",
+    "artifact_index_sha256",
+)
+_AUTHORITY_SCENE_FIELDS = (
+    "id",
+    "start",
+    "end",
+    "kind",
+    "family",
+    "role",
+    "structured_layer_id",
+    "structured_layer_hash",
+    "artifact_hash",
+    "evidence_id",
+    "source_literal",
+    "assets",
+    "graphic_roi",
+    "presenter_roi",
+    "motion_window_start_sample",
+    "motion_window_end_sample",
+)
+
+
+def _renderer_roi(value: Any, field: str) -> dict[str, float]:
+    if not isinstance(value, dict) or set(value) != {"x", "y", "width", "height"}:
+        raise ValueError(f"{field} must be an exact normalized ROI")
+    roi = {
+        key: _renderer_finite_number(value.get(key), f"{field}.{key}", minimum=0.0)
+        for key in ("x", "y", "width", "height")
+    }
+    if roi["width"] <= 0 or roi["height"] <= 0:
+        raise ValueError(f"{field} width and height must be positive")
+    if roi["x"] + roi["width"] > 1.0 or roi["y"] + roi["height"] > 1.0:
+        raise ValueError(f"{field} must remain inside the normalized frame")
+    return roi
+
+
+def _final_sample(value: float) -> int:
+    return int(
+        (Decimal(str(value)) * Decimal(48000)).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+
+
+def _renderer_scene_failures(
+    item: dict[str, Any], item_index: int, start: float, end: float
+) -> list[str]:
+    if not _SCENE_RESOLVED_FIELDS.intersection(item):
+        return []
+    path = f"items[{item_index}]"
+    missing = sorted(_SCENE_RESOLVED_FIELDS.difference(item))
+    if missing:
+        raise ValueError(f"{path} scene receipt is missing fields: {missing}")
+    if item.get("eligibility") not in {"eligible", "ineligible"}:
+        raise ValueError(f"{path}.eligibility is invalid")
+    reason = item.get("eligibility_reason")
+    if item.get("eligibility") == "eligible" and reason is not None:
+        raise ValueError(f"{path}.eligibility_reason must be null when eligible")
+    if item.get("eligibility") == "ineligible" and reason not in _INELIGIBLE_REASONS:
+        raise ValueError(f"{path}.eligibility_reason is invalid")
+    if item.get("family") not in _SCENE_FAMILIES:
+        raise ValueError(f"{path}.family is invalid")
+    if item.get("importance") not in {"low", "medium", "high"}:
+        raise ValueError(f"{path}.importance is invalid")
+    for field in ("major_graphic", "micro_silent", "static_fallback"):
+        if not isinstance(item.get(field), bool):
+            raise ValueError(f"{path}.{field} must be a boolean")
+    if item.get("stage") not in {"full_screen_graphic", "split_graphic_presenter"}:
+        raise ValueError(f"{path}.stage is invalid")
+    if item.get("trigger_role") not in {
+        None,
+        "title_enter",
+        "scene_transition",
+        "row_reveal",
+        "count_complete",
+        "chart_complete",
+        "grid_complete",
+        "typing",
+    }:
+        raise ValueError(f"{path}.trigger_role is invalid")
+
+    motion_start = item.get("motion_window_start_sample")
+    motion_end = item.get("motion_window_end_sample")
+    if (
+        type(motion_start) is not int
+        or type(motion_end) is not int
+        or motion_start < _final_sample(start)
+        or motion_end > _final_sample(end)
+        or motion_end <= motion_start
+    ):
+        raise ValueError(f"{path}.motion_window must be positive and inside the scene")
+    graphic = _renderer_roi(item.get("graphic_roi"), f"{path}.graphic_roi")
+    presenter = None
+    if item.get("presenter_roi") is not None:
+        presenter = _renderer_roi(item.get("presenter_roi"), f"{path}.presenter_roi")
+    if item.get("stage") == "split_graphic_presenter":
+        if presenter is None:
+            raise ValueError(f"{path}.presenter_roi is required for split stage")
+        overlap_width = max(
+            0.0,
+            min(graphic["x"] + graphic["width"], presenter["x"] + presenter["width"])
+            - max(graphic["x"], presenter["x"]),
+        )
+        overlap_height = max(
+            0.0,
+            min(graphic["y"] + graphic["height"], presenter["y"] + presenter["height"])
+            - max(graphic["y"], presenter["y"]),
+        )
+        if overlap_width * overlap_height > 1e-9:
+            raise ValueError(f"{path} split-stage ROIs overlap")
+
+    motion = item.get("motion")
+    if not isinstance(motion, dict):
+        raise ValueError(f"{path}.motion is required for a resolved scene")
+    observed_fallback = (
+        motion.get("status") == "fallback" or motion.get("faithful") is not True
+    )
+    if item.get("static_fallback") is not observed_fallback:
+        raise ValueError(f"{path}.static_fallback disagrees with renderer motion")
+
+    failures: list[str] = []
+    if item.get("role") == "section_title" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "title_reveal"
+        or item.get("importance") != "high"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "scene_transition"
+    ):
+        failures.append(f"{path} section-title scene contract is inconsistent")
+    if item.get("role") == "opening_title" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "title_reveal"
+        or item.get("importance") != "high"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "full_screen_graphic"
+        or item.get("trigger_role") != "title_enter"
+    ):
+        failures.append(f"{path} opening-title scene contract is inconsistent")
+    if item.get("role") == "metric_emphasis" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "count_stat"
+        or item.get("importance") != "high"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "count_complete"
+    ):
+        failures.append(f"{path} metric-emphasis scene contract is inconsistent")
+    if item.get("role") == "list_explanation" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "staggered_list"
+        or item.get("importance") != "medium"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "row_reveal"
+    ):
+        failures.append(f"{path} list-explanation scene contract is inconsistent")
+    if item.get("role") == "data_explanation" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "analytics_dashboard"
+        or item.get("importance") != "high"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "chart_complete"
+    ):
+        failures.append(f"{path} data-explanation scene contract is inconsistent")
+    if item.get("role") == "prompt_command" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "typed_prompt"
+        or item.get("importance") != "medium"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "typing"
+    ):
+        failures.append(f"{path} prompt-command scene contract is inconsistent")
+    if item.get("role") == "workflow_progress" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "grid_progress"
+        or item.get("importance") != "medium"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "grid_complete"
+    ):
+        failures.append(f"{path} workflow-progress scene contract is inconsistent")
+    if item.get("role") == "asset_showcase" and (
+        item.get("eligibility") != "eligible"
+        or item.get("family") != "asset_mosaic"
+        or item.get("importance") != "high"
+        or item.get("major_graphic") is not True
+        or item.get("micro_silent") is not False
+        or item.get("stage") != "split_graphic_presenter"
+        or item.get("trigger_role") != "scene_transition"
+    ):
+        failures.append(f"{path} asset-showcase scene contract is inconsistent")
+    if item.get("major_graphic") is True:
+        if graphic["width"] * graphic["height"] < 0.15:
+            failures.append(f"{path} major graphic ROI covers less than 15% of frame")
+        if end - start < 0.8:
+            failures.append(f"{path} major graphic lasts less than 0.8 seconds")
+    if item.get("eligibility") == "eligible" and item.get("static_fallback") is True:
+        failures.append(f"{path} eligible scene was delivered as a static fallback")
+    return failures
+
+
+def _visual_authority_failures(
+    evidence_items: list[dict[str, Any]],
+    breathing_intervals: Any,
+    motion_input: Any,
+    motion_attribution: Any,
+    authority: dict[str, Any],
+) -> list[str]:
+    if (
+        type(authority) is not dict
+        or type(authority.get("schema_version")) is not int
+        or authority.get("schema_version") != 1
+        or authority.get("source") != "frozen_visual_authority"
+    ):
+        raise ValueError("visual authority schema/source is invalid")
+    for field in _AUTHORITY_HASH_FIELDS:
+        value = authority.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"visual authority {field} must be lowercase SHA-256")
+    declared_hash = authority.get("authority_hash")
+    if not isinstance(declared_hash, str) or re.fullmatch(
+        r"[0-9a-f]{64}", declared_hash
+    ) is None:
+        raise ValueError("visual authority hash must be lowercase SHA-256")
+    hash_material = {key: value for key, value in authority.items() if key != "authority_hash"}
+    if contract_registry.canonical_hash(hash_material) != declared_hash:
+        raise ValueError("visual authority hash does not match its canonical payload")
+    expected_items = authority.get("items")
+    if not isinstance(expected_items, list):
+        raise ValueError("visual authority items must be a list")
+    expected_breathing = authority.get("a_roll_breathing_intervals")
+    if not isinstance(expected_breathing, list):
+        raise ValueError("visual authority A-roll breathing intervals must be a list")
+
+    def index(items: list[dict[str, Any]], label: str) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        by_id: dict[str, dict[str, Any]] = {}
+        duplicates: list[str] = []
+        for position, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValueError(f"{label}[{position}] must be an object")
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                raise ValueError(f"{label}[{position}].id is required")
+            if item_id in by_id:
+                duplicates.append(item_id)
+            else:
+                by_id[item_id] = item
+        return by_id, duplicates
+
+    expected_by_id, expected_duplicates = index(expected_items, "visual authority items")
+    observed_by_id, observed_duplicates = index(evidence_items, "renderer evidence items")
+    failures = [
+        f"visual authority has duplicate scene id {item_id}"
+        for item_id in expected_duplicates
+    ]
+    failures.extend(
+        f"renderer evidence has duplicate scene id {item_id}"
+        for item_id in observed_duplicates
+    )
+    if breathing_intervals != expected_breathing:
+        failures.append(
+            "renderer A-roll breathing intervals do not match frozen authority"
+        )
+    expected_motion_attribution = {
+        str(item["id"]): item["motion_attribution"]
+        for item in expected_items
+        if "motion_attribution" in item
+    }
+    if expected_motion_attribution:
+        expected_motion_input = authority.get("motion_input")
+        if not isinstance(expected_motion_input, dict):
+            raise ValueError("visual authority motion_input must be an object")
+        if not isinstance(motion_input, dict):
+            raise ValueError("renderer motion_input must be an object")
+        if (
+            {key: value for key, value in motion_input.items() if key != "base_path"}
+            != expected_motion_input
+        ):
+            failures.append("renderer motion input does not match frozen authority")
+        if not isinstance(motion_attribution, dict):
+            raise ValueError("renderer motion_attribution must be an object")
+        if motion_attribution != expected_motion_attribution:
+            failures.append("renderer motion attribution does not match frozen authority")
+    for item_id in sorted(expected_by_id.keys() - observed_by_id.keys()):
+        failures.append(f"renderer evidence is missing authority scene {item_id}")
+    for item_id in sorted(observed_by_id.keys() - expected_by_id.keys()):
+        failures.append(f"renderer evidence has extra scene {item_id}")
+    for item_id in sorted(expected_by_id.keys() & observed_by_id.keys()):
+        expected = expected_by_id[item_id]
+        observed = observed_by_id[item_id]
+        missing = [field for field in _AUTHORITY_SCENE_FIELDS if field not in expected]
+        if missing:
+            raise ValueError(
+                f"visual authority scene {item_id} is missing fields: {missing}"
+            )
+        for field in _AUTHORITY_SCENE_FIELDS:
+            if observed.get(field) != expected[field]:
+                failures.append(
+                    f"renderer scene {item_id} {field} does not match frozen authority"
+                )
+    return failures
+
+
+def _motion_probe_failures(
+    evidence_items: list[dict[str, Any]], motion_probes: Any, motion_input: Any
+) -> list[str]:
+    """Validate exact per-scene final-pixel motion observations."""
+    if not isinstance(motion_probes, dict):
+        raise ValueError("motion_probes must be an object")
+    major_items = {
+        str(item.get("id") or ""): item
+        for item in evidence_items
+        if item.get("major_graphic") is True
+    }
+    if set(motion_probes) != set(major_items):
+        raise ValueError("motion_probes must exactly cover every major graphic")
+    if not major_items:
+        return []
+    if not isinstance(motion_input, dict):
+        raise ValueError("motion_input must be an object")
+    fps = motion_input.get("fps")
+    if type(fps) is not int or fps <= 0 or 48_000 % fps:
+        raise ValueError("motion_input.fps must divide the evidence sample rate")
+    frame_samples = 48_000 // fps
+    failures: list[str] = []
+    for scene_id, item in major_items.items():
+        probe = motion_probes.get(scene_id)
+        if not isinstance(probe, dict) or set(probe) != {
+            "sample_positions",
+            "graphic_roi",
+            "candidate_matches",
+            "pairs",
+            "detected",
+        }:
+            raise ValueError(f"motion probe {scene_id} has an invalid shape")
+        start = item.get("motion_window_start_sample")
+        end = item.get("motion_window_end_sample")
+        if type(start) is not int or type(end) is not int or end <= start:
+            raise ValueError(f"motion probe {scene_id} has no valid scene window")
+        first_frame = (start + frame_samples - 1) // frame_samples
+        last_frame = end // frame_samples
+        if last_frame - first_frame + 1 < 3:
+            raise ValueError(
+                f"motion probe {scene_id} window contains fewer than three frames"
+            )
+        expected_positions = []
+        for fraction in (0.1, 0.5, 0.9):
+            target = start + int((end - start) * fraction)
+            frame_index = (target + frame_samples // 2) // frame_samples
+            frame_index = max(first_frame, min(last_frame, frame_index))
+            position = frame_index * frame_samples
+            if expected_positions and position <= expected_positions[-1]:
+                position = expected_positions[-1] + frame_samples
+            expected_positions.append(position)
+        if expected_positions[-1] > last_frame * frame_samples:
+            expected_positions = [
+                (last_frame - 2 + index) * frame_samples for index in range(3)
+            ]
+        if probe.get("sample_positions") != expected_positions:
+            raise ValueError(f"motion probe {scene_id} sampled the wrong positions")
+        if probe.get("graphic_roi") != item.get("graphic_roi"):
+            raise ValueError(f"motion probe {scene_id} sampled the wrong ROI")
+        candidate_matches = probe.get("candidate_matches")
+        if not isinstance(candidate_matches, list) or len(candidate_matches) != 3:
+            raise ValueError(
+                f"motion probe {scene_id} must contain three candidate matches"
+            )
+        for match_index, (match, expected_sample) in enumerate(
+            zip(candidate_matches, expected_positions, strict=True)
+        ):
+            if not isinstance(match, dict) or set(match) != {
+                "sample",
+                "ssim",
+                "matched",
+            }:
+                raise ValueError(
+                    f"motion probe {scene_id} candidate_matches[{match_index}] "
+                    "has an invalid shape"
+                )
+            if match.get("sample") != expected_sample:
+                raise ValueError(
+                    f"motion probe {scene_id} candidate_matches[{match_index}] "
+                    "sample is invalid"
+                )
+            _renderer_finite_number(
+                match.get("ssim"),
+                f"motion probe {scene_id} candidate_matches[{match_index}].ssim",
+            )
+            if not isinstance(match.get("matched"), bool):
+                raise ValueError(
+                    f"motion probe {scene_id} candidate_matches[{match_index}].matched "
+                    "is invalid"
+                )
+        pairs = probe.get("pairs")
+        if not isinstance(pairs, list) or len(pairs) != 3:
+            raise ValueError(f"motion probe {scene_id} must contain three pairs")
+        for pair_index, pair in enumerate(pairs):
+            if not isinstance(pair, dict) or set(pair) != {
+                "left_sample",
+                "right_sample",
+                "ssim",
+                "changed_pixel_fraction",
+                "detected",
+            }:
+                raise ValueError(
+                    f"motion probe {scene_id} pairs[{pair_index}] has an invalid shape"
+                )
+            for field in ("left_sample", "right_sample"):
+                if type(pair.get(field)) is not int or pair[field] < 0:
+                    raise ValueError(
+                        f"motion probe {scene_id} pairs[{pair_index}].{field} is invalid"
+                    )
+            for field in ("ssim", "changed_pixel_fraction"):
+                _renderer_finite_number(
+                    pair.get(field),
+                    f"motion probe {scene_id} pairs[{pair_index}].{field}",
+                )
+            if not isinstance(pair.get("detected"), bool):
+                raise ValueError(
+                    f"motion probe {scene_id} pairs[{pair_index}].detected is invalid"
+                )
+        if not isinstance(probe.get("detected"), bool):
+            raise ValueError(f"motion probe {scene_id}.detected must be a boolean")
+        if not all(match["matched"] for match in candidate_matches):
+            failures.append(
+                f"major graphic {scene_id} does not match frozen composite states"
+            )
+        if probe["detected"] is not True:
+            failures.append(
+                f"major graphic {scene_id} has no detected final-pixel motion"
+            )
+    return failures
+
+
+def rendered_visual_quality_report(
+    evidence: dict[str, Any], authority: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Aggregate deterministic visual-quality metrics from renderer evidence.
 
     This is intentionally separate from ``visual_quality_report``: the latter
@@ -452,17 +939,21 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
     faithful_motion_count = 0
     fallback_motion_count = 0
     unfaithful_motion: list[tuple[str, str]] = []
+    scene_failures: list[str] = []
 
     for item_index, item in enumerate(items):
         if not isinstance(item, dict):
             raise ValueError(f"items[{item_index}] must be an object")
         item_id = _renderer_identifier(item, "id", item_index, required=True)
-        _renderer_identifier(item, "kind", item_index, required=True)
+        kind = _renderer_identifier(item, "kind", item_index, required=True)
         start = _renderer_finite_number(item.get("start"), f"items[{item_index}].start")
         end = _renderer_finite_number(item.get("end"), f"items[{item_index}].end")
         if end < start:
             raise ValueError(f"items[{item_index}].end must be >= start")
         intervals.append((start, end))
+        scene_failures.extend(
+            _renderer_scene_failures(item, item_index, start, end)
+        )
 
         component_id = _renderer_identifier(item, "component_id", item_index)
         if component_id is not None:
@@ -490,6 +981,56 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"items[{item_index}].minimum_primary_font_px is required"
             )
+        if kind == "mosaic":
+            if component_id != "asset-mosaic":
+                raise ValueError(
+                    f"items[{item_index}].component_id must be asset-mosaic for mosaic"
+                )
+            for field in ("structured_layer_hash", "artifact_hash"):
+                value = item.get(field)
+                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                    raise ValueError(f"items[{item_index}].{field} must be lowercase SHA-256")
+            evidence_id = _renderer_identifier(
+                item, "evidence_id", item_index, required=True
+            )
+            source_literal = _renderer_identifier(
+                item, "source_literal", item_index, required=True
+            )
+            assets = item.get("assets")
+            if not isinstance(assets, list) or not 2 <= len(assets) <= 4:
+                raise ValueError(
+                    f"items[{item_index}].assets must contain two to four snapshots"
+                )
+            seen_assets: set[tuple[str, str]] = set()
+            for asset_index, asset in enumerate(assets):
+                asset_path = f"items[{item_index}].assets[{asset_index}]"
+                if not isinstance(asset, dict) or set(asset) != {
+                    "asset_id", "path", "sha256", "evidence_id", "source_literal"
+                }:
+                    raise ValueError(f"{asset_path} must be an exact frozen descriptor")
+                asset_id = asset.get("asset_id")
+                relative = asset.get("path")
+                digest = asset.get("sha256")
+                if not isinstance(asset_id, str) or not asset_id:
+                    raise ValueError(f"{asset_path}.asset_id is required")
+                if (
+                    not isinstance(relative, str)
+                    or not relative
+                    or relative.startswith("/")
+                    or "\\" in relative
+                    or any(part in {"", ".", ".."} for part in relative.split("/"))
+                ):
+                    raise ValueError(f"{asset_path}.path must be normalized project-relative")
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValueError(f"{asset_path}.sha256 must be lowercase SHA-256")
+                if asset.get("evidence_id") != evidence_id or asset.get(
+                    "source_literal"
+                ) != source_literal:
+                    raise ValueError(f"{asset_path} transcript binding is inconsistent")
+                identity = (asset_id, relative)
+                if identity in seen_assets:
+                    raise ValueError(f"{asset_path} duplicates an earlier snapshot")
+                seen_assets.add(identity)
 
         motion = item.get("motion")
         if motion is None:
@@ -542,7 +1083,33 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
             unfaithful_motion.append((str(item_id), str(reason)))
 
     minimum_font = min(font_sizes) if font_sizes else None
-    failures: list[str] = []
+    failures: list[str] = list(scene_failures)
+    if authority is not None:
+        breathing_intervals = evidence.get("a_roll_breathing_intervals")
+        failures.extend(
+            _visual_authority_failures(
+                items,
+                breathing_intervals,
+                evidence.get("motion_input"),
+                evidence.get("motion_attribution"),
+                authority,
+            )
+        )
+        failures.extend(
+            _motion_probe_failures(
+                items,
+                evidence.get("motion_probes"),
+                evidence.get("motion_input"),
+            )
+        )
+        import visual_scene_coverage
+
+        scene_coverage = visual_scene_coverage.evaluate_scene_coverage(
+            duration,
+            breathing_intervals,
+            [item for item in items if item.get("major_graphic") is True],
+        )
+        failures.extend(scene_coverage["failures"])
     warnings: list[str] = []
     visual_beat_count = len(items)
     if visual_beat_count != expected_visual_beat_count:
@@ -568,7 +1135,7 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
         if requested_motion_count
         else None
     )
-    return {
+    report = {
         "schema_version": 1,
         "source": "renderer_evidence",
         "status": "fail" if failures else "pass",
@@ -592,6 +1159,14 @@ def rendered_visual_quality_report(evidence: dict[str, Any]) -> dict[str, Any]:
         "failures": failures,
         "warnings": warnings,
     }
+    if authority is not None:
+        report["a_roll_breathing_intervals"] = breathing_intervals
+        report["scene_coverage"] = scene_coverage
+        report["motion_probes"] = evidence["motion_probes"]
+        report["authority"] = authority
+        report["authority_hash"] = authority["authority_hash"]
+        report["raw_evidence"] = evidence
+    return report
 
 
 def rendered_visual_evidence_path(project_dir: Path, render_id: str) -> Path:

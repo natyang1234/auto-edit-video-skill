@@ -743,6 +743,122 @@ class DeliveryEnvelopeTests(unittest.TestCase):
         )
         self.assertFalse(stage.exists())
 
+    def test_publication_revalidates_visual_authority_before_final_envelope(self) -> None:
+        stage, sources, _prepared = self._stage()
+        calls = 0
+
+        def revalidate() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise delivery_envelope.DeliveryEnvelopeError(
+                    "visual authority changed during publication"
+                )
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError,
+            "visual authority changed",
+        ):
+            delivery_envelope.publish_direct_delivery(
+                self.project,
+                stage,
+                staged_sources=sources,
+                expected_output=self.external_output,
+                revalidate_authority=revalidate,
+            )
+        self.assertEqual(calls, 2)
+        self.assertFalse(self.external_output.exists())
+        self.assertFalse(delivery_envelope.finalized_path(self.project, self.render_id).exists())
+
+    def test_prepared_envelope_rejects_staged_visual_authority_mismatch(self) -> None:
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+        }
+        authority = {
+            "schema_version": 1,
+            "source": "frozen_visual_authority",
+            "visual_plan_revision": "a" * 64,
+            "visual_plan_sha256": "b" * 64,
+            "structured_layers_sha256": "c" * 64,
+            "artifact_index_sha256": "d" * 64,
+            "a_roll_breathing_intervals": [],
+            "items": [],
+        }
+        authority["authority_hash"] = contract_registry.canonical_hash(authority)
+        mismatched = json.loads(json.dumps(authority))
+        mismatched["visual_plan_revision"] = "e" * 64
+        mismatched["authority_hash"] = contract_registry.canonical_hash(
+            {key: value for key, value in mismatched.items() if key != "authority_hash"}
+        )
+        sources["output"].write_bytes(b"candidate")
+        sources["qa_report"].write_text('{"status":"pass"}\n', encoding="utf-8")
+        sources["contact_sheet"].write_bytes(b"contact")
+        sources["visual_evidence"].write_text(
+            json.dumps({"authority": mismatched}) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError,
+            "staged visual authority",
+        ):
+            delivery_envelope.build_prepared_envelope(
+                self.project,
+                self.render_id,
+                self.external_output,
+                self.state,
+                sources,
+                renderer_script=Path(__file__).resolve(),
+                ffmpeg_executable=self.ffmpeg,
+                visual_authority=authority,
+            )
+
+    def test_prepared_envelope_requires_complete_canonical_staged_authority(self) -> None:
+        stage = self._begin()
+        sources = {
+            "output": stage / "candidate.mp4",
+            "qa_report": stage / "qa_report.json",
+            "contact_sheet": stage / "contact_sheet.png",
+            "visual_evidence": stage / "visual_evidence.json",
+            "motion_evidence": stage / "visual_evidence.json",
+        }
+        authority = {
+            "schema_version": 1,
+            "source": "frozen_visual_authority",
+            "visual_plan_revision": "a" * 64,
+            "visual_plan_sha256": "b" * 64,
+            "structured_layers_sha256": "c" * 64,
+            "artifact_index_sha256": "d" * 64,
+            "a_roll_breathing_intervals": [],
+            "items": [],
+        }
+        authority["authority_hash"] = contract_registry.canonical_hash(authority)
+        sources["output"].write_bytes(b"candidate")
+        sources["qa_report"].write_text('{"status":"pass"}\n', encoding="utf-8")
+        sources["contact_sheet"].write_bytes(b"contact")
+        invalid_hash = json.loads(json.dumps(authority))
+        invalid_hash["authority_hash"] = "0" * 64
+        for report in ({}, {"authority": invalid_hash}):
+            with self.subTest(report=report):
+                sources["visual_evidence"].write_text(
+                    json.dumps(report) + "\n", encoding="utf-8"
+                )
+                with self.assertRaises(delivery_envelope.DeliveryEnvelopeError):
+                    delivery_envelope.build_prepared_envelope(
+                        self.project,
+                        self.render_id,
+                        self.external_output,
+                        self.state,
+                        sources,
+                        renderer_script=Path(__file__).resolve(),
+                        ffmpeg_executable=self.ffmpeg,
+                        visual_authority=authority,
+                    )
+
     def test_caption_v2_is_hash_bound_at_its_fixed_canonical_destination(self) -> None:
         stage = self._begin()
         sources = {

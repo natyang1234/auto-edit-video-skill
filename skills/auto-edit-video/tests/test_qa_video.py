@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import os
 import shutil
 import subprocess
 import sys
@@ -16,6 +18,8 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import qa_video  # noqa: E402
+import contract_registry  # noqa: E402
+from visual_quality import rendered_visual_quality_report  # noqa: E402
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -161,6 +165,268 @@ class QaVideoGateTest(unittest.TestCase):
         self.assertIn("policy", report, "report must echo the enforced QA policy")
         self.assertEqual(report["sfx_delivery"]["source"], "not_provided")
         self.assertEqual(report["sfx_delivery"]["status"], "not_evaluated")
+
+    def test_visual_authority_is_freshly_recomputed_not_aggregate_trusted(self) -> None:
+        video = self.dir / "forged-visual-pass.mp4"
+        make_video(video, video_source="testsrc", audio_source="sine=frequency=440")
+        raw = {
+            "schema_version": 1,
+            "duration_s": 2.0,
+            "motion_intensity": "low",
+            "expected_visual_beat_count": 1,
+            "items": [
+                {
+                    "id": "unexpected-scene",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "kind": "title",
+                    "font_evidence_required": True,
+                    "minimum_primary_font_px": 48.0,
+                }
+            ],
+        }
+        authority = {
+            "schema_version": 1,
+            "source": "frozen_visual_authority",
+            "visual_plan_revision": "a" * 64,
+            "visual_plan_sha256": "b" * 64,
+            "structured_layers_sha256": "c" * 64,
+            "artifact_index_sha256": "d" * 64,
+            "a_roll_breathing_intervals": [],
+            "items": [],
+        }
+        raw["a_roll_breathing_intervals"] = []
+        raw["motion_probes"] = {}
+        authority["authority_hash"] = contract_registry.canonical_hash(authority)
+        forged = {
+            "schema_version": 1,
+            "source": "renderer_evidence",
+            "status": "pass",
+            "expected_visual_beat_count": 1,
+            "visual_beat_count": 1,
+            "failures": [],
+            "warnings": [],
+            "raw_evidence": raw,
+            "authority": authority,
+            "authority_hash": authority["authority_hash"],
+        }
+
+        with self.assertRaisesRegex(ValueError, "fresh visual authority recomputation"):
+            qa_video.inspect(
+                video,
+                self.dir / "forged-visual-report.json",
+                self.dir / "forged-visual-contact.png",
+                visual_report=forged,
+            )
+
+    def test_static_pixels_cannot_reuse_a_forged_passing_motion_probe(self) -> None:
+        video = self.dir / "static-forged-motion.mp4"
+        make_video(
+            video,
+            video_source="color=c=gray",
+            audio_source="sine=frequency=440",
+        )
+        base = self.dir / "motion-base.mp4"
+        make_video(base, video_source="color=c=gray", audio_source=None)
+        source = self.dir / "frozen-card.png"
+        subprocess.run(
+            [
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=white:s=60x60:r=1",
+                "-frames:v", "1", "-update", "1", str(source),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        source_sha256 = qa_video.sfx_delivery.sha256_file(source)
+        binding = {
+            "artifact_sha256": source_sha256,
+            "source_path": str(source),
+            "source_sha256": source_sha256,
+            "source_kind": "image",
+            "canvas_width": 320,
+            "canvas_height": 240,
+            "source_start_sample": 0,
+            "source_end_sample": 96_000,
+            "placement": {
+                "width_percent": 18.75,
+                "x_percent": 25.0,
+                "y_percent": 20.833333,
+                "animation": "pan",
+            },
+        }
+        public_binding = {
+            key: value for key, value in binding.items() if key != "source_path"
+        }
+        scene = {
+            "id": "opening-title",
+            "start": 0.0,
+            "end": 2.0,
+            "kind": "title",
+            "component_id": "opening-title",
+            "style_pack_id": "kinetic-social",
+            "font_evidence_required": True,
+            "minimum_primary_font_px": 48.0,
+            "structured_layer_id": "layer-opening-title",
+            "structured_layer_hash": "a" * 64,
+            "artifact_hash": source_sha256,
+            "motion": {
+                "requested": "slide-up",
+                "delivered": "slide-up",
+                "faithful": True,
+                "status": "native",
+            },
+            "eligibility": "eligible",
+            "eligibility_reason": None,
+            "family": "title_reveal",
+            "role": "opening_title",
+            "importance": "high",
+            "major_graphic": True,
+            "micro_silent": False,
+            "stage": "full_screen_graphic",
+            "trigger_role": "title_enter",
+            "motion_window_start_sample": 0,
+            "motion_window_end_sample": 96000,
+            "graphic_roi": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+            "presenter_roi": None,
+            "static_fallback": False,
+        }
+        forged_probe = {
+            "sample_positions": [9600, 48000, 86400],
+            "graphic_roi": copy.deepcopy(scene["graphic_roi"]),
+            "candidate_matches": [
+                {"sample": sample, "ssim": 0.99, "matched": True}
+                for sample in (9600, 48000, 86400)
+            ],
+            "pairs": [
+                {
+                    "left_sample": left,
+                    "right_sample": right,
+                    "ssim": 0.8,
+                    "changed_pixel_fraction": 0.2,
+                    "detected": True,
+                }
+                for left, right in (
+                    (9600, 48000),
+                    (48000, 86400),
+                    (9600, 86400),
+                )
+            ],
+            "detected": True,
+        }
+        raw = {
+            "schema_version": 1,
+            "duration_s": 2.0,
+            "motion_intensity": "high",
+            "expected_visual_beat_count": 1,
+            "a_roll_breathing_intervals": [],
+            "motion_probes": {scene["id"]: copy.deepcopy(forged_probe)},
+            "motion_input": {
+                "base_path": str(base),
+                "base_sha256": qa_video.sfx_delivery.sha256_file(base),
+                "canvas_width": 320,
+                "canvas_height": 240,
+                "fps": 30,
+            },
+            "frozen_graphics": {scene["id"]: binding},
+            "motion_attribution": {scene["id"]: public_binding},
+            "items": [scene],
+        }
+        authority_scene_fields = (
+            "id", "start", "end", "kind", "family", "role",
+            "structured_layer_id", "structured_layer_hash", "artifact_hash",
+            "evidence_id", "source_literal", "assets", "graphic_roi",
+            "presenter_roi", "motion_window_start_sample",
+            "motion_window_end_sample",
+        )
+        authority = {
+            "schema_version": 1,
+            "source": "frozen_visual_authority",
+            "visual_plan_revision": "c" * 64,
+            "visual_plan_sha256": "d" * 64,
+            "structured_layers_sha256": "e" * 64,
+            "artifact_index_sha256": "f" * 64,
+            "a_roll_breathing_intervals": [],
+            "items": [
+                {field: copy.deepcopy(scene.get(field)) for field in authority_scene_fields}
+            ],
+            "motion_input": {
+                "base_sha256": raw["motion_input"]["base_sha256"],
+                "canvas_width": 320,
+                "canvas_height": 240,
+                "fps": 30,
+            },
+        }
+        authority["items"][0]["motion_attribution"] = copy.deepcopy(public_binding)
+        authority["authority_hash"] = contract_registry.canonical_hash(authority)
+        forged_report = rendered_visual_quality_report(raw, authority)
+        self.assertEqual(forged_report["status"], "pass", forged_report["failures"])
+
+        fresh_probe = copy.deepcopy(forged_probe)
+        fresh_probe["pairs"][0]["ssim"] = 0.80003
+        with patch(
+            "visual_motion_probe.measure_declared_motion",
+            return_value={scene["id"]: fresh_probe},
+        ):
+            fresh_report, ok = qa_video.inspect(
+                video,
+                self.dir / "fresh-motion-report.json",
+                self.dir / "fresh-motion-contact.png",
+                visual_report=forged_report,
+            )
+        self.assertTrue(ok, fresh_report["failures"])
+        self.assertEqual(
+            fresh_report["visual_delivery"]["motion_probes"][scene["id"]],
+            fresh_probe,
+        )
+        self.assertNotEqual(
+            fresh_report["visual_delivery"]["motion_probes"][scene["id"]],
+            forged_probe,
+        )
+
+        with self.assertRaisesRegex(ValueError, "fresh visual authority recomputation"):
+            qa_video.inspect(
+                video,
+                self.dir / "static-forged-report.json",
+                self.dir / "static-forged-contact.png",
+                visual_report=forged_report,
+            )
+
+        fps_mutation = copy.deepcopy(forged_report)
+        fps_mutation["raw_evidence"]["motion_input"]["fps"] = 15
+        with self.assertRaises(ValueError):
+            qa_video.inspect(
+                video,
+                self.dir / "fps-mutated-report.json",
+                self.dir / "fps-mutated-contact.png",
+                visual_report=fps_mutation,
+            )
+
+        source_payload = source.read_bytes()
+        source_replacement = self.dir / ".source-replacement.png"
+        source_replacement.write_bytes(b"atomically replaced source")
+        os.replace(source_replacement, source)
+        with self.assertRaisesRegex(ValueError, "frozen graphic.*SHA-256"):
+            qa_video.inspect(
+                video,
+                self.dir / "source-mutated-report.json",
+                self.dir / "source-mutated-contact.png",
+                visual_report=forged_report,
+            )
+        source.write_bytes(source_payload)
+
+        base_payload = base.read_bytes()
+        base_replacement = self.dir / ".base-replacement.mp4"
+        base_replacement.write_bytes(b"atomically replaced base")
+        os.replace(base_replacement, base)
+        with self.assertRaisesRegex(ValueError, "motion base visual.*SHA-256"):
+            qa_video.inspect(
+                video,
+                self.dir / "base-mutated-report.json",
+                self.dir / "base-mutated-contact.png",
+                visual_report=forged_report,
+            )
+        base.write_bytes(base_payload)
 
     def test_valid_independent_sfx_evidence_is_embedded(self) -> None:
         video = self.dir / "sfx-pass.mp4"

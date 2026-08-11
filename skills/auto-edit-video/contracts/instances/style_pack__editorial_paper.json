@@ -37,6 +37,7 @@
     {"id": "warning-checklist", "kind": "warning_checklist", "layout": "left-stack", "motion": {"preset": "slide-up", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},
     {"id": "title-lockup", "kind": "title_lockup", "layout": "lower-third", "motion": {"preset": "slide-up", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},
     {"id": "carousel-grid", "kind": "carousel_grid", "layout": "full-bleed", "motion": {"preset": "fade", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},
+    {"id": "asset-mosaic", "kind": "asset_mosaic", "layout": "full-bleed", "motion": {"preset": "fade", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},
     {"id": "progress", "kind": "progress", "layout": "bottom-band", "motion": {"preset": "slide-up", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},
     {"id": "calendar-reveal", "kind": "calendar_reveal", "layout": "center", "motion": {"preset": "fade", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},
     {"id": "note-card", "kind": "note_card", "layout": "left-stack", "motion": {"preset": "slide-up", "enter": "fade", "exit": "fade", "duration_range": [0.3, 1.5]}},

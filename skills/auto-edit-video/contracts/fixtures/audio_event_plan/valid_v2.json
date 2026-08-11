@@ -19,7 +19,7 @@
     "max_overlap": 2,
     "max_cues_per_minute": 40,
     "density_cap": 2,
-    "priority_order": ["title_enter", "grid_fill", "count_tick", "row_reveal", "typing"],
+    "priority_order": ["title_enter", "transition", "grid_fill", "complete", "count_tick", "row_reveal", "typing"],
     "candidate_order": ["title-1", "row-1"],
     "kept_trigger_ids": ["title-1", "row-1"],
     "dropped_trigger_ids": [],

@@ -69,7 +69,9 @@
           "items": {
             "enum": [
               "title_enter",
+              "transition",
               "grid_fill",
+              "complete",
               "count_tick",
               "row_reveal",
               "typing"
@@ -116,15 +118,17 @@
               "asset_transient_anchor_sample": {"type": "integer", "minimum": 0},
               "expected_transient_sample": {"type": "integer", "minimum": 0},
               "role": {
-                "enum": ["title_enter", "row_reveal", "count_tick", "grid_fill", "typing"]
+                "enum": ["title_enter", "transition", "row_reveal", "count_tick", "grid_fill", "typing", "complete"]
               },
               "asset_id": {
                 "enum": [
                   "soft-ui-tick-v1",
+                  "short-whoosh-v1",
                   "short-pop-v1",
                   "short-riser-v1",
                   "soft-impact-v1",
                   "typing-tick-v1"
+                  ,"completion-chime-v1"
                 ]
               },
               "evidence": {
@@ -137,8 +141,11 @@
                     "properties": {
                       "id": {"type": "string", "minLength": 1},
                       "onset_sample": {"type": "integer", "minimum": 0},
-                      "kind": {"enum": ["title", "dynamic_list", "stat", "chart"]},
+                      "kind": {"enum": ["title", "dynamic_list", "stat", "chart", "mosaic"]},
                       "component_id": {"type": ["string", "null"]},
+                      "title_kind": {"const": "section"},
+                      "family": {"enum": ["grid_progress", "asset_mosaic"]},
+                      "trigger_role": {"enum": ["grid_complete", "scene_transition"]},
                       "motion": {
                         "type": "object",
                         "required": ["requested", "delivered", "faithful", "status"],
@@ -282,8 +289,11 @@
                 "properties": {
                   "id": {"type": "string", "minLength": 1},
                   "onset_sample": {"type": "integer", "minimum": 0},
-                  "kind": {"enum": ["title", "dynamic_list", "stat", "chart"]},
+                  "kind": {"enum": ["title", "dynamic_list", "stat", "chart", "mosaic"]},
                   "component_id": {"type": ["string", "null"]},
+                  "title_kind": {"const": "section"},
+                  "family": {"enum": ["grid_progress", "asset_mosaic"]},
+                  "trigger_role": {"enum": ["grid_complete", "scene_transition"]},
                   "motion": {
                     "type": "object",
                     "required": ["requested", "delivered", "faithful", "status"],

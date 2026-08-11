@@ -192,9 +192,12 @@ STRUCTURED_BEATS = {
     # A quote, a question, a contrast and a definition are drawn from a layer
     # the same way the first four are; the words on them come out of the
     # transcript, so each one still has to name the evidence it was built on.
-    "quote", "question", "comparison", "term",
+    "quote", "question", "comparison", "term", "typed_prompt", "grid_progress",
+    "asset_mosaic",
 }
-TITLE_KINDS = {"full-screen-hook", "section", "lower-third", "quote", "hero-stat"}
+TITLE_KINDS = {
+    "full-screen-hook", "section", "lower-third", "quote", "hero-stat", "prompt"
+}
 
 
 def _nonempty_str(value) -> bool:
@@ -543,6 +546,49 @@ def semantic_structured_layer(layers) -> list[str]:
                         errors.append(
                             f"{entry_path}: needs evidence_id or explicit conceptual:true"
                         )
+        elif layer_type == "mosaic":
+            evidence_id = payload.get("evidence_id")
+            source_literal = payload.get("source_literal")
+            if not _nonempty_str(payload.get("title")):
+                errors.append(f"{path}.title: non-empty transcript title required")
+            if not _nonempty_str(evidence_id) or not _nonempty_str(source_literal):
+                errors.append(f"{path}: mosaic must bind transcript evidence")
+            assets = payload.get("assets")
+            if not isinstance(assets, list) or not 2 <= len(assets) <= 4:
+                errors.append(f"{path}.assets: mosaic requires two to four assets")
+                continue
+            seen_ids: set[str] = set()
+            seen_paths: set[str] = set()
+            for asset_index, asset in enumerate(assets):
+                asset_path = f"{path}.assets[{asset_index}]"
+                required = {
+                    "asset_id", "path", "sha256", "evidence_id", "source_literal"
+                }
+                if not isinstance(asset, dict) or set(asset) != required:
+                    errors.append(f"{asset_path}: exact frozen asset descriptor required")
+                    continue
+                asset_id = asset.get("asset_id")
+                rel_path = asset.get("path")
+                digest = asset.get("sha256")
+                if not _nonempty_str(asset_id):
+                    errors.append(f"{asset_path}.asset_id: non-empty id required")
+                if (
+                    not _nonempty_str(rel_path)
+                    or str(rel_path).startswith("/")
+                    or "\\" in str(rel_path)
+                    or any(part in {"", ".", ".."} for part in str(rel_path).split("/"))
+                ):
+                    errors.append(f"{asset_path}.path: normalized project-relative path required")
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    errors.append(f"{asset_path}.sha256: lowercase SHA-256 required")
+                if asset.get("evidence_id") != evidence_id:
+                    errors.append(f"{asset_path}.evidence_id: must match mosaic evidence")
+                if asset.get("source_literal") != source_literal:
+                    errors.append(f"{asset_path}.source_literal: must match mosaic source")
+                if asset_id in seen_ids or rel_path in seen_paths:
+                    errors.append(f"{asset_path}: duplicate asset identity")
+                seen_ids.add(asset_id)
+                seen_paths.add(rel_path)
     return errors
 
 
@@ -560,6 +606,17 @@ def semantic_video_analysis(analysis) -> list[str]:
 
 def semantic_visual_plan(visual_plan, structured_layers=None) -> list[str]:
     errors = []
+    scene_fields = {
+        "eligibility",
+        "eligibility_reason",
+        "family",
+        "role",
+        "importance",
+        "major_graphic",
+        "micro_silent",
+        "stage",
+        "trigger_role",
+    }
     layer_by_id = None
     if structured_layers is not None:
         layer_by_id = {item["id"]: item for item in structured_layers.get("items", [])}
@@ -569,7 +626,119 @@ def semantic_visual_plan(visual_plan, structured_layers=None) -> list[str]:
             errors.append(f"{path}: end must be greater than start")
         conceptual = item.get("conceptual_only", False)
         beat = item.get("beat")
-        if beat in {"stat", "chart", "dynamic_list"} and not conceptual and not item.get("evidence_ids"):
+        if scene_fields.intersection(item):
+            missing = sorted(scene_fields.difference(item))
+            if missing:
+                errors.append(f"{path}: scene contract missing {missing}")
+            elif item.get("eligibility") == "eligible" and item.get(
+                "eligibility_reason"
+            ) is not None:
+                errors.append(
+                    f"{path}.eligibility_reason: eligible scene requires null"
+                )
+            elif item.get("eligibility") == "ineligible" and item.get(
+                "eligibility_reason"
+            ) is None:
+                errors.append(
+                    f"{path}.eligibility_reason: ineligible scene requires a reason"
+                )
+            if item.get("role") == "section_title" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "title_reveal"
+                or item.get("importance") != "high"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "scene_transition"
+                or beat != "title"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: section-title scene contract is inconsistent")
+            if item.get("role") == "opening_title" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "title_reveal"
+                or item.get("importance") != "high"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "full_screen_graphic"
+                or item.get("trigger_role") != "title_enter"
+                or beat != "title"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: opening-title scene contract is inconsistent")
+            if item.get("role") == "metric_emphasis" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "count_stat"
+                or item.get("importance") != "high"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "count_complete"
+                or beat != "stat"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: metric-emphasis scene contract is inconsistent")
+            if item.get("role") == "list_explanation" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "staggered_list"
+                or item.get("importance") != "medium"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "row_reveal"
+                or beat != "dynamic_list"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: list-explanation scene contract is inconsistent")
+            if item.get("role") == "data_explanation" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "analytics_dashboard"
+                or item.get("importance") != "high"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "chart_complete"
+                or beat != "chart"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: data-explanation scene contract is inconsistent")
+            if item.get("role") == "prompt_command" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "typed_prompt"
+                or item.get("importance") != "medium"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "typing"
+                or beat != "typed_prompt"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: prompt-command scene contract is inconsistent")
+            if item.get("role") == "workflow_progress" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "grid_progress"
+                or item.get("importance") != "medium"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "grid_complete"
+                or beat != "grid_progress"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: workflow-progress scene contract is inconsistent")
+            if item.get("role") == "asset_showcase" and (
+                item.get("eligibility") != "eligible"
+                or item.get("family") != "asset_mosaic"
+                or item.get("importance") != "high"
+                or item.get("major_graphic") is not True
+                or item.get("micro_silent") is not False
+                or item.get("stage") != "split_graphic_presenter"
+                or item.get("trigger_role") != "scene_transition"
+                or beat != "asset_mosaic"
+                or conceptual is not False
+            ):
+                errors.append(f"{path}: asset-showcase scene contract is inconsistent")
+        if beat in {"stat", "chart", "dynamic_list", "grid_progress", "asset_mosaic"} and not conceptual and not item.get("evidence_ids"):
             errors.append(f"{path}: factual beat requires evidence_ids unless conceptual_only")
         if beat in STRUCTURED_BEATS:
             if item.get("structured_layer_id") is None:
@@ -946,8 +1115,10 @@ def semantic_audio_event_plan(artifact) -> list[str]:
 
     role_priority = {
         "title_enter": 0,
+        "transition": 0,
         "grid_fill": 1,
         "count_tick": 1,
+        "complete": 1,
         "row_reveal": 2,
         "typing": 3,
     }
@@ -968,6 +1139,13 @@ def semantic_audio_event_plan(artifact) -> list[str]:
         kind = trigger.get("kind")
         component = trigger.get("component_id")
         requested = motion.get("requested")
+        if (
+            kind == "title"
+            and trigger.get("title_kind") == "section"
+            and component in {None, "kinetic-title", "title-lockup"}
+            and requested in {"pop", "pop-in", "slide-up", "slide-in"}
+        ):
+            return ("transition", "short-whoosh-v1")
         direct = trigger_role.get((kind, component, requested))
         if direct is not None:
             return direct
@@ -979,10 +1157,26 @@ def semantic_audio_event_plan(artifact) -> list[str]:
             "staggered-reveal", "check-pop"
         }:
             return ("row_reveal", "short-pop-v1")
+        if (
+            kind == "stat"
+            and component == "progress"
+            and trigger.get("family") == "grid_progress"
+            and trigger.get("trigger_role") == "grid_complete"
+            and requested == "fill"
+        ):
+            return ("complete", "completion-chime-v1")
         if kind == "stat" and component in {"hero-stat", "progress"} and requested in {"count-up", "fill"}:
             return ("count_tick", "short-riser-v1")
         if kind == "chart" and component == "dashboard" and requested in {"pan", "fill"}:
             return ("grid_fill", "soft-impact-v1")
+        if (
+            kind == "mosaic"
+            and component == "asset-mosaic"
+            and trigger.get("family") == "asset_mosaic"
+            and trigger.get("trigger_role") == "scene_transition"
+            and requested == "pan"
+        ):
+            return ("transition", "short-whoosh-v1")
         return None
 
     def validate_event(event, path: str, *, is_v2: bool) -> tuple[dict | None, tuple[int, int, str] | None]:
@@ -1051,6 +1245,8 @@ def semantic_audio_event_plan(artifact) -> list[str]:
         if not is_v2:
             if "component_id" in trigger:
                 errors.append(f"{path}.evidence.trigger.component_id: v1 field is not allowed")
+            if "title_kind" in trigger:
+                errors.append(f"{path}.evidence.trigger.title_kind: v1 field is not allowed")
             if isinstance(evidence, dict) and "renderer_trigger_sha256" in evidence:
                 errors.append(f"{path}.evidence.renderer_trigger_sha256: v1 field is not allowed")
             if trigger.get("kind") != "title":
@@ -1072,7 +1268,25 @@ def semantic_audio_event_plan(artifact) -> list[str]:
             errors.append(f"{path}.evidence.trigger.motion: motion was not faithfully delivered")
         if status not in {"native", "rendered"} or not isinstance(motion, dict) or motion.get("faithful") is not True:
             errors.append(f"{path}.evidence.trigger.motion: trigger is not faithful")
-        if set(trigger) != {"id", "onset_sample", "kind", "component_id", "motion"}:
+        expected_trigger_fields = {
+            "id", "onset_sample", "kind", "component_id", "motion"
+        }
+        if trigger.get("title_kind") == "section":
+            expected_trigger_fields.add("title_kind")
+        has_scene_family = trigger.get("family") in {"grid_progress", "asset_mosaic"}
+        has_scene_trigger = trigger.get("trigger_role") in {
+            "grid_complete", "scene_transition"
+        }
+        if has_scene_family or has_scene_trigger:
+            expected_trigger_fields.update({"family", "trigger_role"})
+            if (trigger.get("family"), trigger.get("trigger_role")) not in {
+                ("grid_progress", "grid_complete"),
+                ("asset_mosaic", "scene_transition"),
+            }:
+                errors.append(
+                    f"{path}.evidence.trigger: scene family and trigger_role are inconsistent"
+                )
+        if set(trigger) != expected_trigger_fields:
             errors.append(f"{path}.evidence.trigger: schema v2 normalized trigger fields are required")
         if not isinstance(evidence, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("renderer_trigger_sha256", ""))):
             errors.append(f"{path}.evidence.renderer_trigger_sha256: canonical renderer hash is required")
@@ -1183,7 +1397,9 @@ def semantic_audio_event_plan(artifact) -> list[str]:
     expected_cap = (stem_count * 40) // (60 * 48000) if type(stem_count) is int else None
     if expected_cap is not None and density.get("density_cap") != expected_cap:
         errors.append("$.density.density_cap: does not match deterministic cap")
-    if density.get("priority_order") != ["title_enter", "grid_fill", "count_tick", "row_reveal", "typing"]:
+    if density.get("priority_order") != [
+        "title_enter", "transition", "grid_fill", "complete", "count_tick", "row_reveal", "typing"
+    ]:
         errors.append("$.density.priority_order: does not match deterministic priority")
     kept_ids = [event.get("trigger_id") for event in events if isinstance(event, dict)]
     dropped = density.get("dropped") if isinstance(density.get("dropped"), list) else []

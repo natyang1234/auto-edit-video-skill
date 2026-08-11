@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import qa_video
@@ -355,7 +357,7 @@ def card_visual_evidence(
         status = "native" if native_faithful else "fallback"
     layer_type = str(layer.get("type") or "")
     floor = structured_card_compositor.primary_font_floor(layer_type)
-    return {
+    evidence = {
         "kind": layer_type,
         "component_id": str(component.get("id") or "") or None,
         "style_pack_id": str(pack.get("id") or "") or None,
@@ -369,6 +371,554 @@ def card_visual_evidence(
             "faithful": faithful,
             "status": status,
         },
+    }
+    if layer_type == "title":
+        payload = layer.get("payload")
+        if isinstance(payload, dict):
+            title_kind = payload.get("title_kind")
+            if isinstance(title_kind, str) and title_kind:
+                evidence["title_kind"] = title_kind
+            evidence_id = payload.get("evidence_id")
+            source_literal = payload.get("source_literal")
+            if isinstance(evidence_id, str) and evidence_id:
+                evidence["evidence_id"] = evidence_id
+            if isinstance(source_literal, str) and source_literal:
+                evidence["source_literal"] = source_literal
+    elif layer_type == "mosaic":
+        payload = layer.get("payload")
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(assets, list) or not 2 <= len(assets) <= 4:
+            raise ValueError("mosaic renderer evidence requires two to four assets")
+        evidence["evidence_id"] = payload.get("evidence_id")
+        evidence["source_literal"] = payload.get("source_literal")
+        evidence["assets"] = [
+            {
+                "asset_id": item.get("asset_id"),
+                "path": item.get("path"),
+                "sha256": item.get("sha256"),
+                "evidence_id": item.get("evidence_id"),
+                "source_literal": item.get("source_literal"),
+            }
+            for item in assets
+            if isinstance(item, dict)
+        ]
+    return evidence
+
+
+SCENE_PLAN_FIELDS = (
+    "eligibility",
+    "eligibility_reason",
+    "family",
+    "role",
+    "importance",
+    "major_graphic",
+    "micro_silent",
+    "stage",
+    "trigger_role",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenVisualAuthority:
+    """Stable scene inputs and bytes held across render and publication."""
+
+    public: dict[str, Any]
+    layers: dict[str, Any]
+    plan: dict[str, Any]
+    artifacts: dict[str, Any]
+    snapshots: tuple[delivery_envelope.FileSnapshot, ...]
+    motion_graphics: dict[str, dict[str, Any]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def revalidate(self) -> None:
+        for snapshot in self.snapshots:
+            delivery_envelope.revalidate_file_snapshot(snapshot)
+
+    def bind_motion_graphic(
+        self,
+        project_dir: Path,
+        scene_id: str,
+        artifact: dict[str, Any],
+        overlay: dict[str, Any],
+        animated_source: str | None,
+        canvas_width: int,
+        canvas_height: int,
+    ) -> str:
+        """Bind one rendered overlay to frozen bytes and an exact placement model."""
+        existing = self.motion_graphics.get(scene_id)
+        if existing is not None:
+            return str(existing["source_path"])
+        authority_item = next(
+            (item for item in self.public["items"] if item.get("id") == scene_id), None
+        )
+        if authority_item is None or authority_item.get("artifact_hash") != artifact.get(
+            "artifact_hash"
+        ):
+            raise ValueError("motion graphic does not match frozen scene authority")
+        artifact_path = Path(str(artifact.get("artifact_id") or ""))
+        if animated_source is None:
+            source_path = artifact_path
+            source_sha256 = str(artifact.get("artifact_hash") or "")
+            source_kind = "image"
+        else:
+            snapshot = delivery_envelope.snapshot_project_file(
+                project_dir,
+                animated_source,
+                label=f"animated motion graphic {scene_id}",
+                capture_bytes=True,
+            )
+            if snapshot.payload is None:
+                raise ValueError("animated motion graphic bytes were not captured")
+            safe_scene = re.sub(r"[^A-Za-z0-9_-]", "_", scene_id)
+            source_path = artifact_path.parent / (
+                f"motion-{safe_scene}-{snapshot.sha256}.mov"
+            )
+            _write_frozen_payload(source_path, snapshot.payload)
+            source_sha256 = snapshot.sha256
+            source_kind = "video"
+            object.__setattr__(self, "snapshots", (*self.snapshots, snapshot))
+        style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+        binding = {
+            "artifact_sha256": str(artifact.get("artifact_hash") or ""),
+            "source_path": str(source_path),
+            "source_sha256": source_sha256,
+            "source_kind": source_kind,
+            "canvas_width": canvas_width,
+            "canvas_height": canvas_height,
+            "source_start_sample": sfx_delivery.seconds_to_samples(overlay["start"]),
+            "source_end_sample": sfx_delivery.seconds_to_samples(overlay["end"]),
+            "placement": {
+                "width_percent": float(style.get("width", 84.0)),
+                "x_percent": float(style.get("x", 50.0)),
+                "y_percent": float(style.get("y", 50.0)),
+                "animation": str(style.get("animation", "none")),
+            },
+        }
+        public_binding = {key: value for key, value in binding.items() if key != "source_path"}
+        authority_item["motion_attribution"] = public_binding
+        self.public["authority_hash"] = contract_registry.canonical_hash(
+            {key: value for key, value in self.public.items() if key != "authority_hash"}
+        )
+        self.motion_graphics[scene_id] = binding
+        return str(source_path)
+
+    def bind_motion_base(
+        self,
+        snapshot: delivery_envelope.FileSnapshot,
+        path: Path,
+        canvas_width: int,
+        canvas_height: int,
+        fps: int,
+    ) -> dict[str, Any]:
+        """Bind the private same-graph base visual used by independent QA."""
+        binding = {
+            "base_path": str(path),
+            "base_sha256": snapshot.sha256,
+            "canvas_width": canvas_width,
+            "canvas_height": canvas_height,
+            "fps": fps,
+        }
+        self.public["motion_input"] = {
+            key: value for key, value in binding.items() if key != "base_path"
+        }
+        self.public["authority_hash"] = contract_registry.canonical_hash(
+            {key: value for key, value in self.public.items() if key != "authority_hash"}
+        )
+        object.__setattr__(self, "snapshots", (*self.snapshots, snapshot))
+        return binding
+
+
+def _write_frozen_payload(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while freezing structured artifact")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sanitize_private_motion_receipts(
+    staged_evidence: Path, staged_report: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Remove QA-only motion paths without hiding a receipt replacement."""
+    staged_visual_payload = read_json(staged_evidence, {}) or {}
+    report_payload = read_json(staged_report, {}) or {}
+    embedded_visual = report_payload.get("visual_delivery")
+    if not isinstance(embedded_visual, dict) or contract_registry.canonical_hash(
+        embedded_visual
+    ) != contract_registry.canonical_hash(staged_visual_payload):
+        raise RuntimeError("QA visual receipt differs from staged visual evidence")
+    if not isinstance(staged_visual_payload.get("raw_evidence"), dict):
+        raise RuntimeError("authority-bound visual evidence has no private QA inputs")
+    staged_visual_payload.pop("raw_evidence")
+    report_payload["visual_delivery"] = staged_visual_payload
+    atomic_write_json(staged_evidence, staged_visual_payload)
+    atomic_write_json(staged_report, report_payload)
+    return staged_visual_payload, report_payload
+
+
+def adopt_fresh_motion_receipt(
+    staged_evidence: Path,
+    staged_report: Path,
+    expected_staged_sha256: str,
+) -> None:
+    """CAS-replace renderer probe numbers with independently recomputed QA values."""
+    if (
+        staged_evidence.is_symlink()
+        or not staged_evidence.is_file()
+        or file_sha256(staged_evidence) != expected_staged_sha256
+    ):
+        raise RuntimeError("staged visual evidence changed during QA")
+    if staged_report.is_symlink() or not staged_report.is_file():
+        raise RuntimeError("staged QA report is not a regular file")
+    supplied = read_json(staged_evidence, {}) or {}
+    report = read_json(staged_report, {}) or {}
+    fresh = report.get("visual_delivery")
+    if not isinstance(fresh, dict):
+        raise RuntimeError("QA report has no fresh visual delivery receipt")
+
+    def stable(payload: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(payload)
+        result.pop("motion_probes", None)
+        raw = result.get("raw_evidence")
+        if isinstance(raw, dict):
+            raw.pop("motion_probes", None)
+        return result
+
+    if contract_registry.canonical_hash(stable(supplied)) != contract_registry.canonical_hash(
+        stable(fresh)
+    ):
+        raise RuntimeError("fresh QA visual receipt changes stable renderer evidence")
+    atomic_write_json(staged_evidence, fresh)
+
+
+def freeze_visual_authority(
+    project_dir: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    clip: dict[str, Any] | None,
+    stage: delivery_envelope.StagingAttempt,
+) -> FrozenVisualAuthority:
+    """Freeze canonical plan, layers, composed bytes, and licensed mosaic inputs."""
+    layers, layers_snapshot = delivery_envelope.snapshot_owned_json(
+        project_dir,
+        "working/structured_layers.json",
+        label="structured visual layers",
+    )
+    plan, plan_snapshot = delivery_envelope.snapshot_owned_json(
+        project_dir,
+        "working/visual_plan_v2.json",
+        label="visual plan v2",
+    )
+    for name, payload in (("structured_layer", layers), ("visual_plan", plan)):
+        errors = contract_registry.validate_artifact(name, payload)
+        if errors:
+            raise ValueError(f"{name} failed contract validation: " + "; ".join(errors))
+    items = plan.get("items")
+    revision = plan.get("revision")
+    if not isinstance(items, list) or revision != contract_registry.canonical_hash(items):
+        raise ValueError("visual plan revision does not match its frozen items")
+
+    canvas = state.get("canvas") or {}
+    target_width = int(canvas.get("width", 1080))
+    render_scale = even(target_width) / max(target_width, 1)
+    pack = style_pack_for_clip(state, clip)
+    import structured_card_compositor
+
+    artifact_index = structured_card_compositor.build_structured_artifacts(
+        project_dir, state, layers, pack, render_scale
+    )
+    index_payload, index_snapshot = delivery_envelope.snapshot_owned_json(
+        project_dir,
+        structured_card_compositor.ARTIFACTS_REL.as_posix(),
+        label="structured artifact index",
+    )
+    if index_payload != artifact_index:
+        raise ValueError("structured artifact index changed after composition")
+    key = structured_card_compositor.canvas_key(canvas, render_scale)
+    frozen_dir = Path(stage) / "frozen_visual_artifacts"
+    frozen_dir.mkdir(mode=0o700)
+    artifact_by_layer: dict[str, Any] = {}
+    snapshots: list[delivery_envelope.FileSnapshot] = [
+        plan_snapshot,
+        layers_snapshot,
+        index_snapshot,
+    ]
+    for ordinal, item in enumerate(artifact_index.get("items", [])):
+        if item.get("canvas") != key:
+            continue
+        relative = item.get("artifact_id")
+        if not isinstance(relative, str):
+            raise ValueError("structured artifact has no project-relative identity")
+        snapshot = delivery_envelope.snapshot_project_file(
+            project_dir,
+            relative,
+            label=f"structured artifact {item.get('layer_id')}",
+            capture_bytes=True,
+        )
+        if snapshot.payload is None or snapshot.sha256 != item.get("artifact_hash"):
+            raise ValueError("structured artifact bytes do not match the frozen index")
+        frozen_path = frozen_dir / f"{ordinal:04d}-{snapshot.sha256}.png"
+        _write_frozen_payload(frozen_path, snapshot.payload)
+        frozen = dict(item)
+        frozen["artifact_id"] = str(frozen_path)
+        artifact_by_layer[str(item.get("layer_id") or "")] = frozen
+        snapshots.append(snapshot)
+
+    layer_by_id = {
+        str(item.get("id")): item
+        for item in layers.get("items", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    source_duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+    clip_start = float(clip.get("start", 0.0)) if clip is not None else 0.0
+    clip_end = float(clip.get("end", source_duration)) if clip is not None else source_duration
+    segments = effective_segments(state_segments(state, source_duration), clip_start, clip_end)
+    breathing_intervals = a_roll_breathing_intervals(items, segments)
+    authority_items: list[dict[str, Any]] = []
+    mosaic_descriptors: list[dict[str, Any]] = []
+    for plan_item in items:
+        if not isinstance(plan_item, dict):
+            raise ValueError("visual plan item must be an object")
+        layer_id = plan_item.get("structured_layer_id")
+        if not isinstance(layer_id, str) or not layer_id:
+            continue
+        layer = layer_by_id.get(layer_id)
+        artifact = artifact_by_layer.get(layer_id)
+        if layer is None or artifact is None:
+            raise ValueError(f"visual plan layer has no frozen artifact: {layer_id}")
+        windows = map_source_range_to_post_cut(
+            segments, float(plan_item.get("start", 0.0)), float(plan_item.get("end", 0.0))
+        )
+        if len(windows) != 1:
+            raise ValueError("frozen structured scene must map to exactly one final window")
+        start, end = windows[0]
+        evidence = card_visual_evidence(pack, layers, layer_id, render_scale, None)
+        resolved = resolved_scene_evidence(plan_item, evidence, start, end)
+        authority_items.append(
+            {
+                "id": str(plan_item.get("id") or ""),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "kind": str(layer.get("type") or ""),
+                "family": resolved.get("family"),
+                "role": resolved.get("role"),
+                "structured_layer_id": layer_id,
+                "structured_layer_hash": artifact.get("structured_layer_hash"),
+                "artifact_hash": artifact.get("artifact_hash"),
+                "evidence_id": evidence.get("evidence_id"),
+                "source_literal": evidence.get("source_literal"),
+                "assets": evidence.get("assets"),
+                "graphic_roi": resolved.get("graphic_roi"),
+                "presenter_roi": resolved.get("presenter_roi"),
+                "motion_window_start_sample": resolved.get("motion_window_start_sample"),
+                "motion_window_end_sample": resolved.get("motion_window_end_sample"),
+            }
+        )
+        if layer.get("type") == "mosaic":
+            payload = layer.get("payload")
+            mosaic_descriptors.extend(
+                item for item in (payload.get("assets") if isinstance(payload, dict) else [])
+                if isinstance(item, dict)
+            )
+    if mosaic_descriptors:
+        registry, registry_snapshot = delivery_envelope.snapshot_owned_json(
+            project_dir, "assets/provenance.json", label="mosaic provenance registry"
+        )
+        delivery_envelope.validate_mosaic_registry_snapshot(
+            registry, mosaic_descriptors
+        )
+        snapshots.append(registry_snapshot)
+        for descriptor in mosaic_descriptors:
+            relative = descriptor.get("path")
+            if not isinstance(relative, str):
+                raise ValueError("mosaic descriptor path is invalid")
+            snapshot = delivery_envelope.snapshot_project_file(
+                project_dir, relative, label=f"mosaic asset {descriptor.get('asset_id')}"
+            )
+            if snapshot.sha256 != descriptor.get("sha256"):
+                raise ValueError("mosaic asset changed after approved composition")
+            snapshots.append(snapshot)
+
+    public = {
+        "schema_version": 1,
+        "source": "frozen_visual_authority",
+        "visual_plan_revision": revision,
+        "visual_plan_sha256": plan_snapshot.sha256,
+        "structured_layers_sha256": layers_snapshot.sha256,
+        "artifact_index_sha256": index_snapshot.sha256,
+        "a_roll_breathing_intervals": breathing_intervals,
+        "items": authority_items,
+    }
+    public["authority_hash"] = contract_registry.canonical_hash(public)
+    return FrozenVisualAuthority(
+        public=public,
+        layers=layers,
+        plan=plan,
+        artifacts=artifact_by_layer,
+        snapshots=tuple(snapshots),
+    )
+
+
+def resolved_scene_evidence(
+    plan_item: dict[str, Any],
+    card_evidence: dict[str, Any],
+    final_start: float,
+    final_end: float,
+) -> dict[str, Any]:
+    """Freeze one planned scene in the final timeline domain.
+
+    Semantic choices stay planner-owned.  This renderer seam only resolves
+    the final sample window and the stage ROIs that it will use to draw the
+    already-selected scene.
+    """
+    present = [field for field in SCENE_PLAN_FIELDS if field in plan_item]
+    if not present:
+        return {}
+    missing = [field for field in SCENE_PLAN_FIELDS if field not in plan_item]
+    if missing:
+        raise ValueError(f"scene plan is missing fields: {missing}")
+    if (
+        isinstance(final_start, bool)
+        or isinstance(final_end, bool)
+        or not isinstance(final_start, (int, float))
+        or not isinstance(final_end, (int, float))
+        or not math.isfinite(float(final_start))
+        or not math.isfinite(float(final_end))
+        or final_start < 0
+        or final_end <= final_start
+    ):
+        raise ValueError("resolved scene final window is invalid")
+    if plan_item.get("role") == "section_title" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "title_reveal"
+        or plan_item.get("importance") != "high"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "scene_transition"
+    ):
+        raise ValueError("section-title scene contract is inconsistent")
+    if plan_item.get("role") == "opening_title" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "title_reveal"
+        or plan_item.get("importance") != "high"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "full_screen_graphic"
+        or plan_item.get("trigger_role") != "title_enter"
+    ):
+        raise ValueError("opening-title scene contract is inconsistent")
+    if plan_item.get("role") == "metric_emphasis" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "count_stat"
+        or plan_item.get("importance") != "high"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "count_complete"
+    ):
+        raise ValueError("metric-emphasis scene contract is inconsistent")
+    if plan_item.get("role") == "list_explanation" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "staggered_list"
+        or plan_item.get("importance") != "medium"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "row_reveal"
+    ):
+        raise ValueError("list-explanation scene contract is inconsistent")
+    if plan_item.get("role") == "data_explanation" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "analytics_dashboard"
+        or plan_item.get("importance") != "high"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "chart_complete"
+    ):
+        raise ValueError("data-explanation scene contract is inconsistent")
+    if plan_item.get("role") == "prompt_command" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "typed_prompt"
+        or plan_item.get("importance") != "medium"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "typing"
+    ):
+        raise ValueError("prompt-command scene contract is inconsistent")
+    if plan_item.get("role") == "workflow_progress" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "grid_progress"
+        or plan_item.get("importance") != "medium"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "grid_complete"
+    ):
+        raise ValueError("workflow-progress scene contract is inconsistent")
+    if plan_item.get("role") == "asset_showcase" and (
+        plan_item.get("eligibility") != "eligible"
+        or plan_item.get("eligibility_reason") is not None
+        or plan_item.get("family") != "asset_mosaic"
+        or plan_item.get("importance") != "high"
+        or plan_item.get("major_graphic") is not True
+        or plan_item.get("micro_silent") is not False
+        or plan_item.get("stage") != "split_graphic_presenter"
+        or plan_item.get("trigger_role") != "scene_transition"
+    ):
+        raise ValueError("asset-showcase scene contract is inconsistent")
+
+    motion = card_evidence.get("motion")
+    if not isinstance(motion, dict):
+        raise ValueError("resolved scene needs renderer motion evidence")
+    duration = float(final_end) - float(final_start)
+    requested = str(motion.get("requested") or "")
+    if requested in {"slide-up", "slide-in", "pop", "pop-in"}:
+        motion_duration = min(0.22, max(0.01, duration * 0.28))
+    elif requested == "fade":
+        motion_duration = min(0.18, max(0.01, duration * 0.22))
+    else:
+        # Content-native animations own their motion over the declared scene.
+        motion_duration = duration
+    motion_end = min(float(final_end), float(final_start) + motion_duration)
+
+    if plan_item.get("stage") == "split_graphic_presenter":
+        graphic_roi = {"x": 0.08, "y": 0.1, "width": 0.84, "height": 0.3}
+        presenter_roi = {"x": 0.0, "y": 0.42, "width": 1.0, "height": 0.58}
+    else:
+        graphic_roi = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+        presenter_roi = None
+
+    return {
+        **{field: plan_item[field] for field in SCENE_PLAN_FIELDS},
+        "motion_window_start_sample": sfx_delivery.seconds_to_samples(
+            f"{float(final_start):.9f}"
+        ),
+        "motion_window_end_sample": sfx_delivery.seconds_to_samples(
+            f"{motion_end:.9f}"
+        ),
+        "graphic_roi": graphic_roi,
+        "presenter_roi": presenter_roi,
+        "static_fallback": (
+            motion.get("status") == "fallback" or motion.get("faithful") is not True
+        ),
     }
 
 
@@ -764,6 +1314,43 @@ def map_source_range_to_post_cut(
     return windows
 
 
+def a_roll_breathing_intervals(
+    plan_items: list[dict[str, Any]],
+    segments: list[tuple[float, float]],
+) -> list[dict[str, Any]]:
+    """Resolve explicit A-roll breathing beats onto the final timeline."""
+    intervals: list[dict[str, Any]] = []
+    for item_index, item in enumerate(plan_items):
+        if not isinstance(item, dict):
+            raise ValueError(f"visual plan items[{item_index}] must be an object")
+        if item.get("beat") != "a_roll_breathing":
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise ValueError("A-roll breathing beat must have a non-empty id")
+        windows = map_source_range_to_post_cut(
+            segments,
+            float(item.get("start", 0.0)),
+            float(item.get("end", 0.0)),
+        )
+        for window_index, (start, end) in enumerate(windows):
+            interval_id = (
+                item_id
+                if len(windows) == 1
+                else f"{item_id}-part-{window_index + 1}"
+            )
+            intervals.append(
+                {
+                    "id": interval_id,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "role": "a_roll_breathing",
+                    "major_graphic": False,
+                }
+            )
+    return intervals
+
+
 def style_pack_for_clip(
     state: dict[str, Any], clip: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -828,6 +1415,8 @@ def build_render_command(
     sfx_stem: Path | None = None,
     dialogue_priority_dialogue: Path | None = None,
     dialogue_priority_sfx: Path | None = None,
+    visual_authority: FrozenVisualAuthority | None = None,
+    motion_base_output: Path | None = None,
 ) -> list[str]:
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -868,6 +1457,7 @@ def build_render_command(
         clip_start, clip_end = segments[0]
         duration = clip_end - clip_start
     evidence_items: list[dict[str, Any]] = []
+    motion_graphics_for_probe: dict[str, dict[str, Any]] = {}
     expected_visual_beat_count = 0
     source_rel = str(manifest.get("source", {}).get("staged_path", ""))
     source = project_dir / source_rel
@@ -909,8 +1499,20 @@ def build_render_command(
         command.extend(["-i", str(visual_source)])
     # Decided before any overlay is read, because it changes which of them
     # are drawn as well as which layer bundle is used.
-    planned_cards = card_plan_bundle(project_dir)
-    card_plan_adopted = planned_cards is not None
+    if visual_authority is not None:
+        layers_bundle = visual_authority.layers
+        visual_plan_v2 = visual_authority.plan
+    else:
+        from editor_server import load_layer_bundle
+
+        layers_bundle, visual_plan_v2 = load_layer_bundle(project_dir)
+        planned_cards = card_plan_bundle(project_dir)
+        if planned_cards is not None:
+            layers_bundle, visual_plan_v2 = planned_cards
+    canonical_plan_adopted = bool(visual_plan_v2.get("items"))
+    breathing_intervals = a_roll_breathing_intervals(
+        visual_plan_v2.get("items", []), segments
+    )
     overlays: list[dict[str, Any]] = []
     import caption_delivery
 
@@ -939,7 +1541,7 @@ def build_render_command(
                     )
                 )
             continue
-        if card_plan_adopted and source_overlay.get("design_role"):
+        if canonical_plan_adopted and source_overlay.get("design_role"):
             # The card plan answers "which cards" on its own. These were put
             # here by the highlight-deck and legacy overlay paths, which the
             # plan replaces; drawing both puts two cards on screen at once —
@@ -988,16 +1590,11 @@ def build_render_command(
                     overlay_visual_evidence(overlay, render_scale)
                 )
     overlays.sort(key=lambda item: (int(item.get("z_index", 0)), float(item.get("start", 0.0))))
-    from editor_server import load_layer_bundle
-
-    layers_bundle, visual_plan_v2 = load_layer_bundle(project_dir)
     # A card plan, once a project has one, is the whole answer to "which
     # cards". Cards used to arrive down three unrelated paths; letting the
     # plan and one of those paths both contribute would restore exactly the
     # drift the plan exists to remove. The design-role overlays those other
     # paths left in the editor state are skipped above on the same flag.
-    if planned_cards is not None:
-        layers_bundle, visual_plan_v2 = planned_cards
     # Composing the cards and placing the plan's beats are separate jobs, and
     # nesting the second inside the first meant a plan of nothing but
     # pictures was skipped whole: no picture drawn, no error, a render that
@@ -1005,7 +1602,9 @@ def build_render_command(
     # plan item is placed either way.
     artifact_by_layer: dict[str, Any] = {}
     resolved_pack = style_pack_for_clip(state, clip)
-    if layers_bundle.get("items"):
+    if visual_authority is not None:
+        artifact_by_layer = visual_authority.artifacts
+    elif layers_bundle.get("items"):
         import structured_card_compositor
 
         if not structured_card_compositor.compositor_available():
@@ -1037,14 +1636,17 @@ def build_render_command(
         for window_start, window_end in windows:
             if layer_ref and layer_ref in artifact_by_layer:
                 artifact = artifact_by_layer[layer_ref]
-                card_y = card_y_for_window(
-                    source, plan_item, artifact, height,
-                    caption_top_fraction(state),
-                    # The band the platform keeps for its own controls; a
-                    # card that clears the speaker can still land behind them.
-                    float((platform_safe_area(state) or {}).get("top", 0) or 0)
-                    / 100.0,
-                )
+                if plan_item.get("stage") == "split_graphic_presenter":
+                    card_y = 25.0
+                else:
+                    card_y = card_y_for_window(
+                        source, plan_item, artifact, height,
+                        caption_top_fraction(state),
+                        # The band the platform keeps for its own controls; a
+                        # card that clears the speaker can still land behind them.
+                        float((platform_safe_area(state) or {}).get("top", 0) or 0)
+                        / 100.0,
+                    )
                 # A content-animating preset gets the real thing when the
                 # animator can deliver it: the same card, rebuilt as a
                 # transparent clip whose digits count and whose rows arrive.
@@ -1061,6 +1663,11 @@ def build_render_command(
                     render_scale,
                     animated_source,
                 )
+                card_evidence["structured_layer_hash"] = artifact.get(
+                    "structured_layer_hash"
+                )
+                card_evidence["structured_layer_id"] = str(layer_ref)
+                card_evidence["artifact_hash"] = artifact.get("artifact_hash")
                 card_evidence.update(
                     {
                         "id": str(plan_item.get("id") or ""),
@@ -1069,10 +1676,12 @@ def build_render_command(
                         "source": "structured_card",
                     }
                 )
-                expected_visual_beat_count += 1
-                evidence_items.append(card_evidence)
-                overlays.append(
-                    {
+                card_evidence.update(
+                    resolved_scene_evidence(
+                        plan_item, card_evidence, window_start, window_end
+                    )
+                )
+                card_overlay = {
                         "id": plan_item.get("id"),
                         "type": "video" if animated_source else "image",
                         "source": animated_source or artifact["artifact_id"],
@@ -1080,6 +1689,7 @@ def build_render_command(
                         "end": window_end,
                         "visible": True,
                         "z_index": 5,
+                        "motion_major": True,
                         # The size it was composed at, kept so the finished
                         # frame can be checked for cards sitting on each
                         # other. ffmpeg derives the drawn height from the
@@ -1107,15 +1717,66 @@ def build_render_command(
                             # The style pack says how this component
                             # should arrive; every card fading in
                             # regardless was the pack going unread. An
-                            # animated card carries its motion inside the
-                            # clip, so it takes no entrance on top.
-                            "animation": "fade" if animated_source else
+                            # animated card keeps its component motion inside
+                            # the clip and adds the existing cross-hold pan so
+                            # final pixels retain measurable motion after an
+                            # early content entrance has completed.
+                            "animation": "pan" if animated_source else
                             motion_for_layer(
                                 resolved_pack, layers_bundle, layer_ref
                             ),
                         },
                     }
-                )
+                if visual_authority is not None:
+                    frozen_source = visual_authority.bind_motion_graphic(
+                        project_dir,
+                        str(plan_item.get("id") or ""),
+                        artifact,
+                        card_overlay,
+                        animated_source,
+                        width,
+                        height,
+                    )
+                    card_overlay["source"] = frozen_source
+                    authority_item = next(
+                        item["motion_attribution"]
+                        for item in visual_authority.public["items"]
+                        if item.get("id") == str(plan_item.get("id") or "")
+                    )
+                    if not isinstance(authority_item, dict):
+                        raise ValueError("motion attribution binding is invalid")
+                    motion_graphics_for_probe[str(plan_item.get("id") or "")] = dict(
+                        visual_authority.motion_graphics[str(plan_item.get("id") or "")]
+                    )
+                else:
+                    legacy_source = Path(
+                        str(animated_source or artifact["artifact_id"])
+                    )
+                    if not legacy_source.is_absolute():
+                        legacy_source = project_dir / legacy_source
+                    motion_graphics_for_probe[str(plan_item.get("id") or "")] = {
+                        "artifact_sha256": str(artifact.get("artifact_hash") or ""),
+                        "source_path": str(legacy_source.resolve()),
+                        "source_sha256": file_sha256(legacy_source),
+                        "source_kind": "video" if animated_source else "image",
+                        "canvas_width": width,
+                        "canvas_height": height,
+                        "source_start_sample": sfx_delivery.seconds_to_samples(
+                            window_start
+                        ),
+                        "source_end_sample": sfx_delivery.seconds_to_samples(
+                            window_end
+                        ),
+                        "placement": {
+                            "width_percent": float(card_overlay["style"]["width"]),
+                            "x_percent": float(card_overlay["style"]["x"]),
+                            "y_percent": float(card_overlay["style"]["y"]),
+                            "animation": str(card_overlay["style"]["animation"]),
+                        },
+                    }
+                expected_visual_beat_count += 1
+                evidence_items.append(card_evidence)
+                overlays.append(card_overlay)
             elif asset_ref:
                 asset_overlay = {
                         "id": plan_item.get("id"),
@@ -1279,7 +1940,24 @@ def build_render_command(
             f"[{visual_input_index if visual_input_index is not None else 0}:v]{base_filter}[v0]"
         ]
     current = "v0"
-    for index, overlay in enumerate(overlays, start=1):
+    ordered_overlays = overlays
+    first_major_index: int | None = None
+    if motion_base_output is not None:
+        non_major = [item for item in overlays if item.get("motion_major") is not True]
+        major = [item for item in overlays if item.get("motion_major") is True]
+        if not major:
+            raise ValueError("motion base sidecar requires a structured major graphic")
+        ordered_overlays = [*non_major, *major]
+        first_major_index = len(non_major) + 1
+    motion_base_label: str | None = None
+    for index, overlay in enumerate(ordered_overlays, start=1):
+        if first_major_index == index:
+            motion_base_label = "motion_base_visual"
+            candidate_label = f"{current}_with_major"
+            filters.append(
+                f"[{current}]split=2[{candidate_label}][{motion_base_label}]"
+            )
+            current = candidate_label
         output_label = f"v{index}"
         kind = overlay.get("type")
         if kind in {"image", "gif", "video"}:
@@ -1444,6 +2122,26 @@ def build_render_command(
             str(output),
         ]
     )
+    if motion_base_output is not None:
+        if motion_base_label is None:
+            raise ValueError("motion base sidecar was not connected to the render graph")
+        motion_base_output.parent.mkdir(parents=True, exist_ok=True)
+        command.extend(
+            [
+                "-map",
+                f"[{motion_base_label}]",
+                "-an",
+                "-t",
+                f"{duration:.3f}",
+                "-r",
+                str(int(canvas.get("fps", 30))),
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv420p",
+                str(motion_base_output),
+            ]
+        )
     if visual_evidence is not None:
         director = DIRECTOR_PRESETS.get(str(state.get("director_style") or ""), {})
         motion_intensity = (
@@ -1460,9 +2158,18 @@ def build_render_command(
                 "motion_intensity": motion_intensity,
                 "expected_visual_beat_count": expected_visual_beat_count,
                 "visual_beat_count": len(evidence_items),
+                "a_roll_breathing_intervals": breathing_intervals,
                 "items": evidence_items,
             }
         )
+        if motion_graphics_for_probe:
+            visual_evidence["frozen_graphics"] = motion_graphics_for_probe
+            visual_evidence["motion_attribution"] = {
+                scene_id: {
+                    key: value for key, value in binding.items() if key != "source_path"
+                }
+                for scene_id, binding in motion_graphics_for_probe.items()
+            }
     return command
 
 
@@ -1619,6 +2326,9 @@ def render_project(
     staged_sfx: tuple[Path, Path, Path] | None = None
     sfx_bindings: tuple[str, str] | None = None
     dialogue_priority_paths: tuple[Path, Path] | None = None
+    visual_authority: FrozenVisualAuthority | None = None
+    motion_base_output: Path | None = None
+    temporary: Path | None = None
     if direct_final:
         if render_id is None:
             raise RuntimeError("direct final render has no delivery identity")
@@ -1638,12 +2348,6 @@ def render_project(
                     "caption_binding_missing",
                     "required translated captions need the caption compositor",
                 )
-        direct_stage = delivery_envelope.begin_staging(
-            project_dir,
-            render_id,
-            expected_output=output,
-        )
-        temporary = direct_stage / delivery_envelope.STAGE_FILENAMES["output"]
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
@@ -1651,17 +2355,40 @@ def render_project(
     publication_attempted = False
     deferred_publication: delivery_envelope.DeferredPublication | None = None
     try:
+        if direct_final:
+            if render_id is None:
+                raise RuntimeError("direct final render has no delivery identity")
+            direct_stage = delivery_envelope.begin_staging(
+                project_dir,
+                render_id,
+                expected_output=output,
+            )
+            if state.get("director_style") == "kinetic-explainer":
+                visual_authority = freeze_visual_authority(
+                    project_dir, state, manifest, clip, direct_stage
+                )
+                motion_base_output = direct_stage / "motion_base_visual.mkv"
+            temporary = direct_stage / delivery_envelope.STAGE_FILENAMES["output"]
+        if temporary is None:
+            raise RuntimeError("render output staging was not initialized")
         visual_source: Path | None = None
         if clip is not None and state.get("visual_quality_mode") == "designed":
             quality_errors = visual_quality_errors(state, manifest, clip)
             if quality_errors:
                 raise ValueError("visual-quality contract failed: " + "; ".join(quality_errors))
+            if visual_authority is not None:
+                scene_plan = visual_authority.plan
+            else:
+                from editor_server import load_layer_bundle
+
+                _scene_layers, scene_plan = load_layer_bundle(project_dir)
+            canonical_scene_plan = bool(scene_plan.get("items"))
             roles = {
                 str(item.get("design_role"))
                 for item in overlays_for_clip(state, clip)
                 if item.get("design_role")
             }
-            if set(DESIGN_ROLES).issubset(roles):
+            if not canonical_scene_plan and set(DESIGN_ROLES).issubset(roles):
                 import caption_compositor
 
                 package_state = (
@@ -1702,6 +2429,8 @@ def render_project(
             clip,
             visual_source,
             visual_evidence=raw_visual_evidence,
+            visual_authority=visual_authority,
+            motion_base_output=motion_base_output,
         )
         if direct_final and state.get("director_style") == "kinetic-explainer":
             if direct_stage is None or render_id is None or raw_visual_evidence is None:
@@ -1723,6 +2452,8 @@ def render_project(
                 visual_evidence=raw_visual_evidence, sfx_stem=staged_sfx[2],
                 dialogue_priority_dialogue=dialogue_priority_paths[0],
                 dialogue_priority_sfx=dialogue_priority_paths[1],
+                visual_authority=visual_authority,
+                motion_base_output=motion_base_output,
             )
         try:
             result = subprocess.run(
@@ -1736,6 +2467,31 @@ def render_project(
         if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
             raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
         if raw_visual_evidence is not None and render_id is not None:
+            if visual_authority is not None:
+                visual_authority.revalidate()
+                if motion_base_output is None:
+                    raise RuntimeError("frozen visual authority has no motion base output")
+                base_relative = motion_base_output.relative_to(project_dir).as_posix()
+                base_snapshot = delivery_envelope.snapshot_project_file(
+                    project_dir,
+                    base_relative,
+                    label="private motion base visual",
+                )
+                canvas = state.get("canvas") or {}
+                raw_visual_evidence["motion_input"] = visual_authority.bind_motion_base(
+                    base_snapshot,
+                    motion_base_output,
+                    even(float(canvas.get("width", 1080))),
+                    even(float(canvas.get("height", 1920))),
+                    int(canvas.get("fps", 30)),
+                )
+                import visual_motion_probe
+
+                motion_probes = visual_motion_probe.measure_declared_motion(
+                    temporary,
+                    raw_visual_evidence,
+                )
+                raw_visual_evidence["motion_probes"] = motion_probes
             evidence_output = (
                 direct_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
                 if direct_stage is not None
@@ -1743,7 +2499,10 @@ def render_project(
             )
             atomic_write_json(
                 evidence_output,
-                rendered_visual_quality_report(raw_visual_evidence),
+                rendered_visual_quality_report(
+                    raw_visual_evidence,
+                    visual_authority.public if visual_authority is not None else None,
+                ),
             )
         if variant_id and quality == "final":
             # QA runs on the temporary output; only a passing QA publishes
@@ -1763,6 +2522,7 @@ def render_project(
             if render_id is None or direct_stage is None:
                 raise RuntimeError("direct final render has no visual evidence identity")
             staged_evidence = direct_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
+            pre_qa_visual_sha256 = file_sha256(staged_evidence)
             if staged_sfx is not None:
                 if sfx_bindings is None:
                     raise RuntimeError("kinetic SFX has no freshness bindings")
@@ -1798,8 +2558,20 @@ def render_project(
                 expected_cut_map_sha256=cut_hash,
                 expected_studio_edits_sha256=expected_studio_edits_hash,
             )
+            if visual_authority is not None:
+                visual_authority.revalidate()
             staged_report = direct_stage / delivery_envelope.STAGE_FILENAMES["qa_report"]
-            report_payload = read_json(staged_report, {}) or {}
+            if visual_authority is not None:
+                adopt_fresh_motion_receipt(
+                    staged_evidence,
+                    staged_report,
+                    pre_qa_visual_sha256,
+                )
+                _staged_visual_payload, report_payload = (
+                    sanitize_private_motion_receipts(staged_evidence, staged_report)
+                )
+            else:
+                report_payload = read_json(staged_report, {}) or {}
             report_payload["video"] = str(output.expanduser().resolve())
             atomic_write_json(staged_report, report_payload)
             staged_sources = {
@@ -1883,6 +2655,9 @@ def render_project(
                 staged_sources,
                 renderer_script=Path(__file__).resolve(),
                 ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+                visual_authority=(
+                    visual_authority.public if visual_authority is not None else None
+                ),
             )
             delivery_envelope.write_prepared_envelope(direct_stage, prepared)
             # The prepared envelope is persisted but still private. Re-read the
@@ -1938,6 +2713,9 @@ def render_project(
                 staged_sources=staged_sources,
                 expected_output=output,
                 defer_commit=defer_delivery_handoff,
+                revalidate_authority=(
+                    visual_authority.revalidate if visual_authority is not None else None
+                ),
             )
             if defer_delivery_handoff:
                 if not isinstance(publication, delivery_envelope.DeferredPublication):
@@ -1947,20 +2725,47 @@ def render_project(
         else:
             os.replace(temporary, output)
     finally:
-        if deferred_publication is None:
-            temporary.unlink(missing_ok=True)
-        if (
-            direct_final
-            and render_id is not None
-            and direct_stage is not None
-            and not published
-            and not publication_attempted
-        ):
-            delivery_envelope.discard_staging(
-                project_dir,
-                render_id,
-                authority=direct_stage,
-            )
+        if publication_attempted:
+            if deferred_publication is None and temporary is not None:
+                temporary.unlink(missing_ok=True)
+        else:
+            primary_error = sys.exc_info()[1]
+            cleanup_errors: list[tuple[str, Exception]] = []
+            try:
+                if deferred_publication is None and temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError as exc:
+                        cleanup_errors.append(("temporary output cleanup", exc))
+            finally:
+                if (
+                    direct_final
+                    and render_id is not None
+                    and direct_stage is not None
+                    and not published
+                ):
+                    try:
+                        delivery_envelope.discard_staging(
+                            project_dir,
+                            render_id,
+                            authority=direct_stage,
+                        )
+                    except Exception as exc:
+                        cleanup_errors.append(("staging discard", exc))
+            if cleanup_errors:
+                if primary_error is not None:
+                    add_note = getattr(primary_error, "add_note", None)
+                    if add_note is not None:
+                        for label, cleanup_error in cleanup_errors:
+                            add_note(f"{label} also failed: {cleanup_error}")
+                else:
+                    label, cleanup_error = cleanup_errors[-1]
+                    add_note = getattr(cleanup_error, "add_note", None)
+                    if add_note is not None:
+                        for other_label, other_error in cleanup_errors[:-1]:
+                            add_note(f"{other_label} also failed: {other_error}")
+                        add_note(f"render cleanup failed during {label}")
+                    raise cleanup_error
     return deferred_publication
 
 
