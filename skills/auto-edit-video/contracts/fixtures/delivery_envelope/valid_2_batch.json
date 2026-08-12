@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "route": "batch",
+  "render_id": "batch_0123456789abcdef0123456789abcdef",
+  "state": "finalized",
+  "quality": "final",
+  "profile": {
+    "id": "teacher-punch",
+    "resolved_profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "timeline": {
+    "editor_state_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "cut_map_sha256": null
+  },
+  "batch": {
+    "schema_version": 1,
+    "batch_id": "batch_0123456789abcdef0123456789abcdef",
+    "members": [
+      {
+        "index": 1,
+        "clip_id": "highlight-first",
+        "render_id": "render_first",
+        "envelope_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "output": {"path": "renders/01-highlight-first-final.mp4", "sha256": "5555555555555555555555555555555555555555555555555555555555555555", "bytes": 12},
+        "archive_name": "01-01-highlight-first-final.mp4",
+        "archive_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      {
+        "index": 2,
+        "clip_id": "highlight-second",
+        "render_id": "render_second",
+        "envelope_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "output": {"path": "renders/02-highlight-second-final.mp4", "sha256": "7777777777777777777777777777777777777777777777777777777777777777", "bytes": 14},
+        "archive_name": "02-02-highlight-second-final.mp4",
+        "archive_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+      }
+    ]
+  },
+  "artifacts": {
+    "output": {"path": "/tmp/batch_0123456789abcdef0123456789abcdef-final.zip", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 64},
+    "qa_report": {"path": "working/delivery_qa/batch_0123456789abcdef0123456789abcdef.json", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "bytes": 10},
+    "contact_sheet": null,
+    "visual_evidence": null,
+    "motion_evidence": null,
+    "caption_v2": null,
+    "audio_event_plan": null,
+    "audio_catalog": null,
+    "sfx_stem": null
+  },
+  "renderer_identity": {
+    "name": "render_editor_timeline",
+    "contract_version": 1,
+    "script_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "ffmpeg_executable_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "prepared_envelope_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+}

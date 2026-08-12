@@ -10,7 +10,7 @@ when recovery cannot prove that a destination is still ours.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import hashlib
 import fcntl
@@ -20,6 +20,7 @@ import re
 import shutil
 import stat
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -45,7 +46,7 @@ DEFERRED_MARKER_KEYS = {
     "binding_sha256",
 }
 DEFERRED_MARKER_STATES = {"pending", "committed"}
-ROUTES = ("direct", "single")
+ROUTES = ("direct", "single", "batch")
 PREPARED_NAME = "prepared.json"
 FINALIZED_NAME = "{render_id}.json"
 ARTIFACT_NAMES = (
@@ -965,6 +966,166 @@ def build_prepared_envelope(
         }
     validate_envelope(root, prepared, sources=staged_sources, expected_state="prepared")
     return prepared
+
+
+def build_batch_envelope(
+    project_dir: Path,
+    batch_id: str,
+    archive: Path,
+    receipt_relative: str,
+    state: dict[str, Any],
+    members: Sequence[Mapping[str, Any]],
+    *,
+    renderer_script: Path,
+    ffmpeg_executable: Path,
+) -> dict[str, Any]:
+    """Bind member order, member output bytes and archive contents.
+
+    ``members`` carries the batch order itself: each entry declares a
+    ``clip_id``, a ``render_id`` and its ``archive_name``, and the 1-based
+    index is taken from that sequence, not from the caller.  Every binding
+    in the returned envelope is read back off disk here — the caller's own
+    digests are never trusted — so a member whose published bytes, whose
+    finalized member envelope, or whose stored archive entry disagrees with
+    the batch can never reach a finalized aggregate.
+    """
+    root = project_dir.resolve()
+    if not RENDER_ID_PATTERN.fullmatch(batch_id):
+        raise DeliveryEnvelopeError(f"batch identity is invalid: {batch_id}")
+    if not members:
+        raise DeliveryEnvelopeError("a batch envelope requires at least one member")
+    import editor_server
+
+    archive_path = _canonical_expected_output(Path(archive))
+    if not archive_path.is_file():
+        raise DeliveryEnvelopeError("batch archive bytes are missing")
+
+    member_payload: list[dict[str, Any]] = []
+    expected_names: list[str] = []
+    for position, member in enumerate(members):
+        render_id = str(member.get("render_id") or "")
+        if not RENDER_ID_PATTERN.fullmatch(render_id):
+            raise DeliveryEnvelopeError(f"batch member identity is invalid: {render_id}")
+        member_envelope_path = finalized_path(root, render_id)
+        member_envelope = _read_json(member_envelope_path)
+        _validate_envelope_structure(member_envelope, expected_state="finalized")
+        if member_envelope.get("route") != "batch":
+            raise DeliveryEnvelopeError(
+                f"batch member {render_id} was not published through the batch route"
+            )
+        output_item = (member_envelope.get("artifacts") or {}).get("output")
+        if not isinstance(output_item, dict) or not isinstance(output_item.get("path"), str):
+            raise DeliveryEnvelopeError(f"batch member {render_id} binds no output")
+        published = _destination_path(root, str(output_item["path"]), allow_external=True)
+        published_snapshot = _snapshot_regular_file(
+            published, label=f"batch member output {render_id}"
+        )
+        if (
+            published_snapshot.sha256 != output_item.get("sha256")
+            or published_snapshot.size != output_item.get("bytes")
+        ):
+            raise DeliveryEnvelopeError(
+                f"batch member {render_id} published output does not match its envelope"
+            )
+        archive_name = str(member.get("archive_name") or "")
+        expected_names.append(archive_name)
+        member_payload.append(
+            {
+                "index": position + 1,
+                "clip_id": str(member.get("clip_id") or ""),
+                "render_id": render_id,
+                "envelope_sha256": _sha256(member_envelope_path),
+                "output": {
+                    "path": _project_relative(
+                        root, published, label=f"batch member output {render_id}"
+                    ),
+                    "sha256": published_snapshot.sha256,
+                    "bytes": published_snapshot.size,
+                },
+                "archive_name": archive_name,
+                "archive_sha256": published_snapshot.sha256,
+            }
+        )
+
+    with zipfile.ZipFile(archive_path, "r") as bundle:
+        stored = [info.filename for info in bundle.infolist() if not info.is_dir()]
+        if stored != expected_names:
+            raise DeliveryEnvelopeError(
+                "batch archive contents do not match the batch member order"
+            )
+        for entry in member_payload:
+            digest = hashlib.sha256()
+            with bundle.open(str(entry["archive_name"]), "r") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != entry["archive_sha256"]:
+                raise DeliveryEnvelopeError(
+                    f"batch archive member {entry['archive_name']} does not match its published output"
+                )
+
+    receipt = _destination_path(root, receipt_relative, allow_external=False)
+    profile_id, profile_hash, _snapshot = _profile_binding(root, state)
+    cut_map = root / "working/cut_map.json"
+    if cut_map.is_symlink():
+        raise DeliveryEnvelopeError("working/cut_map.json must not be a symlink")
+    prepared = {
+        "schema_version": 1,
+        "route": "batch",
+        "render_id": batch_id,
+        "state": "prepared",
+        "quality": "final",
+        "profile": {"id": profile_id, "resolved_profile_hash": profile_hash},
+        "timeline": {
+            "editor_state_revision": editor_server.editor_state_revision(state),
+            "cut_map_sha256": _sha256(cut_map) if cut_map.is_file() else None,
+        },
+        "batch": {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "members": member_payload,
+        },
+        "artifacts": {
+            "output": _artifact_record(
+                root, archive_path, str(archive_path), allow_external=True
+            ),
+            "qa_report": _artifact_record(root, receipt, receipt_relative),
+            "contact_sheet": None,
+            "visual_evidence": None,
+            "motion_evidence": None,
+            "caption_v2": None,
+            "audio_event_plan": None,
+            "audio_catalog": None,
+            "sfx_stem": None,
+        },
+        "renderer_identity": _renderer_identity(renderer_script, ffmpeg_executable),
+        "prepared_envelope_hash": None,
+    }
+    validate_envelope(root, prepared, expected_state="prepared")
+    return prepared
+
+
+def finalize_batch_envelope(
+    project_dir: Path, prepared: dict[str, Any]
+) -> dict[str, Any]:
+    """Publish the aggregate binding; nothing may cite a batch before this."""
+    root = project_dir.resolve()
+    batch_id = str(prepared.get("render_id") or "")
+    finalized = json.loads(json.dumps(prepared))
+    finalized["state"] = "finalized"
+    finalized["prepared_envelope_hash"] = contract_registry.canonical_hash(prepared)
+    validate_envelope(root, finalized, expected_state="finalized")
+    destination = finalized_path(root, batch_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _safe_directory(destination.parent, create=False)
+    if destination.is_symlink() or destination.exists():
+        # A finalized envelope is the delivery's identity; never overwrite one.
+        raise DeliveryEnvelopeError(
+            f"a finalized delivery envelope already exists for {batch_id}"
+        )
+    _atomic_write_json(destination, finalized)
+    if _read_json(destination) != finalized:
+        raise DeliveryEnvelopeError("batch delivery envelope changed during write")
+    return finalized
 
 
 def write_prepared_envelope(stage_dir: Path, envelope: dict[str, Any]) -> Path:
@@ -1975,29 +2136,31 @@ def commit_deferred_publication(authority: DeferredPublication) -> None:
     ordering for every destination-directory rename.
     """
     validated = _validate_deferred_publication(authority, expected_state="pending")
+    # The lease is this attempt's only authority to roll back, so it is held
+    # until the commit is durable.  Releasing it on a failed commit would strand
+    # the publication public: abort_deferred_publication would then reject its
+    # own authority as stale and the caller could never undo the handoff.
+    validate_deferred_publication(validated)
+    _write_deferred_marker(
+        validated.project_dir,
+        validated.stage_dir,
+        validated.render_id,
+        expected_output=validated.expected_output,
+        state="committed",
+        transaction_id=validated._transaction_id,
+    )
     try:
-        validate_deferred_publication(validated)
-        _write_deferred_marker(
-            validated.project_dir,
-            validated.stage_dir,
-            validated.render_id,
-            expected_output=validated.expected_output,
-            state="committed",
-            transaction_id=validated._transaction_id,
-        )
-        try:
-            _remove_stage(validated.stage_dir)
-        except (OSError, DeliveryEnvelopeError):
-            # The persisted committed marker makes cleanup retryable after
-            # process death. Publication is already public and must not be
-            # reclassified as rollback-only.
-            pass
-    finally:
-        _release_staging_lease(
-            validated.project_dir,
-            validated.render_id,
-            validated._owner_token,
-        )
+        _remove_stage(validated.stage_dir)
+    except (OSError, DeliveryEnvelopeError):
+        # The persisted committed marker makes cleanup retryable after
+        # process death. Publication is already public and must not be
+        # reclassified as rollback-only.
+        pass
+    _release_staging_lease(
+        validated.project_dir,
+        validated.render_id,
+        validated._owner_token,
+    )
 
 
 def _compensate_restore_attempt(applied: list[dict[str, Any]]) -> None:

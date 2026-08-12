@@ -4,6 +4,7 @@ import base64
 import contextlib
 import binascii
 import dataclasses
+import errno
 import hashlib
 import http.client
 import json
@@ -51,6 +52,22 @@ from editor_server import (  # noqa: E402
 # Mirrors what the policy-enforcing qa_video writes; delivery validation
 # rejects QA reports that lack this block (pre-policy reports).
 SYNTHETIC_QA_POLICY = dataclasses.asdict(qa_video.QaPolicy())
+
+
+def synthetic_visual_authority() -> dict[str, object]:
+    """A canonical frozen-visual-authority block as the renderer reports it."""
+    material = {
+        "schema_version": 1,
+        "source": "frozen_visual_authority",
+        "visual_plan_revision": "1" * 64,
+        "visual_plan_sha256": "2" * 64,
+        "structured_layers_sha256": "3" * 64,
+        "artifact_index_sha256": "4" * 64,
+    }
+    return {
+        **material,
+        "authority_hash": contract_registry.canonical_hash(material),
+    }
 from render_editor_timeline import (  # noqa: E402
     build_render_command,
     direct_final_render_id,
@@ -900,6 +917,7 @@ class EditorServerTests(unittest.TestCase):
                             "schema_version": 1,
                             "source": "renderer_evidence",
                             "status": "pass",
+                            "authority": synthetic_visual_authority(),
                             "duration_s": 10.0,
                             "minimum_primary_font_px": 48.0,
                             "expected_visual_beat_count": 1,
@@ -2082,6 +2100,9 @@ class EditorServerTests(unittest.TestCase):
         published_sha = hashlib.sha256(output.read_bytes()).hexdigest()
         self.assertEqual(envelope["artifacts"]["output"]["sha256"], published_sha)
         self.assertEqual(completed["output_sha256"], published_sha)
+        # Backlog alignment: the single route binds the frozen visual authority
+        # the direct route already carries.
+        self.assertEqual(envelope["visual_authority"], synthetic_visual_authority())
         for name in ("qa_report", "contact_sheet", "visual_evidence", "motion_evidence"):
             item = envelope["artifacts"][name]
             self.assertIsInstance(item, dict, name)
@@ -2409,6 +2430,367 @@ class EditorServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 409)
         self.assertIn("clip set", str(rejected["error"]))
+
+    def run_batch_final_render(
+        self,
+        *,
+        patches: tuple[object, ...] = (),
+        after_render: object | None = None,
+    ) -> tuple[dict[str, object], list[str]]:
+        """Drive one batch render through the public HTTP API."""
+        state, clip_ids = self.approve_batch_prerequisites()
+        fake_run = self.fake_batch_subprocess(after_render=after_render)
+        with (
+            patch("editor_server.subprocess.run", side_effect=fake_run),
+            patch("editor_server.ffprobe_has_visual_stream", return_value=True),
+        ):
+            with contextlib.ExitStack() as stack:
+                for entered in patches:
+                    stack.enter_context(entered)
+                status, accepted = self.json_request(
+                    "POST",
+                    "/api/render-batch",
+                    {"quality": "final", "expected_revision": state["revision"]},
+                )
+                self.assertEqual(status, 202, accepted)
+                return self.wait_for_render_terminal(), clip_ids
+
+    def assert_batch_published_nothing(self, previous: dict[str, object]) -> None:
+        """No member output, no archive, no envelope, previous pointer intact."""
+        renders = self.project / "renders"
+        self.assertEqual(
+            sorted(item.name for item in renders.glob("*-final.mp4")),
+            [],
+            "a failed batch left member outputs published",
+        )
+        self.assertEqual(
+            sorted(item.name for item in renders.glob("*-final.zip")),
+            [],
+            "a failed batch left an archive published",
+        )
+        envelope_dir = self.project / "working/delivery_envelopes"
+        self.assertEqual(
+            sorted(item.name for item in envelope_dir.glob("*.json")),
+            [],
+            "a failed batch left a finalized delivery envelope",
+        )
+        self.assertEqual(
+            json.loads(
+                (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+            ),
+            previous,
+        )
+
+    def assert_batch_staging_clean(self) -> None:
+        """A terminated batch owns its own render ids: no stage may survive it."""
+        staging = self.project / delivery_envelope.STAGING_REL
+        leftovers = sorted(
+            entry.name
+            for entry in (staging.iterdir() if staging.is_dir() else [])
+            if entry.name != ".locks"
+        )
+        self.assertEqual(
+            leftovers,
+            [],
+            "a failed batch left private staging state behind",
+        )
+
+    def test_batch_publishes_only_through_finalized_batch_envelope(self) -> None:
+        """Phase 4: a batch binds member order, member hashes and ZIP contents.
+
+        The archive and the delivery pointer may only become public once one
+        finalized batch envelope binds every member output byte-for-byte and
+        the exact bytes stored inside the ZIP.
+        """
+        completed, clip_ids = self.run_batch_final_render()
+        self.assertEqual(completed["state"], "complete", completed)
+        batch_id = str(completed["batch_id"])
+        envelope_path = self.project / f"working/delivery_envelopes/{batch_id}.json"
+        self.assertTrue(
+            envelope_path.is_file(),
+            "batch published an archive and a pointer without a finalized envelope",
+        )
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["route"], "batch")
+        self.assertEqual(envelope["state"], "finalized")
+        self.assertEqual(envelope["render_id"], batch_id)
+        self.assertIsInstance(envelope["prepared_envelope_hash"], str)
+        self.assertEqual(envelope["batch"]["batch_id"], batch_id)
+
+        delivery = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        members = envelope["batch"]["members"]
+        self.assertEqual([member["clip_id"] for member in members], clip_ids)
+        self.assertEqual([member["index"] for member in members], [1, 2])
+        archive = self.project / str(delivery["archive"])
+        self.assertEqual(
+            envelope["artifacts"]["output"]["sha256"],
+            hashlib.sha256(archive.read_bytes()).hexdigest(),
+        )
+        with zipfile.ZipFile(archive, "r") as bundle:
+            self.assertEqual(
+                bundle.namelist(),
+                [member["archive_name"] for member in members],
+            )
+            for member in members:
+                self.assertEqual(
+                    hashlib.sha256(bundle.read(str(member["archive_name"]))).hexdigest(),
+                    member["archive_sha256"],
+                )
+        for member, item in zip(members, delivery["items"], strict=True):
+            published = self.project / str(item["output"])
+            published_sha = hashlib.sha256(published.read_bytes()).hexdigest()
+            self.assertEqual(member["output"]["sha256"], published_sha)
+            self.assertEqual(item["output_sha256"], published_sha)
+            member_envelope_path = (
+                self.project
+                / f"working/delivery_envelopes/{member['render_id']}.json"
+            )
+            self.assertTrue(member_envelope_path.is_file(), member["render_id"])
+            self.assertEqual(
+                hashlib.sha256(member_envelope_path.read_bytes()).hexdigest(),
+                member["envelope_sha256"],
+            )
+            member_envelope = json.loads(
+                member_envelope_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(member_envelope["route"], "batch")
+            self.assertEqual(member_envelope["state"], "finalized")
+            self.assertEqual(
+                member_envelope["artifacts"]["output"]["sha256"], published_sha
+            )
+            # Backlog alignment: server envelopes bind the frozen visual
+            # authority the direct route already carries.
+            self.assertEqual(
+                member_envelope["visual_authority"], synthetic_visual_authority()
+            )
+        # No private candidate survives a committed batch.
+        for member in members:
+            self.assertFalse(
+                (
+                    self.project
+                    / f"working/delivery_envelopes/.staging/{member['render_id']}"
+                ).exists(),
+                member["render_id"],
+            )
+
+    def test_batch_member_mutated_after_render_publishes_no_member(self) -> None:
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-member-mutation",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+
+        def mutate_first_member(render_number: int) -> None:
+            if render_number != 2:
+                return
+            for candidate in sorted((self.project / "renders").glob("01-*-final.mp4")):
+                candidate.write_bytes(b"tampered-member-output")
+
+        failed, _clip_ids = self.run_batch_final_render(
+            after_render=mutate_first_member
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertIsNone(failed["output"])
+        self.assert_batch_published_nothing(previous)
+        self.assert_batch_staging_clean()
+
+    def test_batch_archive_rewritten_before_binding_publishes_nothing(self) -> None:
+        """The aggregate must bind the bytes actually stored in the ZIP."""
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-archive-rewrite",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_build = delivery_envelope.build_batch_envelope
+
+        def rewrite_archive_then_build(
+            project_dir: Path,
+            batch_id: str,
+            archive: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            with zipfile.ZipFile(archive, "r") as bundle:
+                entries = [
+                    (info.filename, bundle.read(info.filename))
+                    for info in bundle.infolist()
+                ]
+            with zipfile.ZipFile(
+                archive, "w", compression=zipfile.ZIP_STORED
+            ) as rewritten:
+                for position, (name, payload) in enumerate(entries):
+                    rewritten.writestr(
+                        name, b"swapped-archive-payload" if position == 0 else payload
+                    )
+            return real_build(project_dir, batch_id, archive, *args, **kwargs)
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "build_batch_envelope",
+                    side_effect=rewrite_archive_then_build,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertIn("archive member", str(failed["message"]))
+        self.assert_batch_published_nothing(previous)
+        self.assert_batch_staging_clean()
+
+    def test_batch_publication_crash_restores_previous_state(self) -> None:
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-crash",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_copy = delivery_envelope._copy_atomic
+        published_finals = 0
+
+        def crash_on_second_member(source: Path, destination: Path) -> None:
+            nonlocal published_finals
+            if Path(destination).name.endswith("-final.mp4"):
+                published_finals += 1
+                if published_finals > 1:
+                    raise OSError("synthetic power loss between batch members")
+            real_copy(source, destination)
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope, "_copy_atomic", side_effect=crash_on_second_member
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assert_batch_published_nothing(previous)
+
+    def test_batch_commit_failure_rolls_back_every_member(self) -> None:
+        """A commit that cannot persist must stay reversible, not half public.
+
+        The staging lease is the authority that lets the batch roll back.  If a
+        commit gives it up before the committed marker is durable, the failed
+        member is stranded public with no way to undo it.
+        """
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-commit-failure",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_write_marker = delivery_envelope._write_deferred_marker
+
+        def fail_committed_marker(*args: object, **kwargs: object) -> dict[str, object]:
+            if kwargs.get("state") == "committed":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write_marker(*args, **kwargs)
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "_write_deferred_marker",
+                    side_effect=fail_committed_marker,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assert_batch_published_nothing(previous)
+        self.assert_batch_staging_clean()
+
+    def test_batch_member_mutated_after_binding_quarantines_and_rolls_back(self) -> None:
+        """Bytes changed between binding and commit are quarantined, not shipped."""
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-post-binding-mutation",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_finalize = delivery_envelope.finalize_batch_envelope
+        tampered = b"tampered-after-batch-binding"
+
+        def tamper_after_finalize(
+            project_dir: Path, prepared: dict[str, object]
+        ) -> object:
+            result = real_finalize(project_dir, prepared)
+            for candidate in sorted((self.project / "renders").glob("01-*-final.mp4")):
+                candidate.write_bytes(tampered)
+            return result
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "finalize_batch_envelope",
+                    side_effect=tamper_after_finalize,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertIn("changed before handoff", str(failed["message"]))
+        self.assert_batch_published_nothing(previous)
+        self.assert_batch_staging_clean()
+        quarantine = self.project / delivery_envelope.QUARANTINE_REL
+        quarantined = sorted(quarantine.rglob("*.conflict")) if quarantine.is_dir() else []
+        self.assertTrue(
+            any(item.read_bytes() == tampered for item in quarantined),
+            "mutated member bytes were dropped instead of quarantined",
+        )
+
+    def test_batch_failure_after_pointer_write_keeps_declared_delivery(self) -> None:
+        """Once the pointer is public the delivery it names may not be deleted."""
+        self.write_json(
+            "working/latest_final_qa.json",
+            {"schema_version": 1, "status": "pass", "sentinel": "batch-previous"},
+        )
+        real_write = editor_server.atomic_write_json
+
+        def fail_after_pointer(path: Path, payload: object) -> None:
+            real_write(path, payload)
+            if Path(path).name == "latest_final_qa.json":
+                raise OSError(errno.EIO, "synthetic crash after the pointer landed")
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    editor_server,
+                    "atomic_write_json",
+                    side_effect=fail_after_pointer,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        pointer = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(pointer["status"], "pass")
+        batch_id = str(pointer["batch_id"])
+        archive = self.project / str(pointer["archive"])
+        self.assertTrue(
+            archive.is_file(),
+            "the pointer names an archive that cleanup deleted",
+        )
+        self.assertEqual(
+            hashlib.sha256(archive.read_bytes()).hexdigest(),
+            pointer["archive_sha256"],
+        )
+        self.assertTrue(
+            (
+                self.project / f"working/delivery_envelopes/{batch_id}.json"
+            ).is_file(),
+            "the declared batch envelope was deleted after the pointer went public",
+        )
+        self.assertTrue(
+            (
+                self.project / f"working/delivery_qa/{batch_id}.json"
+            ).is_file(),
+            "the declared batch receipt was deleted after the pointer went public",
+        )
 
     def test_failed_batch_preserves_previous_latest_delivery(self) -> None:
         state, _clip_ids = self.approve_batch_prerequisites()

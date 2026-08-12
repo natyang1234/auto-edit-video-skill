@@ -1506,6 +1506,24 @@ def approved_highlights_in_plan_order(
     return ordered, errors
 
 
+def staged_visual_authority(staged_evidence: Path) -> dict[str, Any] | None:
+    """Transcribe the renderer's frozen visual authority for envelope binding.
+
+    The server renders out of process, so unlike the direct route this is a
+    transcription of the renderer's own evidence rather than an independent
+    in-process freeze.  It is still worth binding: the envelope builder
+    re-derives the block's canonical ``authority_hash`` and ties it to the
+    published evidence bytes, so the delivered envelope names exactly which
+    visual plan the published video was built from and any later edit of that
+    claim breaks the finalized hash chain.
+    """
+    report = read_json(staged_evidence, None)
+    if not isinstance(report, dict):
+        return None
+    authority = report.get("authority")
+    return authority if isinstance(authority, dict) else None
+
+
 def delivery_qa_errors(project_dir: Path, state: dict[str, Any]) -> list[str]:
     """Verify that the final gate is tied to current, untampered delivery artifacts."""
     receipt = read_json(project_dir / LATEST_DELIVERY_QA_REL, None)
@@ -5840,18 +5858,34 @@ class EditorHandler(BaseHTTPRequestHandler):
         batch_id: str,
         job: dict[str, Any],
         state_revision: str,
-    ) -> dict[str, Any]:
-        """Render and QA one frozen final snapshot without publishing it as latest."""
+    ) -> tuple[dict[str, Any], delivery_envelope.DeferredPublication]:
+        """Render, QA and *reversibly* publish one frozen final snapshot.
+
+        Phase 4 batch route: the member is published through the same Phase 0b
+        staging/journal/CAS machinery the single route uses, but with the
+        commit deferred.  Its bytes are therefore live for packaging while the
+        batch transaction can still restore the exact prior public state.
+        """
         render_id = str(job["render_id"])
         clip_id = str(job["clip_id"])
         snapshot_path = Path(job["snapshot_path"])
         output_name = str(job["output_name"])
-        output = self.server.project_dir / "renders" / output_name
-        temporary = output.parent / f".{output.stem}.{render_id}.part.mp4"
-        qa_report = self.server.project_dir / "qa" / f"{render_id}-qa-report.json"
-        qa_contact = self.server.project_dir / "qa" / f"{render_id}-contact.png"
+        project_dir = self.server.project_dir
+        script = SKILL_DIR / "scripts/render_editor_timeline.py"
+        output = project_dir / "renders" / output_name
+        qa_report = project_dir / "qa" / f"{render_id}.json"
+        qa_contact = project_dir / "qa" / f"{render_id}-contact.png"
         output.parent.mkdir(parents=True, exist_ok=True)
+        staging: delivery_envelope.StagingAttempt | None = None
+        publication: delivery_envelope.DeferredPublication | None = None
+        handed_off = False
         try:
+            staging = delivery_envelope.begin_staging(
+                project_dir, render_id, expected_output=output
+            )
+            temporary = staging / delivery_envelope.STAGE_FILENAMES["output"]
+            staged_qa_report = staging / delivery_envelope.STAGE_FILENAMES["qa_report"]
+            staged_contact = staging / delivery_envelope.STAGE_FILENAMES["contact_sheet"]
             snapshot_payload = read_json(snapshot_path, {}) or {}
             visual_quality = (
                 snapshot_payload.get("visual_quality")
@@ -5860,7 +5894,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             )
             command = [
                 sys.executable,
-                str(SKILL_DIR / "scripts/render_editor_timeline.py"),
+                str(script),
                 "--project-dir",
                 str(self.server.project_dir),
                 "--snapshot",
@@ -5895,9 +5929,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "--video",
                 str(temporary),
                 "--report",
-                str(qa_report),
+                str(staged_qa_report),
                 "--contact",
-                str(qa_contact),
+                str(staged_contact),
                 "--visual-evidence",
                 str(rendered_visual_evidence_path(self.server.project_dir, render_id)),
                 # Every clip shares the declaration frozen into the batch's
@@ -5916,9 +5950,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("delivery QA failed: batch clip QA timed out") from exc
-            qa_payload = read_json(qa_report, {}) or {}
+            qa_payload = read_json(staged_qa_report, {}) or {}
             qa_payload["visual_quality"] = visual_quality
-            atomic_write_json(qa_report, qa_payload)
+            # The delivered report names the public output it vouches for; it is
+            # frozen into the prepared envelope, so bind it before preparing.
+            qa_payload["video"] = str(output)
+            atomic_write_json(staged_qa_report, qa_payload)
             visual_delivery = qa_payload.get("visual_delivery")
             if (
                 qa_result.returncode != 0
@@ -5926,6 +5963,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 or not isinstance(visual_delivery, dict)
                 or visual_delivery.get("status") != "pass"
             ):
+                # Nothing is published, but the human still needs the evidence:
+                # copy it out without minting any pointer or envelope.
+                qa_report.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(staged_qa_report, qa_report)
+                if staged_contact.is_file():
+                    shutil.copyfile(staged_contact, qa_contact)
                 failure_receipt = {
                     "schema_version": 1,
                     "batch_id": batch_id,
@@ -5960,8 +6003,43 @@ class EditorHandler(BaseHTTPRequestHandler):
                     )
                 )
 
-            output_sha = file_sha256(temporary)
-            os.replace(temporary, output)
+            from render_editor_timeline import ffmpeg_path
+
+            staged_evidence = staging / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
+            shutil.copyfile(
+                rendered_visual_evidence_path(project_dir, render_id),
+                staged_evidence,
+            )
+            staged_sources = {
+                "output": temporary,
+                "qa_report": staged_qa_report,
+                "contact_sheet": staged_contact,
+                "visual_evidence": staged_evidence,
+                "motion_evidence": staged_evidence,
+            }
+            prepared = delivery_envelope.build_prepared_envelope(
+                project_dir,
+                render_id,
+                output,
+                snapshot_payload.get("state") or {},
+                staged_sources,
+                renderer_script=script,
+                ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+                visual_authority=staged_visual_authority(staged_evidence),
+                route="batch",
+            )
+            delivery_envelope.write_prepared_envelope(staging.stage_dir, prepared)
+            publication = delivery_envelope.publish_direct_delivery(
+                project_dir,
+                staging,
+                staged_sources=staged_sources,
+                expected_output=output,
+                defer_commit=True,
+            )
+            # The deferred publication owns the staging lease from here on; the
+            # batch transaction either commits or restores the prior state.
+            staging = None
+            output_sha = str(publication.finalized["artifacts"]["output"]["sha256"])
             render_receipt = {
                 "schema_version": 1,
                 "batch_id": batch_id,
@@ -5982,8 +6060,8 @@ class EditorHandler(BaseHTTPRequestHandler):
                 / f"{render_id}.json"
             )
             atomic_write_json(render_receipt_path, render_receipt)
-            qa_payload["video"] = str(output)
-            atomic_write_json(qa_report, qa_payload)
+            # The published report is envelope-bound; rewriting it here would
+            # break the finalized hash binding.
             delivery = {
                 "schema_version": 1,
                 "batch_id": batch_id,
@@ -6011,9 +6089,25 @@ class EditorHandler(BaseHTTPRequestHandler):
                 self.server.project_dir / "working/delivery_qa" / f"{render_id}.json",
                 delivery,
             )
-            return delivery
+            handed_off = True
+            return delivery, publication
         finally:
-            temporary.unlink(missing_ok=True)
+            if publication is not None and not handed_off:
+                # The member never reached the batch transaction; restore the
+                # exact prior public state rather than leaking a half member.
+                try:
+                    delivery_envelope.abort_deferred_publication(publication)
+                except (OSError, delivery_envelope.DeliveryEnvelopeError):
+                    pass
+            if staging is not None:
+                # Publication never started or failed before taking the
+                # journal; releasing the lease must not mask the real error.
+                try:
+                    delivery_envelope.discard_staging(
+                        project_dir, render_id, authority=staging
+                    )
+                except (OSError, delivery_envelope.DeliveryEnvelopeError):
+                    pass
 
     def render_batch_worker(
         self,
@@ -6023,10 +6117,15 @@ class EditorHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Render a batch transaction and publish latest_final_qa only on full success."""
         completed: list[dict[str, Any]] = []
+        project_dir = self.server.project_dir
         archive_name = f"{batch_id}-final.zip"
         archive = self.server.project_dir / "renders" / archive_name
         archive_temporary = archive.parent / f".{archive_name}.{uuid.uuid4().hex}.part"
         current_clip_id: str | None = None
+        # Every member is published reversibly until the whole batch is bound.
+        pending: list[delivery_envelope.DeferredPublication] = []
+        archive_published = False
+        delivery_declared = False
         try:
             for index, job in enumerate(jobs, start=1):
                 current_clip_id = str(job["clip_id"])
@@ -6037,7 +6136,10 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "current_index": index,
                     }
                 )
-                item = self.render_batch_item(batch_id, job, state_revision)
+                item, publication = self.render_batch_item(
+                    batch_id, job, state_revision
+                )
+                pending.append(publication)
                 item["archive_name"] = f"{index:02d}-{Path(str(item['output'])).name}"
                 completed.append(item)
                 self.server.render_status.update(
@@ -6081,30 +6183,6 @@ class EditorHandler(BaseHTTPRequestHandler):
                             f"batch output changed before packaging: {item['clip_id']}"
                         )
                     bundle.write(output, arcname=str(item["archive_name"]))
-            os.replace(archive_temporary, archive)
-            batch_receipt = {
-                "schema_version": 2,
-                "kind": "batch",
-                "delivery_kind": "batch",
-                "batch_id": batch_id,
-                "quality": "final",
-                "state_revision": state_revision,
-                "status": "pass",
-                "clip_ids": [str(job["clip_id"]) for job in jobs],
-                "item_count": len(completed),
-                "items": completed,
-                "archive": str(archive.relative_to(self.server.project_dir)),
-                "archive_sha256": file_sha256(archive),
-                "archive_download_name": archive_name,
-                "warnings": [
-                    {"clip_id": item["clip_id"], "items": item.get("warnings", [])}
-                    for item in completed
-                    if item.get("warnings")
-                ],
-                "failures": [],
-                "human_review_required": True,
-                "completed_at": now_utc(),
-            }
             versioned_receipt = (
                 self.server.project_dir / "working/delivery_qa" / f"{batch_id}.json"
             )
@@ -6158,7 +6236,62 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "; ".join(dict.fromkeys(authorization_errors))
                         + "; previous delivery was preserved"
                     )
+                from render_editor_timeline import ffmpeg_path
+
+                # Publish the archive and its receipt first: the aggregate
+                # envelope binds those exact bytes, and nothing points at them
+                # until the envelope is finalized below.
+                os.replace(archive_temporary, archive)
+                archive_published = True
+                batch_receipt = {
+                    "schema_version": 2,
+                    "kind": "batch",
+                    "delivery_kind": "batch",
+                    "batch_id": batch_id,
+                    "quality": "final",
+                    "state_revision": state_revision,
+                    "status": "pass",
+                    "clip_ids": [str(job["clip_id"]) for job in jobs],
+                    "item_count": len(completed),
+                    "items": completed,
+                    "archive": str(archive.relative_to(self.server.project_dir)),
+                    "archive_sha256": file_sha256(archive),
+                    "archive_download_name": archive_name,
+                    "warnings": [
+                        {"clip_id": item["clip_id"], "items": item.get("warnings", [])}
+                        for item in completed
+                        if item.get("warnings")
+                    ],
+                    "failures": [],
+                    "human_review_required": True,
+                    "completed_at": now_utc(),
+                }
                 atomic_write_json(versioned_receipt, batch_receipt)
+                prepared_batch = delivery_envelope.build_batch_envelope(
+                    project_dir,
+                    batch_id,
+                    archive,
+                    str(versioned_receipt.relative_to(project_dir)),
+                    current_state,
+                    [
+                        {
+                            "clip_id": str(item["clip_id"]),
+                            "render_id": str(item["render_id"]),
+                            "archive_name": str(item["archive_name"]),
+                        }
+                        for item in completed
+                    ],
+                    renderer_script=SKILL_DIR / "scripts/render_editor_timeline.py",
+                    ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+                )
+                delivery_envelope.finalize_batch_envelope(project_dir, prepared_batch)
+                # The batch is bound end to end; only now do the member
+                # publications become irreversible.
+                while pending:
+                    # Drop each publication as it commits so a failure part way
+                    # through only ever rolls back what is still reversible.
+                    delivery_envelope.commit_deferred_publication(pending[0])
+                    pending.pop(0)
                 final_approval = manifest.setdefault("approvals", {}).get("final")
                 if isinstance(final_approval, dict) and final_approval.get("approved"):
                     manifest["approvals"]["final"] = {
@@ -6180,6 +6313,11 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "delivery_qa": batch_receipt,
                     }
                 )
+                # Cleanup stops here: an interrupted pointer write can still
+                # have landed, so from this point the archive, receipt and
+                # envelope are treated as declared. Deleting them would leave
+                # the public pointer naming bytes that no longer exist.
+                delivery_declared = True
                 atomic_write_json(
                     self.server.project_dir / LATEST_DELIVERY_QA_REL,
                     batch_receipt,
@@ -6205,7 +6343,27 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "approval_revisions": revisions,
                 "finished_at": now_utc(),
             }
-        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            zipfile.BadZipFile,
+            delivery_envelope.DeliveryEnvelopeError,
+        ) as exc:
+            # A batch is one delivery: no member survives a failed batch, and
+            # the previous publication has to come back byte for byte.
+            for publication in reversed(pending):
+                try:
+                    delivery_envelope.abort_deferred_publication(publication)
+                except (OSError, delivery_envelope.DeliveryEnvelopeError):
+                    pass
+            pending.clear()
+            if archive_published and not delivery_declared:
+                archive.unlink(missing_ok=True)
+                versioned_receipt.unlink(missing_ok=True)
+                delivery_envelope.finalized_path(project_dir, batch_id).unlink(
+                    missing_ok=True
+                )
             diagnostic_items = list(completed)
             if current_clip_id:
                 failed_job = next(
@@ -6454,6 +6612,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     staged_sources,
                     renderer_script=script,
                     ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+                    visual_authority=staged_visual_authority(staged_evidence),
                     route="single",
                 )
                 delivery_envelope.write_prepared_envelope(staging.stage_dir, prepared)

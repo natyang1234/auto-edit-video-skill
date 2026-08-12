@@ -947,6 +947,48 @@ def semantic_director_mode(artifact) -> list[str]:
     return errors
 
 
+def _semantic_batch_binding(batch) -> list[str]:
+    """Member order, identity and archive placement must be unambiguous."""
+    errors: list[str] = []
+    if not isinstance(batch, dict):
+        return ["$.batch: must be an object"]
+    if type(batch.get("schema_version")) is not int or batch.get("schema_version") != 1:
+        errors.append("$.batch.schema_version: must be integer 1")
+    members = batch.get("members")
+    if not isinstance(members, list) or not members:
+        return errors + ["$.batch.members: at least one member is required"]
+    render_ids: list[str] = []
+    archive_names: list[str] = []
+    for position, member in enumerate(members):
+        if not isinstance(member, dict):
+            errors.append(f"$.batch.members[{position}]: must be an object")
+            continue
+        if member.get("index") != position + 1:
+            errors.append(
+                f"$.batch.members[{position}].index: must be the 1-based member order"
+            )
+        render_ids.append(str(member.get("render_id")))
+        archive_names.append(str(member.get("archive_name")))
+        for digest_key in ("envelope_sha256", "archive_sha256"):
+            digest = member.get(digest_key)
+            if isinstance(digest, str) and digest != digest.lower():
+                errors.append(
+                    f"$.batch.members[{position}].{digest_key}: must use lowercase hexadecimal"
+                )
+        output = member.get("output")
+        if isinstance(output, dict):
+            digest = output.get("sha256")
+            if isinstance(digest, str) and digest != digest.lower():
+                errors.append(
+                    f"$.batch.members[{position}].output.sha256: must use lowercase hexadecimal"
+                )
+    if len(set(render_ids)) != len(render_ids):
+        errors.append("$.batch.members: render identities must be unique")
+    if len(set(archive_names)) != len(archive_names):
+        errors.append("$.batch.members: archive member names must be unique")
+    return errors
+
+
 def semantic_delivery_envelope(artifact) -> list[str]:
     """Validate delivery-envelope invariants not expressible in the dialect."""
     errors: list[str] = []
@@ -960,17 +1002,37 @@ def semantic_delivery_envelope(artifact) -> list[str]:
         errors.append(
             "$.prepared_envelope_hash: finalized envelope must bind a canonical prepared hash"
         )
+    # A batch aggregate envelope binds member deliveries, not one render's own
+    # per-render evidence: its members each carry that evidence in their own
+    # envelope, so the per-render artifact slots must be empty here.
+    batch = artifact.get("batch")
+    aggregate = batch is not None
+    if aggregate:
+        if artifact.get("route") != "batch":
+            errors.append("$.batch: only the batch route may bind an aggregate delivery")
+        errors.extend(_semantic_batch_binding(batch))
     artifacts = artifact.get("artifacts")
     if isinstance(artifacts, dict):
-        for required_name in (
-            "output",
-            "qa_report",
-            "contact_sheet",
-            "visual_evidence",
-            "motion_evidence",
-        ):
+        required_names = (
+            ("output", "qa_report")
+            if aggregate
+            else (
+                "output",
+                "qa_report",
+                "contact_sheet",
+                "visual_evidence",
+                "motion_evidence",
+            )
+        )
+        for required_name in required_names:
             if artifacts.get(required_name) is None:
-                errors.append(f"$.artifacts.{required_name}: required for direct delivery")
+                errors.append(f"$.artifacts.{required_name}: required for this delivery route")
+        if aggregate:
+            for member_name in ("contact_sheet", "visual_evidence", "motion_evidence"):
+                if artifacts.get(member_name) is not None:
+                    errors.append(
+                        f"$.artifacts.{member_name}: batch aggregate evidence belongs to its members"
+                    )
         for name, item in artifacts.items():
             if item is None:
                 continue
@@ -996,7 +1058,13 @@ def semantic_delivery_envelope(artifact) -> list[str]:
         if any(sfx_present) and not all(sfx_present):
             errors.append("$.artifacts: SFX plan, catalog and stem must be all-null or all-present")
         profile = artifact.get("profile")
-        if isinstance(profile, dict) and profile.get("id") == "kinetic-explainer" and not all(sfx_present):
+        if (
+            isinstance(profile, dict)
+            and profile.get("id") == "kinetic-explainer"
+            and not all(sfx_present)
+            # The members carry the SFX evidence; the aggregate binds them.
+            and not aggregate
+        ):
             errors.append("$.artifacts: kinetic-explainer direct delivery requires SFX artifacts")
     renderer = artifact.get("renderer_identity")
     if isinstance(renderer, dict):
