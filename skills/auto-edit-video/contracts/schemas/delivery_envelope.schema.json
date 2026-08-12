@@ -1,6 +1,6 @@
 {
   "$id": "delivery_envelope",
-  "title": "Direct finalized delivery envelope",
+  "title": "Finalized delivery envelope (direct and server-single routes)",
   "x_schema_version": 1,
   "type": "object",
   "required": [
@@ -17,7 +17,7 @@
   ],
   "properties": {
     "schema_version": {"const": 1},
-    "route": {"const": "direct"},
+    "route": {"enum": ["direct", "single"]},
     "render_id": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]{1,120}$"

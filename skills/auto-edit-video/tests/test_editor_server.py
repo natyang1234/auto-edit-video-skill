@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import binascii
 import dataclasses
 import hashlib
@@ -2010,6 +2011,173 @@ class EditorServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         bootstrap = json.loads(body.decode("utf-8"))
         self.assertFalse(bootstrap["approval_current"]["final"])
+
+    def run_single_final_render(
+        self,
+        *,
+        patches: tuple[object, ...] = (),
+    ) -> dict[str, object]:
+        """Drive one single-route final render through the public HTTP API."""
+        state, clip_ids = self.approve_batch_prerequisites()
+        fake_run = self.fake_batch_subprocess()
+        with (
+            patch("editor_server.subprocess.run", side_effect=fake_run),
+            patch("editor_server.ffprobe_has_visual_stream", return_value=True),
+        ):
+            with contextlib.ExitStack() as stack:
+                for entered in patches:
+                    stack.enter_context(entered)
+                status, accepted = self.json_request(
+                    "POST",
+                    "/api/render",
+                    {
+                        "quality": "final",
+                        "clip_id": clip_ids[0],
+                        "expected_revision": state["revision"],
+                    },
+                )
+                self.assertEqual(status, 202, accepted)
+                return self.wait_for_render_terminal()
+
+    def assert_single_route_published_nothing(self, previous: dict[str, object]) -> None:
+        """No output, no finalized envelope, previous public pointer intact."""
+        self.assertEqual(
+            sorted(item.name for item in (self.project / "renders").glob("*-final.mp4")),
+            [],
+        )
+        envelope_dir = self.project / "working/delivery_envelopes"
+        self.assertEqual(
+            sorted(item.name for item in envelope_dir.glob("*.json")),
+            [],
+        )
+        self.assertEqual(
+            json.loads(
+                (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+            ),
+            previous,
+        )
+
+    def test_single_final_render_publishes_only_through_finalized_envelope(self) -> None:
+        """Phase 4: the server single route must publish like the direct route.
+
+        A finalized delivery envelope has to exist and bind the published
+        output bytes *before* ``render_status`` exposes a downloadable pointer.
+        """
+        completed = self.run_single_final_render()
+
+        self.assertEqual(completed["state"], "complete", completed)
+        render_id = str(completed["render_id"])
+        envelope_path = self.project / f"working/delivery_envelopes/{render_id}.json"
+        self.assertTrue(
+            envelope_path.is_file(),
+            "single route exposed a downloadable pointer without a finalized envelope",
+        )
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["state"], "finalized")
+        self.assertEqual(envelope["route"], "single")
+        self.assertEqual(envelope["render_id"], render_id)
+        self.assertIsInstance(envelope["prepared_envelope_hash"], str)
+        output = self.project / "renders" / str(completed["download_name"])
+        self.assertTrue(output.is_file(), completed)
+        published_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+        self.assertEqual(envelope["artifacts"]["output"]["sha256"], published_sha)
+        self.assertEqual(completed["output_sha256"], published_sha)
+        for name in ("qa_report", "contact_sheet", "visual_evidence", "motion_evidence"):
+            item = envelope["artifacts"][name]
+            self.assertIsInstance(item, dict, name)
+            artifact = self.project / str(item["path"])
+            self.assertTrue(artifact.is_file(), name)
+            self.assertEqual(
+                hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                item["sha256"],
+                name,
+            )
+        # No private candidate survives a success.
+        self.assertFalse(
+            (self.project / f"working/delivery_envelopes/.staging/{render_id}").exists()
+        )
+
+    def test_single_route_crash_between_published_artifacts_restores_prior_state(self) -> None:
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "single-route-previous-must-survive-crash",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_copy = delivery_envelope._copy_atomic
+        copies = 0
+
+        def crash_after_first_copy(source: Path, destination: Path) -> None:
+            nonlocal copies
+            copies += 1
+            if copies > 1:
+                raise OSError("synthetic power loss between published artifacts")
+            real_copy(source, destination)
+
+        failed = self.run_single_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope, "_copy_atomic", side_effect=crash_after_first_copy
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertIsNone(failed["output"])
+        self.assert_single_route_published_nothing(previous)
+
+    def test_single_route_candidate_mutated_after_prepared_envelope_never_publishes(self) -> None:
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "single-route-previous-must-survive-mismatch",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_write = delivery_envelope.write_prepared_envelope
+
+        def tamper_after_prepared(stage_dir: Path, envelope: dict[str, object]) -> Path:
+            written = real_write(stage_dir, envelope)
+            candidate = Path(stage_dir) / delivery_envelope.STAGE_FILENAMES["output"]
+            candidate.write_bytes(candidate.read_bytes() + b"tampered-after-prepare")
+            return written
+
+        failed = self.run_single_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "write_prepared_envelope",
+                    side_effect=tamper_after_prepared,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assertIn("hash/size mismatch", str(failed["message"]))
+        self.assert_single_route_published_nothing(previous)
+
+    def test_single_route_finalize_failure_restores_previous_publication(self) -> None:
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "single-route-previous-must-survive-finalize-failure",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_atomic = delivery_envelope._atomic_write_json
+
+        def fail_finalized_envelope(path: Path, payload: object) -> None:
+            if Path(path).parent.name == "delivery_envelopes":
+                raise OSError("synthetic finalize failure")
+            real_atomic(path, payload)
+
+        failed = self.run_single_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "_atomic_write_json",
+                    side_effect=fail_finalized_envelope,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assert_single_route_published_nothing(previous)
 
     def test_batch_render_requires_cas_and_current_human_gates(self) -> None:
         self.write_approved_highlight_plan()

@@ -6285,22 +6285,35 @@ class EditorHandler(BaseHTTPRequestHandler):
         state_revision: str,
     ) -> None:
         script = SKILL_DIR / "scripts/render_editor_timeline.py"
-        output = self.server.project_dir / "renders" / output_name
+        project_dir = self.server.project_dir
+        output = project_dir / "renders" / output_name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # Phase 4 single route: a final render is a private candidate until a
+        # finalized delivery envelope binds it.  Preview renders stay on the
+        # legacy in-place temporary because they publish no delivery evidence.
+        staging: delivery_envelope.StagingAttempt | None = None
+        published = False
         temporary = output.parent / f".{output.stem}.{render_id}.part.mp4"
-        command = [
-            sys.executable,
-            str(script),
-            "--project-dir",
-            str(self.server.project_dir),
-            "--snapshot",
-            str(snapshot_path),
-            "--quality",
-            quality,
-            "--output",
-            str(temporary),
-        ]
-        temporary.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if quality == "final":
+                # Staging must succeed inside the guarded block: a failure here
+                # has to leave a terminal render_status, not a stuck "running".
+                staging = delivery_envelope.begin_staging(
+                    project_dir, render_id, expected_output=output
+                )
+                temporary = staging / delivery_envelope.STAGE_FILENAMES["output"]
+            command = [
+                sys.executable,
+                str(script),
+                "--project-dir",
+                str(project_dir),
+                "--snapshot",
+                str(snapshot_path),
+                "--quality",
+                quality,
+                "--output",
+                str(temporary),
+            ]
             snapshot_payload = read_json(snapshot_path, {}) or {}
             visual_quality = (
                 snapshot_payload.get("visual_quality")
@@ -6321,20 +6334,28 @@ class EditorHandler(BaseHTTPRequestHandler):
             qa_payload: dict[str, Any] | None = None
             qa_report: Path | None = None
             qa_contact: Path | None = None
+            staged_qa_report: Path | None = None
+            staged_contact: Path | None = None
             if quality == "final":
-                qa_report = self.server.project_dir / "qa" / f"{render_id}-qa-report.json"
-                qa_contact = self.server.project_dir / "qa" / f"{render_id}-contact.png"
+                if staging is None:
+                    raise RuntimeError("final render has no delivery staging identity")
+                # Canonical Phase 0b destinations; the bytes stay private in the
+                # staging directory until publication copies them here.
+                qa_report = project_dir / "qa" / f"{render_id}.json"
+                qa_contact = project_dir / "qa" / f"{render_id}-contact.png"
+                staged_qa_report = staging / delivery_envelope.STAGE_FILENAMES["qa_report"]
+                staged_contact = staging / delivery_envelope.STAGE_FILENAMES["contact_sheet"]
                 qa_command = [
                     sys.executable,
                     str(SKILL_DIR / "scripts/qa_video.py"),
                     "--video",
                     str(temporary),
                     "--report",
-                    str(qa_report),
+                    str(staged_qa_report),
                     "--contact",
-                    str(qa_contact),
+                    str(staged_contact),
                     "--visual-evidence",
-                    str(rendered_visual_evidence_path(self.server.project_dir, render_id)),
+                    str(rendered_visual_evidence_path(project_dir, render_id)),
                     # The declaration frozen into the snapshot this render was
                     # authorized against, not whatever the project says now,
                     # and the geometry it was laid out against.
@@ -6352,9 +6373,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise RuntimeError("delivery QA timed out; previous output was preserved") from exc
-                qa_payload = read_json(qa_report, {}) or {}
+                qa_payload = read_json(staged_qa_report, {}) or {}
                 qa_payload["visual_quality"] = visual_quality
-                atomic_write_json(qa_report, qa_payload)
+                # The delivered report names the public output it vouches for;
+                # it is frozen into the prepared envelope, so bind it here.
+                qa_payload["video"] = str(output)
+                atomic_write_json(staged_qa_report, qa_payload)
                 visual_delivery = qa_payload.get("visual_delivery")
                 if (
                     qa_result.returncode != 0
@@ -6362,6 +6386,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                     or not isinstance(visual_delivery, dict)
                     or visual_delivery.get("status") != "pass"
                 ):
+                    # Nothing is published, but the human still needs the
+                    # evidence: copy it out without minting any pointer.
+                    qa_report.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(staged_qa_report, qa_report)
+                    if staged_contact.is_file():
+                        shutil.copyfile(staged_contact, qa_contact)
                     failure_receipt = {
                         "schema_version": 1,
                         "render_id": render_id,
@@ -6399,8 +6429,48 @@ class EditorHandler(BaseHTTPRequestHandler):
                     }
                     return
 
-            output_sha = file_sha256(temporary)
-            os.replace(temporary, output)
+            if quality == "final":
+                if staging is None or staged_qa_report is None or staged_contact is None:
+                    raise RuntimeError("final render has no staged delivery evidence")
+                from render_editor_timeline import ffmpeg_path
+
+                staged_evidence = staging / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
+                shutil.copyfile(
+                    rendered_visual_evidence_path(project_dir, render_id),
+                    staged_evidence,
+                )
+                staged_sources = {
+                    "output": temporary,
+                    "qa_report": staged_qa_report,
+                    "contact_sheet": staged_contact,
+                    "visual_evidence": staged_evidence,
+                    "motion_evidence": staged_evidence,
+                }
+                prepared = delivery_envelope.build_prepared_envelope(
+                    project_dir,
+                    render_id,
+                    output,
+                    snapshot_payload.get("state") or {},
+                    staged_sources,
+                    renderer_script=script,
+                    ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+                    route="single",
+                )
+                delivery_envelope.write_prepared_envelope(staging.stage_dir, prepared)
+                finalized = delivery_envelope.publish_direct_delivery(
+                    project_dir,
+                    staging,
+                    staged_sources=staged_sources,
+                    expected_output=output,
+                )
+                # Publication released the staging lease and either published
+                # every destination or restored the previous public state.
+                published = True
+                staging = None
+                output_sha = str(finalized["artifacts"]["output"]["sha256"])
+            else:
+                output_sha = file_sha256(temporary)
+                os.replace(temporary, output)
             receipt = {
                 "schema_version": 1,
                 "render_id": render_id,
@@ -6422,8 +6492,8 @@ class EditorHandler(BaseHTTPRequestHandler):
             revisions: dict[str, str] | None = None
             is_current = True
             if quality == "final" and qa_payload is not None and qa_report is not None and qa_contact is not None:
-                qa_payload["video"] = str(output)
-                atomic_write_json(qa_report, qa_payload)
+                # The published report is envelope-bound; rewriting it here
+                # would break the finalized hash binding.
                 delivery_qa = {
                     "schema_version": 1,
                     "render_id": render_id,
@@ -6501,7 +6571,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "approval_revisions": revisions,
                 "finished_at": now_utc(),
             }
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             self.server.render_status = {
                 "state": "failed",
                 "message": str(exc)[-1200:],
@@ -6509,10 +6579,21 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "clip_id": clip_id,
                 "render_id": render_id,
                 "output": None,
+                "previous_publication_preserved": True,
                 "finished_at": now_utc(),
             }
         finally:
-            temporary.unlink(missing_ok=True)
+            if staging is not None:
+                # Publication never started or failed before taking the
+                # journal; releasing the lease must not mask the real error.
+                try:
+                    delivery_envelope.discard_staging(
+                        project_dir, render_id, authority=staging
+                    )
+                except (OSError, delivery_envelope.DeliveryEnvelopeError):
+                    pass
+            if not published:
+                temporary.unlink(missing_ok=True)
 
     def handle_cover(self) -> None:
         try:

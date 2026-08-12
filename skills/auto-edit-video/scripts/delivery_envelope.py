@@ -45,6 +45,7 @@ DEFERRED_MARKER_KEYS = {
     "binding_sha256",
 }
 DEFERRED_MARKER_STATES = {"pending", "committed"}
+ROUTES = ("direct", "single")
 PREPARED_NAME = "prepared.json"
 FINALIZED_NAME = "{render_id}.json"
 ARTIFACT_NAMES = (
@@ -834,8 +835,15 @@ def build_prepared_envelope(
     ffmpeg_executable: Path,
     destinations: Mapping[str, str] | None = None,
     visual_authority: Mapping[str, Any] | None = None,
+    route: str = "direct",
 ) -> dict[str, Any]:
-    """Build a prepared v1 payload from observed private artifact bytes."""
+    """Build a prepared v1 payload from observed private artifact bytes.
+
+    ``route`` records which publisher minted the envelope.  Every route shares
+    this staging/journal/CAS machinery; only the label differs.
+    """
+    if route not in ROUTES:
+        raise DeliveryEnvelopeError(f"unsupported delivery route: {route}")
     root = project_dir.resolve()
     sfx_names = ("audio_event_plan", "audio_catalog", "sfx_stem")
     included_sfx = [name for name in sfx_names if staged_sources.get(name) is not None]
@@ -929,7 +937,7 @@ def build_prepared_envelope(
 
     prepared = {
         "schema_version": 1,
-        "route": "direct",
+        "route": route,
         "render_id": render_id,
         "state": "prepared",
         "quality": "final",
@@ -1175,6 +1183,10 @@ def snapshot_finalized_delivery(
     if envelope.get("render_id") != render_id:
         raise DeliveryEnvelopeError(
             "finalized envelope render_id does not match the current direct render"
+        )
+    if envelope.get("route") != "direct":
+        raise DeliveryEnvelopeError(
+            "finalized envelope was not published by the direct renderer route"
         )
 
     profile_id, profile_hash, profile_snapshot = _profile_binding(root, state)
