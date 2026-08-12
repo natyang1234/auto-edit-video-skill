@@ -106,13 +106,88 @@
             "additionalProperties": {
               "type": "string"
             }
+          },
+          "typography": {
+            "type": "object",
+            "description": "SPEC Phase 3 v1 §1 type tokens actually used to draw this item.",
+            "properties": {
+              "primary_font_size": {
+                "type": "number",
+                "minimum": 0
+              },
+              "primary_line_count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "secondary_font_size": {
+                "type": ["number", "null"],
+                "minimum": 0,
+                "description": "Null when the caption carries no translation: there is no secondary tier to report a size for."
+              },
+              "secondary_line_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "needs_shortening": {
+                "type": "boolean",
+                "description": "True when the secondary floor overrode the 0.62 ratio; sub-slice 3 resolves this by shortening the translation."
+              },
+              "secondary_ratio": {
+                "type": ["number", "null"],
+                "minimum": 0,
+                "description": "Secondary size divided by primary size as drawn (nominally 0.62); null without a translation. Above 0.62 the 32px floor held the translation up because the spoken line shrank, which is what needs_shortening reports."
+              },
+              "measured": {
+                "type": "object",
+                "description": "SPEC Phase 3 v1 §2 layout read back out of the drawn frame, not derived from the tokens above.",
+                "properties": {
+                  "primary_line_pitch": {
+                    "type": ["number", "null"],
+                    "minimum": 0,
+                    "description": "Baseline-to-baseline distance inside the spoken block; null for a single-line block."
+                  },
+                  "secondary_line_pitch": {
+                    "type": ["number", "null"],
+                    "minimum": 0,
+                    "description": "Baseline-to-baseline distance inside the translation block; null below two translation lines."
+                  },
+                  "block_gap": {
+                    "type": ["number", "null"],
+                    "description": "Extra space between the spoken and translation blocks; null when there is no translation."
+                  },
+                  "translation_height": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Raster height the translation added, gap included; the renderer's y-shift reads this via artifact.spoken_height."
+                  }
+                },
+                "required": [
+                  "block_gap",
+                  "primary_line_pitch",
+                  "secondary_line_pitch",
+                  "translation_height"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "measured",
+              "needs_shortening",
+              "primary_font_size",
+              "primary_line_count",
+              "secondary_font_size",
+              "secondary_line_count",
+              "secondary_ratio"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [
           "artifact",
           "caption_item_id",
           "clusters",
-          "glyph_runs"
+          "glyph_runs",
+          "typography"
         ],
         "additionalProperties": false
       }

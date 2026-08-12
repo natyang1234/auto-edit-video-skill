@@ -1934,6 +1934,31 @@ def build_render_command(
             caption_plan = caption_compositor.build_render_plan(
                 project_dir, render_caption_state, render_scale
             )
+            # SPEC Phase 3 v1 §1: a translation the 32px floor held above
+            # its 0.62 share is a caption in §3's flow. §3 passes it at
+            # step 1 when it still wraps inside two lines, which is most of
+            # them, so this is reported rather than refused — and refusing
+            # it would be a dead end besides: shortening the English cannot
+            # change a ratio the *spoken* size set. The case §3 cannot
+            # finish — a translation that needs a third line even at its
+            # floor — fails closed in the compositor itself, at every
+            # quality, and reaches the CLI as exit 2.
+            flagged = [
+                (str(item.get("caption_item_id")), typography.get("secondary_ratio"))
+                for item, typography in (
+                    (item, item.get("typography") or {})
+                    for item in caption_plan.get("items", [])
+                )
+                if typography.get("needs_shortening")
+            ]
+            if flagged:
+                print(
+                    json.dumps({"caption_typography": {
+                        "floor_overrode_ratio": [item_id for item_id, _ in flagged],
+                        "ratios": [ratio for _, ratio in flagged],
+                    }}, ensure_ascii=False),
+                    file=sys.stderr,
+                )
             disallowed = caption_plan.get("receipt", {}).get("disallowed_fallbacks") or []
             if disallowed and quality == "final":
                 raise ValueError(

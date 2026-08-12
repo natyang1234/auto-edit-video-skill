@@ -111,7 +111,7 @@ class BothDrawingPassesUseTheMovedSpansTests(unittest.TestCase):
         import inspect
 
         source = inspect.getsource(compositor.render_caption_png)
-        before_wrap = source.split('text = "\\n".join(lines)')[0]
+        before_wrap = source.split('text = "\\n".join(spoken_lines)')[0]
         self.assertEqual(
             before_wrap.count('overlay.get("effect_spans")'), 1, before_wrap[-400:]
         )

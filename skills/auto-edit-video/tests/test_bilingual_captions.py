@@ -7,6 +7,7 @@ did render the taller block climbed up over the picture.
 """
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -191,6 +192,131 @@ class CaptionBlockClearsThePlatformMarginTests(unittest.TestCase):
             safe, 1000, 1000,
         )
         self.assertAlmostEqual(moved[0]["style"]["y"], 55.0, places=6)
+
+
+class TranslationThatNeedsShorteningDoesNotPublishTests(unittest.TestCase):
+    """Where SPEC Phase 3 v1 §3 runs out of steps, nothing is published.
+
+    §3 step 1 passes a translation the 32px floor held above its 0.62 share
+    as long as it still wraps inside two lines, so that on its own is
+    reported, not refused — and refusing it would name a remedy that cannot
+    work, since shortening the English does not change a ratio the spoken
+    size set. A translation that needs a third line even at its floor is
+    the case §3 cannot finish (its step 3, provider re-translation, is not
+    built), and that one never reaches an output file.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory(prefix="phase3-shortening-gate-")
+        self.project = Path(self._tmp.name)
+        (self.project / "source").mkdir()
+        (self.project / "working").mkdir()
+        (self.project / "source/source.mp4").write_bytes(b"source")
+        self.addCleanup(self._tmp.cleanup)
+        self.manifest = {
+            "source": {
+                "staged_path": "source/source.mp4",
+                "duration_s": 2.0,
+                "has_audio": True,
+            }
+        }
+
+    def state(self, translation: str, max_width: float = 45) -> dict:
+        return {
+            "canvas": {"width": 1080, "height": 1920, "fps": 30},
+            "segments": [{"source_start": 0.0, "source_end": 2.0}],
+            "overlays": [{
+                "id": "caption-0001", "type": "caption", "visible": True,
+                "text": "我們今天要介紹全新規格與完整的操作流程說明",
+                "translation": translation,
+                "start": 0.0, "end": 2.0,
+                # Narrow enough that the spoken line only fits two lines at
+                # 44px, which pins the translation to its 32px floor.
+                "style": {"font_size": 52, "max_width": max_width, "x": 50, "y": 50},
+            }],
+        }
+
+    def build(self, quality: str, translation: str, max_width: float = 45) -> list[str]:
+        return renderer.build_render_command(
+            self.project,
+            self.state(translation, max_width),
+            self.manifest,
+            self.project / "out.mp4",
+            quality,
+        )
+
+    @unittest.skipUnless(
+        compositor.compositor_available(), "needs macOS CoreText"
+    )
+    def test_a_final_cut_refuses_a_translation_that_cannot_be_laid_out(self) -> None:
+        long_translation = (
+            "today we are introducing the entirely new specification along "
+            "with the complete operating procedure and its notes"
+        )
+        with self.assertRaisesRegex(ValueError, "shortened"):
+            self.build("final", long_translation)
+        self.assertFalse((self.project / "out.mp4").exists())
+
+    @unittest.skipUnless(
+        compositor.compositor_available(), "needs macOS CoreText"
+    )
+    def test_a_preview_refuses_it_too_rather_than_dropping_words(self) -> None:
+        # There is no smaller size and no third line to put it on, so there
+        # is nothing to preview either — the alternative is silently losing
+        # the end of the sentence.
+        long_translation = (
+            "today we are introducing the entirely new specification along "
+            "with the complete operating procedure and its notes"
+        )
+        with self.assertRaisesRegex(ValueError, "shortened"):
+            self.build("preview", long_translation)
+
+    @unittest.skipUnless(
+        compositor.compositor_available(), "needs macOS CoreText"
+    )
+    def test_a_translation_held_up_by_its_floor_still_publishes(self) -> None:
+        # 0.72 of the spoken size rather than 0.62, because the spoken line
+        # shrank and the floor did not. It is reported, and it ships: no
+        # amount of shortening would change that ratio.
+        command = self.build("final", "a short translation line")
+        self.assertEqual(command[-1], str(self.project / "out.mp4"))
+
+    @unittest.skipUnless(
+        compositor.compositor_available(), "needs macOS CoreText"
+    )
+    def test_the_floor_conflict_is_reported_rather_than_swallowed(self) -> None:
+        import contextlib
+        import io
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.build("final", "a short translation line")
+        reported = [
+            json.loads(line)["caption_typography"]
+            for line in stderr.getvalue().splitlines()
+            if "caption_typography" in line
+        ]
+        self.assertEqual(
+            reported[0]["floor_overrode_ratio"], ["caption-0001"], stderr.getvalue()
+        )
+        self.assertGreater(reported[0]["ratios"][0], compositor.TRANSLATION_SCALE)
+
+    def test_the_cli_reports_a_refused_cut_as_exit_2(self) -> None:
+        from unittest.mock import patch
+
+        output = self.project / "gated.mp4"
+        argv = [
+            "render_editor_timeline.py", "--project-dir", str(self.project),
+            "--output", str(output), "--quality", "final",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(
+            renderer, "render_project",
+            side_effect=ValueError("captions need shortening"),
+        ):
+            self.assertEqual(renderer.main(), 2)
+        self.assertFalse(output.exists())
 
 
 class ProviderFallbackTests(unittest.TestCase):

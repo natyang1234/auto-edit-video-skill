@@ -29,6 +29,20 @@
         "height": 200,
         "padding": 9,
         "spoken_height": 200
+      },
+      "typography": {
+        "primary_font_size": 52.0,
+        "primary_line_count": 1,
+        "secondary_font_size": null,
+        "secondary_line_count": 0,
+        "needs_shortening": false,
+        "secondary_ratio": null,
+        "measured": {
+          "primary_line_pitch": null,
+          "secondary_line_pitch": null,
+          "block_gap": null,
+          "translation_height": 0.0
+        }
       }
     }
   ],

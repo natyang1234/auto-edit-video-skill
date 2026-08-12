@@ -10,9 +10,7 @@ nat 2026-08-12 授權 Claude 擬定本規格（PRD Phase 3 僅質化描述）；
 | `caption.primary.floor` | 40px（= 52 × 0.77，低於此值 fail closed 而非再縮） | 現行 MIN_AUTOFIT_SCALE 0.82 → 42.6px，取整放寬至 40 |
 | `caption.secondary.scale` | 0.62（現行 TRANSLATION_SCALE，不變） | caption_compositor.py:34 |
 | `caption.secondary.floor` | 32px | Phase 0e QA 既有 font floor 32px，沿用為硬下限 |
-| `caption.secondary.min_scale` | 0.55（re-chunk 前允許的最低比例；32/52≈0.615，此值僅在 primary 已縮字時生效） | 推導 |
-
-規則：secondary 實際字級 = primary 實際字級 × 0.62，但不得低於 32px；若兩條件衝突（primary 縮到 40px 時 0.62×40=24.8 < 32），以 32px floor 優先，此時進入第 3 節縮短/重排流程，不得渲染低於 32px 的英文。
+規則（v1.1 修訂，2026-08-12 實作定案）：secondary 實際字級 = primary 實際字級 × 0.62，但不得低於 32px×render_scale（floor 與字級同單位，preview 等縮小輸出按比例縮）。floor 覆蓋比例時屬合法狀態：plan 記錄實際 `secondary_ratio` 並以 `caption_typography.floor_overrode_ratio` 回報，照常出片；**只有 floor 字級下譯文仍需第 3 行（版面確實放不下）才 fail closed**（所有品質等級、compositor 層拋錯、CLI exit 2 無輸出）。原 v1 的 `min_scale 0.55` 刪除（基準 52px 下名義 secondary 32.24px 與 floor 僅差 0.7%，該 token 無鑑別力且不可達）。排版規格版本以 `TYPOGRAPHY_REVISION` 常數進 plan cache revision hash，確保規格變更使舊 plan 失效。
 
 ## 2. Line-height rules
 
@@ -23,6 +21,8 @@ nat 2026-08-12 授權 Claude 擬定本規格（PRD Phase 3 僅質化描述）；
 | 主／副區塊間距 | 0.35 × 副字幕字級 |
 | 中文主字幕行數上限 | 2 行 |
 | 英文副字幕行數上限 | 2 行（PRD「never creates a third subtitle line」＝英文區塊絕不出現第 3 行） |
+
+帶強調（`effect_spans.font_scale`）時：主字幕行高 = 1.25 × max(base 字級, 該區塊最大 run 字級)，即強調把行距等比撐開、**任何情況不得小於 1.25 × base**。此為 v1.1 補訂：釘死在 1.25×base 時，強調 run 的 ascent 超過釘值會讓 CoreText 反向壓縮行盒（實測 font_scale 1.18 → 61.0px／規格 65.0，1.8 → 49.0px 已小於字級本身，兩行 CJK 字面相貼）。副字幕行高與區塊間距不受強調影響。
 
 現況為 CoreText 原生 ascent+descent+leading（caption_compositor.py:581-584），改為顯式倍數；行高計算必須進入 caption 高度量測與 safe-area clamp（render_editor_timeline.py:1309-1355）的同一套數字，不得量測用一套、渲染用另一套。
 
