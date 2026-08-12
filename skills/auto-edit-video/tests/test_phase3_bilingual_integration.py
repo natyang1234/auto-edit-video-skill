@@ -50,6 +50,56 @@ def _long_translation(self) -> None:
     self.wfile.write(payload)
 
 
+def _long_then_short_translation(self) -> None:
+    """Loopback provider that returns unbreakable on first request,
+    then returns a shorter, breakable translation when retried with
+    character budget constraint.
+
+    This simulates the semantic shortening flow:
+    1. First call: provider returns long translation (unbreakable)
+    2. Renderer detects safe-area violation
+    3. Renderer retries with explicit character budget
+    4. Second call: provider returns short translation (breakable)
+    5. Result passes safe-area check
+    """
+    length = int(self.headers.get("Content-Length", "0"))
+    request = json.loads(self.rfile.read(length).decode("utf-8"))
+    messages = request["messages"]
+    last_message = json.loads(messages[-1]["content"].rsplit("\n", 1)[-1])
+    requested = last_message if isinstance(last_message, list) else [last_message]
+
+    # Check if this is a retry request (contains character budget constraint)
+    is_retry = any(
+        "字元" in (msg.get("content", "") or "") or "character" in (msg.get("content", "") or "")
+        for msg in messages[:-1] if msg.get("role") == "assistant"
+    ) or "character budget" in messages[-1].get("content", "")
+
+    if is_retry:
+        # Retry: return a shorter, breakable translation
+        translated = "a concise translation"
+    else:
+        # First attempt: return unbreakable translation
+        translated = "unbreakabletranslationrunwithnospacesorhyphensanywhereinsideitatallwhatsoever"
+
+    content = {
+        "items": [
+            {
+                "caption_instance_id": item["caption_instance_id"],
+                "translated_text": translated,
+            }
+            for item in requested
+        ]
+    }
+    payload = json.dumps(
+        {"message": {"content": json.dumps(content, ensure_ascii=False)}}
+    ).encode("utf-8")
+    self.send_response(200)
+    self.send_header("Content-Type", "application/json")
+    self.send_header("Content-Length", str(len(payload)))
+    self.end_headers()
+    self.wfile.write(payload)
+
+
 class Phase3BilingualPublicCutRedTests(phase0e.unittest.TestCase):
     """Reuse one Phase 0e fixture without inheriting its complete test suite."""
 
@@ -87,5 +137,61 @@ class Phase3BilingualPublicCutRedTests(phase0e.unittest.TestCase):
                     + stderr
                     + json.dumps(payload, ensure_ascii=False),
                 )
+            finally:
+                fixture.tearDown()
+
+    def test_provider_retry_with_character_budget_when_translation_overflows(self) -> None:
+        """Sub-slice 3: When initial translation is too long and unbreakable,
+        renderer should retry provider with character budget constraint and
+        use the shortened result.
+
+        RED: provider is called twice (once initial, once with budget),
+        receipt records the shortening attempt.
+        """
+        fixture = phase0e.Phase0eKineticIntegrationTests(
+            "test_public_cut_delivers_bilingual_motion_sfx_and_finalized_envelope"
+        )
+        with patch.object(phase0e._OllamaHandler, "do_POST", _long_then_short_translation):
+            fixture.setUp()
+            try:
+                code, payload, stderr = fixture._run_cut()
+                # Should succeed (code == 0) because retry provided shorter translation
+                self.assertEqual(
+                    code,
+                    0,
+                    "provider retry with character budget should allow cut to succeed: "
+                    + stderr
+                    + json.dumps(payload, ensure_ascii=False),
+                )
+                # Verify no safe-area violations in final output
+                if code == 0:
+                    placements = json.loads(
+                        (fixture.project / "working/overlay_placements.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    review = placements.get("review", {})
+                    safe_area_findings = review.get("safe_area", [])
+                    caption_safe_area = [
+                        f for f in safe_area_findings
+                        if f.get("overlay", "").startswith("image caption-")
+                    ]
+                    self.assertEqual(
+                        len(caption_safe_area),
+                        0,
+                        f"caption should not violate safe area after retry: "
+                        + json.dumps(caption_safe_area, ensure_ascii=False),
+                    )
+                # Verify receipt records shortening attempt
+                translations = json.loads(
+                    (fixture.project / "working/caption_translations.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                # Receipt should indicate shortening was applied
+                for item in translations.get("items", []):
+                    # This is where we'd check for shortening record in receipt
+                    # (to be implemented in caption_translator.py receipt)
+                    pass
             finally:
                 fixture.tearDown()
