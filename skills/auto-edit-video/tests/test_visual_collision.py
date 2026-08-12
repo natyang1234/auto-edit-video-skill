@@ -152,12 +152,23 @@ class WhatStopsARenderTests(unittest.TestCase):
 
     def test_a_platform_margin_does_not(self) -> None:
         # Where it will be posted is a judgement, not a defect in the frame:
-        # a delivery that never goes to Reels is not broken by Reels' buttons.
+        # a preview that never goes to Reels is not broken by Reels' buttons.
         report = vc.review(
             [placed("title", y=0.094, width=0.77, height=0.057)], REELS_SAFE
         )
         self.assertTrue(report["safe_area"])
         self.assertEqual(vc.blocking(report), [])
+
+    def test_a_platform_margin_stops_a_publish_cut(self) -> None:
+        # A cut that is actually going to the platform is a different
+        # judgement: what its own controls will cover is now a defect, not
+        # a maybe. The caller opts in with block_safe_area for that case.
+        report = vc.review(
+            [placed("title", y=0.094, width=0.77, height=0.057)], REELS_SAFE
+        )
+        problems = vc.blocking(report, block_safe_area=True)
+        self.assertTrue(problems)
+        self.assertIn(report["safe_area"][0]["detail"], problems)
 
 
 class InkNotRasterTests(unittest.TestCase):

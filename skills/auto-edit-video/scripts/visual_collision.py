@@ -217,12 +217,18 @@ def review(
     }
 
 
-def blocking(findings: dict[str, Any]) -> list[str]:
+def blocking(findings: dict[str, Any], block_safe_area: bool = False) -> list[str]:
     """The findings that mean the frame is wrong, not merely tight.
 
     Two overlays on top of each other, or text running off the canvas, are
-    defects in what was drawn. Reaching into a platform's reserved margin is
-    a judgement about where it will be posted, so it is reported and not
-    raised: a delivery that never goes to Reels is not broken by it.
+    defects in what was drawn: always blocking. Reaching into a platform's
+    reserved margin is a judgement about where it will be posted, so by
+    default it is reported and not raised — a preview that never goes to
+    Reels is not broken by it. A caller that already knows this frame is
+    being posted to that platform's own margins passes block_safe_area=True
+    to make the same finding a defect.
     """
-    return [item["detail"] for item in findings["collisions"] + findings["off_frame"]]
+    problems = list(findings["collisions"]) + list(findings["off_frame"])
+    if block_safe_area:
+        problems += findings["safe_area"]
+    return [item["detail"] for item in problems]

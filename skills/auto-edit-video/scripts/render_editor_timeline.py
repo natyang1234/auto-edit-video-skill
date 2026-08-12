@@ -1235,6 +1235,11 @@ def captionized_overlays(
                     "height": artifact["height"],
                     "padding": artifact.get("padding", 0),
                 },
+                # The compositor's output is always type "image" — this is
+                # the only trace left of whether it was a caption or an
+                # emphasis block, which a safe-area clamp still needs to
+                # tell from an unrelated card or asset overlay.
+                "caption_kind": overlay.get("type"),
                 "style": {
                     "width": max(5.0, min(100.0, artifact["width"] / max(width, 1) * 100.0)),
                     "x": float(style.get("x", 50)),
@@ -1253,6 +1258,101 @@ def captionized_overlays(
             }
         )
     return converted
+
+
+def constrain_caption_wrap_to_safe_area(
+    overlays: list[dict[str, Any]], safe: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Narrow a caption's wrap width to what the platform actually leaves clear.
+
+    A caption wraps to the director's own max_width, chosen for how a
+    caption looks and unaware of any platform. Reaching past the platform's
+    left or right margin is not a style choice once this frame is actually
+    going there, so the tighter of the two wins.
+    """
+    if not isinstance(safe, dict) or not safe:
+        return overlays
+    try:
+        left = float(safe.get("left", 0))
+        safe_width = 100.0 - left - float(safe.get("right", 0))
+    except (TypeError, ValueError):
+        return overlays
+    if safe_width <= 0:
+        return overlays
+    # The narrowed block must sit on the safe column's own centre. Where
+    # the platform's left and right margins differ (TikTok: 8 and 14),
+    # leaving x at the frame's centre still runs the block past the
+    # tighter margin even though its width now fits between them.
+    safe_center = left + safe_width / 2.0
+    adjusted: list[dict[str, Any]] = []
+    changed = False
+    for overlay in overlays:
+        style = overlay.get("style") if is_plain_caption(overlay) else None
+        if not isinstance(style, dict):
+            adjusted.append(overlay)
+            continue
+        try:
+            current = float(style.get("max_width", 84))
+        except (TypeError, ValueError):
+            adjusted.append(overlay)
+            continue
+        if current <= safe_width:
+            adjusted.append(overlay)
+            continue
+        changed = True
+        moved = dict(overlay)
+        moved["style"] = {**style, "max_width": safe_width, "x": safe_center}
+        adjusted.append(moved)
+    return adjusted if changed else overlays
+
+
+def clamp_captions_into_safe_area(
+    overlays: list[dict[str, Any]],
+    safe: dict[str, Any] | None,
+    width: int,
+    height: int,
+) -> list[dict[str, Any]]:
+    """Move a caption's block clear of the platform's own reserved margin.
+
+    A translation grows the block downward from the spoken line without
+    knowing where the platform's own controls sit. This only ever moves a
+    caption up, and only as far as needed; one that still cannot fit is left
+    where it was, so visual_collision reports a real, remaining problem
+    instead of one already hidden here.
+    """
+    if not isinstance(safe, dict) or not safe or width <= 0 or height <= 0:
+        return overlays
+    try:
+        limit_bottom = 1.0 - float(safe.get("bottom", 0)) / 100.0
+    except (TypeError, ValueError):
+        return overlays
+    placements = {
+        placement["id"]: placement for placement in placements_of(overlays, width, height)
+    }
+    adjusted: list[dict[str, Any]] = []
+    changed = False
+    for overlay in overlays:
+        overlay_id = str(overlay.get("id") or "")
+        placement = placements.get(overlay_id)
+        style = overlay.get("style")
+        if (
+            overlay.get("caption_kind") not in CAPTION_TYPES
+            or placement is None
+            or "height" not in placement
+            or not isinstance(style, dict)
+            or not isinstance(style.get("y"), (int, float))
+        ):
+            adjusted.append(overlay)
+            continue
+        overflow = (placement["y"] + placement["height"] / 2.0) - limit_bottom
+        if overflow <= 0.0:
+            adjusted.append(overlay)
+            continue
+        changed = True
+        moved = dict(overlay)
+        moved["style"] = {**style, "y": float(style["y"]) - overflow * 100.0}
+        adjusted.append(moved)
+    return adjusted if changed else overlays
 
 
 def state_segments(state: dict[str, Any], source_duration: float) -> list[tuple[float, float]]:
@@ -1823,10 +1923,12 @@ def build_render_command(
             + "; ".join(dropped_beats[:5])
         )
 
+    safe_area = platform_safe_area(state)
     if any(is_plain_caption(overlay) for overlay in overlays):
         import caption_compositor
 
         if caption_compositor.compositor_available():
+            overlays = constrain_caption_wrap_to_safe_area(overlays, safe_area)
             render_caption_state = dict(state)
             render_caption_state["overlays"] = overlays
             caption_plan = caption_compositor.build_render_plan(
@@ -1840,6 +1942,7 @@ def build_render_command(
                     "project font or mark the caption for review"
                 )
             overlays = captionized_overlays(overlays, caption_plan, width, height)
+            overlays = clamp_captions_into_safe_area(overlays, safe_area, width, height)
 
     # Placement already tries to avoid the speaker. Nothing looked at the
     # result: two cards could hold the same moment, a card could sit on the
@@ -1848,9 +1951,7 @@ def build_render_command(
     import visual_collision
 
     placements = placements_of(overlays, width, height)
-    collision_review = visual_collision.review(
-        placements, platform_safe_area(state)
-    )
+    collision_review = visual_collision.review(placements, safe_area)
     atomic_write_json(project_dir / "working/overlay_placements.json", {
         "schema_version": 1,
         "canvas": {"width": width, "height": height},
@@ -1864,11 +1965,16 @@ def build_render_command(
         }}, ensure_ascii=False),
         file=sys.stderr,
     )
-    # Not gated on final. `cut` — the one command this is normally driven by
-    # — renders preview, and two cards on top of each other is exactly as
-    # wrong there. Both shipped projects report none, so nothing that works
-    # today starts failing.
-    problems = visual_collision.blocking(collision_review)
+    # Collisions and off-frame overlays are not gated on final. `cut` — the
+    # one command this is normally driven by — renders preview, and two
+    # cards on top of each other is exactly as wrong there. Both shipped
+    # projects report none, so nothing that works today starts failing.
+    # The platform's own reserved margin is only a defect once this frame
+    # is actually going to that platform, which is what quality == "final"
+    # means here.
+    problems = visual_collision.blocking(
+        collision_review, block_safe_area=quality == "final"
+    )
     if problems:
         raise ValueError(
             "the frame has overlays sitting on each other or running off it: "
