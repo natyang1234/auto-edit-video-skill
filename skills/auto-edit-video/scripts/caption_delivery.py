@@ -63,6 +63,33 @@ SHORTENING_MAX_ROUNDS = 1
 # is compared with the one derived from the manifest, which knows the
 # provider but cannot know how long the answers came back.
 SHORTENING_RECEIPT_KEYS = ("shortening_rounds", "shortening_character_budgets")
+# The preservation contract is a judgement about one *answer*, and the
+# provider is a 7B local model sampling a new one every time. Failing the
+# whole delivery on the first violation makes a cut a dice roll: six
+# consecutive real cuts died on four different codes, each of which a
+# resample would have cleared. So a violation is fed back and asked again —
+# twice, never more. Two, because the failure this is for is sampling noise
+# and a third round buys almost nothing against a model that genuinely
+# cannot comply, while every round is wall-clock time on the user's own
+# machine. After the ceiling the original verdict stands and the delivery
+# fails closed exactly as before.
+VALIDATION_MAX_ROUNDS = 2
+# The codes that describe an answer, as opposed to a broken pipe. A shape
+# the schema rejects (`translation_invalid`, `translation_incomplete`) or a
+# provider that never answered is not something re-asking can fix, so those
+# keep failing on the first attempt.
+CONTRACT_VIOLATION_CODES = frozenset(
+    {
+        "translation_unchanged",
+        "translation_order_mismatch",
+        "translation_duplicate",
+        "translation_identity_invalid",
+        "translation_token_missing",
+        "translation_number_invented",
+        "translation_number_order",
+    }
+)
+VALIDATION_RECEIPT_KEYS = ("validation_retry_rounds",)
 MAX_CAPTION_SOURCES = 20_000
 MAX_CAPTION_TEXT_CHARS = 4_000
 MAX_CAPTION_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -72,6 +99,243 @@ SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 ASCII_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._+/-]*|\d+(?:\.\d+)?(?:%|[A-Za-z]+)?")
 CHINESE_RE = re.compile(r"[\u3400-\u9fff]")
 TRANSLATION_NORMALISE_RE = re.compile(r"[\W_]+", re.UNICODE)
+# How a number is *written* is the target language's business; which number
+# it is, is the speaker's. Fullwidth digits are what a Chinese IME and
+# whisper both produce, and en groups thousands where zh often does not, so
+# both are flattened on both sides before anything is compared. Nothing else
+# about the token is touched.
+FULLWIDTH_NUMERIC_MAP = {
+    **{0xFF10 + offset: 0x30 + offset for offset in range(10)},
+    0xFF05: ord("%"),  # \uff05
+    0xFF0E: ord("."),  # \uff0e
+}
+# Only a real grouping is a grouping: three digits after every comma, and
+# nothing after the last group. "12,00" is not 1200, it is a typo or a
+# different number, and it stays visible to the comparison.
+THOUSANDS_GROUP_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?!\d)")
+NUMERIC_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
+CHINESE_DIGIT_VALUES = {
+    "\u96f6": 0, "\u3007": 0, "\u4e00": 1, "\u4e8c": 2, "\u5169": 2, "\u4e24": 2, "\u4e09": 3, "\u56db": 4,
+    "\u4e94": 5, "\u516d": 6, "\u4e03": 7, "\u516b": 8, "\u4e5d": 9,
+}
+CHINESE_UNIT_VALUES = {"\u5341": 10, "\u767e": 100, "\u5343": 1000}
+CHINESE_MYRIAD = {"\u842c": 10000, "\u4e07": 10000}
+CHINESE_NUMERAL_CHARS = frozenset(CHINESE_DIGIT_VALUES) | frozenset(
+    CHINESE_UNIT_VALUES
+) | frozenset(CHINESE_MYRIAD)
+CHINESE_PERCENT_PREFIXES = ("\u767e\u5206\u4e4b", "\u767e\u5206\u9ede")
+# A single numeral character is not read as a number at all, and neither is
+# a compound that comes out under ten. \u4e00 is the most common character in
+# Chinese subtitles (\u4e00\u8d77, \u4e00\u76f4, \u4e00\u5b9a, \u7b2c\u4e00\u6b21) and \u5341\u5206 means "very"; \u842c\u4e00
+# means "in case" and parses to 1. Reading those as quantities would demand
+# a digit in the translation of ordinary speech and refuse every correct
+# answer, which is how a preservation rule gets switched off. Ten is where
+# the idiom rate falls below the quantity rate.
+CHINESE_NUMBER_MIN_VALUE = 10
+
+
+def normalise_numerals(text: str) -> str:
+    """Fullwidth digits to ASCII, thousands separators removed."""
+    return THOUSANDS_GROUP_RE.sub(
+        lambda match: match.group(0).replace(",", ""),
+        text.translate(FULLWIDTH_NUMERIC_MAP),
+    )
+
+
+def _parse_chinese_numerals(run: str) -> int | None:
+    """Value of a pure numeral run, or None if it is not one."""
+    if not run:
+        return None
+    total = 0
+    section = 0
+    digit: int | None = None
+    for char in run:
+        if char in CHINESE_DIGIT_VALUES:
+            digit = CHINESE_DIGIT_VALUES[char]
+        elif char in CHINESE_UNIT_VALUES:
+            # \u5341\u516b is eighteen: the leading one is implied, so a unit with
+            # nothing in front of it multiplies one, not zero.
+            section += (1 if digit is None else digit) * CHINESE_UNIT_VALUES[char]
+            digit = None
+        elif char in CHINESE_MYRIAD:
+            total += (section + (digit or 0)) * CHINESE_MYRIAD[char]
+            section = 0
+            digit = None
+        else:
+            return None
+    return total + section + (digit or 0)
+
+
+def chinese_number_value(text: str) -> str | None:
+    """The number a Chinese numeral run states, if it states one.
+
+    Deliberately conservative \u2014 see CHINESE_NUMBER_MIN_VALUE. A None here
+    means "not enough signal to enforce", not "zero".
+    """
+    if len(text) < 2 or any(char not in CHINESE_NUMERAL_CHARS for char in text):
+        return None
+    value = _parse_chinese_numerals(text)
+    if value is None or value < CHINESE_NUMBER_MIN_VALUE:
+        return None
+    return str(value)
+
+
+def chinese_percent_value(text: str) -> str | None:
+    """"\u767e\u5206\u4e4b\u516b\u5341\u4e03" -> "87%". The sign is part of what has to survive."""
+    for prefix in CHINESE_PERCENT_PREFIXES:
+        if text.startswith(prefix):
+            value = _parse_chinese_numerals(text[len(prefix):])
+            # No minimum here: \u767e\u5206\u4e4b\u4e94 is unambiguously five percent, the
+            # prefix is the signal the bare characters lacked.
+            return None if value is None else f"{value}%"
+    return None
+
+
+def _chinese_number_spans(text: str) -> list[tuple[int, str]]:
+    """(offset, value) for every Chinese-written number, in source order.
+
+    Percentages carry their sign; everything else is the bare value, which
+    is what the translation has to contain somewhere in its own digits.
+    """
+    found: list[tuple[int, str]] = []
+    index = 0
+    while index < len(text):
+        prefix = next(
+            (
+                candidate
+                for candidate in CHINESE_PERCENT_PREFIXES
+                if text.startswith(candidate, index)
+            ),
+            None,
+        )
+        start = index + len(prefix) if prefix else index
+        end = start
+        while end < len(text) and text[end] in CHINESE_NUMERAL_CHARS:
+            end += 1
+        if end == start:
+            index += 1
+            continue
+        run = text[start:end]
+        value = (
+            chinese_percent_value(f"{prefix}{run}") if prefix
+            else chinese_number_value(run)
+        )
+        if value is not None:
+            found.append((index, value))
+        index = end
+    return found
+
+
+def _number_key(literal: str) -> str:
+    """One number, one spelling: 08, 8 and 8.0 are the same quantity."""
+    text = literal.rstrip("%")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    text = text.lstrip("0")
+    return text or "0"
+
+
+def _ascii_number_spans(text: str) -> list[tuple[int, str]]:
+    return [
+        (match.start(), match.group(0))
+        for match in NUMERIC_TOKEN_RE.finditer(text)
+        # A number inside a code or a brand (NEO2026, H264) is that token's
+        # business, not a quantity of its own.
+        if match.start() == 0 or not (
+            text[match.start() - 1].isalpha() or text[match.start() - 1] == "-"
+        )
+    ]
+
+
+def source_number_sequence(text: str) -> list[str]:
+    """Every number the source states, as bare values, in source order.
+
+    Both the digits it wrote and the ones it spelled in Chinese: a caption
+    that says \u4e09\u5341 states thirty just as much as one that says 30.
+
+    Advisory only. Nothing blocking reads this any more (v1.4, 2026-08-13):
+    the Chinese half of it turned out to refuse correct English far more
+    often than it caught a changed fact, because ordinary English does not
+    put a digit where Chinese put a numeral (\u5341\u5e74\u524d -> "ten years ago",
+    \u5343\u842c\u5225 -> "do not"). It stays for metadata and for a human reading
+    a report; the enforced half is `source_arabic_number_sequence`.
+    """
+    normalised = normalise_numerals(text)
+    spans = _ascii_number_spans(normalised) + _chinese_number_spans(normalised)
+    return [_number_key(value) for _offset, value in sorted(spans)]
+
+
+def source_arabic_number_sequence(text: str) -> list[str]:
+    """Only the numbers the source wrote in digits, in source order.
+
+    The enforceable half of the source's numbers. A digit in the source is
+    a fact the translation has to carry through unchanged; a numeral the
+    source spelled in Chinese is a fact this program cannot read reliably
+    enough to convict an answer over.
+    """
+    normalised = normalise_numerals(text)
+    return [_number_key(value) for _offset, value in _ascii_number_spans(normalised)]
+
+
+def states_chinese_numerals(text: str) -> bool:
+    """Whether the source spells anything in Chinese numeral characters.
+
+    Deliberately the loosest possible test \u2014 one character is enough,
+    including the ones the converter refuses to read as quantities
+    (\u4e00\u8d77, \u5341\u5206, \u842c\u4e00). The claim being made downstream is not "this
+    source states a number", it is "this program cannot say what numbers
+    this source states", and that claim is true for \u5341\u5206 as much as for
+    \u4e09\u5341. Being wrong in this direction costs a missed mutation in one
+    caption; being wrong in the other direction refuses correct captions
+    by the dozen, which is how the rule gets switched off entirely.
+    """
+    return any(char in CHINESE_NUMERAL_CHARS for char in text)
+
+
+def translation_number_sequence(text: str) -> list[str]:
+    """Every number the translation puts on screen, in the order drawn."""
+    normalised = normalise_numerals(text)
+    return [_number_key(value) for _offset, value in _ascii_number_spans(normalised)]
+
+
+def chinese_number_advisories(source: str, translated: str) -> list[str]:
+    """Numbers the source seems to spell in Chinese and the answer omits.
+
+    Advisory, never blocking (v1.4, 2026-08-13). Every entry here is a
+    guess a human should be allowed to overrule, which is why it returns
+    strings for a report instead of raising: 三分之一 -> "1/3" lands here
+    and is a perfectly good caption.
+    """
+    delivered = set(translation_number_sequence(translated))
+    stated = [
+        _number_key(value)
+        for _offset, value in _chinese_number_spans(normalise_numerals(source))
+    ]
+    return [value for value in stated if value not in delivered]
+
+
+def _token_key(token: str) -> str:
+    """Casefolded, except where case is what the token means.
+
+    A brand shouted at the start of a sentence is still the brand, so
+    words fold. A unit does not: 5mW is a phone charger and 5MW is a power
+    station, and folding them together let that mutation through.
+    """
+    if token[:1].isdigit() and any(char.isalpha() for char in token):
+        return token
+    return token.casefold()
+
+
+def _sequence_difference(left: list[str], right: list[str]) -> list[str]:
+    """Members of `left` that `right` does not have as many of."""
+    remaining = list(right)
+    missing: list[str] = []
+    for value in left:
+        if value in remaining:
+            remaining.remove(value)
+        else:
+            missing.append(value)
+    return missing
 
 
 class CaptionDeliveryError(ValueError):
@@ -1006,11 +1270,61 @@ def _shortening_prompt(
     )
 
 
+def _revalidation_prompt(
+    instances: list[dict[str, Any]],
+    target: str,
+    errors: list[CaptionDeliveryError],
+) -> str:
+    """Ask again, saying what was wrong with the last answer.
+
+    A retry that repeats the original prompt is a second roll of the same
+    dice. This one names the rule that was broken and which caption broke
+    it, so the second sample is drawn with the information the first one
+    was missing — and it restates the rules rather than relaxing any of
+    them, because the answer it produces faces the identical validator.
+    """
+    # Built as a preface to the original prompt rather than as a
+    # replacement for it. A retry prompt written from scratch is a
+    # different instruction, and a small model answers it differently in
+    # ways that have nothing to do with the rejection: the first version of
+    # this leaned on "keep every name and number exactly as it appears" and
+    # the model started returning the Chinese source untranslated. The task
+    # has not changed, so the wording of the task does not change either —
+    # only what went wrong is added, in front.
+    rejected = "; ".join(
+        f"{error.code} ({error.detail})" if error.detail else error.code
+        for error in errors
+    )
+    return (
+        f"Your previous answer was rejected by an automatic check: "
+        f"{rejected}. Fix exactly that and change nothing "
+        "else. Reminders, in the order they are most often broken: "
+        f"translated_text must be written in {target}, never in the source "
+        "language; identity_preserved belongs only on a line deliberately "
+        "left in the source language, and its identity_reason must be "
+        "exactly one of brand, proper_name, code, number_unit — no other "
+        "word; leave identity_reason out entirely when identity_preserved "
+        "is false; every number, unit, percentage and name in the source "
+        "must appear in translated_text in the same order, and no number "
+        "may appear that the source does not contain; repeat each "
+        "caption_instance_id back exactly as given, including when only one "
+        "caption is listed.\n\n"
+        + _translation_prompt(instances, target)
+    )
+
+
 def _receipt_identity(receipt: Any) -> Any:
-    """The receipt without this delivery's shortening bookkeeping."""
+    """The receipt without this delivery's own bookkeeping.
+
+    How many rounds it took is a record of what happened while producing
+    this artifact, not part of who the provider is. The receipt is compared
+    against one derived from the manifest to catch a swapped provider, and
+    a retried delivery must not read as a different provider.
+    """
     if not isinstance(receipt, dict):
         return receipt
-    return {key: value for key, value in receipt.items() if key not in SHORTENING_RECEIPT_KEYS}
+    bookkeeping = set(SHORTENING_RECEIPT_KEYS) | set(VALIDATION_RECEIPT_KEYS)
+    return {key: value for key, value in receipt.items() if key not in bookkeeping}
 
 
 def _overflowing_budgets(
@@ -1057,69 +1371,197 @@ def _overflowing_budgets(
     return budgets
 
 
+def _judge_translation(
+    expected: dict[str, Any],
+    proposed: dict[str, Any],
+    translated: str,
+    instance_id: str,
+    glossary_tokens: set[str],
+) -> dict[str, Any]:
+    """The verdict on one answer: the adopted item, or why not.
+
+    Split out from the loop so a caller can hold a verdict per caption
+    instead of only the first one, without any of the rules moving.
+    """
+    source = expected["corrected_source"].strip()
+    identity = proposed.get("identity_preserved") is True
+    reason = proposed.get("identity_reason")
+    # An empty reason field is an unfilled field, not a claim. Local 7B
+    # models routinely answer `"identity_reason": ""` alongside
+    # `identity_preserved: false`, which says exactly what `null` says
+    # and used to fail the delivery. Nothing is let through by reading
+    # it as absent: the exemption hangs on identity_preserved, and a
+    # reason that actually names something still contradicts a false
+    # claim and is still rejected below.
+    if isinstance(reason, str) and not reason.strip():
+        reason = None
+    if identity:
+        if reason not in IDENTITY_REASONS:
+            raise CaptionDeliveryError("translation_identity_invalid", instance_id)
+    elif reason is not None:
+        raise CaptionDeliveryError("translation_identity_invalid", instance_id)
+    source_normalised = TRANSLATION_NORMALISE_RE.sub("", source).casefold()
+    translated_normalised = TRANSLATION_NORMALISE_RE.sub("", translated).casefold()
+    if (
+        CHINESE_RE.search(source)
+        and translated_normalised == source_normalised
+        and not identity
+    ):
+        raise CaptionDeliveryError("translation_unchanged", instance_id)
+    # Compared on the numbers, not on how they were typed: fullwidth
+    # digits and thousands separators are flattened on both sides first
+    # (a real cut died on `2000` vs `2,000`, a correct answer refused).
+    source_tokens = ASCII_TOKEN_RE.findall(normalise_numerals(source))
+    delivered_tokens = ASCII_TOKEN_RE.findall(normalise_numerals(translated))
+    required = {_token_key(token) for token in source_tokens} | glossary_tokens.intersection(
+        token.casefold() for token in source_tokens
+    )
+    delivered = {_token_key(token) for token in delivered_tokens}
+    missing = sorted(required - delivered)
+    if missing:
+        raise CaptionDeliveryError("translation_token_missing", f"{instance_id}: {', '.join(missing)}")
+    # Sets lose three things a caption cannot afford to lose: how many
+    # times a value was said, in what order, and whether the answer
+    # added one nobody said. So the numbers are compared as a sequence.
+    #
+    # Digits only, on the source side (v1.4, 2026-08-13). Reading the
+    # numbers a caption spelled in Chinese is best-effort and best-effort
+    # is not a basis for failing a delivery closed: correct English
+    # answers this rule refused include 十年前 -> "10 years ago",
+    # 前十名 -> "Top 10", 三分之一 -> "1/3", 十點三十分 -> "10:30" and
+    # 千萬別忘記 -> "Do not forget". nat reviews the cut; a rule that
+    # cries wolf on ordinary sentences gets turned off wholesale and then
+    # protects nothing, including the digits it could actually read.
+    source_values = source_arabic_number_sequence(source)
+    delivered_values = translation_number_sequence(translated)
+    missing_values = _sequence_difference(source_values, delivered_values)
+    if missing_values:
+        raise CaptionDeliveryError(
+            "translation_token_missing",
+            f"{instance_id}: {', '.join(missing_values)}",
+        )
+    # Symmetric to the above, and the part that is easy to get wrong: if
+    # the source's numbers cannot be read, then neither "the answer
+    # invented one" nor "the answer reordered them" can be claimed about
+    # this caption — both accusations are statements about the source's
+    # number sequence, which is exactly what is unavailable. Only captions
+    # whose numbers are wholly ASCII stay convictable on these two, and
+    # those keep both rules untouched.
+    if not states_chinese_numerals(source):
+        invented = _sequence_difference(delivered_values, source_values)
+        if invented:
+            # The direction nothing checked: a number on screen that the
+            # speaker never said is not a translation error the viewer can
+            # see, it is a fabricated fact in the speaker's mouth.
+            raise CaptionDeliveryError(
+                "translation_number_invented", f"{instance_id}: {', '.join(invented)}"
+            )
+        if source_values != delivered_values:
+            # Same numbers, rearranged: "12 hours for 24 dollars" and
+            # "24 hours for 12 dollars" carry identical tokens and opposite
+            # meanings.
+            raise CaptionDeliveryError(
+                "translation_number_order",
+                f"{instance_id}: {' '.join(source_values)} -> {' '.join(delivered_values)}",
+            )
+    return {
+        "translated_text": translated,
+        "translation_status": "identity_preserved" if identity else "translated",
+        "identity_preserved": identity,
+        "identity_reason": reason if identity else None,
+    }
+
+
 def _validate_translations(
     instances: list[dict[str, Any]],
     response: dict[str, Any],
     glossary: list[str],
 ) -> list[dict[str, Any]]:
+    """Every answer, or the first reason one of them is unacceptable."""
+    results, failures = _validate_translations_with_failures(
+        instances, response, glossary
+    )
+    if failures:
+        raise failures[0][1]
+    return [result for result in results if result is not None]
+
+
+def _validate_translations_with_failures(
+    instances: list[dict[str, Any]],
+    response: dict[str, Any],
+    glossary: list[str],
+) -> tuple[list[dict[str, Any] | None], list[tuple[int, CaptionDeliveryError]]]:
+    """Judge every item, and say which ones failed rather than only the first.
+
+    Same rules, same codes, same order — the difference is that a caller
+    who intends to ask again learns *which* captions to ask about. Asking
+    again about all of them turned out to be actively harmful: on a real
+    delivery qwen2.5:7b answered nine captions well and two badly, and
+    re-asking the whole set brought back eleven untranslated Chinese lines.
+
+    Anything that is not attributable to one item — a response of the wrong
+    shape, wrong length, or misaligned ids — is still raised, because there
+    is no per-item verdict to give. An item-level failure already found
+    outranks it, so that this reports exactly what the first-failure
+    version reported.
+    """
     raw = response.get("items")
     if set(response) != {"items"}:
         raise CaptionDeliveryError("translation_invalid", "provider response has unexpected fields")
     if not isinstance(raw, list) or len(raw) != len(instances):
         raise CaptionDeliveryError("translation_incomplete", "provider item count mismatch")
-    output: list[dict[str, Any]] = []
+    output: list[dict[str, Any] | None] = []
+    failures: list[tuple[int, CaptionDeliveryError]] = []
     seen: set[str] = set()
+
+    def _structural(error: CaptionDeliveryError) -> CaptionDeliveryError:
+        """The first item-level verdict wins over a later structural one."""
+        return failures[0][1] if failures else error
+
     glossary_tokens = {token.casefold() for term in glossary for token in ASCII_TOKEN_RE.findall(str(term))}
     for index, (expected, proposed) in enumerate(zip(instances, raw, strict=True)):
         if not isinstance(proposed, dict):
-            raise CaptionDeliveryError("translation_invalid", f"item {index} is not an object")
+            raise _structural(CaptionDeliveryError("translation_invalid", f"item {index} is not an object"))
         if not set(proposed).issubset(
             {"caption_instance_id", "translated_text", "identity_preserved", "identity_reason"}
         ):
-            raise CaptionDeliveryError("translation_invalid", f"item {index} has unexpected fields")
+            raise _structural(CaptionDeliveryError("translation_invalid", f"item {index} has unexpected fields"))
         instance_id = str(proposed.get("caption_instance_id") or "")
+        if not instance_id and len(instances) == 1:
+            # An id left out of a one-item exchange cannot be ambiguous:
+            # one caption was asked about, one answer came back, and there
+            # is no other caption it could belong to. The id exists to stop
+            # answers being matched to the wrong caption, and with a single
+            # item that mapping is forced.
+            #
+            # This is not theoretical tidying — it is what a per-caption
+            # retry runs into. qwen2.5:7b echoes the id happily in a list
+            # of six and drops it when the list has one, so the retried
+            # answer was correct and thrown away for a missing field, three
+            # rounds in a row, and the cut died. An id that is *present and
+            # different* is still a mismatch: that one says the provider
+            # answered about something else.
+            instance_id = str(expected["caption_instance_id"])
         if instance_id != expected["caption_instance_id"]:
-            raise CaptionDeliveryError("translation_order_mismatch", f"item {index}")
+            raise _structural(CaptionDeliveryError("translation_order_mismatch", f"item {index}"))
         if instance_id in seen:
-            raise CaptionDeliveryError("translation_duplicate", instance_id)
+            raise _structural(CaptionDeliveryError("translation_duplicate", instance_id))
         seen.add(instance_id)
         translated = str(proposed.get("translated_text") or "").strip()
         if not translated:
-            raise CaptionDeliveryError("translation_incomplete", instance_id)
+            raise _structural(CaptionDeliveryError("translation_incomplete", instance_id))
         if len(translated) > MAX_CAPTION_TEXT_CHARS:
-            raise CaptionDeliveryError("translation_invalid", f"{instance_id} text is too long")
-        source = expected["corrected_source"].strip()
-        identity = proposed.get("identity_preserved") is True
-        reason = proposed.get("identity_reason")
-        if identity:
-            if reason not in IDENTITY_REASONS:
-                raise CaptionDeliveryError("translation_identity_invalid", instance_id)
-        elif reason is not None:
-            raise CaptionDeliveryError("translation_identity_invalid", instance_id)
-        source_normalised = TRANSLATION_NORMALISE_RE.sub("", source).casefold()
-        translated_normalised = TRANSLATION_NORMALISE_RE.sub("", translated).casefold()
-        if (
-            CHINESE_RE.search(source)
-            and translated_normalised == source_normalised
-            and not identity
-        ):
-            raise CaptionDeliveryError("translation_unchanged", instance_id)
-        required = {token.casefold() for token in ASCII_TOKEN_RE.findall(source)} | glossary_tokens.intersection(
-            token.casefold() for token in ASCII_TOKEN_RE.findall(source)
-        )
-        delivered = {token.casefold() for token in ASCII_TOKEN_RE.findall(translated)}
-        missing = sorted(required - delivered)
-        if missing:
-            raise CaptionDeliveryError("translation_token_missing", f"{instance_id}: {', '.join(missing)}")
-        output.append(
-            {
-                "translated_text": translated,
-                "translation_status": "identity_preserved" if identity else "translated",
-                "identity_preserved": identity,
-                "identity_reason": reason if identity else None,
-            }
-        )
-    return output
+            raise _structural(CaptionDeliveryError("translation_invalid", f"{instance_id} text is too long"))
+        try:
+            output.append(
+                _judge_translation(
+                    expected, proposed, translated, instance_id, glossary_tokens
+                )
+            )
+        except CaptionDeliveryError as exc:
+            output.append(None)
+            failures.append((index, exc))
+    return output, failures
 
 
 def _caption_overlays(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1173,25 +1615,84 @@ def _translate_and_adopt(
     receipt: dict[str, Any],
     model_call: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
-    try:
-        response = model_call(
-            _translation_prompt(expected["instances"], target),
-            "caption_translation",
-            model=model,
-            timeout=timeout,
-        )
-    except CaptionDeliveryError:
-        raise
-    except Exception as exc:
-        raise CaptionDeliveryError("translation_provider_failed", str(exc)[:500]) from exc
-    # The blocking provider wait is the point where another process can swap
-    # project paths.  Reject before validating or adopting any returned data.
-    _verify_project_trust(trust)
-    if not isinstance(response, dict):
-        raise CaptionDeliveryError("translation_invalid", "provider response must be an object")
     subtitles = manifest.get("subtitles") if isinstance(manifest.get("subtitles"), dict) else {}
     glossary = subtitles.get("glossary") if isinstance(subtitles.get("glossary"), list) else []
-    translations = _validate_translations(expected["instances"], response, glossary)
+    # A rejected answer is asked again with the rejection in the prompt, up
+    # to VALIDATION_MAX_ROUNDS times, and then the rejection stands. The
+    # provider is a sampling model: the first answer being wrong says much
+    # less about whether it can meet the contract than three do, and one
+    # bad sample used to cost the whole cut. Nothing here loosens what
+    # counts as wrong — the retried answer goes through exactly the same
+    # `_validate_translations` that turned the last one down.
+    #
+    # Only the captions that were turned down are asked about again. The
+    # first attempt at this re-asked the whole set and made deliveries
+    # worse, not better: qwen2.5:7b answered nine of eleven captions well,
+    # and a re-ask that included the nine came back with eleven
+    # untranslated Chinese lines. A caption that already passed is kept and
+    # never shown to the provider again.
+    adopted: list[dict[str, Any] | None] = [None] * len(expected["instances"])
+    pending = list(enumerate(expected["instances"]))
+    prompt = _translation_prompt([instance for _index, instance in pending], target)
+    validation_rounds = 0
+    while True:
+        try:
+            response = model_call(
+                prompt,
+                "caption_translation",
+                model=model,
+                timeout=timeout,
+                # Which try this is, so a provider pinned to a fixed seed
+                # can draw a different sample instead of returning the
+                # rejected answer verbatim.
+                attempt=validation_rounds,
+            )
+        except CaptionDeliveryError:
+            raise
+        except Exception as exc:
+            raise CaptionDeliveryError("translation_provider_failed", str(exc)[:500]) from exc
+        # The blocking provider wait is the point where another process can
+        # swap project paths.  Reject before validating or adopting any
+        # returned data — including before deciding whether to ask again,
+        # so a retry is never issued against a project that moved.
+        _verify_project_trust(trust)
+        if not isinstance(response, dict):
+            raise CaptionDeliveryError("translation_invalid", "provider response must be an object")
+        asked = [instance for _index, instance in pending]
+        try:
+            results, failures = _validate_translations_with_failures(
+                asked, response, glossary
+            )
+        except CaptionDeliveryError as exc:
+            # Not a verdict on any one caption — a response of the wrong
+            # shape or with the ids out of order. Worth one more ask for
+            # the same reason a violation is, and about the same captions.
+            if (
+                exc.code not in CONTRACT_VIOLATION_CODES
+                or validation_rounds >= VALIDATION_MAX_ROUNDS
+            ):
+                raise
+            validation_rounds += 1
+            prompt = _revalidation_prompt(asked, target, [exc])
+            continue
+        for (index, _instance), result in zip(pending, results, strict=True):
+            if result is not None:
+                adopted[index] = result
+        if not failures:
+            break
+        if validation_rounds >= VALIDATION_MAX_ROUNDS:
+            # The ceiling: the verdict on the first caption still failing
+            # stands, and the delivery fails closed exactly as it did
+            # before any of this existed.
+            raise failures[0][1]
+        validation_rounds += 1
+        pending = [pending[position] for position, _exc in failures]
+        prompt = _revalidation_prompt(
+            [instance for _index, instance in pending],
+            target,
+            [exc for _position, exc in failures],
+        )
+    translations = [item for item in adopted if item is not None]
 
     # SPEC Phase 3 v1 §3 step 3, between wrapping and failing closed: the
     # captions whose translation still needs a third line at its floor size
@@ -1247,6 +1748,7 @@ def _translate_and_adopt(
         **receipt,
         "shortening_rounds": rounds,
         "shortening_character_budgets": dict(sorted(budgets.items())),
+        "validation_retry_rounds": validation_rounds,
     }
     items: list[dict[str, Any]] = []
     for instance, translated in zip(expected["instances"], translations, strict=True):
@@ -1280,7 +1782,21 @@ def _translate_and_adopt(
         translated_by_source.setdefault(item["caption_source_id"], item["translated_text"])
     for overlay in _caption_overlays(bound_state):
         source_id = str(overlay.get("caption_source_id") or "")
-        overlay["translation"] = translated_by_source[source_id]
+        if source_id in translated_by_source:
+            overlay["translation"] = translated_by_source[source_id]
+        else:
+            # A caption the cut does not use. The transcript covers the
+            # whole recording and the timeline covers what was kept, so an
+            # editor state normally holds overlays no segment touches —
+            # `expected_instances` never asks the provider about them and
+            # there is no translation to bind. This used to index straight
+            # into the map and take the run down with a KeyError.
+            #
+            # Removed rather than left as it was: an overlay carrying a
+            # translation from an older delivery would be a line nobody
+            # delivered for this timeline, and the state is about to be
+            # stamped with this delivery's hash.
+            overlay.pop("translation", None)
         overlay["caption_delivery_artifact_sha256"] = artifact_sha256
     bound_state["caption_delivery"] = {
         "schema_version": 2,

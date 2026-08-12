@@ -263,7 +263,7 @@ class CaptionDeliveryContractTests(unittest.TestCase):
             "items": [
                 {
                     "caption_instance_id": item["caption_instance_id"],
-                    "translated_text": f"English line {index + 1}",
+                    "translated_text": f"English line {chr(ord('A') + index)}",
                 }
                 for index, item in enumerate(requested)
             ]
@@ -284,7 +284,7 @@ class CaptionDeliveryContractTests(unittest.TestCase):
         self.assertEqual(len({item["caption_instance_id"] for item in artifact["items"]}), 2)
         self.assertEqual(
             [item["translated_text"] for item in artifact["items"]],
-            ["English line 1", "English line 2"],
+            ["English line A", "English line B"],
         )
         self.assertEqual(artifact["provider_receipt"]["mode"], "local_loopback")
         self.assertEqual(artifact["provider_receipt"]["consent_mode"], "not_required_local")
@@ -394,7 +394,7 @@ class CaptionDeliveryContractTests(unittest.TestCase):
                         "translated_text": (
                             "Chinese Pro 30kg"
                             if index == 0
-                            else f"English line {index + 1}"
+                            else f"English line {chr(ord('A') + index)}"
                         ),
                     }
                     for index, item in enumerate(requested)
@@ -469,7 +469,7 @@ class CaptionDeliveryContractTests(unittest.TestCase):
                 "items": [
                     {
                         "caption_instance_id": item["caption_instance_id"],
-                        "translated_text": f"Revised English {index + 1}",
+                        "translated_text": f"Revised English {chr(ord('A') + index)}",
                     }
                     for index, item in enumerate(requested)
                 ]
@@ -743,7 +743,7 @@ class CaptionDeliveryContractTests(unittest.TestCase):
                     "items": [
                         {
                             "caption_instance_id": item["caption_instance_id"],
-                            "translated_text": f"Public English {index + 1}",
+                            "translated_text": f"Public English {chr(ord('A') + index)}",
                         }
                         for index, item in enumerate(requested)
                     ]

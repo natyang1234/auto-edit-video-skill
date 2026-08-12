@@ -570,6 +570,91 @@ class ContextualSemanticCalibrationTests(unittest.TestCase):
         self.assertEqual(body["options"]["num_ctx"], 16384)
         self.assertEqual(body["options"]["num_predict"], 1536)
 
+    def test_the_first_attempt_is_still_pinned_and_a_retry_is_not(self) -> None:
+        # Determinism is the default the rest of the pipeline is built on,
+        # so attempt 0 does not move. A retry has to: re-asking a model
+        # pinned to temperature 0 and seed 42 returns the previous answer
+        # word for word, which makes a bounded retry a bill rather than a
+        # second sample. Observed — two retries, three identical rejected
+        # answers, one dead cut.
+        first = self._options_for(attempt=0)
+        self.assertEqual(first["temperature"], 0)
+        self.assertEqual(first["seed"], 42)
+        retry = self._options_for(attempt=1)
+        self.assertNotEqual(retry["seed"], first["seed"])
+        self.assertGreater(retry["temperature"], 0)
+        self.assertNotEqual(self._options_for(attempt=2)["seed"], retry["seed"])
+
+    @classmethod
+    def _options_for(cls, *, attempt: int) -> dict:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read() -> bytes:
+                return json.dumps(
+                    {"message": {"content": json.dumps({"items": []})}}
+                ).encode("utf-8")
+
+        with patch.dict("os.environ", {"OLLAMA_HOST": "http://127.0.0.1:11434"}):
+            with patch("urllib.request.urlopen", return_value=FakeResponse()) as opened:
+                ollama_json_model_call(
+                    "{}", "caption_translation", model="qwen2.5:7b", attempt=attempt
+                )
+        return json.loads(opened.call_args.args[0].data.decode("utf-8"))["options"]
+
+    @staticmethod
+    def _system_message_for(stage: str) -> str:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read() -> bytes:
+                return json.dumps(
+                    {"message": {"content": json.dumps({"items": []})}}
+                ).encode("utf-8")
+
+        with patch.dict("os.environ", {"OLLAMA_HOST": "http://127.0.0.1:11434"}):
+            with patch("urllib.request.urlopen", return_value=FakeResponse()) as opened:
+                ollama_json_model_call("{}", stage, model="qwen2.5:7b")
+        body = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        return body["messages"][0]["content"]
+
+    def test_the_correction_stages_keep_their_preserve_the_source_system_prompt(
+        self,
+    ) -> None:
+        # This is the right instruction for the job it was written for:
+        # proposing spelling corrections, where anything not explicitly
+        # corrected must come back untouched.
+        system = self._system_message_for("propose")
+        self.assertIn("Preserve", system)
+        self.assertIn("source wording", system)
+
+    def test_the_translation_stage_is_not_told_to_preserve_the_source_wording(
+        self,
+    ) -> None:
+        # The same system prompt was being sent for translation, where it
+        # says the opposite of the task: "preserve Taiwan Traditional
+        # Chinese, source wording, numbers, punctuation ... unless
+        # explicitly corrected" is an instruction to hand the Chinese back.
+        #
+        # That is exactly what qwen2.5:7b did on a real cut — every caption
+        # returned verbatim, `translation_unchanged`, no video — and it is
+        # why the delivery's own retry could not save it: re-asking with a
+        # system prompt that contradicts the request only buys the same
+        # answer again.
+        system = self._system_message_for("caption_translation")
+        self.assertNotIn("source wording", system)
+        self.assertIn("translat", system.casefold())
+
 
 if __name__ == "__main__":
     unittest.main()

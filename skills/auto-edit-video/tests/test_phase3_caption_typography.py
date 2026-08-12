@@ -249,6 +249,78 @@ class CaptionOverflowRenderTests(unittest.TestCase):
         )
 
 
+class LaidOutLineCountTests(unittest.TestCase):
+    """The two-line cap is about the frame, not about the wrapper's opinion.
+
+    `_wrap_translation` hands back one "line" whenever it finds nothing to
+    break on — but CoreText then breaks the same run wherever it likes and
+    draws seven. Counting the wrapper's list is counting an intention; the
+    lines the framesetter produced are the caption. So the cap is enforced,
+    and reported, on what was laid out.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="phase3-laidout-tests-")
+        self.project = Path(self._tmp.name)
+        (self.project / "working").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def state(self, text: str, translation: str | None = None, max_width: float = 84):
+        overlay = {
+            "id": "caption-0001", "type": "caption", "text": text,
+            "start": 0.0, "end": 2.0, "visible": True,
+            "style": {"font_size": 52, "max_width": max_width},
+        }
+        if translation:
+            overlay["translation"] = translation
+        return {"canvas": {"width": 1080, "height": 1920}, "overlays": [overlay]}
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_an_unbreakable_translation_fails_closed_instead_of_drawing_seven_lines(
+        self,
+    ) -> None:
+        # 312 characters with nowhere to wrap: the wrapper returns it as a
+        # single line, the framesetter draws it as seven or eight, and the
+        # caption used to render exit 0 with secondary_line_count 1.
+        with self.assertRaises(cc.CaptionOverflowError):
+            cc.build_render_plan(
+                self.project,
+                self.state("我們今天要介紹全新規格", translation="a" * 312),
+            )
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_an_unbreakable_spoken_caption_fails_closed_too(self) -> None:
+        # The same hole existed one tier up: an unbreakable primary run was
+        # wrapped as one line, drawn on eleven, and reported as one.
+        with self.assertRaises(cc.CaptionOverflowError):
+            cc.build_render_plan(self.project, self.state("a" * 312))
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_translation_drawn_on_two_lines_is_reported_as_two(self) -> None:
+        # Same shape, short enough that the framesetter fits it inside the
+        # two-line cap: legal, so it renders — and the count it renders at
+        # is the count the plan has to carry.
+        item = cc.build_render_plan(
+            self.project,
+            self.state("我們今天要介紹全新規格", translation="a" * 60),
+        )["items"][0]
+        typography = item["typography"]
+        self.assertEqual(typography["secondary_line_count"], 2)
+        self.assertIsNotNone(typography["measured"]["secondary_line_pitch"])
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_translation_drawn_on_one_line_still_reports_one(self) -> None:
+        # The counterpart: a translation that really is one line must not be
+        # inflated by the new measurement, and a single line has no pitch.
+        item = cc.build_render_plan(
+            self.project,
+            self.state("我們今天要介紹全新規格", translation="a short line"),
+        )["items"][0]
+        typography = item["typography"]
+        self.assertEqual(typography["secondary_line_count"], 1)
+        self.assertIsNone(typography["measured"]["secondary_line_pitch"])
+
+
 class MeasuredLayoutTests(unittest.TestCase):
     """The line height in the SPEC is the pitch in the raster, not a label.
 
@@ -609,6 +681,115 @@ class PlanCacheKnowsAboutTypographyTests(unittest.TestCase):
         self.assertEqual(
             contract_registry.validate_artifact("caption_render_plan", rebuilt), []
         )
+
+
+class TranslationRangeUnitTests(unittest.TestCase):
+    """Which lines belong to the translation, measured in one unit.
+
+    The block split asks "is this line at or past where the translation
+    starts", and until this class existed the two sides of that comparison
+    were counted differently: the boundary came from Python string lengths
+    (code points) while the line's own location comes from CoreText
+    (UTF-16 code units). For text inside the BMP those are the same number,
+    which is why it held for years; every emoji in a caption makes them
+    drift apart by one, and the drift is one-directional — a *spoken* line
+    is pushed past the boundary and counted as translation.
+
+    Everything downstream of that split is then wrong at once: the two-line
+    cap (SPEC Phase 3 v1 §4) is enforced per block, so a spoken line moved
+    into the translation bucket both hides a spoken overflow and invents a
+    translation overflow; the reported line counts describe a layout that
+    was not drawn; and the measured pitch/gap are read off the wrong
+    baselines.
+
+    These tests pin the two ends. The control in each is the same caption
+    with no emoji: emoji do not change how many lines a run needs, so any
+    difference between the two is the unit bug and nothing else.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="phase3-utf16-tests-")
+        self.project = Path(self._tmp.name)
+        (self.project / "working").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def state(self, text: str, translation: str | None = None, max_width: float = 84):
+        overlay = {
+            "id": "caption-0001", "type": "caption", "text": text,
+            "start": 0.0, "end": 2.0, "visible": True,
+            "style": {"font_size": 52, "max_width": max_width},
+        }
+        if translation:
+            overlay["translation"] = translation
+        return {"canvas": {"width": 1080, "height": 1920}, "overlays": [overlay]}
+
+    def typography(self, text: str, translation: str | None = None) -> dict:
+        return cc.build_render_plan(
+            self.project, self.state(text, translation=translation)
+        )["items"][0]["typography"]
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_one_line_translation_under_emoji_is_reported_as_one_line(self) -> None:
+        # 36 emoji wrap onto two spoken lines — the same two the caption
+        # renders with no translation at all, asserted first so the number
+        # below is compared against something measured, not assumed. The
+        # translation is a single short word, so the only honest answer is
+        # 2 + 1; the code-point boundary sits mid-emoji-run and hands the
+        # second spoken line to the translation, which reported 2 + 2.
+        self.assertEqual(self.typography("\U0001F600" * 36)["primary_line_count"], 2)
+        typography = self.typography("\U0001F600" * 36, "ok")
+        self.assertEqual(typography["primary_line_count"], 2)
+        self.assertEqual(typography["secondary_line_count"], 1)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_emoji_do_not_shrink_the_reported_spoken_block(self) -> None:
+        # Further past the boundary the first spoken line goes too, and the
+        # plan claims a one-line caption for a block drawn on two.
+        text = "\U0001F600" * 38 + "短"
+        self.assertEqual(self.typography(text)["primary_line_count"], 2)
+        typography = self.typography(text, "ok")
+        self.assertEqual(typography["primary_line_count"], 2)
+        self.assertEqual(typography["secondary_line_count"], 1)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_legal_two_plus_two_caption_is_not_refused_for_containing_emoji(
+        self,
+    ) -> None:
+        # The expensive half of the same bug: two spoken lines and a
+        # two-line translation is exactly what §4 allows, and the control
+        # renders it. Add emoji to the spoken text and spoken lines pile
+        # into the translation bucket until it counts three, and a caption
+        # that fits fails closed — an emoji in the transcript taking the
+        # whole cut down.
+        translation = "a" * 60
+        control = self.typography("看到 想到 為什麼 這樣子 完全不對", translation)
+        self.assertEqual(control["secondary_line_count"], 2)
+
+        text = "\U0001F600" * 38 + "短"
+        self.assertEqual(self.typography(text)["primary_line_count"], 2)
+        typography = self.typography(text, translation)
+        self.assertEqual(typography["primary_line_count"], 2)
+        self.assertEqual(typography["secondary_line_count"], 2)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_measured_layout_is_read_off_the_right_baselines(self) -> None:
+        # The counts are the visible symptom; the measurements come off the
+        # same split. A two-line spoken block has a primary pitch, and a
+        # one-line translation has no secondary pitch — with the buckets
+        # crossed the caption reported the opposite of both.
+        typography = self.typography("\U0001F600" * 36, "ok")
+        measured = typography["measured"]
+        self.assertIsNotNone(measured["primary_line_pitch"])
+        self.assertIsNone(measured["secondary_line_pitch"])
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_emoji_free_captions_are_unaffected(self) -> None:
+        # The regression guard for the fix itself: for text with no
+        # surrogate pairs the two units agree, so nothing about these
+        # numbers may move.
+        typography = self.typography("看到 想到 為什麼 這樣子 完全不對", "a" * 60)
+        self.assertEqual(typography["primary_line_count"], 1)
+        self.assertEqual(typography["secondary_line_count"], 2)
 
 
 if __name__ == "__main__":

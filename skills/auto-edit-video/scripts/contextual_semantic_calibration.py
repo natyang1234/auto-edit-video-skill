@@ -406,8 +406,19 @@ def ollama_json_model_call(
     *,
     model: str,
     timeout: int = 300,
+    attempt: int = 0,
 ) -> dict[str, Any]:
-    """Call a loopback-only Ollama model with deterministic JSON output."""
+    """Call a loopback-only Ollama model with deterministic JSON output.
+
+    `attempt` is which try this is, and it exists so that a caller who
+    re-asks after rejecting an answer actually gets a different one.
+    Attempt 0 stays exactly as deterministic as it has always been —
+    temperature 0, seed 42 — because reproducibility is the default the
+    rest of the pipeline is built on. A later attempt moves the seed and
+    lifts the temperature just off zero: re-asking a model pinned to a
+    fixed seed returns the same answer word for word, so a retry against
+    it is not a second sample, it is the same sample billed twice.
+    """
 
     if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", model):
         raise ValueError("Ollama model name is invalid")
@@ -420,6 +431,25 @@ def ollama_json_model_call(
     endpoint = urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, "/api/chat", "", "")
     )
+    # One system prompt used to go out for every stage, and it was written
+    # for the correction stages: "preserve ... source wording ... unless
+    # explicitly corrected" is exactly right when the job is to propose
+    # spelling fixes and hand everything else back untouched. Sent with a
+    # *translation* request it says the opposite of the request, and
+    # qwen2.5:7b did what the system prompt told it — a real cut came back
+    # with every caption still in Chinese, `translation_unchanged`, no
+    # video. A retry cannot fix a contradiction it is re-sent with.
+    system_prompt = (
+        "Return only the requested JSON. Preserve Taiwan Traditional Chinese, "
+        "source wording, numbers, punctuation, and English unless explicitly corrected."
+    )
+    if stage == "caption_translation":
+        system_prompt = (
+            "Return only the requested JSON. You are translating subtitles: "
+            "translated_text must be written in the requested target language, "
+            "never left in the source language. Carry every number, unit, "
+            "percentage, brand and proper name across unchanged."
+        )
     body = json.dumps(
         {
             "model": model,
@@ -428,16 +458,13 @@ def ollama_json_model_call(
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "Return only the requested JSON. Preserve Taiwan Traditional Chinese, "
-                        "source wording, numbers, punctuation, and English unless explicitly corrected."
-                    ),
+                    "content": system_prompt,
                 },
                 {"role": "user", "content": prompt},
             ],
             "options": {
-                "temperature": 0,
-                "seed": 42,
+                "temperature": 0 if attempt <= 0 else 0.3,
+                "seed": 42 + max(0, int(attempt)),
                 "num_ctx": 16384,
                 "num_predict": 1536,
             },

@@ -199,6 +199,18 @@ class CaptionOverflowError(ValueError):
     """
 
 
+def utf16_length(text: str) -> int:
+    """Length in UTF-16 code units — the unit CoreText counts offsets in.
+
+    Every offset that crosses the CoreText boundary (line locations, run
+    ranges, cluster boundaries, span starts) is a UTF-16 index into the
+    NSString, not a Python code point index. Any Python-side offset that
+    will be compared with one has to be built with this, or the two agree
+    only until the first character outside the BMP.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def line_height_px(font_size: float, secondary: bool = False) -> float:
     """Explicit line-to-line distance for one caption tier (SPEC §2)."""
     scale = LINE_HEIGHT_SECONDARY_SCALE if secondary else LINE_HEIGHT_PRIMARY_SCALE
@@ -790,7 +802,18 @@ def render_caption_png(
                 "third line or quietly dropping words"
             )
         translation_text = "\n".join(translation_lines)
-        translation_range = (len(text) + 1, len(text) + 1 + len(translation_text))
+        # UTF-16 code units, because that is what this range is compared
+        # against: CoreText line, run and span offsets are all UTF-16 (see
+        # caption_engine.boundary_map / snap_span), and `len()` counts code
+        # points. The two agree for everything inside the BMP and disagree
+        # by one per emoji, always in the same direction — so a spoken line
+        # past the boundary was filed under the translation, which hid a
+        # spoken overflow, invented a translation overflow, and measured
+        # the pitch of one block off the baselines of the other.
+        translation_start = utf16_length(text) + 1
+        translation_range = (
+            translation_start, translation_start + utf16_length(translation_text)
+        )
         text = f"{text}\n{translation_text}"
     base_font = _make_base_font(ct, font_size, font_file)
 
@@ -1138,6 +1161,37 @@ def render_caption_png(
         line for line in laid_out
         if translation_range is not None and line["location"] >= translation_range[0]
     ]
+    # SPEC Phase 3 v1 §4's two-line cap, checked against the frame rather
+    # than against the wrapper that fed it. `_wrap_translation` reports one
+    # line for a run it found nothing to break — and then the framesetter
+    # breaks that run wherever it likes and draws seven of them. Until this
+    # comparison existed the cap held only for translations the wrapper
+    # could break: the ones it could not sailed past it, rendered exit 0,
+    # and reported secondary_line_count 1 for a block eight lines tall.
+    # Same fail-closed path as the declared check above, for the same
+    # reason — a caption over the cap is not a caption to fix at draw time.
+    if len(translation_laid_out) > MAX_CAPTION_LINES:
+        raise CaptionOverflowError(
+            f"translation for caption {overlay.get('id')!r} must be "
+            f"shortened: it was laid out on {len(translation_laid_out)} "
+            f"lines at its {secondary_size:.1f}px size even though it was "
+            f"wrapped as {secondary_line_count}, and SPEC Phase 3 v1 §4 "
+            "caps a caption at two — the line count that counts is the one "
+            "the framesetter drew"
+        )
+    if len(spoken_laid_out) > MAX_CAPTION_LINES:
+        raise CaptionOverflowError(
+            f"caption {overlay.get('id')!r} was laid out on "
+            f"{len(spoken_laid_out)} lines at {font_size:.1f}px even though "
+            f"it was wrapped as {primary_line_count} — SPEC Phase 3 v1 §4 "
+            "caps a caption at two lines, measured on the frame"
+        )
+    # Reported from the frame for the same reason it is enforced there: a
+    # plan that says one line about a block drawn on two is a number no
+    # downstream check can use.
+    primary_line_count = len(spoken_laid_out) or primary_line_count
+    if translation_range is not None:
+        secondary_line_count = len(translation_laid_out) or secondary_line_count
 
     def _pitch(block: list[dict[str, float]]) -> float | None:
         """Baseline-to-baseline distance inside one block, as drawn."""

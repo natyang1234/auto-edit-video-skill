@@ -39,6 +39,13 @@ nat 2026-08-12 授權 Claude 擬定本規格（PRD Phase 3 僅質化描述）；
 
 - 數字、百分比、單位、品牌名、產品名、專有名詞翻譯時**逐字保留**，不改寫、不換算——契約已存在（caption_delivery.py:54,958-1020 `identity_preserved`/`identity_reason`），Phase 3 只補 **mutation 測試**：竄改數字、單位換算、品牌改寫、專名音譯等變體必須被 `_validate_translations` 擋下。
 - 第 3 節 shortening 重試的字元預算 prompt 必須明示「數字/專名不可刪減」；shortening 後的譯文仍須通過 identity 驗證。
+- **中文數字保真＝best-effort，不阻擋（v1.4，2026-08-13 主 session 裁定）**：來源以中文數字書寫的量（三十、百分之八十七、二十四）**不再硬性要求譯文出現對應阿拉伯數字**。`chinese_number_value`/`chinese_percent_value`/`source_number_sequence` 保留為 metadata／warning（另見 `chinese_number_advisories`），其產出不進任何 blocking 檢查。
+  - 理由＝誤殺率遠高於命中率：十年前→"10 years ago"、前十名→"Top 10"、二十四小時→"Open 24/7"、三分之一→"1/3"、十點三十分→"Meeting at 10:30"、千萬別忘記→"Do not forget"、百分之零點五→"0.5%"、百分之八十七→"87 percent" 全為正確譯文卻被舊規則擋下。規則對日常中文語句頻繁 fail closed，實務結果是整組保真閘被關掉，連讀得準的阿拉伯數字也一併失去保護。
+  - **對稱豁免**：來源含任何中文數字字元（`CHINESE_NUMERAL_CHARS`，含 一/十/萬 等成語用字）時，該 caption 一併豁免 `translation_number_invented` 與 `translation_number_order`——讀不出來源數列，就無法宣稱譯文「憑空捏造」或「換序」，這兩項指控都是對來源數列的陳述。
+  - **硬強制僅限來源阿拉伯數字**（不得退步）：來源寫成數字時，`translation_token_missing`（含 multiset 重複次數）、`translation_number_invented`、`translation_number_order` 全數維持；A1 正規化（2,000≡2000、全形數字、`12,00` 仍視為 1200 並擋）維持；`5mW≠5MW` 大小寫敏感維持；品牌名 casefold 維持。
+  - 兜底＝§5 的 nat 看片簽核。特徵化測試：test_phase3_preservation_mutations.py（`ChineseNumberBestEffortTests`／`ChineseNumberFalsePositiveTests`／`ArabicNumberEnforcementSurvivesTests`）。
+  - **豁免範圍為整句（已知缺口，v1.4 收案確認）**：來源含 一/十 等字（含 一起/一直 等慣用語）時該 caption 的 invented/order 一併關閉——「一起投資了 100 元」譯文憑空 +300% 會放行（存在性 token_missing 仍護住 100 本身，實測 3→5 被擋）。第五輪 verifier 建議的收窄法（僅解析出真數值才豁免＋每數字溯源）會對「二十四小時→Open 24/7」類慣用譯法製造新誤殺，故不採；記 Phase 4 backlog 再議。
+- **已知接受的缺口（v1.3，2026-08-13 主 session 裁定）**：整句中文在合法 identity_reason 下原樣不翻可通過驗證——identity 機制約束「哪些理由」而非「可回聲多少」；收窄需武斷的名字/句子判別且違反 Phase 0c 已 checkpoint 契約。風險上限＝漏「未翻譯」不會漏「翻譯錯誤」，由 §5 的 nat 看片簽核把關。特徵化測試：test_phase3_preservation_mutations.py。
 
 ## 5. 驗收（Phase 3 完成定義）
 
