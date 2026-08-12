@@ -1585,6 +1585,25 @@ def semantic_caption_delivery(artifact) -> list[str]:
             errors.append(f"$.items[{index}]: identity exception is incomplete")
         if identity is False and (reason is not None or status != "translated"):
             errors.append(f"$.items[{index}]: translated item has identity exception fields")
+    # SPEC Phase 3 v1 §3 step 3: a budget belongs to a caption instance in
+    # this very delivery, and a budget without a round is a record of a
+    # provider call that either did not happen or was not counted.
+    receipt = artifact.get("provider_receipt")
+    if isinstance(receipt, dict):
+        budgets = receipt.get("shortening_character_budgets")
+        rounds = receipt.get("shortening_rounds")
+        if isinstance(budgets, dict):
+            unknown = sorted(set(budgets) - seen_instances)
+            if unknown:
+                errors.append(
+                    "$.provider_receipt.shortening_character_budgets: "
+                    f"unknown caption instances {', '.join(unknown)}"
+                )
+            if type(rounds) is int and bool(budgets) != (rounds > 0):
+                errors.append(
+                    "$.provider_receipt.shortening_rounds: does not agree with "
+                    "the recorded character budgets"
+                )
     return errors
 
 

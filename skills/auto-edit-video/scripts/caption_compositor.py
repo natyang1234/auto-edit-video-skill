@@ -180,6 +180,12 @@ BLOCK_GAP_SCALE = 0.35
 # SPEC §4: never three lines. A caption that needs one is a caption that
 # has to fail closed, not one that quietly grows.
 MAX_CAPTION_LINES = 2
+# SPEC §3 step 3: the character budget handed back to the translator is two
+# lines of measured capacity, minus a margin. The margin is there because a
+# budget is a count of characters and a line is a count of pixels: an answer
+# of exactly the measured capacity is one wide glyph away from not fitting,
+# and the whole point of asking again is not to have to ask a third time.
+CHARACTER_BUDGET_SAFETY = 0.95
 
 
 class CaptionOverflowError(ValueError):
@@ -425,6 +431,43 @@ def fit_caption_text(
     return wrapped, font_size
 
 
+def measured_line_capacity(text: str, measure, max_width: float) -> int:
+    """How many characters of ``text`` one line actually holds.
+
+    Measured, not counted. A budget derived from a rule of thumb ("roughly
+    forty Latin characters") is a different ruler from the one the frame is
+    cut with, and a translation cut to the wrong ruler comes back still too
+    long — so the capacity is the longest prefix of this very text that this
+    very ``measure`` says fits, at the size the raster will use.
+
+    Prefix width grows with prefix length, so the answer is bisected rather
+    than walked: a 4,000-character translation is 12 measurements, not 4,000.
+    """
+    if not text:
+        return 0
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if measure(text[:middle]) <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def character_budget(
+    text: str,
+    measure,
+    max_width: float,
+    *,
+    max_lines: int = MAX_CAPTION_LINES,
+    safety: float = CHARACTER_BUDGET_SAFETY,
+) -> int:
+    """SPEC §3 step 3: max_lines x measured line capacity x the safety margin."""
+    capacity = measured_line_capacity(text, measure, max_width)
+    return max(1, int(max_lines * capacity * safety))
+
+
 def _character_map(original: str, wrapped: str) -> list[int]:
     """Where each character of `original` ended up in `wrapped`, or -1.
 
@@ -492,14 +535,22 @@ def rewrapped_effect_spans(
     return moved
 
 
-def render_caption_png(
+def _measure_context(
     project_dir: Path,
     overlay: dict[str, Any],
     canvas: dict[str, Any],
     render_scale: float,
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Shape + rasterise one caption overlay; returns the plan item dict."""
+    """One ruler for one caption, built once and shared.
+
+    SPEC Phase 3 v1 §2 is explicit that the numbers deciding a break must be
+    the numbers that draw it. Two callers need these measurements — the
+    raster below, and the character budget in `translation_fit` — so they
+    are derived here rather than twice, because a budget measured with a
+    slightly different font, width or scale than the raster is a budget that
+    silently permits a translation the frame then rejects.
+    """
     modules = _load_coretext()
     if not modules:
         raise RuntimeError("caption compositor is not available")
@@ -550,7 +601,143 @@ def render_caption_png(
             )
         except (TypeError, ValueError):
             continue
-    wrap_width = frame_width / max(1.0, emphasis_scale)
+    return {
+        "modules": modules,
+        "ct": ct,
+        "foundation": foundation,
+        "quartz": quartz,
+        "pack": pack,
+        "pack_source": pack_source,
+        "style": style,
+        "style_sources": style_sources,
+        "text": text,
+        "translation": translation,
+        "canvas_width": canvas_width,
+        "font_size": font_size,
+        "max_width": max_width,
+        "frame_width": frame_width,
+        "font_binding": font_binding,
+        "font_file": font_file,
+        "measure_at": measure_at,
+        "wrap_width": frame_width / max(1.0, emphasis_scale),
+    }
+
+
+def _wrap_translation(
+    translation: str,
+    measure_at,
+    font_size: float,
+    wrap_width: float,
+    render_scale: float,
+) -> tuple[list[str], float, bool]:
+    """(lines, secondary size, floor-overrode-ratio) for the second line."""
+    secondary_size, needs_shortening = secondary_font_size(font_size, render_scale)
+    secondary_measure = measure_at(secondary_size)
+    if secondary_measure(translation) <= wrap_width:
+        lines = [translation]
+    else:
+        lines = wrap_lines(translation, secondary_measure, wrap_width) or [translation]
+    return lines, secondary_size, needs_shortening
+
+
+def translation_fit(
+    project_dir: Path,
+    overlay: dict[str, Any],
+    canvas: dict[str, Any],
+    render_scale: float = 1.0,
+    state: dict[str, Any] | None = None,
+    *,
+    translation: str | None = None,
+) -> dict[str, Any]:
+    """Ask, before anything is drawn, whether this translation will fit.
+
+    SPEC Phase 3 v1 §3 step 3. `render_caption_png` answers the same question
+    by raising, which is the right answer at render time and a useless one at
+    translation time — by then the provider has been paid and the artifact
+    hashed. This answers it as data instead, and when the answer is no it
+    carries the measured character budget to ask the provider again with.
+
+    `reason` is `"primary"` when it is the spoken line that overflows: no
+    amount of shortening the translation fixes that, so there is no budget
+    and no retry, only the fail-closed at render.
+    """
+    context = _measure_context(project_dir, overlay, canvas, render_scale, state)
+    value = context["translation"] if translation is None else translation.strip()
+    empty = {
+        "fits": True,
+        "reason": None,
+        "character_budget": None,
+        "line_count": 0,
+        "secondary_font_size": None,
+    }
+    if not value:
+        return empty
+    wrap_width = context["wrap_width"]
+    spoken_lines, font_size = fit_caption_text(
+        context["text"], context["measure_at"], context["font_size"], wrap_width,
+        floor_px=CAPTION_PRIMARY_FLOOR * render_scale, max_lines=MAX_CAPTION_LINES,
+    )
+    if len(spoken_lines) > MAX_CAPTION_LINES:
+        return {**empty, "fits": False, "reason": "primary"}
+    lines, secondary_size, _needs_shortening = _wrap_translation(
+        value, context["measure_at"], font_size, wrap_width, render_scale
+    )
+    secondary_measure = context["measure_at"](secondary_size)
+    # Counting lines is not enough. A run with nothing to break on comes back
+    # as one line — one line wider than the frame, which no wrap and no shrink
+    # to the floor can save, and which the safe-area check discards a whole
+    # render later. Two lines "holding" a translation is a fact about pixels.
+    fits_the_frame = all(
+        secondary_measure(line) <= wrap_width for line in lines
+    )
+    if len(lines) <= MAX_CAPTION_LINES and fits_the_frame:
+        return {
+            "fits": True,
+            "reason": None,
+            "character_budget": None,
+            "line_count": len(lines),
+            "secondary_font_size": secondary_size,
+        }
+    # A budget of two lines' capacity is only honest if the text can be made
+    # to occupy two lines. A run with no break point cannot: telling a
+    # translator it has ninety-five characters when only forty-seven of them
+    # will ever be on screen buys back the same answer and burns the one
+    # retry §3 allows.
+    usable_lines = (
+        MAX_CAPTION_LINES
+        if wrap_lines(value, secondary_measure, wrap_width) is not None
+        else 1
+    )
+    return {
+        "fits": False,
+        "reason": "secondary",
+        "character_budget": character_budget(
+            value, secondary_measure, wrap_width, max_lines=usable_lines
+        ),
+        "line_count": len(lines),
+        "secondary_font_size": secondary_size,
+    }
+
+
+def render_caption_png(
+    project_dir: Path,
+    overlay: dict[str, Any],
+    canvas: dict[str, Any],
+    render_scale: float,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shape + rasterise one caption overlay; returns the plan item dict."""
+    context = _measure_context(project_dir, overlay, canvas, render_scale, state)
+    ct, foundation, quartz = context["modules"]
+    style, style_sources = context["style"], context["style_sources"]
+    text = context["text"]
+    translation = context["translation"]
+    font_size = context["font_size"]
+    frame_width = context["frame_width"]
+    font_binding = context["font_binding"]
+    font_file = context["font_file"]
+    measure_at = context["measure_at"]
+    wrap_width = context["wrap_width"]
 
     # Decide the breaks here rather than letting the framesetter fill greedily:
     # it packs the first line and strands whatever is left, which is how a
@@ -589,14 +776,9 @@ def render_caption_png(
     primary_line_count = len(spoken_lines)
     secondary_line_count = 0
     if translation:
-        secondary_size, needs_shortening = secondary_font_size(font_size, render_scale)
-        secondary_measure = measure_at(secondary_size)
-        if secondary_measure(translation) <= wrap_width:
-            translation_lines = [translation]
-        else:
-            translation_lines = (
-                wrap_lines(translation, secondary_measure, wrap_width) or [translation]
-            )
+        translation_lines, secondary_size, needs_shortening = _wrap_translation(
+            translation, measure_at, font_size, wrap_width, render_scale
+        )
         secondary_line_count = len(translation_lines)
         if secondary_line_count > MAX_CAPTION_LINES:
             raise CaptionOverflowError(

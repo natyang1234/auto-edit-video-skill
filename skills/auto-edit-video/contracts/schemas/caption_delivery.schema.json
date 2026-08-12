@@ -14,14 +14,19 @@
     "required": {"type": "boolean"},
     "provider_receipt": {
       "type": "object",
-      "required": ["provider_id", "mode", "model", "config_sha256", "consent_mode", "consent_sha256"],
+      "required": ["provider_id", "mode", "model", "config_sha256", "consent_mode", "consent_sha256", "shortening_rounds", "shortening_character_budgets"],
       "properties": {
         "provider_id": {"const": "ollama"},
         "mode": {"const": "local_loopback"},
         "model": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,120}$"},
         "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "consent_mode": {"const": "not_required_local"},
-        "consent_sha256": {"type": "null"}
+        "consent_sha256": {"type": "null"},
+        "shortening_rounds": {"type": "integer", "minimum": 0, "maximum": 1},
+        "shortening_character_budgets": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        }
       },
       "additionalProperties": false
     },
@@ -49,14 +54,19 @@
           "target_language": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,19}$"},
           "provider_receipt": {
             "type": "object",
-            "required": ["provider_id", "mode", "model", "config_sha256", "consent_mode", "consent_sha256"],
+            "required": ["provider_id", "mode", "model", "config_sha256", "consent_mode", "consent_sha256", "shortening_rounds", "shortening_character_budgets"],
             "properties": {
               "provider_id": {"const": "ollama"},
               "mode": {"const": "local_loopback"},
               "model": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,120}$"},
               "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
               "consent_mode": {"const": "not_required_local"},
-              "consent_sha256": {"type": "null"}
+              "consent_sha256": {"type": "null"},
+              "shortening_rounds": {"type": "integer", "minimum": 0, "maximum": 1},
+              "shortening_character_budgets": {
+                "type": "object",
+                "additionalProperties": {"type": "integer", "minimum": 1}
+              }
             },
             "additionalProperties": false
           },

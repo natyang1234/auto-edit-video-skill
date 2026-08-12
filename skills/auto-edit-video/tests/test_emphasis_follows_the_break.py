@@ -110,8 +110,13 @@ class BothDrawingPassesUseTheMovedSpansTests(unittest.TestCase):
         # addressing the unbroken line again.
         import inspect
 
+        # The measuring context is entirely pre-wrap by construction — it is
+        # what the wrap is decided with — so it counts as "before the wrap"
+        # in full, wherever the scale pass physically lives.
         source = inspect.getsource(compositor.render_caption_png)
-        before_wrap = source.split('text = "\\n".join(spoken_lines)')[0]
+        before_wrap = inspect.getsource(compositor._measure_context) + source.split(
+            'text = "\\n".join(spoken_lines)'
+        )[0]
         self.assertEqual(
             before_wrap.count('overlay.get("effect_spans")'), 1, before_wrap[-400:]
         )

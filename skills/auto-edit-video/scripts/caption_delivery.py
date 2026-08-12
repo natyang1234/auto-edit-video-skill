@@ -52,6 +52,17 @@ CHUNKER = {
     },
 }
 IDENTITY_REASONS = {"brand", "proper_name", "code", "number_unit"}
+# SPEC Phase 3 v1 §3 step 3: a translation that does not fit in two lines at
+# its floor size is asked for again with a measured character budget — once.
+# Once, because a second retry buys a shorter answer at the price of an
+# unbounded provider loop, and because the caption still fails closed at
+# render (§4) if the one retry was not enough.
+SHORTENING_MAX_ROUNDS = 1
+# The rounds and budgets are a record of what happened during one delivery,
+# not part of the provider's identity. They are stripped before the receipt
+# is compared with the one derived from the manifest, which knows the
+# provider but cannot know how long the answers came back.
+SHORTENING_RECEIPT_KEYS = ("shortening_rounds", "shortening_character_budgets")
 MAX_CAPTION_SOURCES = 20_000
 MAX_CAPTION_TEXT_CHARS = 4_000
 MAX_CAPTION_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -955,6 +966,97 @@ def _translation_prompt(instances: list[dict[str, Any]], target: str) -> str:
     )
 
 
+def _shortening_prompt(
+    instances: list[dict[str, Any]],
+    target: str,
+    budgets: dict[str, int],
+) -> str:
+    """Ask again for the same lines, shorter, without licence to drop facts.
+
+    SPEC Phase 3 v1 §4: a shorter line is worth having; a shorter line that
+    lost the number, the unit or the brand is not, it is a wrong subtitle
+    that happens to fit. So the budget is stated per caption and the things
+    that may not be spent to meet it are stated with it, and the answer is
+    validated exactly like the first one — this prompt is a request, not a
+    permission slip.
+    """
+    request = [
+        {
+            "caption_instance_id": item["caption_instance_id"],
+            "source": item["corrected_source"],
+            "character_budget": budgets[item["caption_instance_id"]],
+        }
+        for item in instances
+    ]
+    return (
+        f"These {target} captions are too long for two lines on screen. "
+        "Translate each source again, shorter, so that translated_text is at "
+        "most character_budget characters long. Say the same thing in fewer "
+        "words; do not summarise away meaning. Numbers, units, brands and "
+        "proper names must not be dropped, abbreviated or converted — keep "
+        "every one of them exactly as it appears in the source, and spend the "
+        "budget on the words around them. "
+        'Return only JSON object {"items":[...]}. '
+        "Keep the exact input order and caption_instance_id; one output per "
+        "input, no extras. Each item needs translated_text. A deliberately "
+        "unchanged brand, proper name, code, or number/unit also needs "
+        "identity_preserved=true and identity_reason equal to brand, "
+        "proper_name, code, or number_unit.\n"
+        + json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _receipt_identity(receipt: Any) -> Any:
+    """The receipt without this delivery's shortening bookkeeping."""
+    if not isinstance(receipt, dict):
+        return receipt
+    return {key: value for key, value in receipt.items() if key not in SHORTENING_RECEIPT_KEYS}
+
+
+def _overflowing_budgets(
+    project_dir: Path,
+    state: dict[str, Any],
+    instances: list[dict[str, Any]],
+    texts: list[str],
+) -> dict[str, int]:
+    """Instance id -> measured character budget, for the ones that overflow.
+
+    Measured through the compositor, which is the only thing that knows what
+    a line holds. A host without it cannot measure, and a guess here would be
+    worse than not asking: it would spend a provider round on a budget no
+    frame agrees with. So an unavailable compositor means no retry, and the
+    render-time fail-closed stays exactly where it was.
+    """
+    try:
+        import caption_compositor
+    except ImportError:  # pragma: no cover - host-dependent
+        return {}
+    if not caption_compositor.compositor_available():
+        return {}
+    overlays = {
+        str(overlay.get("caption_source_id") or ""): overlay
+        for overlay in _caption_overlays(state)
+    }
+    canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
+    budgets: dict[str, int] = {}
+    for instance, text in zip(instances, texts, strict=True):
+        overlay = overlays.get(str(instance.get("caption_source_id") or ""))
+        if overlay is None:
+            continue
+        try:
+            fit = caption_compositor.translation_fit(
+                project_dir, overlay, canvas, 1.0, state, translation=text
+            )
+        except (OSError, ValueError, RuntimeError, KeyError):
+            # Measuring failed, so nothing was learned about this caption.
+            # Leaving it alone keeps the existing behaviour rather than
+            # inventing a budget from a measurement that did not happen.
+            continue
+        if not fit["fits"] and fit["reason"] == "secondary":
+            budgets[instance["caption_instance_id"]] = fit["character_budget"]
+    return budgets
+
+
 def _validate_translations(
     instances: list[dict[str, Any]],
     response: dict[str, Any],
@@ -1090,6 +1192,62 @@ def _translate_and_adopt(
     subtitles = manifest.get("subtitles") if isinstance(manifest.get("subtitles"), dict) else {}
     glossary = subtitles.get("glossary") if isinstance(subtitles.get("glossary"), list) else []
     translations = _validate_translations(expected["instances"], response, glossary)
+
+    # SPEC Phase 3 v1 §3 step 3, between wrapping and failing closed: the
+    # captions whose translation still needs a third line at its floor size
+    # are asked for again, once, with the budget the compositor measured for
+    # them. Everything else is left untouched — a translation that fits does
+    # not cost a second provider round.
+    budgets = _overflowing_budgets(
+        trust.root,
+        bound_state,
+        expected["instances"],
+        [item["translated_text"] for item in translations],
+    )
+    rounds = 0
+    if budgets:
+        rounds = SHORTENING_MAX_ROUNDS
+        retry_instances = [
+            instance
+            for instance in expected["instances"]
+            if instance["caption_instance_id"] in budgets
+        ]
+        try:
+            retry_response = model_call(
+                _shortening_prompt(retry_instances, target, budgets),
+                "caption_translation",
+                model=model,
+                timeout=timeout,
+            )
+        except CaptionDeliveryError:
+            raise
+        except Exception as exc:
+            raise CaptionDeliveryError("translation_provider_failed", str(exc)[:500]) from exc
+        _verify_project_trust(trust)
+        if not isinstance(retry_response, dict):
+            raise CaptionDeliveryError(
+                "translation_invalid", "provider response must be an object"
+            )
+        # The shorter answer earns no exemption: same validation, same
+        # identity rules. A retry is where a provider is most tempted to
+        # drop the unit to make the length.
+        shortened = _validate_translations(retry_instances, retry_response, glossary)
+        by_instance = {
+            instance["caption_instance_id"]: value
+            for instance, value in zip(retry_instances, shortened, strict=True)
+        }
+        translations = [
+            by_instance.get(instance["caption_instance_id"], value)
+            for instance, value in zip(expected["instances"], translations, strict=True)
+        ]
+    # The receipt is built after the answers are final, so the artifact is
+    # hashed once, over what will actually be drawn. A retry never rewrites
+    # already-hashed bytes; there are none yet.
+    receipt = {
+        **receipt,
+        "shortening_rounds": rounds,
+        "shortening_character_budgets": dict(sorted(budgets.items())),
+    }
     items: list[dict[str, Any]] = []
     for instance, translated in zip(expected["instances"], translations, strict=True):
         item = dict(instance)
@@ -1274,8 +1432,8 @@ def validate_for_render(
         raise CaptionDeliveryError("translation_provider_unsupported", provider)
     current_receipt = provider_receipt(manifest)
     if (
-        artifact.get("provider_receipt") != current_receipt
-        or stored_receipt != current_receipt
+        _receipt_identity(artifact.get("provider_receipt")) != current_receipt
+        or _receipt_identity(stored_receipt) != current_receipt
     ):
         raise CaptionDeliveryError("caption_binding_missing", "provider receipt is stale")
     transcript = _load_json(_owned_artifact(root, Path("working/transcript_words.json")))

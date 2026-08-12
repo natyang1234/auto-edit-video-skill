@@ -32,7 +32,7 @@ nat 2026-08-12 授權 Claude 擬定本規格（PRD Phase 3 僅質化描述）；
 
 1. **wrap**：base size 換行；≤2 行且不觸 safe-area → 過。
 2. **autofit**：整體（主+副等比）縮字至 primary floor 40px／secondary floor 32px；符合 → 過。
-3. **semantic shortening（provider 重試）**：對該 caption instance 以明確字元預算重新要求翻譯（預算 = 2 行 × floor 字級實測行容量 × 0.95），最多重試 1 次；provider receipt 記錄 shortening 輪次。
+3. **semantic shortening（provider 重試）**：對該 caption instance 以明確字元預算重新要求翻譯（預算 = 2 行 × floor 字級實測行容量 × 0.95；**v1.2 修訂：無斷行機會的整段文本改用 1 行容量 × 0.95**，否則預算大於原譯文長度、重試無意義），最多重試 1 次；provider receipt 記錄 shortening 輪次與預算。已知限制：預算在 safe-area 收窄 max_width 前量測，收窄後才溢出的案例由既有 safe-area gate fail closed 兜底。
 4. **fail closed**：仍放不下 → exit 2（沿用 6435c34 safe-area gate 語義），絕不靜默截斷、絕不第 3 行、絕不低於 floor 渲染。
 
 ## 4. Terminology / number preservation（nat 拍板 2026-08-12）
