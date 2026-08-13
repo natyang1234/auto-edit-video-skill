@@ -606,15 +606,19 @@ class ShorteningRetryPreservationTests(_DeliveryRoundtripCase):
     the shortened one is not.
     """
 
-    def _retry_rejects(self, shortened: dict, code: str) -> None:
+    def _retry_rejects(self, shortened: dict, code: str, asks: int = 2) -> None:
         first = {"translated_text": f"{self.LONG} 42km Notion"}
         rounds: list[str] = []
         with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
             self._create([first, shortened], rounds)
         self.assertEqual(caught.exception.code, code)
         # The first answer was clean and merely too long, so the rejection
-        # under test has to be the shortened one: two rounds, not one.
-        self.assertEqual(len(rounds), 2, rounds)
+        # under test has to be the shortened one: never one round. The
+        # preservation codes cost exactly one shortening ask and then fail
+        # closed; the two codes that are sampling noise rather than a
+        # trade-off (`SHORTENING_REASK_CODES`) spend their re-asks first and
+        # fail closed at the same ceiling, which is what `asks` names.
+        self.assertEqual(len(rounds), asks, rounds)
         self.assertIn("character_budget", rounds[1])
 
     @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
@@ -670,6 +674,11 @@ class ShorteningRetryPreservationTests(_DeliveryRoundtripCase):
                 "identity_reason": "budget",
             },
             "translation_identity_invalid",
+            # A field the model could not fill correctly is a broken sample,
+            # not the §4 trade-off, so it is re-asked like a source-language
+            # answer — and then fails closed at the same ceiling, with the
+            # same verdict, having adopted nothing.
+            asks=2 + caption_delivery.VALIDATION_MAX_ROUNDS,
         )
 
     @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")

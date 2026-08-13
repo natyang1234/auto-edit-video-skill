@@ -101,7 +101,18 @@ CONTRACT_VIOLATION_CODES = frozenset(
 # frame. That one is sampling noise, and sampling noise is what a resample
 # is for; the resampled answer faces the identical validator and the last
 # verdict still fails the delivery closed.
-SHORTENING_REASK_CODES = frozenset({"translation_wrong_language"})
+#
+# `translation_identity_invalid` joins it for the same reason, from the same
+# material: the third consecutive ATQT run answered the shortening question
+# with `"identity_preserved": []` and `"identity_reason": []` — lists where a
+# boolean and one word belong — and died with zero re-asks. A field the model
+# could not even type is not the budget trade-off either; it is the same
+# broken sample, and the identity check runs first, so it is also what a
+# source-language answer gets *called* when both are wrong at once. The
+# ceiling is unchanged: still `VALIDATION_MAX_ROUNDS`, still fail-closed.
+SHORTENING_REASK_CODES = frozenset(
+    {"translation_wrong_language", "translation_identity_invalid"}
+)
 # Whether an answer had to be re-asked caption by caption is, like the round
 # counts, a record of how this one delivery went rather than part of who the
 # provider is — a delivery that needed it must not read as a swapped
@@ -1397,7 +1408,10 @@ def _revalidation_preface(errors: list[CaptionDeliveryError], target: str) -> st
         "only on a line deliberately "
         "left in the source language, and its identity_reason must be "
         "exactly one of brand, proper_name, code, number_unit — no other "
-        "word; leave identity_reason out entirely when identity_preserved "
+        "word; identity_preserved must be the boolean true or false and "
+        "never a list, an object or a string, and identity_reason must be "
+        "a single one of those words as a plain string, never a list; "
+        "leave identity_reason out entirely when identity_preserved "
         "is false; every number, unit, percentage and name in the source "
         "must appear in translated_text in the same order, and no number "
         "may appear that the source does not contain; repeat each "

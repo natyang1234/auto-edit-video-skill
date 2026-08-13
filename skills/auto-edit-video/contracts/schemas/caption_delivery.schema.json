@@ -27,7 +27,7 @@
           "type": "object",
           "additionalProperties": {"type": "integer", "minimum": 1}
         },
-        "validation_retry_rounds": {"type": "integer", "minimum": 0, "maximum": 2},
+        "validation_retry_rounds": {"type": "integer", "minimum": 0, "maximum": 4},
         "individual_reask": {"type": "boolean"}
       },
       "additionalProperties": false
@@ -69,7 +69,7 @@
                 "type": "object",
                 "additionalProperties": {"type": "integer", "minimum": 1}
               },
-              "validation_retry_rounds": {"type": "integer", "minimum": 0, "maximum": 2},
+              "validation_retry_rounds": {"type": "integer", "minimum": 0, "maximum": 4},
         "individual_reask": {"type": "boolean"}
             },
             "additionalProperties": false

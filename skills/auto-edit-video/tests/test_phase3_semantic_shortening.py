@@ -424,6 +424,138 @@ class ShorteningRoundIsRevalidatedTests(ShorteningRetryTests):
         self.assertEqual(len(prompts), 2)
 
 
+class ShorteningIdentityFieldTypeTests(ShorteningRetryTests):
+    """A field of the wrong *type* is the same sampling noise, not a verdict.
+
+    Verbatim from the ATQT cut's third consecutive run (replay of the live
+    7B provider): asked to shorten two captions, it answered
+    `"identity_preserved": []` and `"identity_reason": []` — lists where a
+    boolean and a word belong. The validator is right to reject that, but
+    the rejection it raises is `translation_identity_invalid`, and only
+    `translation_wrong_language` was worth a resample, so the delivery died
+    on the first roll of the die with zero re-asks — the very failure the
+    wrong-language second chance exists to prevent, wearing a different
+    code. A field the model could not type is a broken answer, not the
+    budget trade-off §4 refuses; it belongs with wrong_language.
+
+    The ceiling does not move: still `VALIDATION_MAX_ROUNDS` re-asks and
+    then the last verdict stands, and the preservation family
+    (`translation_token_missing` and friends) still costs exactly one
+    shortening round before failing closed.
+    """
+
+    # Both fields as the live model actually returned them.
+    TYPE_CONFUSED = {
+        "translated_text": SHORT_TRANSLATION,
+        "identity_preserved": [],
+        "identity_reason": [],
+    }
+
+    def _recorder(self, replies: list):
+        """As the parent's, but an entry may be a whole item dict.
+
+        The defect is in fields other than `translated_text`, so the
+        recorder has to be able to put them on the wire.
+        """
+        prompts: list[str] = []
+
+        def model_call(prompt: str, _stage: str, **_kwargs) -> dict:
+            requested = json.loads(prompt.rsplit("\n", 1)[-1])
+            prompts.append(prompt)
+            reply = replies[min(len(prompts), len(replies)) - 1]
+            if isinstance(reply, str):
+                reply = {"translated_text": reply}
+            return {
+                "items": [
+                    {"caption_instance_id": item["caption_instance_id"], **reply}
+                    for item in requested
+                ]
+            }
+
+        return model_call, prompts
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_mistyped_identity_field_is_asked_again(self) -> None:
+        artifact, prompts = self._create(
+            [LONG_TRANSLATION, self.TYPE_CONFUSED, SHORT_TRANSLATION]
+        )
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("translation_identity_invalid", prompts[2])
+        # Still a shortening ask: the budget travels with the second chance.
+        instance_id = artifact["items"][0]["caption_instance_id"]
+        budget = artifact["provider_receipt"]["shortening_character_budgets"][
+            instance_id
+        ]
+        self.assertIn(str(budget), prompts[2])
+        self.assertEqual(artifact["items"][0]["translated_text"], SHORT_TRANSLATION)
+        self.assertEqual(artifact["provider_receipt"]["shortening_rounds"], 1)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_second_ask_says_what_shape_the_identity_fields_take(self) -> None:
+        # Naming the code is not enough for a model that answered `[]`: the
+        # re-ask has to say the fields are a boolean and a single word.
+        _artifact, prompts = self._create(
+            [LONG_TRANSLATION, self.TYPE_CONFUSED, SHORT_TRANSLATION]
+        )
+        retry = prompts[2].casefold()
+        self.assertIn("identity_preserved must be the boolean true or false", retry)
+        self.assertIn("never a list", retry)
+        self.assertIn("identity_reason must be a single one of those words", retry)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_ceiling_does_not_move_and_it_still_fails_closed(self) -> None:
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+            self._create([LONG_TRANSLATION, self.TYPE_CONFUSED])
+        self.assertEqual(caught.exception.code, "translation_identity_invalid")
+        self.assertFalse((self.project / caption_delivery.CAPTION_REL).exists())
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_wire_count_is_the_same_ceiling_as_wrong_language(self) -> None:
+        model_call, prompts = self._recorder([LONG_TRANSLATION, self.TYPE_CONFUSED])
+        with self.assertRaises(caption_delivery.CaptionDeliveryError):
+            caption_delivery.create_delivery(
+                self.project, "en", required=True, model_call=model_call
+            )
+        # One first-round ask, one shortening ask, VALIDATION_MAX_ROUNDS re-asks.
+        self.assertEqual(
+            len(prompts), 2 + caption_delivery.VALIDATION_MAX_ROUNDS
+        )
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_well_typed_identity_claim_still_means_what_it_meant(self) -> None:
+        artifact, prompts = self._create(
+            [
+                LONG_TRANSLATION,
+                {
+                    "translated_text": SHORT_TRANSLATION,
+                    "identity_preserved": True,
+                    "identity_reason": "brand",
+                },
+            ]
+        )
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(artifact["items"][0]["translated_text"], SHORT_TRANSLATION)
+        self.assertIs(artifact["items"][0]["identity_preserved"], True)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_dropped_unit_still_costs_exactly_one_round(self) -> None:
+        # The §4 trade-off is untouched: buying the budget by dropping the
+        # unit is asked once and then fails closed, no resample.
+        self.transcript["caption_segments"][0]["text"] = "第一句中文 42km"
+        self.transcript["words"][0]["text"] = "第一句中文 42km"
+        self.state["overlays"][0]["text"] = "第一句中文 42km"
+        self._write_project()
+        model_call, prompts = self._recorder(
+            [LONG_TRANSLATION + " 42km", SHORT_TRANSLATION]
+        )
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+            caption_delivery.create_delivery(
+                self.project, "en", required=True, model_call=model_call
+            )
+        self.assertEqual(caught.exception.code, "translation_token_missing")
+        self.assertEqual(len(prompts), 2)
+
+
 class DeliveryMeasuresTheFrameTheRenderWillCutTests(unittest.TestCase):
     """SPEC §3 v1.2 gap: delivery must measure the frame render actually cuts.
 
@@ -601,6 +733,101 @@ class ShorteningTriggersOnTheRenderedWidthTests(ShorteningRetryTests):
         artifact, prompts = self._create([fits])
         self.assertEqual(len(prompts), 1)
         self.assertEqual(artifact["provider_receipt"]["shortening_rounds"], 0)
+
+
+class RetryRoundsAreCountedHonestlyTests(ShorteningRetryTests):
+    """The receipt's round ceiling has to be the one the code can reach.
+
+    `validation_retry_rounds` is a sum of two independently capped budgets:
+    the first-round re-asks (at most `VALIDATION_MAX_ROUNDS`) plus the
+    shortening round's re-asks (capped by the same constant, on its own
+    counter, and then added in). Its reachable maximum is therefore twice
+    `VALIDATION_MAX_ROUNDS`, but the schema wrote down one of the two — so
+    a delivery that legitimately spent three rounds and came back correct
+    died at the contract as `caption_contract_invalid`, having done exactly
+    what it was allowed to do. Observed on the ATQT cut.
+
+    Nothing is loosened here: each wire-level ceiling is untouched and the
+    delivery still fails closed at it. Only the bookkeeping stops lying
+    about how high the two of them can add up to.
+    """
+
+    #: What the code can actually reach: two independently capped budgets.
+    THEORETICAL_MAX = 2 * caption_delivery.VALIDATION_MAX_ROUNDS
+
+    def _receipt_schemas(self) -> dict[str, dict]:
+        schema = contract_registry.load_schemas()["caption_delivery"]
+        return {
+            "root": schema["properties"]["provider_receipt"]["properties"][
+                "validation_retry_rounds"
+            ],
+            "items": schema["properties"]["items"]["items"]["properties"][
+                "provider_receipt"
+            ]["properties"]["validation_retry_rounds"],
+        }
+
+    def test_the_schema_ceiling_is_the_sum_the_code_can_reach(self) -> None:
+        for where, node in self._receipt_schemas().items():
+            with self.subTest(receipt=where):
+                self.assertEqual(node["maximum"], self.THEORETICAL_MAX)
+                self.assertEqual(node["minimum"], 0)
+
+    def test_a_receipt_that_spent_every_round_validates(self) -> None:
+        artifact = json.loads(
+            (
+                SKILL_DIR / "contracts/fixtures/caption_delivery/valid.json"
+            ).read_text("utf-8")
+        )
+        for rounds in range(self.THEORETICAL_MAX + 1):
+            with self.subTest(rounds=rounds):
+                artifact["provider_receipt"]["validation_retry_rounds"] = rounds
+                artifact["items"][0]["provider_receipt"] = artifact[
+                    "provider_receipt"
+                ]
+                self.assertEqual(
+                    contract_registry.validate_artifact("caption_delivery", artifact),
+                    [],
+                )
+
+    def test_a_round_count_beyond_the_sum_is_still_rejected(self) -> None:
+        artifact = json.loads(
+            (
+                SKILL_DIR / "contracts/fixtures/caption_delivery/valid.json"
+            ).read_text("utf-8")
+        )
+        artifact["provider_receipt"]["validation_retry_rounds"] = (
+            self.THEORETICAL_MAX + 1
+        )
+        artifact["items"][0]["provider_receipt"] = artifact["provider_receipt"]
+        self.assertTrue(
+            contract_registry.validate_artifact("caption_delivery", artifact)
+        )
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_delivery_that_spent_both_budgets_is_not_a_contract_violation(
+        self,
+    ) -> None:
+        # Two first-round re-asks (the wire ceiling), then an overlong but
+        # otherwise correct answer, then one shortening re-ask: three rounds,
+        # every one of them permitted, ending in an answer that passes.
+        wrong_language = "这个阶段它代表商品价格持续上涨"
+        artifact, prompts = self._create(
+            [
+                wrong_language,
+                wrong_language,
+                LONG_TRANSLATION,
+                wrong_language,
+                SHORT_TRANSLATION,
+            ]
+        )
+        self.assertEqual(len(prompts), 5)
+        receipt = artifact["provider_receipt"]
+        self.assertEqual(
+            receipt["validation_retry_rounds"],
+            caption_delivery.VALIDATION_MAX_ROUNDS + 1,
+        )
+        self.assertEqual(receipt["shortening_rounds"], 1)
+        self.assertEqual(artifact["items"][0]["translated_text"], SHORT_TRANSLATION)
 
 
 if __name__ == "__main__":
