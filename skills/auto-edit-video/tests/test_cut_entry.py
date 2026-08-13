@@ -1048,3 +1048,64 @@ class ShortSourceIsTheClipTests(unittest.TestCase):
         # keeps the best-scored item's naming, and spans the full duration.
         self.assertIn("if target is None:", source)
         self.assertIn("start=0.0, end=round(source_duration, 3)", source)
+
+
+class ProblemsStayLocatableTests(unittest.TestCase):
+    """A reported problem must still say which thing failed.
+
+    Long failures were reported as `f"{title}: {str(exc).strip()[-200:]}"`
+    — the last two hundred characters, which throws away the *head* of the
+    message, and the head is the only part that identifies anything. Real
+    entries the ATQT runs produced:
+
+        用三根K棒找結構點:  -7.955071 dB below active dialogue", ...
+        三根K棒找出結構點: cbfe939bc7468/contact_sheet.png", ...
+
+    Both begin mid-token. Neither says what failed, and the second is a
+    render id sliced in half, so it cannot even be looked up. The clip
+    title is kept because it is prepended after the slice; everything the
+    exception itself said about the cause is gone.
+
+    A bounded report keeps the head, which names the failure, and the
+    tail, which usually carries the detail, and says out loud how much was
+    dropped between them.
+    """
+
+    LONG_RENDER_FAILURE = (
+        "kinetic timeline render failed for render_id "
+        "direct-final-9db785fb33282b389aa8: qa report "
+        + "x" * 900
+        + " qa/direct-final-9db785fb33282b389aa8-cbfe939bc7468/contact_sheet.png"
+    )
+
+    def test_the_head_of_a_long_failure_survives(self) -> None:
+        detail = auto_edit._problem_detail(self.LONG_RENDER_FAILURE)
+        self.assertTrue(
+            detail.startswith("kinetic timeline render failed for render_id"), detail
+        )
+        self.assertIn("direct-final-9db785fb33282b389aa8", detail)
+
+    def test_the_tail_survives_too(self) -> None:
+        detail = auto_edit._problem_detail(self.LONG_RENDER_FAILURE)
+        self.assertTrue(detail.endswith("contact_sheet.png"), detail)
+
+    def test_the_elision_is_declared_and_bounded(self) -> None:
+        detail = auto_edit._problem_detail(self.LONG_RENDER_FAILURE)
+        self.assertIn("elided", detail)
+        self.assertLess(len(detail), len(self.LONG_RENDER_FAILURE))
+        self.assertLessEqual(len(detail), 600)
+
+    def test_a_short_failure_is_reported_word_for_word(self) -> None:
+        message = "translation_wrong_language: caption-instance-4a3f275082498813"
+        self.assertEqual(auto_edit._problem_detail(f"  {message}  "), message)
+
+    def test_no_call_site_still_slices_from_the_head(self) -> None:
+        import inspect
+
+        source = inspect.getsource(auto_edit.cmd_cut)
+        self.assertNotIn("[-200:]", source)
+        self.assertIn("_problem_detail(", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

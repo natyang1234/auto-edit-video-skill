@@ -4126,6 +4126,36 @@ def _step(label: str) -> None:
     print(f"… {label}", file=sys.stderr, flush=True)
 
 
+PROBLEM_DETAIL_HEAD = 320
+PROBLEM_DETAIL_TAIL = 200
+
+
+def _problem_detail(text: str) -> str:
+    """A reported failure, shortened from the middle rather than the head.
+
+    Long failures used to be reported as their last two hundred characters,
+    which is the one part that identifies nothing. Real entries from the
+    ATQT runs read `用三根K棒找結構點:  -7.955071 dB below active dialogue"`
+    and `三根K棒找出結構點: cbfe939bc7468/contact_sheet.png"` — both begin
+    mid-token, neither says what failed, and the second is a render id
+    sliced in half, so it cannot even be looked up afterwards.
+
+    The head names the failure and the tail usually carries the specific
+    value, so both survive and the gap between them says how much was
+    dropped. Nothing is shortened that fits.
+    """
+    text = text.strip()
+    limit = PROBLEM_DETAIL_HEAD + PROBLEM_DETAIL_TAIL
+    if len(text) <= limit:
+        return text
+    elided = len(text) - limit
+    return (
+        f"{text[:PROBLEM_DETAIL_HEAD]}"
+        f" …[{elided} chars elided]… "
+        f"{text[-PROBLEM_DETAIL_TAIL:]}"
+    )
+
+
 def _args_for(command: str, *argv: str) -> argparse.Namespace:
     """Build a sub-command's arguments through its own parser.
 
@@ -4882,7 +4912,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
                 # the delivery must not imply it succeeded.
                 problems.append(
                     "captions were not translated: "
-                    + (translated.stderr or translated.stdout or "").strip()[-300:]
+                    + _problem_detail(translated.stderr or translated.stdout or "")
                 )
 
     manifest = read_json(manifest_path)
@@ -4993,7 +5023,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
                 # boundary, including failures before a clip enters `made`.
                 deferred_publications.append(deferred_publication)
             except (ValueError, OSError, RuntimeError, SystemExit) as exc:
-                problems.append(f"{title}: {str(exc).strip()[-200:]}")
+                problems.append(f"{title}: {_problem_detail(str(exc))}")
                 continue
         else:
             result = _subprocess.run(
@@ -5002,7 +5032,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
                 check=False, capture_output=True, text=True,
             )
             if result.returncode != 0:
-                problems.append(f"{title}: {(result.stderr or '').strip()[-200:]}")
+                problems.append(f"{title}: {_problem_detail(result.stderr or '')}")
                 continue
         if direct_final:
             try:

@@ -51,6 +51,12 @@ nat 2026-08-12 授權 Claude 擬定本規格（PRD Phase 3 僅質化描述）；
   - **identity 豁免縮至真專名**：`identity_preserved` 只在**來源自身**拉丁佔比 ≥0.5 時豁免（品牌／代號／拉丁專名，如 `Notion`、`S outh bound`）；譯文與來源逐字相同且來源為拉丁即滿足同一判準。來源是中文句子者無論標什麼 `identity_reason` 一律擋——v1.3 的 identity 語義自此僅剩「真專名」。target 非拉丁語言（zh／ja…）完全不套用本節。
   - **依據＝真素材故障**：38 秒台南片 target=en，qwen2.5:7b 十二則全數回中文（繁轉簡），其中 8 則以 `identity_preserved:proper_name` 整句逃逸、其餘 4 則因簡化後與來源不同而躲過 `translation_unchanged`，雙語成片變中文配中文。
   - 測試：test_phase4_real_media_defects.py（`TargetLanguageScriptTests`／`TargetLanguageRetryTests`，含真片 11 則逐則重現）。既有測試依本裁定更新兩處並於原地註明：test_phase3_preservation_mutations.py 的整句回聲特徵化測試改為 reject、test_caption_delivery_v2.py `test_identity_exception_is_item_scoped_and_reason_limited` 的來源改為拉丁品牌名。
+- **未翻殘句檢查＝script 檢查的第二把尺（v1.6，2026-08-14 主 session 裁定，補強 v1.5 不取代）**：同一 target 條件下，譯文中出現**連續 CJK 串長 > `MAX_TARGET_SCRIPT_CJK_RUN`(3)** 即判未翻殘句，錯誤碼沿用 `translation_wrong_language`（不新增碼），因此自動享有既有 bounded 重試與 shortening 輪的 `SHORTENING_REASK_CODES` 重問，重試後仍殘留則 fail closed。
+  - **判準與理由**：v1.5 的拉丁佔比問的是「整句是不是寫在目標語言」，它看不見「翻一半」——真片實例 `three k-sticks下去定义`＝12 拉丁字母對 4 漢字、佔比 0.75，v1.5 判合格，四個沒翻的字直接燒進成片。故改量**最長連續串**而非總量：3 字以內＝v1.5 明文要保護的專名島（臺南／誠品／西門町），一句英文帶幾個都合法；4 字以上不是「保留的名字」，是「沒翻的子句」。
+  - **兩檢查各自獨立、都要有牙**：佔比擋整句異語言（`你在哪`→`你在哪`，最長串僅 3 也必須擋）；串長擋半翻殘句（佔比 0.75 也必須擋）。實作上兩者同時通過才算寫在目標語言。
+  - **identity 豁免語義不變**：仍只看**來源**拉丁佔比 ≥0.5，豁免同時涵蓋兩把尺（`Kinetic Explainer 動態說明模式` 原樣回聲在 brand 下仍放行）。無字母譯文（`90`／`🔥🔥🔥`）維持中性放行。target 非拉丁語言完全不套用。
+  - **已知取捨**：4 字以上的中文專名（如 4 字店名）會被擋下並觸發重問；串長只跨 CJK 字元本身，中間夾全形標點會被切斷（`下去、定义` 判為 2+2 通過）——留為已知缺口，不在本裁定內收窄。重問 prompt 同步加一句明講「不得留下超過三字的原文串」。
+  - 測試：test_phase4_real_media_defects.py（`HalfTranslatedAnswersAreNotTranslationsTests`／`HalfTranslatedRetryTests`，含真片 `three k-sticks下去定义` 逐則重現與「佔比單獨會放行」的對照斷言）。既有 v1.5 測試一則未改。
 
 ## 5. 驗收（Phase 3 完成定義）
 

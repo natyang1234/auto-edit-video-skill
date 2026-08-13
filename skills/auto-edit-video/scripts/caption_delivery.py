@@ -137,6 +137,16 @@ CJK_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7
 # stopped here is not subtle \u2014 it is an entire sentence in the wrong
 # language, where the ratio is 0.
 MIN_TARGET_SCRIPT_RATIO = 0.5
+# The same characters again, as runs, because the ratio cannot see a
+# half-translated line (SPEC Phase 3 v1 §4 v1.6). "three k-sticks下去定义",
+# from the real ATQT cut, is 0.75 Latin and shipped four untranslated
+# characters into the final.
+CJK_RUN_RE = re.compile(CJK_SCRIPT_RE.pattern + "+")
+# Three characters is the island the ratio rule was written to protect —
+# 臺南, 誠品, 西門町, a name an English caption is right to keep in its
+# own script. Four in a row is not a name being kept, it is a clause
+# nobody translated.
+MAX_TARGET_SCRIPT_CJK_RUN = 3
 # The delivery path always states the target it asked for. This default is
 # for the validator's other callers, and it is a target the check is *on*
 # for rather than off, so that a caller who forgets to pass one loses a
@@ -1380,7 +1390,11 @@ def _revalidation_preface(errors: list[CaptionDeliveryError], target: str) -> st
         f"{rejected}. Fix exactly that and change nothing "
         "else. Reminders, in the order they are most often broken: "
         f"translated_text must be written in {target}, never in the source "
-        "language; identity_preserved belongs only on a line deliberately "
+        "language, and it must be translated all the way through — a line "
+        "that is half English and half source language is rejected, so no "
+        "run of more than three source-language characters may remain "
+        "except a short place or brand name; identity_preserved belongs "
+        "only on a line deliberately "
         "left in the source language, and its identity_reason must be "
         "exactly one of brand, proper_name, code, number_unit — no other "
         "word; leave identity_reason out entirely when identity_preserved "
@@ -1504,6 +1518,22 @@ def _latin_script_ratio(text: str) -> float | None:
     return latin / (latin + cjk)
 
 
+def _carries_untranslated_cjk_run(text: str) -> bool:
+    """Whether a run of CJK too long to be a kept name survives in the text.
+
+    SPEC Phase 3 v1 §4 (v1.6). Independent of the ratio and needed because
+    of what the ratio cannot see: a line half translated and half not is
+    *mostly* Latin and passes v1.5 on the numbers. Measured as the longest
+    unbroken run rather than a count, so that an English sentence carrying
+    one or two short names in their own script stays legal however many of
+    them it carries — the run is what tells a name apart from a clause.
+    """
+    return any(
+        len(match.group(0)) > MAX_TARGET_SCRIPT_CJK_RUN
+        for match in CJK_RUN_RE.finditer(text)
+    )
+
+
 def _writes_in_target_script(source: str, translated: str, identity: bool) -> bool:
     """Whether this answer is written in a Latin-script target's script.
 
@@ -1522,9 +1552,24 @@ def _writes_in_target_script(source: str, translated: str, identity: bool) -> bo
     such a source verbatim is that same test passing. A source that is
     itself a Chinese sentence cannot be a name left alone, whatever the
     stamp says.
+
+    Two measurements decide it, not one (v1.6 adds the second, 2026-08-14).
+    The ratio catches a whole sentence in the wrong language. It does not
+    catch a sentence half translated: the real ATQT delivery shipped
+    `three k-sticks下去定义`, twelve Latin letters to four Han characters,
+    a ratio of 0.75, straight through v1.5 and into a burned-in final. So
+    an untranslated *run* fails the answer too, and each check has to pass
+    on its own. The identity exemption is unchanged and still governs both:
+    a mostly-Latin source echoed back is exempt from either verdict.
     """
     ratio = _latin_script_ratio(translated)
-    if ratio is None or ratio >= MIN_TARGET_SCRIPT_RATIO:
+    # An answer with no letters of either script (a number, a date, "🔥🔥🔥")
+    # has no script to be written in and never had.
+    if ratio is None:
+        return True
+    if ratio >= MIN_TARGET_SCRIPT_RATIO and not _carries_untranslated_cjk_run(
+        translated
+    ):
         return True
     if not identity:
         return False

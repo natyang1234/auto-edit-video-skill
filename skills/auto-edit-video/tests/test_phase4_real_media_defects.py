@@ -1420,5 +1420,133 @@ class SharedTokenAnswersAreNeverPlacedByPositionTests(_DeliveryRoundtripCase):
         )
 
 
+class HalfTranslatedAnswersAreNotTranslationsTests(unittest.TestCase):
+    """A sentence half in English and half untranslated is not an answer.
+
+    SPEC Phase 3 v1 §4 (v1.6). The ratio rule of v1.5 asks whether the
+    answer is *mostly* Latin, and a half-translated line is: on the real
+    90-second ATQT cut, `three k-sticks下去定义` counts twelve Latin
+    letters against four Han characters, a ratio of 0.75, and shipped.
+    The English half is not the point — the four characters nobody
+    translated are, and they are burned into the delivered final.
+
+    So the ratio keeps its job (a whole sentence in the wrong language,
+    ratio near 0) and a second, independent rule takes the case it cannot
+    see: a run of more than three consecutive CJK characters inside a
+    Latin-target answer is untranslated residue. Three or fewer is the
+    island the v1.5 rule was written to protect — `臺南`, `誠品`, a name
+    an English caption is right to keep in its own script.
+    """
+
+    def _judge(
+        self,
+        source: str,
+        translated: str,
+        reason: str | None = None,
+        target: str = "en",
+    ):
+        instances = [
+            {
+                "caption_instance_id": "caption-instance-0000000000000001",
+                "corrected_source": source,
+            }
+        ]
+        item = {
+            "caption_instance_id": instances[0]["caption_instance_id"],
+            "translated_text": translated,
+        }
+        if reason is not None:
+            item["identity_preserved"] = True
+            item["identity_reason"] = reason
+        return caption_delivery._validate_translations(
+            instances, {"items": [item]}, [], target=target
+        )
+
+    def _rejects(self, source: str, translated: str, reason: str | None = None) -> None:
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+            self._judge(source, translated, reason)
+        self.assertEqual(caught.exception.code, "translation_wrong_language", translated)
+
+    def _accepts(self, source: str, translated: str, reason: str | None = None) -> None:
+        result = self._judge(source, translated, reason)
+        self.assertEqual(result[0]["translated_text"], translated)
+
+    def test_the_real_half_translated_caption_is_rejected(self) -> None:
+        # Verbatim from working/caption_delivery_v2.json of the ATQT cut.
+        self._rejects("三根K棒下去定義", "three k-sticks下去定义")
+
+    def test_the_ratio_alone_would_have_let_it_through(self) -> None:
+        # States the gap this slice closes: the v1.5 measurement, on its
+        # own, calls that answer Latin-script and is not wrong about it.
+        self.assertGreaterEqual(
+            caption_delivery._latin_script_ratio("three k-sticks下去定义"),
+            caption_delivery.MIN_TARGET_SCRIPT_RATIO,
+        )
+
+    def test_a_short_name_island_is_still_accepted(self) -> None:
+        # Two and three characters: what the ratio rule was written to
+        # keep, and what this rule must not take away.
+        self._accepts("我們約在臺南見面", "We are meeting in 臺南 tonight")
+        self._accepts("誠品今天有活動", "誠品 has an event today")
+        self._accepts("約在西門町見", "See you at 西門町")
+        self._accepts("臺南和誠品都很好", "Both 臺南 and 誠品 are great")
+
+    def test_four_characters_of_residue_are_rejected(self) -> None:
+        self._rejects("結構高點很重要", "The 結構高點 matters")
+        self._rejects("我們今天要講三根K棒", "Today we talk about 三根K棒的用法")
+
+    def test_the_two_rules_have_teeth_independently(self) -> None:
+        # A whole Chinese sentence: caught by the ratio, and its longest
+        # run is beside the point.
+        self._rejects("你在哪", "你在哪", "proper_name")
+        # Islands short enough for the run rule, but so many of them that
+        # the answer is not written in English at all.
+        self._rejects("臺南天氣很好今天真棒", "臺南 A 天氣 B 很好 C 今天 D 真棒 E")
+
+    def test_a_neutral_answer_is_still_accepted(self) -> None:
+        self._accepts("90", "90", "number_unit")
+        self._accepts("好耶", "🔥🔥🔥")
+
+    def test_a_latin_source_kept_verbatim_keeps_its_exemption(self) -> None:
+        # v1.5 semantics unchanged: the exemption is for a source that is
+        # itself mostly Latin, echoed back because it was right to.
+        self._accepts("Notion", "Notion", "brand")
+        self._accepts(
+            "Kinetic Explainer 動態說明模式", "Kinetic Explainer 動態說明模式", "brand"
+        )
+
+    def test_a_chinese_target_is_left_alone(self) -> None:
+        result = self._judge("三根K棒下去定義", "用三根K棒把它定義出來", target="zh")
+        self.assertEqual(result[0]["translated_text"], "用三根K棒把它定義出來")
+        # The same pair asked for in en is exactly the failure above.
+        self._rejects("三根K棒下去定義", "用三根K棒把它定義出來")
+
+
+class HalfTranslatedRetryTests(_DeliveryRoundtripCase):
+    """Residue is worth one more ask, and then it is fatal."""
+
+    SOURCES = ("三根K棒下去定義",)
+
+    def test_a_half_translated_answer_is_asked_about_again(self) -> None:
+        artifact, rounds = self._create(
+            [
+                {"translated_text": "three k-sticks下去定义"},
+                {"translated_text": "define it with three k-sticks"},
+            ]
+        )
+        self.assertEqual(len(rounds), 2)
+        self.assertIn("translation_wrong_language", rounds[1])
+        self.assertEqual(
+            artifact["items"][0]["translated_text"], "define it with three k-sticks"
+        )
+
+    def test_a_provider_that_keeps_the_residue_fails_closed(self) -> None:
+        half = {"translated_text": "three k-sticks下去定义"}
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+            self._create([half, half, half, half])
+        self.assertEqual(caught.exception.code, "translation_wrong_language")
+        self.assertFalse((self.project / caption_delivery.CAPTION_REL).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
