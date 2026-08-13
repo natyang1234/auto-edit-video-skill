@@ -357,30 +357,35 @@ class PreservationMutationTests(_OneCaptionCase):
     def test_punctuation_only_edits_do_not_count_as_translating(self) -> None:
         self._rejects("第一句中文", "第一句，中文！", "translation_unchanged")
 
-    def test_a_whole_chinese_line_echoed_under_a_valid_reason_is_still_accepted(
+    def test_a_whole_chinese_line_echoed_under_a_valid_reason_is_rejected(
         self,
     ) -> None:
-        """Characterisation, not endorsement — the one gap left open.
+        """The gap this file recorded as open, closed by SPEC §4 v1.5.
 
-        `identity_preserved` with one of the four reasons buys exactly one
-        exemption: the "you echoed the source" check. Today nothing bounds
-        *how much* source may be echoed under it, so a provider that labels
-        a whole Chinese sentence `identity_reason: brand` is accepted, and
-        the Phase 0c contract test
-        `test_identity_exception_is_item_scoped_and_reason_limited` locks
-        that in. Narrowing it (e.g. refusing an identity claim over a source
-        that carries sentence structure) is a contract change, not a bug
-        fix, so it is nat's call rather than this slice's — recorded here so
-        the gap is visible instead of assumed closed. What the gap cannot
-        do is let a fact through: every mutation above stays rejected under
-        the same claim.
+        Until 2026-08-13 this was a characterisation test: `identity_
+        preserved` with one of the four reasons bought the "you echoed the
+        source" exemption, nothing bounded *how much* source could be
+        echoed under it, and a whole Chinese sentence labelled
+        `identity_reason: brand` was accepted. It was recorded as nat's
+        call rather than this slice's — and then a real cut made the call,
+        shipping twelve `en` captions in Chinese, eight of them through
+        exactly this door.
+
+        v1.5 narrows the exemption to what it was written for: a source
+        that is itself mostly Latin. A Chinese sentence is not a name left
+        alone, whatever the stamp says, and it now fails as
+        `translation_wrong_language` — a contract violation with the same
+        bounded retry as every other.
         """
-        item = self._accepts(
+        self._rejects(
             "今天要講的是一個完整的中文句子",
             "今天要講的是一個完整的中文句子",
+            "translation_wrong_language",
             identity=True,
             reason="brand",
         )
+        # The exemption itself still works where it belongs.
+        item = self._accepts("Notion", "Notion", identity=True, reason="brand")
         self.assertEqual(item["translation_status"], "identity_preserved")
         self.assertEqual(item["identity_reason"], "brand")
 

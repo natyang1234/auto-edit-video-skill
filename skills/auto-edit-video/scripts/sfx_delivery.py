@@ -37,10 +37,34 @@ CANDIDATE_CORRELATION_THRESHOLD = 0.30
 _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES = 512
 _PIPELINE_LAG_DIALOGUE_STRIDE = 67
 _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES = 512
-# AAC framing commonly contributes 512 decoded samples of end padding for a
-# 48 kHz stream.  Bind that bounded codec tolerance explicitly to the staged
-# final-domain stem duration; all larger count drift fails closed.
+# Candidate sample-count tolerance against the staged final-domain stem is
+# DIRECTIONAL, because the codec artefact it absorbs only has one sign.
+#
+# Surplus (candidate longer than planned): AAC framing commonly contributes
+# up to 512 decoded samples of end padding at 48 kHz; 1024 bounds that with
+# margin.  Nothing else in the pipeline can lengthen the mix, so anything
+# beyond this is a different render and fails closed.
+#
+# Deficit (candidate shorter than planned): the AAC encoder ends the stream
+# on a frame boundary and drops the trailing partial frame rather than
+# padding it, so a real final decodes short.  Phase 4 measured 3.1k-3.3k
+# samples short on every real kinetic cut; four AAC frames (4 x 1024 = 4096)
+# bounds that with one frame of margin.  Ruling of 2026-08-13: the symmetric
+# 1024 window was rejecting genuine deliveries, and widening it symmetrically
+# would have loosened the surplus side for no codec reason.
 CANDIDATE_SAMPLE_COUNT_TOLERANCE = 1024
+CANDIDATE_SAMPLE_COUNT_TOLERANCE_TRAILING = 4096
+
+
+def candidate_sample_count_within_tolerance(delta: int) -> bool:
+    """Signed codec tolerance for candidate-vs-planned sample counts.
+
+    `delta` is observed minus expected.  Deliverer and QA both decide with
+    this one predicate so the two sides can never drift apart.
+    """
+    if delta >= 0:
+        return delta <= CANDIDATE_SAMPLE_COUNT_TOLERANCE
+    return -delta <= CANDIDATE_SAMPLE_COUNT_TOLERANCE_TRAILING
 DIALOGUE_PRIORITY_WINDOW_SAMPLES = 12000
 DIALOGUE_PRIORITY_THRESHOLD_DBFS = -45.0
 DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB = 6.0
@@ -2023,7 +2047,7 @@ def verify_delivery(
     candidate_output_sha256: str | None = None
     candidate_audio: DecodedWav | None = None
     candidate_sample_count_delta: int | None = None
-    candidate_sample_count_within_tolerance: bool | None = None
+    candidate_sample_count_ok: bool | None = None
     if candidate_path is not None:
         candidate_path = Path(candidate_path)
         try:
@@ -2036,13 +2060,15 @@ def verify_delivery(
             )
             if expected_sample_count is None:
                 failures.append("candidate output: expected SFX sample count is unavailable")
-                candidate_sample_count_within_tolerance = False
+                candidate_sample_count_ok = False
             else:
                 candidate_sample_count_delta = len(candidate_audio.samples) - expected_sample_count
-                candidate_sample_count_within_tolerance = (
-                    abs(candidate_sample_count_delta) <= CANDIDATE_SAMPLE_COUNT_TOLERANCE
+                candidate_sample_count_ok = (
+                    candidate_sample_count_within_tolerance(
+                        candidate_sample_count_delta
+                    )
                 )
-                if not candidate_sample_count_within_tolerance:
+                if not candidate_sample_count_ok:
                     failures.append(
                         "candidate output: decoded sample count differs from planned SFX stem "
                         f"by {candidate_sample_count_delta} samples"
@@ -2297,7 +2323,7 @@ def verify_delivery(
             observed_cues.append({**output_cue, "evidence_source": "candidate_output_audio"})
             if (
                 output_cue["status"] != "pass"
-                or candidate_sample_count_within_tolerance is False
+                or candidate_sample_count_ok is False
             ):
                 # A sidecar cue cannot count as delivered when the candidate
                 # output itself did not carry its final-domain audio.
@@ -2334,6 +2360,9 @@ def verify_delivery(
                 "expected_sample_count": expected_sample_count,
                 "sample_count_delta": candidate_sample_count_delta,
                 "sample_count_tolerance_samples": CANDIDATE_SAMPLE_COUNT_TOLERANCE,
+                "sample_count_tolerance_trailing_samples": (
+                    CANDIDATE_SAMPLE_COUNT_TOLERANCE_TRAILING
+                ),
                 "decoded_pcm_sha256": sha256_bytes(candidate_audio.pcm),
             }
             if candidate_audio is not None else None
@@ -2414,7 +2443,7 @@ def _verify_multi_event_delivery(
     candidate_output_sha256: str | None = None
     candidate_audio: DecodedWav | None = None
     candidate_sample_count_delta: int | None = None
-    candidate_sample_count_within_tolerance: bool | None = None
+    candidate_sample_count_ok: bool | None = None
     if candidate_path is not None:
         candidate_path = Path(candidate_path)
         try:
@@ -2425,13 +2454,15 @@ def _verify_multi_event_delivery(
             )
             if expected_sample_count is None:
                 failures.append("candidate output: expected SFX sample count is unavailable")
-                candidate_sample_count_within_tolerance = False
+                candidate_sample_count_ok = False
             else:
                 candidate_sample_count_delta = len(candidate_audio.samples) - expected_sample_count
-                candidate_sample_count_within_tolerance = (
-                    abs(candidate_sample_count_delta) <= CANDIDATE_SAMPLE_COUNT_TOLERANCE
+                candidate_sample_count_ok = (
+                    candidate_sample_count_within_tolerance(
+                        candidate_sample_count_delta
+                    )
                 )
-                if not candidate_sample_count_within_tolerance:
+                if not candidate_sample_count_ok:
                     failures.append(
                         "candidate output: decoded sample count differs from planned SFX stem "
                         f"by {candidate_sample_count_delta} samples"
@@ -2815,7 +2846,7 @@ def _verify_multi_event_delivery(
                 failures.append("candidate output: event timing is invalid for audio evidence")
             candidate_cues.append(output_cue)
             observed_cues.append(output_cue)
-        if any(item["status"] != "pass" for item in candidate_cues) or candidate_sample_count_within_tolerance is False:
+        if any(item["status"] != "pass" for item in candidate_cues) or candidate_sample_count_ok is False:
             delivered_events = []
     if failures:
         delivered_events = []
@@ -2844,6 +2875,9 @@ def _verify_multi_event_delivery(
                 "expected_sample_count": expected_sample_count,
                 "sample_count_delta": candidate_sample_count_delta,
                 "sample_count_tolerance_samples": CANDIDATE_SAMPLE_COUNT_TOLERANCE,
+                "sample_count_tolerance_trailing_samples": (
+                    CANDIDATE_SAMPLE_COUNT_TOLERANCE_TRAILING
+                ),
                 "decoded_pcm_sha256": sha256_bytes(candidate_audio.pcm),
             }
             if candidate_audio is not None else None

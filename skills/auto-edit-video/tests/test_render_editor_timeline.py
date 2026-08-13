@@ -479,16 +479,52 @@ class Phase0dRenderCommandTests(unittest.TestCase):
         self.assertIn("[adialogue_evidence]", command)
         self.assertIn("[asfx_ducked_evidence]", command)
 
-    def test_sfx_rejects_multi_cut_timeline(self) -> None:
+    @patch("render_editor_timeline.source_has_audible_signal", return_value=True)
+    def test_sfx_mixes_over_a_multi_cut_dialogue_track(self, _audible: object) -> None:
+        # Pause trimming always produces more than one cut, so the SFX mix
+        # has to accept one.  The dialogue side becomes the same trim/concat
+        # chain the non-SFX route already builds, bounded to the final
+        # duration; everything downstream of [adialogue] is unchanged,
+        # because the cue axis is the final axis either way.
         self.state["segments"] = [
             {"source_start": 0.0, "source_end": 0.8},
             {"source_start": 1.0, "source_end": 1.8},
         ]
-        with self.assertRaisesRegex(ValueError, "single-cut"):
-            build_render_command(
-                self.project, self.state, self.manifest, self.project / "out.mp4", "final",
-                sfx_stem=self.stem,
-            )
+        command = build_render_command(
+            self.project, self.state, self.manifest, self.project / "out.mp4", "final",
+            sfx_stem=self.stem,
+        )
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertNotIn("-ss", command)
+        self.assertIn(
+            "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            "asplit=2[ain0][ain1]",
+            graph,
+        )
+        self.assertIn(
+            "[ain0]atrim=start=0.000000:end=0.800000,asetpts=PTS-STARTPTS[aseg0]", graph
+        )
+        self.assertIn(
+            "[ain1]atrim=start=1.000000:end=1.800000,asetpts=PTS-STARTPTS[aseg1]", graph
+        )
+        self.assertIn("[aseg0][aseg1]concat=n=2:v=0:a=1[adialogue_cat]", graph)
+        self.assertIn(
+            "[adialogue_cat]atrim=0:1.600000,asetpts=PTS-STARTPTS[adialogue]", graph
+        )
+        # The stem still enters unshifted, so a cue planned at final time t
+        # stays at final time t across the join.
+        self.assertIn(
+            "[2:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            "asetpts=PTS-STARTPTS[asfx]",
+            graph,
+        )
+        self.assertIn("[adialogue]asplit=2[adialogue_mix][adialogue_key]", graph)
+        self.assertIn(
+            "[asfx][adialogue_key]sidechaincompress=", graph
+        )
+        self.assertIn("[adialogue_mix][asfx_ducked]amix=inputs=2:normalize=0", graph)
+        self.assertEqual(graph.count("loudnorm="), 1)
+        self.assertEqual(graph.count("concat=n=2"), 2)
 
     def test_private_motion_receipt_sanitize_rejects_either_side_replacement(
         self,

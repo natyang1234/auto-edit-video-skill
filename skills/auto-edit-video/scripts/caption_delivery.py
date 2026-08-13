@@ -87,9 +87,17 @@ CONTRACT_VIOLATION_CODES = frozenset(
         "translation_token_missing",
         "translation_number_invented",
         "translation_number_order",
+        "translation_wrong_language",
     }
 )
-VALIDATION_RECEIPT_KEYS = ("validation_retry_rounds",)
+# Whether an answer had to be re-asked caption by caption is, like the round
+# counts, a record of how this one delivery went rather than part of who the
+# provider is — a delivery that needed it must not read as a swapped
+# provider when the receipt is re-derived from the manifest.
+VALIDATION_RECEIPT_KEYS = (
+    "validation_retry_rounds",
+    "individual_reask",
+)
 MAX_CAPTION_SOURCES = 20_000
 MAX_CAPTION_TEXT_CHARS = 4_000
 MAX_CAPTION_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -99,6 +107,29 @@ SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 ASCII_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._+/-]*|\d+(?:\.\d+)?(?:%|[A-Za-z]+)?")
 CHINESE_RE = re.compile(r"[\u3400-\u9fff]")
 TRANSLATION_NORMALISE_RE = re.compile(r"[\W_]+", re.UNICODE)
+# SPEC Phase 3 v1 \u00a74 (v1.5): which script the answer is written in.
+#
+# Only the targets whose own writing system is Latin are judged this way; a
+# zh or ja delivery is none of this rule's business and is left alone. The
+# language subtag is what counts, so `en`, `en-US` and `pt-BR` all land here.
+LATIN_SCRIPT_TARGETS = frozenset(
+    {"en", "es", "fr", "de", "it", "pt", "nl", "pl", "tr", "id", "ms", "vi"}
+)
+LATIN_SCRIPT_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u1e00-\u1eff]")
+# Han, kana and hangul. Not "everything that is not Latin": a rule that
+# cannot name what it saw has no business failing a delivery closed.
+CJK_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+# Half of the letters, not all of them. A correct English caption keeps a
+# name in its own script often enough ("We are meeting in \u81fa\u5357 tonight") that
+# demanding zero CJK would refuse good answers, and the failure being
+# stopped here is not subtle \u2014 it is an entire sentence in the wrong
+# language, where the ratio is 0.
+MIN_TARGET_SCRIPT_RATIO = 0.5
+# The delivery path always states the target it asked for. This default is
+# for the validator's other callers, and it is a target the check is *on*
+# for rather than off, so that a caller who forgets to pass one loses a
+# caption to a retry instead of losing the rule.
+DEFAULT_VALIDATION_TARGET = "en"
 # How a number is *written* is the target language's business; which number
 # it is, is the speaker's. Fullwidth digits are what a Chinese IME and
 # whisper both produce, and en groups thousands where zh often does not, so
@@ -1371,12 +1402,56 @@ def _overflowing_budgets(
     return budgets
 
 
+def _latin_script_ratio(text: str) -> float | None:
+    """Share of the letters that are Latin, or None when there are none.
+
+    Digits, punctuation, spaces and emoji are counted on neither side:
+    they say nothing about which language a line is written in, and a
+    caption that is only "90" or only "🔥🔥🔥" is the same caption in every
+    target. Those come back as None — no opinion — rather than as 0.
+    """
+    latin = len(LATIN_SCRIPT_RE.findall(text))
+    cjk = len(CJK_SCRIPT_RE.findall(text))
+    if latin + cjk == 0:
+        return None
+    return latin / (latin + cjk)
+
+
+def _writes_in_target_script(source: str, translated: str, identity: bool) -> bool:
+    """Whether this answer is written in a Latin-script target's script.
+
+    SPEC Phase 3 v1 §4 (v1.5). The check the twelve-caption Tainan delivery
+    walked straight through: qwen2.5:7b answered every `en` caption in
+    Chinese, converted traditional to simplified — so the answers differed
+    from their sources and `translation_unchanged` never fired — and
+    stamped eight of them `identity_preserved=true, proper_name`, which
+    excused the rest. The bilingual final shipped Chinese under Chinese.
+
+    So the script is decided here, deterministically, instead of being
+    taken on the model's word. The identity exemption survives for what it
+    was written for and no further (v1.5 narrows v1.3): a line the model
+    was right to leave alone is one whose *source* is already mostly Latin
+    — a brand, a code, a Latin proper name, `S outh bound` — and echoing
+    such a source verbatim is that same test passing. A source that is
+    itself a Chinese sentence cannot be a name left alone, whatever the
+    stamp says.
+    """
+    ratio = _latin_script_ratio(translated)
+    if ratio is None or ratio >= MIN_TARGET_SCRIPT_RATIO:
+        return True
+    if not identity:
+        return False
+    source_ratio = _latin_script_ratio(source)
+    return source_ratio is not None and source_ratio >= MIN_TARGET_SCRIPT_RATIO
+
+
 def _judge_translation(
     expected: dict[str, Any],
     proposed: dict[str, Any],
     translated: str,
     instance_id: str,
     glossary_tokens: set[str],
+    target: str,
 ) -> dict[str, Any]:
     """The verdict on one answer: the adopted item, or why not.
 
@@ -1408,6 +1483,10 @@ def _judge_translation(
         and not identity
     ):
         raise CaptionDeliveryError("translation_unchanged", instance_id)
+    if target.split("-")[0].casefold() in LATIN_SCRIPT_TARGETS and not (
+        _writes_in_target_script(source, translated, identity)
+    ):
+        raise CaptionDeliveryError("translation_wrong_language", instance_id)
     # Compared on the numbers, not on how they were typed: fullwidth
     # digits and thousands separators are flattened on both sides first
     # (a real cut died on `2000` vs `2,000`, a correct answer refused).
@@ -1476,10 +1555,12 @@ def _validate_translations(
     instances: list[dict[str, Any]],
     response: dict[str, Any],
     glossary: list[str],
+    *,
+    target: str = DEFAULT_VALIDATION_TARGET,
 ) -> list[dict[str, Any]]:
     """Every answer, or the first reason one of them is unacceptable."""
     results, failures = _validate_translations_with_failures(
-        instances, response, glossary
+        instances, response, glossary, target=target
     )
     if failures:
         raise failures[0][1]
@@ -1490,6 +1571,8 @@ def _validate_translations_with_failures(
     instances: list[dict[str, Any]],
     response: dict[str, Any],
     glossary: list[str],
+    *,
+    target: str = DEFAULT_VALIDATION_TARGET,
 ) -> tuple[list[dict[str, Any] | None], list[tuple[int, CaptionDeliveryError]]]:
     """Judge every item, and say which ones failed rather than only the first.
 
@@ -1555,13 +1638,100 @@ def _validate_translations_with_failures(
         try:
             output.append(
                 _judge_translation(
-                    expected, proposed, translated, instance_id, glossary_tokens
+                    expected, proposed, translated, instance_id, glossary_tokens, target
                 )
             )
         except CaptionDeliveryError as exc:
             output.append(None)
             failures.append((index, exc))
     return output, failures
+
+
+def _answers_carry_no_ids(
+    instances: list[dict[str, Any]],
+    response: dict[str, Any],
+) -> bool:
+    """Whether the answer is a full-length batch reply carrying no ids at all.
+
+    The shape that has to be re-asked one caption at a time: as many answers
+    as captions, every entry an object, and **not one** of them naming the
+    caption it belongs to. There is nothing here to match an answer to a
+    caption on, so nothing places them — see
+    `_reask_each_caption_individually`.
+
+    A *partly* identified answer is not this shape and is left strictly
+    alone. One id present means the provider was tracking ids for at least
+    that item, so the absent ones are missing information rather than a
+    uniform omission, and the strict id match stands.
+    """
+    raw = response.get("items")
+    if not isinstance(raw, list) or len(raw) != len(instances) or not raw:
+        return False
+    for item in raw:
+        if not isinstance(item, dict) or str(item.get("caption_instance_id") or ""):
+            return False
+    return True
+
+
+def _reask_each_caption_individually(
+    instances: list[dict[str, Any]],
+    *,
+    prompt_for: Callable[[dict[str, Any]], str],
+    model_call: Callable[..., dict[str, Any]],
+    model: str,
+    timeout: int,
+    trust: _ProjectTrust,
+    attempt: int,
+) -> dict[str, Any]:
+    """Ask about each caption on its own, and merge the answers back.
+
+    The fallback when a batch cannot be read by position: an answer to a
+    question that named exactly one caption cannot be misattributed, because
+    there is no other caption it could belong to. The one-item carve-out for
+    a missing id is safe for the same reason, and this reuses it rather than
+    widening it.
+
+    It costs one provider call per caption, which is why it is not the
+    default. Nothing here judges a translation — the merged answer goes
+    through exactly the same `_validate_translations_with_failures` as a
+    batch reply, keeps its per-caption verdicts, and whatever still fails
+    fails closed exactly as before.
+    """
+    items: list[dict[str, Any]] = []
+    for instance in instances:
+        try:
+            response = model_call(
+                prompt_for(instance),
+                "caption_translation",
+                model=model,
+                timeout=timeout,
+                attempt=attempt,
+            )
+        except CaptionDeliveryError:
+            raise
+        except Exception as exc:
+            raise CaptionDeliveryError("translation_provider_failed", str(exc)[:500]) from exc
+        # Same reason as the batch path: the blocking wait is where another
+        # process can swap project paths, so trust is re-checked before any
+        # returned data is kept.
+        _verify_project_trust(trust)
+        if not isinstance(response, dict) or set(response) != {"items"}:
+            raise CaptionDeliveryError("translation_invalid", "provider response must be an object")
+        raw = response["items"]
+        if not isinstance(raw, list) or len(raw) != 1:
+            raise CaptionDeliveryError("translation_incomplete", "provider item count mismatch")
+        item = raw[0]
+        if not isinstance(item, dict):
+            raise CaptionDeliveryError("translation_invalid", "item 0 is not an object")
+        given = str(item.get("caption_instance_id") or "")
+        if given and given != instance["caption_instance_id"]:
+            # An id that names a different caption is the provider answering
+            # about something else, single question or not.
+            raise CaptionDeliveryError(
+                "translation_order_mismatch", str(instance["caption_instance_id"])
+            )
+        items.append({**item, "caption_instance_id": instance["caption_instance_id"]})
+    return {"items": items}
 
 
 def _caption_overlays(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1576,6 +1746,83 @@ def _caption_overlays(state: dict[str, Any]) -> list[dict[str, Any]]:
         and item.get("visible", True)
         and item.get("source") == "working/transcript_words.json"
     ]
+
+
+def _attribute_partial_response(
+    pending: list[tuple[int, dict[str, Any]]],
+    response: dict[str, Any],
+) -> tuple[list[tuple[int, dict[str, Any]]], dict[str, Any], list[tuple[int, dict[str, Any]]]]:
+    """Split a wrong-length answer into the captions it answered and the rest.
+
+    Returns `(answered, response_for_answered, unanswered)`. When the list
+    is the right length, or when it cannot be attributed caption by caption
+    — items that are not objects, ids that were never asked about, the same
+    id twice, or an answer with no id at all — nothing is split off and the
+    caller's validator gives the same verdict it always gave.
+
+    Items naming a caption that was not asked about are dropped rather than
+    argued with: every caption that reaches a frame is one this delivery
+    asked for and validated individually, and an answer about some other
+    caption cannot become one of them.
+    """
+    unchanged = (pending, response, [])
+    if set(response) != {"items"}:
+        return unchanged
+    raw = response.get("items")
+    if not isinstance(raw, list) or len(raw) == len(pending):
+        return unchanged
+    wanted = {str(instance["caption_instance_id"]) for _index, instance in pending}
+    by_id: dict[str, Any] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            return unchanged
+        instance_id = str(item.get("caption_instance_id") or "")
+        if not instance_id or instance_id in by_id:
+            return unchanged
+        if instance_id in wanted:
+            by_id[instance_id] = item
+    answered = [
+        entry for entry in pending if str(entry[1]["caption_instance_id"]) in by_id
+    ]
+    if not answered:
+        return unchanged
+    unanswered = [
+        entry for entry in pending if str(entry[1]["caption_instance_id"]) not in by_id
+    ]
+    aligned = {
+        "items": [by_id[str(instance["caption_instance_id"])] for _index, instance in answered]
+    }
+    return answered, aligned, unanswered
+
+
+def caption_generation_decision(state: dict[str, Any]) -> tuple[bool, str]:
+    """Whether this project draws captions at all, and why.
+
+    `editor_server.caption_render_decision` writes this when the project is
+    set up: a source that already carries burned-in subtitles gets no
+    second set drawn over it. The transcript keeps its caption segments
+    either way, which is why delivery has to read the decision rather than
+    infer it from an empty overlay list.
+    """
+    decision = state.get("caption_generation")
+    if not isinstance(decision, dict) or decision.get("enabled") is not False:
+        return True, str(decision.get("reason") or "") if isinstance(decision, dict) else ""
+    return False, str(decision.get("reason") or "caption generation is disabled")
+
+
+def require_caption_overlays(state: dict[str, Any]) -> None:
+    """Refuse a delivery for a project that draws no captions, by name.
+
+    Comparing transcript sources against overlays that were never meant to
+    exist reported `caption overlay count mismatch`: true about the numbers
+    and wrong about the cause, and it cost two real cuts before anyone read
+    the state. The count check below still owns every other disagreement —
+    this only speaks when the state says there are no captions *and* there
+    are none.
+    """
+    enabled, reason = caption_generation_decision(state)
+    if not enabled and not _caption_overlays(state):
+        raise CaptionDeliveryError("caption_generation_disabled", reason)
 
 
 def _bind_sources_to_state(state: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1635,6 +1882,7 @@ def _translate_and_adopt(
     pending = list(enumerate(expected["instances"]))
     prompt = _translation_prompt([instance for _index, instance in pending], target)
     validation_rounds = 0
+    individual_reask = False
     while True:
         try:
             response = model_call(
@@ -1659,9 +1907,40 @@ def _translate_and_adopt(
         if not isinstance(response, dict):
             raise CaptionDeliveryError("translation_invalid", "provider response must be an object")
         asked = [instance for _index, instance in pending]
+        # A list of the wrong length is not a verdict on any one caption,
+        # and it used to end the delivery where it stood: a real cut died
+        # with `provider item count mismatch` after one ask, with the
+        # caption the provider *did* answer answered correctly. Split it
+        # instead — the answers that name a caption asked about are judged
+        # by exactly the same validator, and the captions left out become
+        # the question for the next round, under the same ceiling.
+        answered, aligned, unanswered = _attribute_partial_response(pending, response)
+        # An answer with no ids anywhere in it is neither adopted nor
+        # refused. Order is not a statement about which answer belongs to
+        # which caption — a provider that reverses two lines and drops the
+        # ids produces exactly the same bytes as one that answered in order
+        # — so it is asked again, one caption per question, where a single
+        # answer has only one caption it could be about. Whatever comes back
+        # is validated exactly as a batch reply is, and still fails closed
+        # if it fails.
+        answered_instances = [instance for _index, instance in answered]
+        if _answers_carry_no_ids(answered_instances, aligned):
+            aligned = _reask_each_caption_individually(
+                answered_instances,
+                prompt_for=lambda instance: _translation_prompt([instance], target),
+                model_call=model_call,
+                model=model,
+                timeout=timeout,
+                trust=trust,
+                attempt=validation_rounds,
+            )
+            individual_reask = True
         try:
             results, failures = _validate_translations_with_failures(
-                asked, response, glossary
+                [instance for _index, instance in answered],
+                aligned,
+                glossary,
+                target=target,
             )
         except CaptionDeliveryError as exc:
             # Not a verdict on any one caption — a response of the wrong
@@ -1675,22 +1954,28 @@ def _translate_and_adopt(
             validation_rounds += 1
             prompt = _revalidation_prompt(asked, target, [exc])
             continue
-        for (index, _instance), result in zip(pending, results, strict=True):
+        for (index, _instance), result in zip(answered, results, strict=True):
             if result is not None:
                 adopted[index] = result
-        if not failures:
+        reasons = [exc for _position, exc in failures]
+        if unanswered:
+            reasons.append(
+                CaptionDeliveryError("translation_incomplete", "provider item count mismatch")
+            )
+        pending = [answered[position] for position, _exc in failures] + unanswered
+        if not pending:
             break
         if validation_rounds >= VALIDATION_MAX_ROUNDS:
             # The ceiling: the verdict on the first caption still failing
             # stands, and the delivery fails closed exactly as it did
-            # before any of this existed.
-            raise failures[0][1]
+            # before any of this existed. With nothing but silence to go
+            # on, the verdict is that silence.
+            raise failures[0][1] if failures else reasons[-1]
         validation_rounds += 1
-        pending = [pending[position] for position, _exc in failures]
         prompt = _revalidation_prompt(
             [instance for _index, instance in pending],
             target,
-            [exc for _position, exc in failures],
+            reasons,
         )
     translations = [item for item in adopted if item is not None]
 
@@ -1732,7 +2017,28 @@ def _translate_and_adopt(
         # The shorter answer earns no exemption: same validation, same
         # identity rules. A retry is where a provider is most tempted to
         # drop the unit to make the length.
-        shortened = _validate_translations(retry_instances, retry_response, glossary)
+        # The shortening round is a second question to the same provider,
+        # which drops ids the same way, so it gets the same treatment for
+        # the same reason: an id-less answer is asked again one caption at a
+        # time rather than placed on the order it came back in.
+        if _answers_carry_no_ids(retry_instances, retry_response):
+            retry_response = _reask_each_caption_individually(
+                retry_instances,
+                prompt_for=lambda instance: _shortening_prompt(
+                    [instance],
+                    target,
+                    {instance["caption_instance_id"]: budgets[instance["caption_instance_id"]]},
+                ),
+                model_call=model_call,
+                model=model,
+                timeout=timeout,
+                trust=trust,
+                attempt=0,
+            )
+            individual_reask = True
+        shortened = _validate_translations(
+            retry_instances, retry_response, glossary, target=target
+        )
         by_instance = {
             instance["caption_instance_id"]: value
             for instance, value in zip(retry_instances, shortened, strict=True)
@@ -1749,6 +2055,7 @@ def _translate_and_adopt(
         "shortening_rounds": rounds,
         "shortening_character_budgets": dict(sorted(budgets.items())),
         "validation_retry_rounds": validation_rounds,
+        "individual_reask": individual_reask,
     }
     items: list[dict[str, Any]] = []
     for instance, translated in zip(expected["instances"], translations, strict=True):
@@ -1876,6 +2183,7 @@ def create_delivery(
     state = _load_json(_owned_artifact(root, Path("working/editor_state.json")))
     if not isinstance(state, dict):
         raise CaptionDeliveryError("caption_timeline_invalid", "editor state missing")
+    require_caption_overlays(state)
     expected = expected_instances(root, transcript, state)
     bound_state = _bind_sources_to_state(state, expected["sources"])
     if model_call is None:

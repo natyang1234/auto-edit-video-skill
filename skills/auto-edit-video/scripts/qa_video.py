@@ -949,11 +949,32 @@ def validate_sfx_report(sfx_report: Any) -> dict[str, Any]:
             raise ValueError(
                 "SFX report sample count tolerance does not match the independent policy"
             )
+        # The deficit side is wider than the surplus side because only one
+        # of them has a codec cause (sfx_delivery, 2026-08-13 ruling).  A
+        # report that omits the field is judged by the stricter symmetric
+        # window, so an older or hand-made report can never buy slack.
+        trailing_tolerance = sfx_delivery.CANDIDATE_SAMPLE_COUNT_TOLERANCE
+        if "sample_count_tolerance_trailing_samples" in audio_evidence:
+            trailing_tolerance = _non_negative_int(
+                audio_evidence.get("sample_count_tolerance_trailing_samples"),
+                "output_audio_evidence.sample_count_tolerance_trailing_samples",
+            )
+            if trailing_tolerance != sfx_delivery.CANDIDATE_SAMPLE_COUNT_TOLERANCE_TRAILING:
+                raise ValueError(
+                    "SFX report sample count tolerance does not match the "
+                    "independent policy"
+                )
         if delta != observed_audio_count - expected_audio_count:
             raise ValueError(
                 "SFX report output_audio_evidence sample count delta is inconsistent"
             )
-        if status == "pass" and abs(delta) > tolerance:
+        # The window itself is the deliverer's predicate, called, not
+        # re-derived here from its constants: the two agreed today and would
+        # part company the day either side gained a case. The checks above
+        # keep their own job — the report must declare the same policy, and
+        # `tolerance`/`trailing_tolerance` exist to be held against it.
+        within = sfx_delivery.candidate_sample_count_within_tolerance(delta)
+        if status == "pass" and not within:
             raise ValueError(
                 "SFX report pass requires candidate sample count within codec tolerance"
             )

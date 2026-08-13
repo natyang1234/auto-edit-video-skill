@@ -694,8 +694,17 @@ def freeze_visual_authority(
         artifact = artifact_by_layer.get(layer_id)
         if layer is None or artifact is None:
             raise ValueError(f"visual plan layer has no frozen artifact: {layer_id}")
-        windows = map_source_range_to_post_cut(
-            segments, float(plan_item.get("start", 0.0)), float(plan_item.get("end", 0.0))
+        # Pause removal splits a scene's source range wherever it spans
+        # dropped material. Those pieces are adjacent on the final axis, so
+        # the scene is one continuous final window and is bound as one.
+        # Anything the merge cannot join really is two scenes, and still
+        # stops the render.
+        windows = merge_contiguous_windows(
+            map_source_range_to_post_cut(
+                segments,
+                float(plan_item.get("start", 0.0)),
+                float(plan_item.get("end", 0.0)),
+            )
         )
         if len(windows) != 1:
             raise ValueError("frozen structured scene must map to exactly one final window")
@@ -1414,6 +1423,33 @@ def map_source_range_to_post_cut(
     return windows
 
 
+WINDOW_ADJACENCY_TOLERANCE_S = 1e-6
+
+
+def merge_contiguous_windows(
+    windows: list[tuple[float, float]],
+    tolerance: float = WINDOW_ADJACENCY_TOLERANCE_S,
+) -> list[tuple[float, float]]:
+    """Join post-cut windows that only a removed pause separates.
+
+    A range that spans dropped material comes back from
+    `map_source_range_to_post_cut` in pieces, and on the *final* axis those
+    pieces touch: everything between them was cut out, so the second one
+    starts exactly where the first ends. Merging them is not a tolerance —
+    it is reading the final axis instead of the source axis.
+
+    Windows that do not touch stay separate, so a caller that requires one
+    window still refuses anything that genuinely is two.
+    """
+    merged: list[tuple[float, float]] = []
+    for start, end in windows:
+        if merged and start <= merged[-1][1] + tolerance:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
 def a_roll_breathing_intervals(
     plan_items: list[dict[str, Any]],
     segments: list[tuple[float, float]],
@@ -1626,10 +1662,15 @@ def build_render_command(
             continue
         if visual_source is not None and source_overlay.get("design_role"):
             # design-role cards are baked by the graphic package
-            for window_start, window_end in map_source_range_to_post_cut(
-                segments,
-                float(source_overlay.get("start", 0.0)),
-                float(source_overlay.get("end", 0.0)),
+            # One card that outlives a removed pause is still one card: its
+            # pieces touch on the final axis, and drawing them separately
+            # gave two pieces of evidence with the same overlay id.
+            for window_start, window_end in merge_contiguous_windows(
+                map_source_range_to_post_cut(
+                    segments,
+                    float(source_overlay.get("start", 0.0)),
+                    float(source_overlay.get("end", 0.0)),
+                )
             ):
                 baked = dict(source_overlay)
                 baked["start"] = window_start
@@ -1660,9 +1701,16 @@ def build_render_command(
         # Overlay times are stored on the source axis; project them onto the
         # post-cut axis. Crossing a removed region yields one window per
         # surviving intersection; fully removed overlays disappear.
-        for window_start, window_end in map_source_range_to_post_cut(
-            segments, raw_start, raw_end
-        ):
+        #
+        # Captions keep those pieces: a caption instance is bound per
+        # surviving intersection, and delivery matched its adopted items to
+        # exactly those windows. Everything else is one overlay with one
+        # identity, so its pieces — adjacent on the final axis, because
+        # what separated them is gone — are drawn as one.
+        raw_windows = map_source_range_to_post_cut(segments, raw_start, raw_end)
+        if source_overlay.get("type") not in {"caption", "emphasis"}:
+            raw_windows = merge_contiguous_windows(raw_windows)
+        for window_start, window_end in raw_windows:
             overlay = dict(source_overlay)
             overlay["style"] = dict(source_overlay.get("style") or {})
             overlay["start"] = window_start
@@ -1727,10 +1775,16 @@ def build_render_command(
     for plan_item in visual_plan_v2.get("items", []):
         layer_ref = plan_item.get("structured_layer_id")
         asset_ref = plan_item.get("selected_asset")
-        windows = map_source_range_to_post_cut(
-            segments,
-            float(plan_item.get("start", 0.0)),
-            float(plan_item.get("end", 0.0)),
+        # The same beat placed twice is two overlays claiming one plan item
+        # and one piece of evidence; a pause removed inside a beat must not
+        # turn it into two. Merged here for the same reason the frozen
+        # authority merges: on the final axis the pieces touch.
+        windows = merge_contiguous_windows(
+            map_source_range_to_post_cut(
+                segments,
+                float(plan_item.get("start", 0.0)),
+                float(plan_item.get("end", 0.0)),
+            )
         )
         placed_before = len(overlays)
         for window_start, window_end in windows:
@@ -2134,12 +2188,39 @@ def build_render_command(
         source, probe_start, probe_span
     )
     if sfx_stem is not None:
-        if multi_segment:
-            raise ValueError("Phase 0d SFX only supports single-cut timelines")
         if not has_audio_stream or sfx_input_index is None:
             raise ValueError("kinetic SFX delivery requires dialogue audio")
-        filters.append("[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                       f"atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[adialogue]")
+        if multi_segment:
+            # Pause trimming always leaves more than one cut, so the SFX mix
+            # has to take a cut dialogue track.  Build it exactly as the
+            # non-SFX route does — same CFR-normalised trim/concat, same
+            # order — and then bound it to the final duration, so that what
+            # reaches [adialogue] is one continuous final-domain track
+            # starting at 0.  Cue times are already final-domain (Phase 0d
+            # 48 kHz round-half-up timebase) and the stem enters unshifted,
+            # so no cue moves when the dialogue is joined: the join changes
+            # what is under a cue, never where the cue is.
+            filters.append(
+                "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"asplit={segment_count}"
+                + "".join(f"[ain{i}]" for i in range(segment_count))
+            )
+            for i, (segment_start, segment_end) in enumerate(segments):
+                filters.append(
+                    f"[ain{i}]atrim=start={segment_start:.6f}:end={segment_end:.6f},"
+                    f"asetpts=PTS-STARTPTS[aseg{i}]"
+                )
+            filters.append(
+                "".join(f"[aseg{i}]" for i in range(segment_count))
+                + f"concat=n={segment_count}:v=0:a=1[adialogue_cat]"
+            )
+            filters.append(
+                f"[adialogue_cat]atrim=0:{duration:.6f},"
+                "asetpts=PTS-STARTPTS[adialogue]"
+            )
+        else:
+            filters.append("[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                           f"atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[adialogue]")
         filters.append(f"[{sfx_input_index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[asfx]")
         filters.append(
             "[adialogue]asplit=3[adialogue_mix][adialogue_key][adialogue_evidence_raw]"

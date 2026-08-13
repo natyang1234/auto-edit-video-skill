@@ -4572,22 +4572,38 @@ def approve_kinetic_timeline(project_dir: Path) -> None:
         state,
         manifest,
     )
-    if not isinstance(caption_artifact, dict) or caption_artifact.get("required") is not True:
-        raise ValueError("kinetic timeline approval requires adopted caption v2")
-    adopted = state.get("caption_delivery")
-    adopted_hash = (
-        str(adopted.get("artifact_sha256") or "")
-        if isinstance(adopted, dict)
-        else ""
-    )
-    render_binding = bound_state.get("_caption_delivery_v2")
-    render_hash = (
-        str(render_binding.get("artifact_sha256") or "")
-        if isinstance(render_binding, dict)
-        else ""
-    )
-    if not re.fullmatch(r"[0-9a-f]{64}", adopted_hash) or render_hash != adopted_hash:
-        raise ValueError("kinetic caption artifact hash binding is incomplete")
+    # A project that draws no captions has no caption artifact to bind, and
+    # demanding one turned "this source already carries its own subtitles"
+    # into a dead cut. The exemption is exactly as narrow as the delivery
+    # skip that precedes it: the state's own recorded decision, no caption
+    # overlays to bind, and nothing adopted or required anywhere. Any
+    # project that ever adopted a delivery still has to bind it.
+    captions_skipped = False
+    try:
+        caption_delivery.require_caption_overlays(state)
+    except caption_delivery.CaptionDeliveryError as exc:
+        if exc.code != "caption_generation_disabled":
+            raise
+        captions_skipped = (
+            caption_artifact is None and state.get("caption_delivery") is None
+        )
+    if not captions_skipped:
+        if not isinstance(caption_artifact, dict) or caption_artifact.get("required") is not True:
+            raise ValueError("kinetic timeline approval requires adopted caption v2")
+        adopted = state.get("caption_delivery")
+        adopted_hash = (
+            str(adopted.get("artifact_sha256") or "")
+            if isinstance(adopted, dict)
+            else ""
+        )
+        render_binding = bound_state.get("_caption_delivery_v2")
+        render_hash = (
+            str(render_binding.get("artifact_sha256") or "")
+            if isinstance(render_binding, dict)
+            else ""
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", adopted_hash) or render_hash != adopted_hash:
+            raise ValueError("kinetic caption artifact hash binding is incomplete")
     revision = gate_revision(root, "timeline", state)
     try:
         delivery_envelope.revalidate_file_snapshot(state_snapshot)
@@ -4929,12 +4945,22 @@ def cmd_cut(args: argparse.Namespace) -> int:
             try:
                 import caption_delivery
 
-                caption_delivery.create_delivery(
-                    project_dir,
-                    kinetic_caption_target(resolved),
-                    required=True,
-                    timeout=args.timeout,
-                )
+                try:
+                    caption_delivery.create_delivery(
+                        project_dir,
+                        kinetic_caption_target(resolved),
+                        required=True,
+                        timeout=args.timeout,
+                    )
+                except caption_delivery.CaptionDeliveryError as exc:
+                    # The project already decided not to draw captions
+                    # because the source carries its own burned-in ones.
+                    # Translating a caption track nobody will draw is not a
+                    # requirement this cut can meet, and drawing a second
+                    # set over the first is not what the viewer wants.
+                    if exc.code != "caption_generation_disabled":
+                        raise
+                    _step(f"leaving the source's own subtitles alone ({exc.detail})")
                 approve_kinetic_timeline(project_dir)
                 # Caption adoption writes both the state and manifest.  The
                 # next clip must start from those current bindings.

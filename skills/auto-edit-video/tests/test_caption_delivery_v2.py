@@ -568,7 +568,18 @@ class CaptionDeliveryContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "caption_project_invalid")
 
     def test_identity_exception_is_item_scoped_and_reason_limited(self) -> None:
+        # Sources changed to Latin brands under SPEC §4 v1.5 (2026-08-13).
+        # This test says what an adopted identity claim looks like and which
+        # reasons are allowed; it used to say it over a Chinese sentence
+        # echoed back verbatim, which v1.5 rejects as
+        # `translation_wrong_language` — that shape is exactly the escape
+        # hatch a real cut shipped Chinese captions through, and it is now
+        # covered by `TargetLanguageScriptTests` in the Phase 4 tests. The
+        # claim being made here is unchanged; only the line it is made about
+        # is now one the exemption was written for.
         expected = caption_delivery.expected_instances(self.project, self.transcript, self.state)
+        for instance, source in zip(expected["instances"], ("Notion", "Figma"), strict=True):
+            instance["corrected_source"] = source
         response = {
             "items": [
                 {

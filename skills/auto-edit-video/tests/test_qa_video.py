@@ -90,6 +90,7 @@ class QaVideoGateTest(unittest.TestCase):
                 "expected_sample_count": 96000,
                 "sample_count_delta": 0,
                 "sample_count_tolerance_samples": 1024,
+                "sample_count_tolerance_trailing_samples": 4096,
                 "decoded_pcm_sha256": "b" * 64,
             },
             "observed_cue_evidence": [{
@@ -491,6 +492,33 @@ class QaVideoGateTest(unittest.TestCase):
         forged_delta["output_audio_evidence"]["sample_count_delta"] = 1
         with self.assertRaisesRegex(ValueError, "delta is inconsistent"):
             qa_video.validate_sfx_report(forged_delta)
+
+    def test_trailing_codec_truncation_has_its_own_directional_tolerance(self) -> None:
+        # 2026-08-13 ruling: a real AAC final is consistently *shorter* than
+        # the planned stem by roughly 3.1k-3.3k samples, because the encoder
+        # drops the trailing partial frame rather than padding it.  That is a
+        # one-directional codec artefact, so the deficit side is bounded at
+        # four AAC frames (4 x 1024) while the surplus side stays at 1024:
+        # audio that appears from nowhere is still not a codec artefact.
+        def report_with(delta: int) -> dict:
+            report = self.sfx_report()
+            evidence = report["output_audio_evidence"]
+            evidence["sample_count"] = evidence["expected_sample_count"] + delta
+            evidence["sample_count_delta"] = delta
+            return report
+
+        qa_video.validate_sfx_report(report_with(-4000))
+        qa_video.validate_sfx_report(report_with(-4096))
+        qa_video.validate_sfx_report(report_with(900))
+        for rejected in (-4200, -4097, 1100, 1025):
+            with self.subTest(delta=rejected):
+                with self.assertRaisesRegex(ValueError, "within codec tolerance"):
+                    qa_video.validate_sfx_report(report_with(rejected))
+
+        forged = report_with(-4000)
+        forged["output_audio_evidence"]["sample_count_tolerance_trailing_samples"] = 8192
+        with self.assertRaisesRegex(ValueError, "independent policy"):
+            qa_video.validate_sfx_report(forged)
 
     def test_v2_dialogue_priority_thresholds_are_strict_and_inclusive(self) -> None:
         exact_threshold = self.sfx_v2_report(dialogue_db=-45.0, sfx_db=-20.0)

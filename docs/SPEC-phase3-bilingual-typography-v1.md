@@ -45,7 +45,12 @@ nat 2026-08-12 授權 Claude 擬定本規格（PRD Phase 3 僅質化描述）；
   - **硬強制僅限來源阿拉伯數字**（不得退步）：來源寫成數字時，`translation_token_missing`（含 multiset 重複次數）、`translation_number_invented`、`translation_number_order` 全數維持；A1 正規化（2,000≡2000、全形數字、`12,00` 仍視為 1200 並擋）維持；`5mW≠5MW` 大小寫敏感維持；品牌名 casefold 維持。
   - 兜底＝§5 的 nat 看片簽核。特徵化測試：test_phase3_preservation_mutations.py（`ChineseNumberBestEffortTests`／`ChineseNumberFalsePositiveTests`／`ArabicNumberEnforcementSurvivesTests`）。
   - **豁免範圍為整句（已知缺口，v1.4 收案確認）**：來源含 一/十 等字（含 一起/一直 等慣用語）時該 caption 的 invented/order 一併關閉——「一起投資了 100 元」譯文憑空 +300% 會放行（存在性 token_missing 仍護住 100 本身，實測 3→5 被擋）。第五輪 verifier 建議的收窄法（僅解析出真數值才豁免＋每數字溯源）會對「二十四小時→Open 24/7」類慣用譯法製造新誤殺，故不採；記 Phase 4 backlog 再議。
-- **已知接受的缺口（v1.3，2026-08-13 主 session 裁定）**：整句中文在合法 identity_reason 下原樣不翻可通過驗證——identity 機制約束「哪些理由」而非「可回聲多少」；收窄需武斷的名字/句子判別且違反 Phase 0c 已 checkpoint 契約。風險上限＝漏「未翻譯」不會漏「翻譯錯誤」，由 §5 的 nat 看片簽核把關。特徵化測試：test_phase3_preservation_mutations.py。
+- ~~**已知接受的缺口（v1.3，2026-08-13 主 session 裁定）**：整句中文在合法 identity_reason 下原樣不翻可通過驗證~~ → **由 v1.5 取代（見下）**。v1.3 的接受範圍（「漏未翻譯不會漏翻譯錯誤，交給 nat 看片把關」）在真素材上被推翻：整支片就是漏的那一種。
+- **目標語言 script 檢查＝確定性阻擋（v1.5，2026-08-13 主 session 裁定，取代 v1.3 接受範圍）**：target 屬拉丁書寫語言（`LATIN_SCRIPT_TARGETS`＝en/es/fr/de/it/pt/nl/pl/tr/id/ms/vi，比對主語言子標籤，故 `en-US` 適用）時，每則譯文在 `_validate_translations` per-item 逐則檢查書寫系統；不合格＝新錯誤碼 `translation_wrong_language`，列入 `CONTRACT_VIOLATION_CODES`，走既有 bounded 重試（`VALIDATION_MAX_ROUNDS`），重試後仍不合格則 fail closed。
+  - **判準**：只數字母——拉丁字母（含附加符號）對 CJK（漢字／假名／諺文），拉丁佔比 ≥ `MIN_TARGET_SCRIPT_RATIO`(0.5) 通過。數字、標點、空白、emoji 兩邊都不計；一則全無字母者（`90`、`2026/8/13`、`🔥🔥🔥`）＝中性放行，不表態。門檻取 0.5 而非 0，是因正確英文譯文常保留一個原文專名（"We are meeting in 臺南 tonight"）；被擋的真實故障是整句異語言，佔比為 0。
+  - **identity 豁免縮至真專名**：`identity_preserved` 只在**來源自身**拉丁佔比 ≥0.5 時豁免（品牌／代號／拉丁專名，如 `Notion`、`S outh bound`）；譯文與來源逐字相同且來源為拉丁即滿足同一判準。來源是中文句子者無論標什麼 `identity_reason` 一律擋——v1.3 的 identity 語義自此僅剩「真專名」。target 非拉丁語言（zh／ja…）完全不套用本節。
+  - **依據＝真素材故障**：38 秒台南片 target=en，qwen2.5:7b 十二則全數回中文（繁轉簡），其中 8 則以 `identity_preserved:proper_name` 整句逃逸、其餘 4 則因簡化後與來源不同而躲過 `translation_unchanged`，雙語成片變中文配中文。
+  - 測試：test_phase4_real_media_defects.py（`TargetLanguageScriptTests`／`TargetLanguageRetryTests`，含真片 11 則逐則重現）。既有測試依本裁定更新兩處並於原地註明：test_phase3_preservation_mutations.py 的整句回聲特徵化測試改為 reject、test_caption_delivery_v2.py `test_identity_exception_is_item_scoped_and_reason_limited` 的來源改為拉丁品牌名。
 
 ## 5. 驗收（Phase 3 完成定義）
 
