@@ -1299,5 +1299,65 @@ class NumberFidelityTests(_OneCaptionCase):
         self._accepts("成長了 ８７%", "it grew 87%")
 
 
+class SingleLetterInsideAChineseWordTests(_OneCaptionCase):
+    """A lone Latin letter glued to Chinese is part of the Chinese word.
+
+    Found on a real cut: 「三根K棒找結構高點」 is one Chinese noun, K棒 =
+    candlestick, and every natural English translation of it says
+    "candlestick" — the letter K has no counterpart to carry. Requiring it
+    made the caption an unsatisfiable contract: no correct answer exists,
+    so the delivery could only fail closed or be turned off.
+
+    The exemption is deliberately narrow: one letter, no digits, and
+    touching Chinese on at least one side. Everything the rule was written
+    to catch — multi-letter brands, units like 5mW, and a lone letter in a
+    Latin sentence where it really is a token of its own — is untouched.
+    """
+
+    def test_a_letter_fused_into_a_chinese_word_need_not_survive(self) -> None:
+        self._accepts(
+            "三根K棒找結構高點", "Find structure highs with three candlesticks"
+        )
+
+    def test_the_same_letter_may_still_be_carried_over(self) -> None:
+        # Exempt means "not required", not "not allowed": an answer that
+        # does keep the letter is still a good answer.
+        self._accepts("三根K棒找結構高點", "Find structure highs with three K bars")
+
+    def test_a_letter_touching_chinese_on_one_side_only_is_exempt(self) -> None:
+        self._accepts("這是 A 級的", "this one is top grade")
+        self._accepts("看 K 就知道", "you can tell from the chart")
+
+    # --- the rule still has teeth ----------------------------------------
+
+    def test_a_multi_letter_token_inside_a_chinese_word_is_still_required(self) -> None:
+        self._rejects(
+            "用RSI指標判斷",
+            "judge it with the momentum indicator",
+            "translation_token_missing",
+        )
+
+    def test_a_unit_next_to_chinese_is_still_required(self) -> None:
+        self._rejects(
+            "這顆充電器只有5mW",
+            "this charger is only five milliwatts",
+            "translation_token_missing",
+        )
+
+    def test_a_lone_letter_in_a_latin_sentence_is_still_required(self) -> None:
+        self._rejects(
+            "我們改用 plan B 執行",
+            "we switched to the backup plan",
+            "translation_token_missing",
+        )
+
+    def test_a_letter_with_a_digit_glued_to_chinese_is_still_required(self) -> None:
+        self._rejects(
+            "先看B1區的量",
+            "look at the volume in the lower zone first",
+            "translation_token_missing",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -502,6 +502,183 @@ class ProviderItemCountCeilingTests(_DeliveryRoundtripCase):
         self.assertFalse((self.project / caption_delivery.CAPTION_REL).exists())
 
 
+class OneStrayItemDoesNotVoidTheIdentifiedOnesTests(_DeliveryRoundtripCase):
+    """A junk item in the list is junk, not a verdict on its neighbours.
+
+    Measured on a real cut: two captions were re-asked, qwen answered with
+    three items — both captions named by id and correctly translated, plus
+    one stray item carrying no id at all. The whole list was thrown away
+    because of the stray, the two good answers with it, and the delivery
+    burned the rest of its rounds re-asking captions it already had, then
+    failed closed.
+
+    An item that names a caption asked about in this round is that
+    caption's answer, whatever else shares the list with it. An item with
+    no id names nothing, and an id from outside this round names nothing
+    here; both are dropped where they stand. Nothing is placed by list
+    position — position is not a claim about which caption an answer is
+    about, and the position-based attribution that used to guess was
+    removed on purpose. Only captions still without an answer go to the
+    next round.
+    """
+
+    SOURCES = ("第一句中文 42km", "第二句中文 Notion")
+
+    def _answer(self, source: str) -> str:
+        return f"line {source.rsplit(' ', 1)[-1]}"
+
+    def _run(self, plan):
+        rounds: list[list[str]] = []
+
+        def model_call(prompt: str, _stage: str, **_kwargs) -> dict:
+            requested = json.loads(prompt.rsplit("\n", 1)[-1])
+            rounds.append([item["source"] for item in requested])
+            return plan(len(rounds), requested)
+
+        artifact = caption_delivery.create_delivery(
+            self.project, "en", required=True, model_call=model_call
+        )
+        return artifact, rounds
+
+    def test_two_identified_answers_survive_a_third_item_with_no_id(self) -> None:
+        def plan(_round: int, requested: list[dict]) -> dict:
+            items = [
+                {
+                    "caption_instance_id": item["caption_instance_id"],
+                    "translated_text": self._answer(item["source"]),
+                }
+                for item in requested
+            ]
+            items.append({"translated_text": "a line about nothing in particular"})
+            return {"items": items}
+
+        artifact, rounds = self._run(plan)
+        # Both captions were answered by name in round one, so there is
+        # nothing left to ask about.
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(
+            [item["translated_text"] for item in artifact["items"]],
+            [self._answer(source) for source in self.SOURCES],
+        )
+        self.assertEqual(artifact["provider_receipt"]["validation_retry_rounds"], 0)
+        self.assertIs(artifact["provider_receipt"]["individual_reask"], False)
+
+    def test_an_item_with_no_id_is_never_adopted_for_a_missing_caption(self) -> None:
+        # Round one names the first caption and answers the second one
+        # without an id. The id-less item is not the second caption's
+        # answer, however plausibly it reads and wherever it sits in the
+        # list: the second caption is asked about again, and what it
+        # finally carries is the answer from that round, not the stray.
+        def plan(round_number: int, requested: list[dict]) -> dict:
+            items = []
+            for item in requested:
+                text = self._answer(item["source"])
+                if round_number == 1 and item["source"].startswith("第二句"):
+                    items.append({"translated_text": "stray answer Notion"})
+                    items.append({"translated_text": "another stray Notion"})
+                    continue
+                items.append(
+                    {
+                        "caption_instance_id": item["caption_instance_id"],
+                        "translated_text": text,
+                    }
+                )
+            return {"items": items}
+
+        artifact, rounds = self._run(plan)
+        self.assertEqual(rounds[0], list(self.SOURCES))
+        self.assertEqual(rounds[1:], [[self.SOURCES[1]]])
+        self.assertEqual(
+            [item["translated_text"] for item in artifact["items"]],
+            [self._answer(source) for source in self.SOURCES],
+        )
+
+    def test_an_id_from_outside_this_round_is_dropped_not_adopted(self) -> None:
+        # The second caption passes in round one; the first is refused and
+        # re-asked alone. The re-ask answers it, and also volunteers a
+        # second item naming the caption that is no longer in question.
+        # That item is about nothing this round asked, so it is dropped and
+        # the caption that already passed keeps the answer it passed with.
+        settled: dict[str, str] = {}
+
+        def plan(round_number: int, requested: list[dict]) -> dict:
+            items = []
+            for item in requested:
+                settled[item["source"]] = item["caption_instance_id"]
+                text = self._answer(item["source"])
+                if round_number == 1 and item["source"].startswith("第一句"):
+                    text = "this line dropped its number"
+                items.append(
+                    {
+                        "caption_instance_id": item["caption_instance_id"],
+                        "translated_text": text,
+                    }
+                )
+            if round_number == 2:
+                items.append(
+                    {
+                        "caption_instance_id": settled[self.SOURCES[1]],
+                        "translated_text": "a late rewrite Notion",
+                    }
+                )
+            return {"items": items}
+
+        artifact, rounds = self._run(plan)
+        self.assertEqual(rounds[1:], [[self.SOURCES[0]]])
+        self.assertEqual(
+            [item["translated_text"] for item in artifact["items"]],
+            [self._answer(source) for source in self.SOURCES],
+        )
+
+    def test_the_same_id_answered_twice_keeps_the_first_answer(self) -> None:
+        # Two answers for one caption is the provider contradicting itself.
+        # The first one stands and the second is refused: adopting the later
+        # one would let a stray repeat overwrite an answer that has already
+        # been judged, and both still face the same validator.
+        def plan(_round: int, requested: list[dict]) -> dict:
+            items = [
+                {
+                    "caption_instance_id": item["caption_instance_id"],
+                    "translated_text": self._answer(item["source"]),
+                }
+                for item in requested
+            ]
+            items.insert(
+                1,
+                {
+                    "caption_instance_id": requested[0]["caption_instance_id"],
+                    "translated_text": "a second opinion 42km",
+                },
+            )
+            return {"items": items}
+
+        artifact, rounds = self._run(plan)
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(
+            [item["translated_text"] for item in artifact["items"]],
+            [self._answer(source) for source in self.SOURCES],
+        )
+
+    def test_a_short_answer_with_no_ids_at_all_still_fails_closed(self) -> None:
+        # Nothing in the list names a caption and the list is not even the
+        # right length: there is no attribution to make, so this stays what
+        # it always was — an incomplete answer, refused without a retry.
+        rounds: list[list[str]] = []
+
+        def model_call(prompt: str, _stage: str, **_kwargs) -> dict:
+            requested = json.loads(prompt.rsplit("\n", 1)[-1])
+            rounds.append([item["source"] for item in requested])
+            return {"items": [{"translated_text": "line 42km"}]}
+
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+            caption_delivery.create_delivery(
+                self.project, "en", required=True, model_call=model_call
+            )
+        self.assertEqual(caught.exception.code, "translation_incomplete")
+        self.assertEqual(len(rounds), 1)
+        self.assertFalse((self.project / caption_delivery.CAPTION_REL).exists())
+
+
 class WholeAnswerWithoutIdsTests(_DeliveryRoundtripCase):
     """Twelve answers, right count, right order, not one id echoed back.
 

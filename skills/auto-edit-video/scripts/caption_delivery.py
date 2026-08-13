@@ -357,6 +357,32 @@ def _token_key(token: str) -> str:
     return token.casefold()
 
 
+def _letter_is_fused_into_cjk(text: str, start: int, end: int) -> bool:
+    """Is this lone Latin letter a part of the Chinese word next to it?
+
+    「三根K棒」 is one noun — K棒 is a candlestick — and every natural
+    English translation of it says "candlestick". Requiring the letter K to
+    reappear made that caption an unsatisfiable contract: no correct answer
+    exists, so the delivery could only fail closed or be switched off, and
+    a rule that cries wolf on ordinary speech protects nothing.
+
+    Kept as narrow as the defect: exactly one letter, no digits, and no
+    Latin word touching it. `5mW` is two characters and stays required,
+    `RSI` is three and stays required, and the B of "plan B" has a Latin
+    word on its left so it stays required even with Chinese after it.
+    Spaces are looked through, because 「這是 A 級的」 is the same word
+    whether or not the speaker's transcript spaced it out.
+    """
+    token = text[start:end]
+    if len(token) != 1 or not token.isascii() or not token.isalpha():
+        return False
+    before = text[:start].rstrip()[-1:]
+    after = text[end:].lstrip()[:1]
+    if LATIN_SCRIPT_RE.match(before) or LATIN_SCRIPT_RE.match(after):
+        return False
+    return bool(CJK_SCRIPT_RE.match(before) or CJK_SCRIPT_RE.match(after))
+
+
 def _sequence_difference(left: list[str], right: list[str]) -> list[str]:
     """Members of `left` that `right` does not have as many of."""
     remaining = list(right)
@@ -1490,11 +1516,21 @@ def _judge_translation(
     # Compared on the numbers, not on how they were typed: fullwidth
     # digits and thousands separators are flattened on both sides first
     # (a real cut died on `2000` vs `2,000`, a correct answer refused).
-    source_tokens = ASCII_TOKEN_RE.findall(normalise_numerals(source))
+    normalised_source = normalise_numerals(source)
+    source_matches = list(ASCII_TOKEN_RE.finditer(normalised_source))
+    source_tokens = [match.group(0) for match in source_matches]
     delivered_tokens = ASCII_TOKEN_RE.findall(normalise_numerals(translated))
-    required = {_token_key(token) for token in source_tokens} | glossary_tokens.intersection(
-        token.casefold() for token in source_tokens
-    )
+    # A single letter welded to a Chinese word is a stroke of that word,
+    # not a term the translation owes back (see `_letter_is_fused_into_cjk`).
+    # A glossary entry still overrules the exemption: naming the term is
+    # the caller saying they want it carried.
+    required = {
+        _token_key(match.group(0))
+        for match in source_matches
+        if not _letter_is_fused_into_cjk(
+            normalised_source, match.start(), match.end()
+        )
+    } | glossary_tokens.intersection(token.casefold() for token in source_tokens)
     delivered = {_token_key(token) for token in delivered_tokens}
     missing = sorted(required - delivered)
     if missing:
@@ -1754,16 +1790,28 @@ def _attribute_partial_response(
 ) -> tuple[list[tuple[int, dict[str, Any]]], dict[str, Any], list[tuple[int, dict[str, Any]]]]:
     """Split a wrong-length answer into the captions it answered and the rest.
 
-    Returns `(answered, response_for_answered, unanswered)`. When the list
-    is the right length, or when it cannot be attributed caption by caption
-    — items that are not objects, ids that were never asked about, the same
-    id twice, or an answer with no id at all — nothing is split off and the
-    caller's validator gives the same verdict it always gave.
+    Returns `(answered, response_for_answered, unanswered)`. An item that
+    names a caption this round asked about is that caption's answer,
+    whatever else shares the list with it. Everything else in the list
+    names no caption that is in question and is dropped where it stands:
+    an item with no id at all, an id from outside this round, and a repeat
+    of an id already answered.
 
-    Items naming a caption that was not asked about are dropped rather than
-    argued with: every caption that reaches a frame is one this delivery
-    asked for and validated individually, and an answer about some other
-    caption cannot become one of them.
+    Dropping rather than voiding is the whole point. A real cut re-asked
+    two captions, got three items back — both captions named by id and
+    correctly translated, plus one stray with no id — and threw the list
+    away because of the stray, then spent the rest of `VALIDATION_MAX_ROUNDS`
+    re-asking captions it already had and failed closed. One junk item is
+    junk; it is not a verdict on the items that did name their caption.
+
+    Nothing is ever placed by list position: position is not a claim about
+    which caption an answer belongs to, so an unidentified item is never
+    some caption's answer by proximity. When no item names a caption in
+    question, nothing is split off and the caller's validator gives the
+    same verdict it always gave — including the id-less full-length shape
+    that is re-asked one caption at a time, which is left untouched here.
+    A response that is not a list of objects is a malformed shape rather
+    than a stray answer, and is likewise left to the validator.
     """
     unchanged = (pending, response, [])
     if set(response) != {"items"}:
@@ -1777,9 +1825,10 @@ def _attribute_partial_response(
         if not isinstance(item, dict):
             return unchanged
         instance_id = str(item.get("caption_instance_id") or "")
-        if not instance_id or instance_id in by_id:
-            return unchanged
-        if instance_id in wanted:
+        # The first answer for a caption stands; a second one is the
+        # provider contradicting itself, and letting the later item win
+        # would let a stray repeat overwrite an answer already given.
+        if instance_id in wanted and instance_id not in by_id:
             by_id[instance_id] = item
     answered = [
         entry for entry in pending if str(entry[1]["caption_instance_id"]) in by_id
