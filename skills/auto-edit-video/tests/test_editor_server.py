@@ -2703,6 +2703,155 @@ class EditorServerTests(unittest.TestCase):
         self.assert_batch_published_nothing(previous)
         self.assert_batch_staging_clean()
 
+    def test_batch_commit_failure_after_first_member_publishes_no_member(self) -> None:
+        """A batch commits at one point, so member two cannot strand member one.
+
+        Committing member by member makes each earlier member irreversible
+        before the batch knows the rest can commit: the second failure then
+        leaves a batch reported failed while member one stays downloadable.
+        """
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-partial-commit",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_write_marker = delivery_envelope._write_deferred_marker
+        committed_markers = 0
+
+        def fail_second_committed_marker(
+            *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            nonlocal committed_markers
+            if kwargs.get("state") == "committed":
+                committed_markers += 1
+                if committed_markers >= 2:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write_marker(*args, **kwargs)
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "_write_deferred_marker",
+                    side_effect=fail_second_committed_marker,
+                ),
+            )
+        )
+        self.assertGreaterEqual(committed_markers, 2)
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assert_batch_published_nothing(previous)
+        self.assert_batch_staging_clean()
+        self.assertFalse(
+            (self.project / delivery_envelope.BATCH_COMMIT_REL).is_dir()
+            and sorted(
+                (self.project / delivery_envelope.BATCH_COMMIT_REL).glob("*.json")
+            ),
+            "a rolled back batch left its commit record behind",
+        )
+
+    def test_batch_rollback_falls_back_when_quarantine_root_is_blocked(self) -> None:
+        """A blocked quarantine root may not keep tampered bytes public."""
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-must-survive-blocked-quarantine",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        quarantine_root = self.project / delivery_envelope.QUARANTINE_REL
+        quarantine_root.parent.mkdir(parents=True, exist_ok=True)
+        quarantine_root.write_bytes(b"planted-file-where-quarantine-root-should-be")
+        real_finalize = delivery_envelope.finalize_batch_envelope
+        tampered = b"tampered-after-batch-binding"
+
+        def tamper_after_finalize(
+            project_dir: Path, prepared: dict[str, object]
+        ) -> object:
+            result = real_finalize(project_dir, prepared)
+            for candidate in sorted((self.project / "renders").glob("01-*-final.mp4")):
+                candidate.write_bytes(tampered)
+            return result
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "finalize_batch_envelope",
+                    side_effect=tamper_after_finalize,
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed", failed)
+        self.assert_batch_published_nothing(previous)
+        self.assertTrue(quarantine_root.is_file(), "the planted path was overwritten")
+        fallback = self.project / delivery_envelope.QUARANTINE_FALLBACK_REL
+        quarantined = sorted(fallback.rglob("*.conflict")) if fallback.is_dir() else []
+        self.assertTrue(
+            any(item.read_bytes() == tampered for item in quarantined),
+            "the fallback quarantine did not receive the tampered member",
+        )
+
+    def test_batch_rollback_failure_reports_leaked_public_paths(self) -> None:
+        """A rollback that cannot reclaim bytes is reported, never swallowed."""
+        previous = {
+            "schema_version": 1,
+            "status": "pass",
+            "sentinel": "batch-previous-during-unclean-rollback",
+        }
+        self.write_json("working/latest_final_qa.json", previous)
+        real_finalize = delivery_envelope.finalize_batch_envelope
+        tampered = b"tampered-and-unreclaimable"
+
+        def tamper_after_finalize(
+            project_dir: Path, prepared: dict[str, object]
+        ) -> object:
+            result = real_finalize(project_dir, prepared)
+            for candidate in sorted((self.project / "renders").glob("01-*-final.mp4")):
+                candidate.write_bytes(tampered)
+            return result
+
+        failed, _clip_ids = self.run_batch_final_render(
+            patches=(
+                patch.object(
+                    delivery_envelope,
+                    "finalize_batch_envelope",
+                    side_effect=tamper_after_finalize,
+                ),
+                patch.object(
+                    delivery_envelope, "_open_quarantine_dir", return_value=None
+                ),
+                patch.object(
+                    delivery_envelope,
+                    "_discard_conflicting_destination",
+                    side_effect=OSError(errno.EIO, "quarantine and disposal both fail"),
+                ),
+            )
+        )
+        self.assertEqual(failed["state"], "failed_unclean", failed)
+        self.assertFalse(failed["previous_latest_preserved"])
+        leaked = [str(path) for path in failed["leaked_paths"]]
+        self.assertTrue(leaked, "an unclean rollback reported no leaked path")
+        self.assertTrue(
+            any("-final.mp4" in path for path in leaked),
+            leaked,
+        )
+        self.assertTrue(failed["rollback_errors"])
+        surviving = [
+            path
+            for path in (self.project / "renders").glob("*-final.mp4")
+            if path.read_bytes() == tampered
+        ]
+        self.assertTrue(
+            surviving, "this test only proves anything while bytes are leaked"
+        )
+        reported = {str((self.project / path).resolve()) for path in leaked}
+        for path in surviving:
+            self.assertIn(
+                str(path.resolve()),
+                reported,
+                "a leaked public path was left out of the batch status",
+            )
+
     def test_batch_member_mutated_after_binding_quarantines_and_rolls_back(self) -> None:
         """Bytes changed between binding and commit are quarantined, not shipped."""
         previous = {

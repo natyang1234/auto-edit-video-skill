@@ -32,6 +32,12 @@ DELIVERY_REL = Path("working/delivery_envelopes")
 STAGING_REL = DELIVERY_REL / ".staging"
 LOCKS_REL = STAGING_REL / ".locks"
 QUARANTINE_REL = DELIVERY_REL / ".quarantine"
+# Used only when the primary quarantine root cannot be opened (occupied by a
+# non-directory, unwritable, or out of space).  An abort must never leave
+# tampered bytes public just because the forensic copy has nowhere to go.
+QUARANTINE_FALLBACK_REL = DELIVERY_REL / ".quarantine-fallback"
+BATCH_COMMIT_REL = DELIVERY_REL / ".batch"
+BATCH_COMMIT_STATES = {"pending", "committed"}
 JOURNAL_NAME = "publication_journal.json"
 DEFERRED_NAME = "deferred_handoff.json"
 DEFERRED_MARKER_KEYS = {
@@ -185,6 +191,27 @@ class DeliveryEnvelopeError(RuntimeError):
     """Raised when a direct delivery cannot be proven safe to publish."""
 
 
+class DeferredAbortError(DeliveryEnvelopeError):
+    """A rollback could not reclaim every destination it had published.
+
+    ``leaked_paths`` names the public destinations that are still holding
+    bytes this attempt put there.  Callers must surface them: a silently
+    swallowed abort leaves tampered bytes downloadable while the batch only
+    reports ``failed``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        render_id: str,
+        leaked_paths: Sequence[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.render_id = render_id
+        self.leaked_paths: tuple[str, ...] = tuple(leaked_paths)
+
+
 def _safe_directory(path: Path, *, create: bool) -> None:
     try:
         metadata = path.lstat()
@@ -331,7 +358,7 @@ def _validate_staging_attempt(
 def _validate_deferred_publication(
     authority: DeferredPublication,
     *,
-    expected_state: str = "pending",
+    expected_state: str | None = "pending",
 ) -> DeferredPublication:
     if not isinstance(authority, DeferredPublication):
         raise DeliveryEnvelopeError("deferred publication authority is required")
@@ -1973,8 +2000,12 @@ def _write_deferred_marker(
     return marker
 
 
-def _deferred_restore_plan(authority: DeferredPublication) -> list[dict[str, Any]]:
-    validated = _validate_deferred_publication(authority)
+def _deferred_restore_plan(
+    authority: DeferredPublication,
+    *,
+    expected_state: str | None = "pending",
+) -> list[dict[str, Any]]:
+    validated = _validate_deferred_publication(authority, expected_state=expected_state)
     journal = _decode_json_snapshot(
         _snapshot_regular_file(
             _journal_path(validated.stage_dir),
@@ -2000,6 +2031,145 @@ def validate_deferred_publication(authority: DeferredPublication) -> None:
                 "deferred publication changed before handoff: "
                 f"{item['relative']}"
             )
+
+
+def _batch_commit_path(project_dir: Path, batch_id: str) -> Path:
+    if not RENDER_ID_PATTERN.fullmatch(batch_id):
+        raise DeliveryEnvelopeError(f"batch identity is invalid: {batch_id}")
+    return project_dir.resolve() / BATCH_COMMIT_REL / f"{batch_id}.json"
+
+
+def _validated_batch_commit_record(record: Any, *, path: Path) -> dict[str, Any] | None:
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != 1
+        or record.get("state") not in BATCH_COMMIT_STATES
+        or not isinstance(record.get("batch_id"), str)
+        or not isinstance(record.get("members"), list)
+        or not all(isinstance(member, str) for member in record["members"])
+    ):
+        raise DeliveryEnvelopeError(f"batch commit record is invalid: {path}")
+    return record
+
+
+def read_batch_commit_record(project_dir: Path, batch_id: str) -> dict[str, Any] | None:
+    """Return the batch's two-phase commit record, or None when unbound."""
+    path = _batch_commit_path(project_dir, batch_id)
+    if not path.is_file():
+        return None
+    return _validated_batch_commit_record(_read_json(path), path=path)
+
+
+def batch_commit_state_for_member(project_dir: Path, render_id: str) -> str | None:
+    """Return the commit state of the batch that owns ``render_id``.
+
+    A member marked committed inside its own stage is only truly committed once
+    the batch that pre-committed it bound itself.  Recovery therefore asks the
+    batch record, never the member marker alone.  A pending record wins over a
+    committed one: rolling back is the safe direction.
+    """
+    directory = project_dir.resolve() / BATCH_COMMIT_REL
+    if not directory.is_dir():
+        return None
+    found: str | None = None
+    for path in sorted(directory.glob("*.json")):
+        try:
+            record = _validated_batch_commit_record(_read_json(path), path=path)
+        except DeliveryEnvelopeError:
+            continue
+        if record is None or render_id not in record["members"]:
+            continue
+        if record["state"] == "pending":
+            return "pending"
+        found = record["state"]
+    return found
+
+
+def _write_batch_commit_record(
+    project_dir: Path,
+    batch_id: str,
+    members: Sequence[str],
+    *,
+    state: str,
+) -> dict[str, Any]:
+    if state not in BATCH_COMMIT_STATES:
+        raise DeliveryEnvelopeError("batch commit record state is invalid")
+    root = project_dir.resolve()
+    _safe_directory(root / DELIVERY_REL, create=True)
+    _safe_directory(root / BATCH_COMMIT_REL, create=True)
+    record = {
+        "schema_version": 1,
+        "state": state,
+        "batch_id": batch_id,
+        "members": [str(member) for member in members],
+    }
+    path = _batch_commit_path(root, batch_id)
+    _atomic_write_json(path, record)
+    _fsync_directory(path.parent)
+    return record
+
+
+def discard_batch_commit(project_dir: Path, batch_id: str) -> bool:
+    """Drop a batch record that never bound itself; refuse to drop a commit."""
+    path = _batch_commit_path(project_dir, batch_id)
+    try:
+        record = read_batch_commit_record(project_dir, batch_id)
+    except DeliveryEnvelopeError:
+        record = None
+    if record is not None and record["state"] == "committed":
+        return False
+    path.unlink(missing_ok=True)
+    return True
+
+
+def _open_quarantine_dir(project_dir: Path, render_id: str) -> Path | None:
+    """Open a quarantine directory, falling back before giving up on one."""
+    for relative in (QUARANTINE_REL, QUARANTINE_FALLBACK_REL):
+        root = project_dir / relative
+        try:
+            root.parent.mkdir(parents=True, exist_ok=True)
+            _safe_directory(root, create=True)
+            target = root / f"{render_id}-{uuid.uuid4().hex}"
+            target.mkdir(mode=0o700)
+            _safe_directory(target, create=False)
+        except (OSError, DeliveryEnvelopeError):
+            continue
+        return target
+    return None
+
+
+def _discard_conflicting_destination(item: dict[str, Any]) -> None:
+    """Last-resort disposal when no quarantine root can be opened.
+
+    Trade-off: the conflicting bytes are lost for forensics.  That is accepted
+    because the alternative is worse — the only other option is leaving bytes
+    this attempt did not vouch for sitting in the public delivery location.
+    """
+    destination = item["destination"]
+    try:
+        destination.unlink(missing_ok=True)
+    except OSError as exc:
+        raise DeliveryEnvelopeError(
+            f"deferred publication conflict could not be discarded: {item['relative']}"
+        ) from exc
+
+
+def _unreclaimed_public_paths(validated: DeferredPublication) -> list[str]:
+    """Best-effort list of destinations a failed abort could not restore."""
+    try:
+        plan = _deferred_restore_plan(validated, expected_state=None)
+    except (OSError, DeliveryEnvelopeError):
+        return [str(validated.expected_output)]
+    leaked: list[str] = []
+    for item in plan:
+        expected = item["prior_sha256"] if item["prior_exists"] else None
+        try:
+            current = _observed_destination_sha(item["destination"], label=item["relative"])
+        except (OSError, DeliveryEnvelopeError):
+            current = "unreadable"
+        if current != expected:
+            leaked.append(str(item["relative"]))
+    return leaked
 
 
 def _quarantine_conflicting_destination(
@@ -2050,11 +2220,34 @@ def _quarantine_conflicting_destination(
             )
 
 
-def abort_deferred_publication(authority: DeferredPublication) -> None:
-    """Restore exact prior destinations, quarantining conflicting current bytes."""
-    validated = _validate_deferred_publication(authority)
+def abort_deferred_publication(
+    authority: DeferredPublication,
+    *,
+    allow_precommitted: bool = False,
+) -> None:
+    """Restore exact prior destinations, quarantining conflicting current bytes.
+
+    ``allow_precommitted`` is for the batch route only: a member marked
+    committed inside its own stage is still rollback-only until the batch
+    commit record binds it, so the batch may undo it.  A member owned by a
+    committed batch is never rolled back.
+
+    A rollback that cannot reclaim every destination raises
+    ``DeferredAbortError`` carrying the leaked public paths.  It never returns
+    quietly with bytes still published.
+    """
+    expected_state = None if allow_precommitted else "pending"
+    validated = _validate_deferred_publication(authority, expected_state=expected_state)
+    if allow_precommitted:
+        if batch_commit_state_for_member(validated.project_dir, validated.render_id) == (
+            "committed"
+        ):
+            raise DeliveryEnvelopeError(
+                "a committed batch member cannot be rolled back: "
+                f"{validated.render_id}"
+            )
     try:
-        plan = _deferred_restore_plan(validated)
+        plan = _deferred_restore_plan(validated, expected_state=expected_state)
         conflicts = [
             item
             for item in plan
@@ -2067,14 +2260,9 @@ def abort_deferred_publication(authority: DeferredPublication) -> None:
         ]
         quarantine_dir: Path | None = None
         if conflicts:
-            quarantine_root = validated.project_dir / QUARANTINE_REL
-            quarantine_root.parent.mkdir(parents=True, exist_ok=True)
-            _safe_directory(quarantine_root, create=True)
-            quarantine_dir = quarantine_root / (
-                f"{validated.render_id}-{uuid.uuid4().hex}"
+            quarantine_dir = _open_quarantine_dir(
+                validated.project_dir, validated.render_id
             )
-            quarantine_dir.mkdir(mode=0o700)
-            _safe_directory(quarantine_dir, create=False)
 
         for index, item in enumerate(plan):
             destination = item["destination"]
@@ -2093,15 +2281,14 @@ def abort_deferred_publication(authority: DeferredPublication) -> None:
             }
             if item["current_conflict"] or current_sha not in permitted:
                 if quarantine_dir is None:
-                    raise DeliveryEnvelopeError(
-                        f"deferred publication conflict has no quarantine: {relative}"
+                    _discard_conflicting_destination(item)
+                else:
+                    _quarantine_conflicting_destination(
+                        validated,
+                        item,
+                        index=index,
+                        quarantine_dir=quarantine_dir,
                     )
-                _quarantine_conflicting_destination(
-                    validated,
-                    item,
-                    index=index,
-                    quarantine_dir=quarantine_dir,
-                )
                 current_sha = None
             if item["prior_exists"]:
                 if current_sha != item["prior_sha256"]:
@@ -2121,6 +2308,17 @@ def abort_deferred_publication(authority: DeferredPublication) -> None:
                     f"deferred publication abort verification failed: {relative}"
                 )
         _remove_stage(validated.stage_dir)
+    except DeferredAbortError:
+        raise
+    except (OSError, DeliveryEnvelopeError) as exc:
+        # Never let a failed rollback pass as "nothing happened": name every
+        # destination still holding this attempt's bytes so the caller can
+        # report the leak instead of swallowing it.
+        raise DeferredAbortError(
+            f"deferred publication rollback failed: {validated.render_id}: {exc}",
+            render_id=validated.render_id,
+            leaked_paths=_unreclaimed_public_paths(validated),
+        ) from exc
     finally:
         _release_staging_lease(
             validated.project_dir,
@@ -2134,6 +2332,20 @@ def commit_deferred_publication(authority: DeferredPublication) -> None:
 
     This protocol covers process death.  It does not claim host/power-loss
     ordering for every destination-directory rename.
+    """
+    validated = precommit_deferred_publication(authority)
+    _finish_committed_publication(validated)
+
+
+def precommit_deferred_publication(
+    authority: DeferredPublication,
+) -> DeferredPublication:
+    """Verify and mark a publication committable while it stays reversible.
+
+    Writing the committed marker destroys nothing: the stage, its backups and
+    the lease all survive, so the caller can still roll the publication back.
+    Splitting the commit here lets a batch verify every member before any
+    member becomes irreversible.
     """
     validated = _validate_deferred_publication(authority, expected_state="pending")
     # The lease is this attempt's only authority to roll back, so it is held
@@ -2149,6 +2361,10 @@ def commit_deferred_publication(authority: DeferredPublication) -> None:
         state="committed",
         transaction_id=validated._transaction_id,
     )
+    return validated
+
+
+def _finish_committed_publication(validated: DeferredPublication) -> None:
     try:
         _remove_stage(validated.stage_dir)
     except (OSError, DeliveryEnvelopeError):
@@ -2161,6 +2377,48 @@ def commit_deferred_publication(authority: DeferredPublication) -> None:
         validated.render_id,
         validated._owner_token,
     )
+
+
+def finish_committed_publication(authority: DeferredPublication) -> None:
+    """Idempotent cleanup of an already committed publication."""
+    validated = _validate_deferred_publication(authority, expected_state="committed")
+    _finish_committed_publication(validated)
+
+
+def commit_deferred_batch(
+    project_dir: Path,
+    batch_id: str,
+    publications: Sequence[DeferredPublication],
+) -> list[str]:
+    """Commit every member of a batch through one decision point.
+
+    Phase 1 pre-commits every member: each is verified and marked, and every
+    irreversible step is deferred.  Any failure here raises with the whole
+    batch still rollback-only.  Phase 2 flips one batch record to
+    ``committed`` — that single atomic write is what makes the batch
+    irreversible, and it is also what recovery reads to decide direction
+    (record committed: roll every member forward; record pending or absent:
+    roll every member back).  Phase 3 is replayable cleanup whose failures
+    are reported, never rolled back.
+    """
+    if not publications:
+        raise DeliveryEnvelopeError("a batch commit requires at least one member")
+    root = project_dir.resolve()
+    members = [publication.render_id for publication in publications]
+    _write_batch_commit_record(root, batch_id, members, state="pending")
+    validated = [
+        precommit_deferred_publication(publication) for publication in publications
+    ]
+    _write_batch_commit_record(root, batch_id, members, state="committed")
+    cleanup_errors: list[str] = []
+    for publication in validated:
+        try:
+            _finish_committed_publication(publication)
+        except (OSError, DeliveryEnvelopeError) as exc:
+            cleanup_errors.append(f"{publication.render_id}: {exc}")
+    if not cleanup_errors:
+        _batch_commit_path(root, batch_id).unlink(missing_ok=True)
+    return cleanup_errors
 
 
 def _compensate_restore_attempt(applied: list[dict[str, Any]]) -> None:
@@ -2349,6 +2607,27 @@ def _recover_stale_staging_locked(
             render_id,
             expected_output=expected_output,
         )
+        if marker["state"] == "committed" and (
+            batch_commit_state_for_member(root, render_id) == "pending"
+        ):
+            # Pre-committed for a batch that never bound itself: the member is
+            # still rollback-only, so recovery must undo it, not keep it.
+            journal = _decode_json_snapshot(
+                _snapshot_regular_file(
+                    _journal_path(stage),
+                    label=f"deferred publication journal {render_id}",
+                    capture_bytes=True,
+                )
+            )
+            _restore_journal(
+                root,
+                stage,
+                journal,
+                render_id=render_id,
+                expected_output=expected_output,
+            )
+            _remove_stage(stage)
+            return
         if marker["state"] == "committed":
             for item in plan:
                 if item["current_conflict"] or item["current_sha256"] != item["new_sha256"]:

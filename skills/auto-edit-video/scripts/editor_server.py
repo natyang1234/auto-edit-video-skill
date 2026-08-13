@@ -6126,6 +6126,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         pending: list[delivery_envelope.DeferredPublication] = []
         archive_published = False
         delivery_declared = False
+        commit_cleanup_pending: list[str] = []
         try:
             for index, job in enumerate(jobs, start=1):
                 current_clip_id = str(job["clip_id"])
@@ -6285,13 +6286,24 @@ class EditorHandler(BaseHTTPRequestHandler):
                     ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
                 )
                 delivery_envelope.finalize_batch_envelope(project_dir, prepared_batch)
-                # The batch is bound end to end; only now do the member
-                # publications become irreversible.
-                while pending:
-                    # Drop each publication as it commits so a failure part way
-                    # through only ever rolls back what is still reversible.
-                    delivery_envelope.commit_deferred_publication(pending[0])
-                    pending.pop(0)
+                # The batch is bound end to end.  commit_deferred_batch verifies
+                # and marks every member while the whole set is still
+                # reversible, then flips one batch record: that single write is
+                # the only point where members become irreversible, so a batch
+                # can never end up half published.
+                committing = list(pending)
+                pending.clear()
+                try:
+                    cleanup_errors = delivery_envelope.commit_deferred_batch(
+                        project_dir, batch_id, committing
+                    )
+                except (OSError, delivery_envelope.DeliveryEnvelopeError):
+                    # Nothing was bound: hand the members back for rollback.
+                    pending.extend(committing)
+                    raise
+                # Committed and public; any leftover stage cleanup is replayable
+                # and therefore reported, never rolled back.
+                commit_cleanup_pending = list(cleanup_errors)
                 final_approval = manifest.setdefault("approvals", {}).get("final")
                 if isinstance(final_approval, dict) and final_approval.get("approved"):
                     manifest["approvals"]["final"] = {
@@ -6343,6 +6355,10 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "approval_revisions": revisions,
                 "finished_at": now_utc(),
             }
+            if commit_cleanup_pending:
+                self.server.render_status["commit_cleanup_pending"] = (
+                    commit_cleanup_pending
+                )
         except (
             OSError,
             RuntimeError,
@@ -6352,12 +6368,34 @@ class EditorHandler(BaseHTTPRequestHandler):
         ) as exc:
             # A batch is one delivery: no member survives a failed batch, and
             # the previous publication has to come back byte for byte.
+            leaked_paths: list[str] = []
+            rollback_errors: list[str] = []
             for publication in reversed(pending):
                 try:
-                    delivery_envelope.abort_deferred_publication(publication)
-                except (OSError, delivery_envelope.DeliveryEnvelopeError):
-                    pass
+                    delivery_envelope.abort_deferred_publication(
+                        publication, allow_precommitted=True
+                    )
+                except (
+                    OSError,
+                    delivery_envelope.DeliveryEnvelopeError,
+                ) as rollback_error:
+                    # A rollback that failed is never silent: the public paths
+                    # it could not reclaim are named in the batch status.
+                    rollback_errors.append(
+                        f"{publication.render_id}: {rollback_error}"
+                    )
+                    paths = [
+                        str(path)
+                        for path in getattr(rollback_error, "leaked_paths", ())
+                    ] or [str(publication.expected_output)]
+                    leaked_paths.extend(
+                        path for path in paths if path not in leaked_paths
+                    )
             pending.clear()
+            try:
+                delivery_envelope.discard_batch_commit(project_dir, batch_id)
+            except (OSError, delivery_envelope.DeliveryEnvelopeError) as discard_error:
+                rollback_errors.append(f"{batch_id}: {discard_error}")
             if archive_published and not delivery_declared:
                 archive.unlink(missing_ok=True)
                 versioned_receipt.unlink(missing_ok=True)
@@ -6399,9 +6437,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "completed_clips": len(completed),
                 "total_clips": len(jobs),
                 "error": str(exc)[-1200:],
-                "previous_latest_preserved": True,
+                "previous_latest_preserved": not leaked_paths,
                 "completed_at": now_utc(),
             }
+            if leaked_paths or rollback_errors:
+                failure["rollback_errors"] = rollback_errors
+                failure["leaked_paths"] = leaked_paths
             try:
                 atomic_write_json(
                     self.server.project_dir
@@ -6412,9 +6453,13 @@ class EditorHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             self.server.render_status = {
-                "state": "qa_failed"
-                if str(exc).startswith("delivery QA failed")
-                else "failed",
+                "state": "failed_unclean"
+                if leaked_paths
+                else (
+                    "qa_failed"
+                    if str(exc).startswith("delivery QA failed")
+                    else "failed"
+                ),
                 "mode": "batch",
                 "message": str(exc)[-1200:],
                 "quality": "final",
@@ -6427,9 +6472,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "items": diagnostic_items,
                 "qa": failure,
                 "output": None,
-                "previous_latest_preserved": True,
+                "previous_latest_preserved": not leaked_paths,
                 "finished_at": now_utc(),
             }
+            if leaked_paths or rollback_errors:
+                self.server.render_status["rollback_errors"] = rollback_errors
+                self.server.render_status["leaked_paths"] = leaked_paths
         finally:
             archive_temporary.unlink(missing_ok=True)
 
