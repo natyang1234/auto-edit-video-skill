@@ -2118,6 +2118,74 @@ class EditorServerTests(unittest.TestCase):
             (self.project / f"working/delivery_envelopes/.staging/{render_id}").exists()
         )
 
+    def approve_current_final(self) -> str:
+        """Record the final approval a downloader must hold, for this revision."""
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        revision = gate_revision(self.project, "final", state)
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        manifest.setdefault("approvals", {})["final"] = {
+            "approved": True,
+            "confirmed_by": "unit-test",
+            "state_revision": revision,
+        }
+        self.write_json("project.json", manifest)
+        return revision
+
+    def test_single_final_download_requires_a_matching_finalized_envelope(self) -> None:
+        """Phase 4 final slice: publication binds bytes; consumption re-asks.
+
+        The single route publishes through a finalized envelope, but the
+        download gate only ever consulted receipts — so deleting or forging
+        the envelope after publication left the pointer downloadable.
+        """
+        completed = self.run_single_final_render()
+        self.assertEqual(completed["state"], "complete", completed)
+        render_id = str(completed["render_id"])
+        relative = f"renders/{completed['download_name']}"
+        self.approve_current_final()
+        self.assertEqual(render_download_errors(self.project, relative), [])
+
+        envelope_path = self.project / f"working/delivery_envelopes/{render_id}.json"
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        envelope_path.unlink()
+        errors = render_download_errors(self.project, relative)
+        self.assertTrue(
+            any("finalized delivery envelope" in item for item in errors),
+            f"a final with no finalized envelope stayed downloadable: {errors}",
+        )
+
+        # A forged envelope that vouches for different bytes must not unlock
+        # the pointer either: the published bytes are the binding.
+        forged = json.loads(json.dumps(envelope))
+        forged["artifacts"]["output"]["sha256"] = "0" * 64
+        self.write_json(f"working/delivery_envelopes/{render_id}.json", forged)
+        errors = render_download_errors(self.project, relative)
+        self.assertTrue(
+            any("finalized delivery envelope" in item for item in errors),
+            f"a forged envelope stayed downloadable: {errors}",
+        )
+
+        # Restoring the real envelope restores exactly the prior answer.
+        self.write_json(f"working/delivery_envelopes/{render_id}.json", envelope)
+        self.assertEqual(render_download_errors(self.project, relative), [])
+
+    def test_single_final_approval_requires_a_matching_finalized_envelope(self) -> None:
+        completed = self.run_single_final_render()
+        self.assertEqual(completed["state"], "complete", completed)
+        render_id = str(completed["render_id"])
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(editor_server.delivery_qa_errors(self.project, state), [])
+        (self.project / f"working/delivery_envelopes/{render_id}.json").unlink()
+        errors = editor_server.delivery_qa_errors(self.project, state)
+        self.assertTrue(
+            any("finalized delivery envelope" in item for item in errors),
+            f"final approval accepted a delivery with no envelope: {errors}",
+        )
+
     def test_single_route_crash_between_published_artifacts_restores_prior_state(self) -> None:
         previous = {
             "schema_version": 1,
@@ -2574,6 +2642,43 @@ class EditorServerTests(unittest.TestCase):
                 ).exists(),
                 member["render_id"],
             )
+
+    def test_batch_download_requires_a_matching_finalized_envelope(self) -> None:
+        """Phase 4 final slice: archive and members re-check their envelope."""
+        completed, _clip_ids = self.run_batch_final_render()
+        self.assertEqual(completed["state"], "complete", completed)
+        batch_id = str(completed["batch_id"])
+        delivery = json.loads(
+            (self.project / "working/latest_final_qa.json").read_text(encoding="utf-8")
+        )
+        archive_relative = str(delivery["archive"])
+        member_relative = str(delivery["items"][0]["output"])
+        self.approve_current_final()
+        self.assertEqual(render_download_errors(self.project, archive_relative), [])
+        self.assertEqual(render_download_errors(self.project, member_relative), [])
+
+        envelope_path = self.project / f"working/delivery_envelopes/{batch_id}.json"
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        envelope_path.unlink()
+        for relative in (archive_relative, member_relative):
+            errors = render_download_errors(self.project, relative)
+            self.assertTrue(
+                any("finalized delivery envelope" in item for item in errors),
+                f"{relative} stayed downloadable with no batch envelope: {errors}",
+            )
+
+        forged = json.loads(json.dumps(envelope))
+        forged["batch"]["members"][0]["output"]["sha256"] = "0" * 64
+        self.write_json(f"working/delivery_envelopes/{batch_id}.json", forged)
+        errors = render_download_errors(self.project, member_relative)
+        self.assertTrue(
+            any("finalized delivery envelope" in item for item in errors),
+            f"a forged batch envelope stayed downloadable: {errors}",
+        )
+
+        self.write_json(f"working/delivery_envelopes/{batch_id}.json", envelope)
+        self.assertEqual(render_download_errors(self.project, archive_relative), [])
+        self.assertEqual(render_download_errors(self.project, member_relative), [])
 
     def test_batch_member_mutated_after_render_publishes_no_member(self) -> None:
         previous = {
@@ -5703,6 +5808,62 @@ class EditorRendererTests(unittest.TestCase):
             receipt["report_sha256"], envelope["artifacts"]["qa_report"]["sha256"]
         )
         self.assert_no_variant_staging_residue()
+
+    def approve_variant_final(self, variant_id: str) -> None:
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        manifest.setdefault("approvals", {})["final_by_variant"] = {
+            variant_id: {
+                "approved": True,
+                "state_revision": editor_server.variant_gate_revision(
+                    self.project, "final", state, variant_id
+                ),
+            }
+        }
+        self.write_json("project.json", manifest)
+
+    def test_variant_download_requires_a_matching_finalized_envelope(self) -> None:
+        """Phase 4 final slice: the variant receipt names an envelope; check it.
+
+        The variant receipt has carried ``delivery_envelope`` since the route
+        was published through one, but the download gate never opened it —
+        deleting or forging the envelope left the variant downloadable.
+        """
+        variant_id = self.VARIANT_ROUTE_ID
+        self.approve_variant_timeline(variant_id)
+        output = self.project / "renders/variant-consumption.mp4"
+        self.render_variant_final(output, variant_id)
+        self.approve_variant_final(variant_id)
+        relative = "renders/variant-consumption.mp4"
+        self.assertEqual(
+            editor_server.render_download_errors(self.project, relative), []
+        )
+
+        render_id = f"variant-{variant_id}"
+        envelope_path = self.project / f"working/delivery_envelopes/{render_id}.json"
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        envelope_path.unlink()
+        errors = editor_server.render_download_errors(self.project, relative)
+        self.assertTrue(
+            any("finalized delivery envelope" in item for item in errors),
+            f"a variant final with no envelope stayed downloadable: {errors}",
+        )
+
+        forged = json.loads(json.dumps(envelope))
+        forged["artifacts"]["output"]["sha256"] = "0" * 64
+        self.write_json(f"working/delivery_envelopes/{render_id}.json", forged)
+        errors = editor_server.render_download_errors(self.project, relative)
+        self.assertTrue(
+            any("finalized delivery envelope" in item for item in errors),
+            f"a forged variant envelope stayed downloadable: {errors}",
+        )
+
+        self.write_json(f"working/delivery_envelopes/{render_id}.json", envelope)
+        self.assertEqual(
+            editor_server.render_download_errors(self.project, relative), []
+        )
 
     def test_variant_route_crash_between_published_artifacts_restores_prior_state(
         self,

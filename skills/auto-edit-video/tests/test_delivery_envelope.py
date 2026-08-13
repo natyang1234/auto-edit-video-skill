@@ -1,6 +1,7 @@
 """Phase 0b direct delivery-envelope tests."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -192,6 +193,104 @@ class DeliveryEnvelopeTests(unittest.TestCase):
                 "motion_evidence",
             ),
         )
+
+    def test_orphan_staging_sweep_recovers_a_stage_no_render_repeats(self) -> None:
+        """A crashed one-off render left its stage stranded forever.
+
+        Recovery only ran when the same render id was staged again, so the
+        rollback material for a render nobody repeats was never applied.
+        """
+        stage, sources, _prepared = self._stage()
+        self._simulate_crash(stage)
+        stage_dir = delivery_envelope.staging_path(self.project, self.render_id)
+        self.assertTrue(stage_dir.is_dir())
+        self.assertTrue(sources["output"].is_file())
+
+        skipped = delivery_envelope.sweep_orphan_staging(self.project)
+
+        self.assertEqual(skipped, [])
+        self.assertFalse(
+            stage_dir.exists(), "the stranded stage survived the startup sweep"
+        )
+        self._attempts.clear()
+
+    def test_orphan_staging_sweep_keeps_a_stage_it_cannot_identify(self) -> None:
+        staging = self.project / delivery_envelope.STAGING_REL
+        stranded = staging / "unidentifiable-render"
+        stranded.mkdir(parents=True)
+        (stranded / "candidate.mp4").write_bytes(b"no prepared envelope here")
+
+        skipped = delivery_envelope.sweep_orphan_staging(self.project)
+
+        self.assertTrue(any("unidentifiable-render" in item for item in skipped), skipped)
+        self.assertTrue(stranded.is_dir(), "an unidentifiable stage must not be deleted")
+
+    def test_direct_published_output_verifies_against_its_finalized_envelope(self) -> None:
+        """Phase 4 final slice: re-verify a published pointer after the run.
+
+        Publication binds bytes to one envelope; every later consumer has to
+        ask the same question again instead of trusting a pointer.
+        """
+        _finalized_path, _qa_path, finalized = self._publish_contextual_delivery()
+        published = str(finalized["artifacts"]["output"]["path"])
+        record = delivery_envelope.verify_published_output(
+            self.project,
+            self.render_id,
+            published,
+            expected_sha256=finalized["artifacts"]["output"]["sha256"],
+            expected_prepared_hash=finalized["prepared_envelope_hash"],
+        )
+        self.assertEqual(record["sha256"], finalized["artifacts"]["output"]["sha256"])
+
+    def test_direct_published_output_refuses_a_missing_finalized_envelope(self) -> None:
+        finalized_path, _qa_path, finalized = self._publish_contextual_delivery()
+        published = str(finalized["artifacts"]["output"]["path"])
+        finalized_path.unlink()
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "finalized delivery envelope"
+        ):
+            delivery_envelope.verify_published_output(
+                self.project, self.render_id, published
+            )
+
+    def test_direct_published_output_refuses_forged_and_swapped_bytes(self) -> None:
+        finalized_path, _qa_path, finalized = self._publish_contextual_delivery()
+        published = Path(str(finalized["artifacts"]["output"]["path"]))
+        # Bytes swapped under a still-valid envelope.
+        published.write_bytes(b"swapped-after-publication")
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "do not match"
+        ):
+            delivery_envelope.verify_published_output(
+                self.project, self.render_id, str(published)
+            )
+        # An envelope re-forged around the swapped bytes still fails: the
+        # receipt-side prepared hash and the declared digest disagree.
+        forged = json.loads(json.dumps(finalized))
+        forged["artifacts"]["output"]["sha256"] = hashlib.sha256(
+            published.read_bytes()
+        ).hexdigest()
+        forged["artifacts"]["output"]["bytes"] = published.stat().st_size
+        finalized_path.write_text(json.dumps(forged), encoding="utf-8")
+        with self.assertRaises(delivery_envelope.DeliveryEnvelopeError):
+            delivery_envelope.verify_published_output(
+                self.project,
+                self.render_id,
+                str(published),
+                expected_sha256=finalized["artifacts"]["output"]["sha256"],
+                expected_prepared_hash=finalized["prepared_envelope_hash"],
+            )
+
+    def test_direct_published_output_refuses_a_path_the_envelope_never_published(
+        self,
+    ) -> None:
+        _finalized_path, qa_path, _finalized = self._publish_contextual_delivery()
+        with self.assertRaisesRegex(
+            delivery_envelope.DeliveryEnvelopeError, "does not publish"
+        ):
+            delivery_envelope.verify_published_output(
+                self.project, self.render_id, str(qa_path)
+            )
 
     def test_contextual_snapshot_rejects_symlinked_finalized_envelope(self) -> None:
         finalized_path, _qa_path, _finalized = self._publish_contextual_delivery()

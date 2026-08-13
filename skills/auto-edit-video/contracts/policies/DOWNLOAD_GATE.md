@@ -27,6 +27,27 @@
   舊專案會被擋下，補救是**重新 render**（只重跑 `qa_video.py` 會讓報告位元組改變、
   `report_sha256` 對不上 receipt，撞到另一個錯誤）。
 
+### 第六條：finalized envelope 必須存在且對得上（2026-08-13 新增）
+四條路（direct／single／batch／variant）都是「先 publish 進 finalized envelope，才產生
+可消費指標」。發布時綁一次不夠——**消費時要再問一次同樣的問題**，否則刪掉 envelope
+等於把交付悄悄降級回「相信 receipt」。放行前另外檢查：
+- receipt 宣告的 `delivery_envelope` 必須位於 `working/delivery_envelopes/<id>.json`，
+  且 `<id>` 與 receipt 的 `render_id`／`batch_id` 一致；
+- 該 envelope `state == "finalized"`、`render_id` 相符、（有宣告時）
+  `prepared_envelope_hash` 與 receipt 相符；
+- 被下載的路徑必須真的由該 envelope 發布（`artifacts.output`，或 batch 的
+  `batch.members[].output`）；
+- **磁碟位元組的 SHA-256 等於 envelope 記載值**（不只等於 receipt 記載值）。
+任一條不成立 → 403，訊息一律 `... does not match its finalized delivery envelope`
+（不分辨失敗型態，避免當成探測介面）。核可閘（`delivery_qa_errors`）套用同一組規則。
+
+**Grandfather 條款（取捨）**：只有「receipt 本身宣告了 `delivery_envelope`」才強制。
+envelope 機制上線前發布的 final，其 receipt 沒有這個欄位，維持原本 receipt-only 閘，
+不必重 render。代價：能寫入 receipt 的攻擊者可以刪掉該欄位把自己降級成舊格式——但同
+一個攻擊者本來就能改 `output_sha256`，威脅模型內並未變差（本機同使用者程序不在防護
+範圍，見下方 CSRF 段）。若哪天要收掉這個條款，做法是專案層一次性 migration 標記
+（「本專案之後所有 final 都必須帶 envelope」），而不是逐 receipt 猜測年代。
+
 ## /qa/ 規則
 - final approval 尚未成立：可讀（人要先看 QA 才核可）。
 - final approval 成立後：僅 current receipt 關聯的 QA 檔（report、contact sheet）可讀，
@@ -36,3 +57,7 @@
 editor server 補齊 Host＋Origin＋CSRF 三件套（與 studio 對齊）。明確界線：CSRF 防
 **跨來源瀏覽器請求**；不防本機惡意程序直接連 loopback——那屬 OS 層信任邊界，
 不在本工具威脅模型內（一台跑多 agent 的機器應以 OS 使用者隔離處理）。
+
+## 七、訊息一致性的精確範圍（2026-08-13 驗證後修訂，取代 §六「不分辨失敗型態」的字面陳述）
+
+envelope 驗證失敗（state/id/prepared-hash/磁碟 sha256 不符、envelope 缺失）一律回統一訊息 `... does not match its finalized delivery envelope`。但三個 **receipt 自述型前置檢查**各有專屬訊息：envelope 欄位不可讀、envelope 路徑落在目錄外、envelope 名稱屬於他 render。此三者僅由 receipt 內容決定——同一路徑每次請求答案固定、下載端無任何可變輸入可探測，故不構成 probing oracle（第四輪對抗驗證 probe A14–A17/B11 實證）。另註：direct 路由由 `revalidate_finalized_delivery` 把關（早於本閘存在的等價機制），`verify_published_output` 的生產呼叫點為 single/batch/variant 三路由；variant receipt 原生無 render_id 欄位，其 id 一致性由 envelope 自身 render_id 與宣告檔名的比對承擔。

@@ -622,6 +622,70 @@ def _variant_report_errors(
     return errors
 
 
+FINALIZED_ENVELOPE_DIR = "working/delivery_envelopes"
+
+
+def _receipt_declared_digest(receipt: dict[str, Any], relative: str) -> str | None:
+    """The digest this receipt itself declares for one published path."""
+    for path_key, digest_key in (("output", "output_sha256"), ("archive", "archive_sha256")):
+        if str(receipt.get(path_key) or "") == relative:
+            declared = str(receipt.get(digest_key) or "")
+            return declared or None
+    return None
+
+
+def finalized_envelope_errors(
+    project_dir: Path,
+    receipt: dict[str, Any],
+    relative: str,
+    label: str,
+) -> list[str]:
+    """Re-verify one consumable pointer against the envelope its receipt names.
+
+    Publication binds bytes to a finalized envelope once; a download or a
+    final approval has to ask the same question again, or deleting the
+    envelope silently downgrades the delivery back to "trust the receipt".
+
+    Grandfather clause: only receipts that *declare* an envelope are held to
+    one.  Finals published before the envelope routes existed carry no
+    ``delivery_envelope`` field and keep their original receipt-only gate.
+    Everything the current renderer writes declares one, so for those a
+    missing or forged envelope fails closed rather than opening the gate.
+    """
+    declared = receipt.get("delivery_envelope")
+    if declared is None:
+        return []
+    if not isinstance(declared, str) or not declared:
+        return [f"{label} names an unreadable finalized delivery envelope"]
+    envelope_rel = Path(declared)
+    render_id = envelope_rel.stem
+    if (
+        envelope_rel.is_absolute()
+        or envelope_rel.parent.as_posix() != FINALIZED_ENVELOPE_DIR
+        or envelope_rel.name != f"{render_id}.json"
+    ):
+        return [f"{label} names a finalized delivery envelope outside its directory"]
+    receipt_id = str(receipt.get("render_id") or receipt.get("batch_id") or "")
+    if receipt_id and receipt_id != render_id:
+        return [f"{label} and its finalized delivery envelope name different renders"]
+    prepared_hash = receipt.get("prepared_envelope_hash")
+    try:
+        delivery_envelope.verify_published_output(
+            project_dir,
+            render_id,
+            relative,
+            expected_sha256=_receipt_declared_digest(receipt, relative),
+            expected_prepared_hash=prepared_hash
+            if isinstance(prepared_hash, str)
+            else None,
+        )
+    except (delivery_envelope.DeliveryEnvelopeError, OSError, ValueError):
+        # One message whatever went wrong: a caller must not be able to probe
+        # the project by reading the difference between the failure modes.
+        return [f"{label} does not match its finalized delivery envelope"]
+    return []
+
+
 def render_download_errors(project_dir: Path, relative: str) -> list[str]:
     """Server-side final download gate (contracts/policies/DOWNLOAD_GATE.md).
 
@@ -662,12 +726,25 @@ def render_download_errors(project_dir: Path, relative: str) -> list[str]:
             report_errors = _variant_report_errors(project_dir, receipt, variant_id, state)
             if report_errors:
                 return report_errors
-            return []
+            return finalized_envelope_errors(
+                project_dir, receipt, relative, f"variant {variant_id} final"
+            )
+    delivery_receipt = read_json(project_dir / LATEST_DELIVERY_QA_REL, None)
+    current = _delivery_receipt_paths(delivery_receipt, ("output", "archive"))
+    if relative in current:
+        # Answered before the approval slot, because a broken envelope binding
+        # is the more specific fact: an approval cannot be current under it
+        # either, and "no approval" would hide why.
+        envelope_errors = finalized_envelope_errors(
+            project_dir,
+            delivery_receipt if isinstance(delivery_receipt, dict) else {},
+            relative,
+            "final output",
+        )
+        if envelope_errors:
+            return envelope_errors
     if not approval_is_current(project_dir, manifest, "final", state):
         return ["final output requires a current final approval before download"]
-    current = _delivery_receipt_paths(
-        read_json(project_dir / LATEST_DELIVERY_QA_REL, None), ("output", "archive")
-    )
     if relative not in current:
         return ["final output is not part of the current delivery receipt"]
     return []
@@ -1647,6 +1724,11 @@ def single_delivery_qa_errors(
             )
         ):
             errors.append("delivery QA visual-quality contract does not match the current timeline")
+    errors.extend(
+        finalized_envelope_errors(
+            project_dir, receipt, str(receipt.get("output") or ""), "delivery QA output"
+        )
+    )
     return errors
 
 
@@ -1840,6 +1922,26 @@ def batch_delivery_qa_errors(
                         errors.append(f"batch delivery archive member {name} changed after verification")
         except (OSError, zipfile.BadZipFile, KeyError, RuntimeError):
             errors.append("batch delivery archive is unreadable")
+    # The aggregate envelope publishes the archive; each member publishes its
+    # own output.  Both bindings are re-checked, so a deleted or forged
+    # envelope locks the batch instead of leaving it approvable.
+    errors.extend(
+        finalized_envelope_errors(project_dir, receipt, archive_rel, "batch delivery archive")
+    )
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        member_output = str(item.get("output") or "")
+        if not member_output:
+            continue
+        errors.extend(
+            finalized_envelope_errors(
+                project_dir,
+                item,
+                member_output,
+                f"batch item {str(item.get('clip_id') or '') or index}",
+            )
+        )
     return errors
 
 
@@ -3352,6 +3454,11 @@ class EditorServer(ThreadingHTTPServer):
         # Complete exact legacy provenance migration before binding the HTTP
         # server so no GET/HEAD request can become a migration trigger.
         asset_registry.migrate_legacy_registry(resolved_project)
+        # Same boundary: recover stages a crashed render left behind before any
+        # request can read this project.  Recovery used to wait for the same
+        # render id to be staged again, which for a one-off render is never.
+        for skipped in delivery_envelope.sweep_orphan_staging(resolved_project):
+            print(f"[editor] stranded delivery stage kept: {skipped}", file=sys.stderr)
         super().__init__(address, EditorHandler)
         self.project_dir = resolved_project
         # Per-server CSRF token; browsers learn it from GET /api/project and
@@ -6078,6 +6185,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "contact_sheet_sha256": file_sha256(qa_contact),
                 "render_receipt": str(render_receipt_path.relative_to(self.server.project_dir)),
                 "render_receipt_sha256": file_sha256(render_receipt_path),
+                # Each member names the envelope that published it; the batch
+                # envelope binds the same bytes again as an aggregate.
+                "delivery_envelope": f"{FINALIZED_ENVELOPE_DIR}/{render_id}.json",
+                "prepared_envelope_hash": publication.finalized.get(
+                    "prepared_envelope_hash"
+                ),
                 "warnings": qa_payload.get("warnings", []),
                 "failures": qa_payload.get("failures", []),
                 "visual_quality": visual_quality,
@@ -6257,6 +6370,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "items": completed,
                     "archive": str(archive.relative_to(self.server.project_dir)),
                     "archive_sha256": file_sha256(archive),
+                    # Only the path: the aggregate envelope hashes this very
+                    # receipt, so it cannot also carry the envelope's hash.
+                    "delivery_envelope": f"{FINALIZED_ENVELOPE_DIR}/{batch_id}.json",
                     "archive_download_name": archive_name,
                     "warnings": [
                         {"clip_id": item["clip_id"], "items": item.get("warnings", [])}
@@ -6635,6 +6751,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     }
                     return
 
+            envelope_binding: dict[str, Any] = {}
             if quality == "final":
                 if staging is None or staged_qa_report is None or staged_contact is None:
                     raise RuntimeError("final render has no staged delivery evidence")
@@ -6675,6 +6792,13 @@ class EditorHandler(BaseHTTPRequestHandler):
                 published = True
                 staging = None
                 output_sha = str(finalized["artifacts"]["output"]["sha256"])
+                # The receipt names the envelope that published these bytes so
+                # every later consumer can re-verify the binding instead of
+                # trusting the pointer.
+                envelope_binding = {
+                    "delivery_envelope": f"{FINALIZED_ENVELOPE_DIR}/{render_id}.json",
+                    "prepared_envelope_hash": finalized.get("prepared_envelope_hash"),
+                }
             else:
                 output_sha = file_sha256(temporary)
                 os.replace(temporary, output)
@@ -6716,6 +6840,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "contact_sheet_sha256": file_sha256(qa_contact),
                     "render_receipt": str(render_receipt_path.relative_to(self.server.project_dir)),
                     "render_receipt_sha256": file_sha256(render_receipt_path),
+                    **envelope_binding,
                     "warnings": qa_payload.get("warnings", []),
                     "failures": qa_payload.get("failures", []),
                     "visual_quality": visual_quality,

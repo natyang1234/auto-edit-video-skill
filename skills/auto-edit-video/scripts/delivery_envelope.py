@@ -1605,6 +1605,95 @@ def revalidate_finalized_delivery(snapshot: FinalizedDeliverySnapshot) -> None:
         )
 
 
+def _published_output_binding(
+    root: Path, envelope: Mapping[str, Any], target: Path
+) -> dict[str, Any] | None:
+    """Find the envelope record that published exactly ``target``.
+
+    A batch envelope publishes an archive *and* every member output, so one
+    lookup has to cover both or the member pointers stay unbound.
+    """
+    records: list[Any] = [(envelope.get("artifacts") or {}).get("output")]
+    batch = envelope.get("batch")
+    if isinstance(batch, dict):
+        for member in batch.get("members") or []:
+            if isinstance(member, dict):
+                records.append(member.get("output"))
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            bound = _destination_path(root, path, allow_external=path.startswith("/"))
+        except DeliveryEnvelopeError:
+            continue
+        if bound == target:
+            return record
+    return None
+
+
+def verify_published_output(
+    project_dir: Path,
+    render_id: str,
+    relative: str,
+    *,
+    expected_sha256: str | None = None,
+    expected_prepared_hash: str | None = None,
+) -> dict[str, Any]:
+    """Re-verify one consumable pointer against its finalized envelope.
+
+    Publication binds bytes to an envelope exactly once; every later consumer
+    — a download, a final approval, a hand-off — has to ask the same question
+    again rather than trusting the pointer that survived.  A pointer whose
+    envelope is gone, whose envelope does not publish it, or whose bytes no
+    longer hash to what was published is refused here.
+    """
+    root = Path(project_dir).resolve()
+    envelope_path = finalized_path(root, render_id)
+    if envelope_path.is_symlink() or envelope_path.resolve() != envelope_path:
+        raise DeliveryEnvelopeError("finalized delivery envelope path is aliased")
+    if not envelope_path.is_file():
+        raise DeliveryEnvelopeError(
+            f"there is no finalized delivery envelope for {render_id}"
+        )
+    envelope = _read_json(envelope_path)
+    _validate_envelope_structure(envelope, expected_state="finalized")
+    if envelope.get("render_id") != render_id:
+        raise DeliveryEnvelopeError(
+            "finalized delivery envelope identity does not match its pointer"
+        )
+    if (
+        expected_prepared_hash is not None
+        and envelope.get("prepared_envelope_hash") != expected_prepared_hash
+    ):
+        raise DeliveryEnvelopeError(
+            "finalized delivery envelope is not the one that published these bytes"
+        )
+    if not isinstance(relative, str) or not relative:
+        raise DeliveryEnvelopeError("published pointer is empty")
+    target = _destination_path(root, relative, allow_external=relative.startswith("/"))
+    record = _published_output_binding(root, envelope, target)
+    if record is None:
+        raise DeliveryEnvelopeError(
+            f"the finalized delivery envelope does not publish {relative}"
+        )
+    if expected_sha256 is not None and expected_sha256 != record.get("sha256"):
+        raise DeliveryEnvelopeError(
+            "pointer and finalized delivery envelope disagree about the published bytes"
+        )
+    if target.is_symlink() or not target.is_file():
+        raise DeliveryEnvelopeError(f"published bytes are missing: {relative}")
+    if _sha256(target) != record.get("sha256") or target.stat().st_size != record.get(
+        "bytes"
+    ):
+        raise DeliveryEnvelopeError(
+            f"published bytes do not match the finalized delivery envelope: {relative}"
+        )
+    return dict(record)
+
+
 @contextmanager
 def finalized_delivery_handoff(
     snapshot: FinalizedDeliverySnapshot,
@@ -2686,6 +2775,58 @@ def recover_stale_staging(
         )
     finally:
         _release_staging_lease(root, render_id, owner_token)
+
+
+def _staged_expected_output(project_dir: Path, stage: Path) -> Path | None:
+    """The output a stranded stage was publishing, from its own private files."""
+    for name, reader in (
+        (DEFERRED_NAME, lambda payload: payload.get("expected_output")),
+        (
+            PREPARED_NAME,
+            lambda payload: ((payload.get("artifacts") or {}).get("output") or {}).get(
+                "path"
+            ),
+        ),
+    ):
+        path = stage / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            declared = reader(_read_json(path))
+        except (DeliveryEnvelopeError, AttributeError):
+            continue
+        if isinstance(declared, str) and declared:
+            entry = Path(declared)
+            return entry if entry.is_absolute() else project_dir / entry
+    return None
+
+
+def sweep_orphan_staging(project_dir: Path) -> list[str]:
+    """Recover every stage no live render still owns.
+
+    A crashed renderer leaves a private stage behind holding the rollback
+    material for a half-published delivery.  Recovery only ran when the same
+    render id was staged again, so a stage for a render nobody repeats stayed
+    stranded forever.  Stages a live render still holds keep their lease and
+    are reported, never touched.
+    """
+    root = Path(project_dir).resolve()
+    staging = root / STAGING_REL
+    if not staging.is_dir():
+        return []
+    skipped: list[str] = []
+    for entry in sorted(staging.iterdir()):
+        if entry.name.startswith(".") or entry.is_symlink() or not entry.is_dir():
+            continue
+        expected = _staged_expected_output(root, entry)
+        if expected is None:
+            skipped.append(f"{entry.name}: the stranded stage declares no output")
+            continue
+        try:
+            recover_stale_staging(root, entry.name, expected_output=expected)
+        except (DeliveryEnvelopeError, OSError, ValueError) as exc:
+            skipped.append(f"{entry.name}: {exc}")
+    return skipped
 
 
 def begin_staging(
