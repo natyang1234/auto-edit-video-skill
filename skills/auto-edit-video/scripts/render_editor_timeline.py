@@ -2397,6 +2397,11 @@ def render_project(
     defer_delivery_handoff: bool = False,
 ) -> delivery_envelope.DeferredPublication | None:
     direct_final = quality == "final" and snapshot_path is None and variant_id is None
+    # Phase 4 sub-slice 3: a variant final is a single, self-contained delivery
+    # exactly like the direct route — one output, its own per-variant evidence,
+    # no cross-render aggregate.  It therefore reuses the same staging/journal/
+    # CAS machinery rather than the batch route's deferred two-phase commit.
+    variant_final = quality == "final" and variant_id is not None
     if defer_delivery_handoff and not direct_final:
         raise ValueError("deferred delivery handoff requires a direct final render")
     render_id: str | None = None
@@ -2453,6 +2458,7 @@ def render_project(
         snapshot_payload = read_json(snapshot_path, {}) or {}
         render_id = str(snapshot_payload.get("render_id") or "") or None
     direct_stage: delivery_envelope.StagingAttempt | None = None
+    variant_stage: delivery_envelope.StagingAttempt | None = None
     caption_v2_artifact: dict[str, Any] | None = None
     staged_sfx: tuple[Path, Path, Path] | None = None
     sfx_bindings: tuple[str, str] | None = None
@@ -2479,6 +2485,10 @@ def render_project(
                     "caption_binding_missing",
                     "required translated captions need the caption compositor",
                 )
+    elif variant_final:
+        # The candidate lives in the staging directory opened below; nothing
+        # public is created until the finalized envelope binds it.
+        output.parent.mkdir(parents=True, exist_ok=True)
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.parent / f".{output.stem}.{uuid.uuid4().hex}.part.mp4"
@@ -2500,6 +2510,15 @@ def render_project(
                 )
                 motion_base_output = direct_stage / "motion_base_visual.mkv"
             temporary = direct_stage / delivery_envelope.STAGE_FILENAMES["output"]
+        elif variant_final:
+            if render_id is None:
+                raise RuntimeError("variant final render has no delivery identity")
+            variant_stage = delivery_envelope.begin_staging(
+                project_dir,
+                render_id,
+                expected_output=output,
+            )
+            temporary = variant_stage / delivery_envelope.STAGE_FILENAMES["output"]
         if temporary is None:
             raise RuntimeError("render output staging was not initialized")
         visual_source: Path | None = None
@@ -2623,9 +2642,10 @@ def render_project(
                     raw_visual_evidence,
                 )
                 raw_visual_evidence["motion_probes"] = motion_probes
+            publication_stage = direct_stage if direct_stage is not None else variant_stage
             evidence_output = (
-                direct_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
-                if direct_stage is not None
+                publication_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
+                if publication_stage is not None
                 else rendered_visual_evidence_path(project_dir, render_id)
             )
             atomic_write_json(
@@ -2635,20 +2655,62 @@ def render_project(
                     visual_authority.public if visual_authority is not None else None,
                 ),
             )
-        if variant_id and quality == "final":
-            # QA runs on the temporary output; only a passing QA publishes
-            # the file + receipt together (no receipt-less final on disk).
-            if render_id is None:
+        if variant_final:
+            # QA runs on the still-private candidate; only a passing QA mints a
+            # prepared envelope, and only publication makes any byte public.
+            if render_id is None or variant_stage is None or variant_id is None:
                 raise RuntimeError("variant final render has no visual evidence identity")
-            receipt = qa_variant_output(
+            staged_report = variant_stage / delivery_envelope.STAGE_FILENAMES["qa_report"]
+            staged_contact = (
+                variant_stage / delivery_envelope.STAGE_FILENAMES["contact_sheet"]
+            )
+            staged_evidence = (
+                variant_stage / delivery_envelope.STAGE_FILENAMES["visual_evidence"]
+            )
+            qa_variant_output(
                 project_dir,
                 temporary,
                 variant_id,
-                rendered_visual_evidence_path(project_dir, render_id),
+                staged_evidence,
                 state,
+                report_path=staged_report,
+                contact_path=staged_contact,
             )
-            os.replace(temporary, output)
-            finalize_variant_delivery_receipt(project_dir, receipt, output, variant_id)
+            # The delivered report names the public output it vouches for, and
+            # the prepared envelope freezes those bytes, so bind it before.
+            report_payload = read_json(staged_report, {}) or {}
+            report_payload["video"] = str(output.expanduser().resolve())
+            atomic_write_json(staged_report, report_payload)
+            staged_sources = {
+                "output": temporary,
+                "qa_report": staged_report,
+                "contact_sheet": staged_contact,
+                "visual_evidence": staged_evidence,
+                "motion_evidence": staged_evidence,
+            }
+            prepared = delivery_envelope.build_prepared_envelope(
+                project_dir,
+                render_id,
+                output,
+                state,
+                staged_sources,
+                renderer_script=Path(__file__).resolve(),
+                ffmpeg_executable=Path(ffmpeg_path()).expanduser().resolve(),
+                route="variant",
+            )
+            delivery_envelope.write_prepared_envelope(variant_stage.stage_dir, prepared)
+            publication_attempted = True
+            finalized = delivery_envelope.publish_direct_delivery(
+                project_dir,
+                variant_stage,
+                staged_sources=staged_sources,
+                expected_output=output,
+            )
+            published = True
+            variant_stage = None
+            finalize_variant_delivery_receipt(
+                project_dir, finalized, output, variant_id
+            )
         elif direct_final:
             if render_id is None or direct_stage is None:
                 raise RuntimeError("direct final render has no visual evidence identity")
@@ -2869,17 +2931,18 @@ def render_project(
                     except OSError as exc:
                         cleanup_errors.append(("temporary output cleanup", exc))
             finally:
+                open_stage = direct_stage if direct_stage is not None else variant_stage
                 if (
-                    direct_final
+                    (direct_final or variant_final)
                     and render_id is not None
-                    and direct_stage is not None
+                    and open_stage is not None
                     and not published
                 ):
                     try:
                         delivery_envelope.discard_staging(
                             project_dir,
                             render_id,
-                            authority=direct_stage,
+                            authority=open_stage,
                         )
                     except Exception as exc:
                         cleanup_errors.append(("staging discard", exc))
@@ -3142,6 +3205,8 @@ def qa_variant_output(
     variant_id: str,
     visual_evidence_path: Path,
     state: dict[str, Any] | None = None,
+    report_path: Path | None = None,
+    contact_path: Path | None = None,
 ) -> dict[str, Any]:
     return qa_unpublished_output(
         project_dir,
@@ -3150,6 +3215,8 @@ def qa_variant_output(
         visual_evidence_path,
         "variant",
         state,
+        report_path=report_path,
+        contact_path=contact_path,
     )
 
 
@@ -3192,11 +3259,15 @@ def qa_direct_final_output(
 
 def finalize_variant_delivery_receipt(
     project_dir: Path,
-    qa_receipt: dict[str, Any],
+    finalized: dict[str, Any],
     output: Path,
     variant_id: str,
 ) -> None:
-    """Per-variant delivery receipt (plan v2 B4): no single-slot clobbering."""
+    """Per-variant delivery receipt (plan v2 B4): no single-slot clobbering.
+
+    Phase 4 sub-slice 3: the pointer is minted *from* the finalized delivery
+    envelope, so a receipt can never name bytes the envelope did not publish.
+    """
     from editor_server import (
         VARIANT_DELIVERY_REL,
         VARIANT_SNAPSHOTS_REL,
@@ -3204,6 +3275,19 @@ def finalize_variant_delivery_receipt(
         read_json as server_read_json,
     )
 
+    if finalized.get("state") != "finalized" or finalized.get("route") != "variant":
+        raise RuntimeError("variant receipt requires a finalized variant envelope")
+    artifacts = finalized.get("artifacts") or {}
+
+    def _artifact(name: str) -> dict[str, Any]:
+        item = artifacts.get(name)
+        if not isinstance(item, dict):
+            raise RuntimeError(f"finalized variant envelope has no {name} artifact")
+        return item
+
+    report_item = _artifact("qa_report")
+    contact_item = _artifact("contact_sheet")
+    report = server_read_json(project_dir / str(report_item["path"]), {}) or {}
     snapshot = server_read_json(
         project_dir / VARIANT_SNAPSHOTS_REL / f"{variant_id}.json", {}
     )
@@ -3214,7 +3298,16 @@ def finalize_variant_delivery_receipt(
         "snapshot_hash": (snapshot or {}).get("snapshot_hash"),
         "status": "pass",
         "output": output.relative_to(project_dir).as_posix(),
-        **qa_receipt,
+        "output_sha256": _artifact("output")["sha256"],
+        "report": str(report_item["path"]),
+        "report_sha256": report_item["sha256"],
+        "contact_sheet": str(contact_item["path"]),
+        "contact_sheet_sha256": contact_item["sha256"],
+        "visual_delivery": report.get("visual_delivery"),
+        "delivery_envelope": delivery_envelope.finalized_path(project_dir, str(finalized["render_id"]))
+        .relative_to(project_dir)
+        .as_posix(),
+        "prepared_envelope_hash": finalized.get("prepared_envelope_hash"),
     }
     delivery_dir = project_dir / VARIANT_DELIVERY_REL
     delivery_dir.mkdir(parents=True, exist_ok=True)

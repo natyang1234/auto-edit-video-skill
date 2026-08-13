@@ -5586,3 +5586,203 @@ class EditorRendererTests(unittest.TestCase):
             ),
             "master edit must re-lock the variant download",
         )
+
+    # ------------------------------------------------------------------
+    # Phase 4 sub-slice 3: variant route finalized envelope
+    # ------------------------------------------------------------------
+
+    VARIANT_ROUTE_ID = "landscape-yt"
+
+    def approve_variant_timeline(self, variant_id: str | None = None) -> dict[str, object]:
+        """Give one landscape variant a current per-variant timeline approval."""
+        variant_id = variant_id or self.VARIANT_ROUTE_ID
+        state = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state["variants"] = [
+            {
+                "variant_id": variant_id,
+                "preset_id": "youtube-landscape",
+                "overrides": [],
+            }
+        ]
+        self.write_json("working/editor_state.json", state)
+        manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        manifest.setdefault("approvals", {})["timeline_by_variant"] = {
+            variant_id: {
+                "approved": True,
+                "state_revision": editor_server.variant_gate_revision(
+                    self.project, "timeline", state, variant_id
+                ),
+            }
+        }
+        self.write_json("project.json", manifest)
+        return state
+
+    def variant_public_state(self, variant_id: str, output: Path) -> dict[str, object]:
+        """Every public byte the variant route may touch, for bit-comparison."""
+        render_id = f"variant-{variant_id}"
+        watched = {
+            "output": output,
+            "envelope": self.project / f"working/delivery_envelopes/{render_id}.json",
+            "receipt": self.project / f"working/delivery_qa/{variant_id}.json",
+            "qa_report": self.project / f"qa/{render_id}.json",
+            "contact_sheet": self.project / f"qa/{render_id}-contact.png",
+            "visual_evidence": (
+                self.project / f"working/render_visual_evidence/{render_id}.json"
+            ),
+        }
+        return {
+            name: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            for name, path in watched.items()
+        }
+
+    def render_variant_final(self, output: Path, variant_id: str | None = None) -> None:
+        """In-process variant final render so faults can be injected."""
+        render_editor_timeline.render_project(
+            self.project.resolve(),
+            output.resolve(),
+            "final",
+            variant_id=variant_id or self.VARIANT_ROUTE_ID,
+        )
+
+    def assert_no_variant_staging_residue(self) -> None:
+        staging = self.project / "working/delivery_envelopes/.staging"
+        residue = (
+            [entry.name for entry in staging.iterdir() if entry.name != ".locks"]
+            if staging.is_dir()
+            else []
+        )
+        self.assertEqual(residue, [])
+
+    def test_variant_final_publishes_only_through_finalized_envelope(self) -> None:
+        """Phase 4: a downloadable variant final needs a finalized envelope.
+
+        Today the variant route ``os.replace``s the candidate into place and
+        writes its own receipt, so a consumer can download bytes that no
+        finalized delivery envelope ever bound.
+        """
+        variant_id = self.VARIANT_ROUTE_ID
+        self.approve_variant_timeline(variant_id)
+        output = self.project / "renders/variant-envelope.mp4"
+        self.run_renderer(
+            "--quality", "final", "--output", str(output), "--variant", variant_id
+        )
+
+        render_id = f"variant-{variant_id}"
+        envelope_path = self.project / f"working/delivery_envelopes/{render_id}.json"
+        self.assertTrue(
+            envelope_path.is_file(),
+            "variant route published a downloadable final without a finalized envelope",
+        )
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["state"], "finalized")
+        self.assertEqual(envelope["route"], "variant")
+        self.assertEqual(envelope["render_id"], render_id)
+        self.assertIsInstance(envelope["prepared_envelope_hash"], str)
+        self.assertEqual(
+            contract_registry.validate_artifact("delivery_envelope", envelope), []
+        )
+        published_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+        self.assertEqual(envelope["artifacts"]["output"]["sha256"], published_sha)
+        for name in ("qa_report", "contact_sheet", "visual_evidence", "motion_evidence"):
+            item = envelope["artifacts"][name]
+            self.assertIsInstance(item, dict, name)
+            artifact = self.project / str(item["path"])
+            self.assertTrue(artifact.is_file(), name)
+            self.assertEqual(
+                hashlib.sha256(artifact.read_bytes()).hexdigest(), item["sha256"], name
+            )
+        receipt = json.loads(
+            (self.project / f"working/delivery_qa/{variant_id}.json").read_text("utf-8")
+        )
+        self.assertEqual(receipt["variant_id"], variant_id)
+        self.assertEqual(receipt["output_sha256"], published_sha)
+        self.assertEqual(receipt["report"], envelope["artifacts"]["qa_report"]["path"])
+        self.assertEqual(
+            receipt["report_sha256"], envelope["artifacts"]["qa_report"]["sha256"]
+        )
+        self.assert_no_variant_staging_residue()
+
+    def test_variant_route_crash_between_published_artifacts_restores_prior_state(
+        self,
+    ) -> None:
+        variant_id = self.VARIANT_ROUTE_ID
+        self.approve_variant_timeline(variant_id)
+        output = self.project / "renders/variant-crash.mp4"
+        self.render_variant_final(output)
+        previous = self.variant_public_state(variant_id, output)
+        self.assertIsNotNone(previous["envelope"])
+
+        real_copy = delivery_envelope._copy_atomic
+        copies = 0
+
+        def crash_after_first_copy(source: Path, destination: Path) -> None:
+            nonlocal copies
+            copies += 1
+            if copies > 1:
+                raise OSError("synthetic power loss between published artifacts")
+            real_copy(source, destination)
+
+        with patch.object(
+            delivery_envelope, "_copy_atomic", side_effect=crash_after_first_copy
+        ):
+            with self.assertRaises((OSError, RuntimeError, ValueError)):
+                self.render_variant_final(output)
+
+        self.assertEqual(self.variant_public_state(variant_id, output), previous)
+        self.assert_no_variant_staging_residue()
+
+    def test_variant_route_candidate_mutated_after_prepared_envelope_never_publishes(
+        self,
+    ) -> None:
+        variant_id = self.VARIANT_ROUTE_ID
+        self.approve_variant_timeline(variant_id)
+        output = self.project / "renders/variant-tamper.mp4"
+        self.render_variant_final(output)
+        previous = self.variant_public_state(variant_id, output)
+
+        real_write = delivery_envelope.write_prepared_envelope
+
+        def tamper_after_prepared(stage_dir: Path, envelope: dict[str, object]) -> Path:
+            written = real_write(stage_dir, envelope)
+            candidate = Path(stage_dir) / delivery_envelope.STAGE_FILENAMES["output"]
+            candidate.write_bytes(candidate.read_bytes() + b"tampered-after-prepare")
+            return written
+
+        with patch.object(
+            delivery_envelope,
+            "write_prepared_envelope",
+            side_effect=tamper_after_prepared,
+        ):
+            with self.assertRaises(delivery_envelope.DeliveryEnvelopeError) as caught:
+                self.render_variant_final(output)
+
+        self.assertIn("hash/size mismatch", str(caught.exception))
+        self.assertEqual(self.variant_public_state(variant_id, output), previous)
+        self.assert_no_variant_staging_residue()
+
+    def test_variant_route_finalize_failure_restores_previous_publication(self) -> None:
+        variant_id = self.VARIANT_ROUTE_ID
+        self.approve_variant_timeline(variant_id)
+        output = self.project / "renders/variant-finalize.mp4"
+        self.render_variant_final(output)
+        previous = self.variant_public_state(variant_id, output)
+
+        real_atomic = delivery_envelope._atomic_write_json
+
+        def fail_finalized_envelope(path: Path, payload: object) -> None:
+            if Path(path).parent.name == "delivery_envelopes":
+                raise OSError("synthetic finalize failure")
+            real_atomic(path, payload)
+
+        with patch.object(
+            delivery_envelope,
+            "_atomic_write_json",
+            side_effect=fail_finalized_envelope,
+        ):
+            with self.assertRaises((OSError, RuntimeError, ValueError)):
+                self.render_variant_final(output)
+
+        self.assertEqual(self.variant_public_state(variant_id, output), previous)
+        self.assert_no_variant_staging_residue()

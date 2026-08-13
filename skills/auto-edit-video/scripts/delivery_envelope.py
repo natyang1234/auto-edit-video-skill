@@ -52,7 +52,7 @@ DEFERRED_MARKER_KEYS = {
     "binding_sha256",
 }
 DEFERRED_MARKER_STATES = {"pending", "committed"}
-ROUTES = ("direct", "single", "batch")
+ROUTES = ("direct", "single", "batch", "variant")
 PREPARED_NAME = "prepared.json"
 FINALIZED_NAME = "{render_id}.json"
 ARTIFACT_NAMES = (

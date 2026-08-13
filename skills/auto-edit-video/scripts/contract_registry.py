@@ -989,6 +989,42 @@ def _semantic_batch_binding(batch) -> list[str]:
     return errors
 
 
+VARIANT_RENDER_ID = re.compile(r"^variant-[A-Za-z0-9_-]{1,110}$")
+
+
+def _semantic_variant_binding(artifact, *, aggregate: bool) -> list[str]:
+    """One variant, one render identity, and canonical per-variant evidence."""
+    errors: list[str] = []
+    if aggregate:
+        errors.append("$.batch: the variant route delivers a single variant, not an aggregate")
+    render_id = artifact.get("render_id")
+    if not isinstance(render_id, str) or VARIANT_RENDER_ID.fullmatch(render_id) is None:
+        errors.append(
+            "$.render_id: variant deliveries must be identified as variant-<variant_id>"
+        )
+        return errors
+    artifacts = artifact.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return errors
+    # A variant receipt is resolved by render identity; a mismatched evidence
+    # destination would let one variant vouch for another variant's bytes.
+    for name, template in (
+        ("qa_report", "qa/{render_id}.json"),
+        ("contact_sheet", "qa/{render_id}-contact.png"),
+        ("visual_evidence", "working/render_visual_evidence/{render_id}.json"),
+        ("motion_evidence", "working/render_visual_evidence/{render_id}.json"),
+    ):
+        item = artifacts.get(name)
+        if not isinstance(item, dict):
+            continue
+        expected = template.format(render_id=render_id)
+        if item.get("path") != expected:
+            errors.append(
+                f"$.artifacts.{name}.path: variant evidence must live at {expected}"
+            )
+    return errors
+
+
 def semantic_delivery_envelope(artifact) -> list[str]:
     """Validate delivery-envelope invariants not expressible in the dialect."""
     errors: list[str] = []
@@ -1011,6 +1047,11 @@ def semantic_delivery_envelope(artifact) -> list[str]:
         if artifact.get("route") != "batch":
             errors.append("$.batch: only the batch route may bind an aggregate delivery")
         errors.extend(_semantic_batch_binding(batch))
+    # The variant route delivers one platform cut per variant. Its identity is
+    # derived from the variant id, so an envelope claiming that route must be
+    # attributable to exactly one variant and may never aggregate members.
+    if artifact.get("route") == "variant":
+        errors.extend(_semantic_variant_binding(artifact, aggregate=aggregate))
     artifacts = artifact.get("artifacts")
     if isinstance(artifacts, dict):
         required_names = (
