@@ -2452,3 +2452,197 @@ class SfxDeliveryTests(unittest.TestCase):
             )
             self.assertEqual(report["status"], "fail", report["failures"])
             self.assertEqual(report["delivered_event_count"], 0)
+
+
+class DialoguePriorityDuckTests(unittest.TestCase):
+    """The mixer, not the QA threshold, is what makes room for the dialogue.
+
+    SFX is delivered under speech, and "under" is a measured relation: the
+    stem has to sit `DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB` below the
+    dialogue in the window around every transient, or the render fails
+    closed with `SFX is only 2.180225 dB below active dialogue` — which is
+    what a real 90-second cut did twice tonight, on two of four events. The
+    sidechain compressor in the graph is a shape, not a guarantee; the
+    guarantee is a per-event attenuation measured against the dialogue this
+    cut actually carries, before a single frame is rendered.
+    """
+
+    LEVELS = (-28.0, -40.0)
+
+    def _dialogue(self, root: Path, total_samples: int, level_db: float) -> Path:
+        amplitude = 10 ** (level_db / 20.0)
+        frame = sfx_delivery._pack_s24(amplitude) * 2
+        path = root / "dialogue_probe.wav"
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(2)
+            wav.setsampwidth(3)
+            wav.setframerate(48000)
+            wav.writeframes(frame * total_samples)
+        return path
+
+    def _stage(self, root: Path, **kwargs):
+        evidence = SfxDeliveryTests.multi_event_visual_evidence()
+        plan_path, _catalog, stem_path = sfx_delivery.stage_multi_event_delivery(
+            root, evidence, "a" * 64, "b" * 64, **kwargs
+        )
+        return json.loads(plan_path.read_text(encoding="utf-8")), stem_path
+
+    def _relative_db(self, plan: dict, stem_path: Path, dialogue_path: Path):
+        stem = sfx_delivery.decode_s24le_wav(stem_path)
+        dialogue = sfx_delivery.decode_s24le_wav(dialogue_path)
+        return {
+            event["id"]: (
+                sfx_delivery._window_rms_dbfs(
+                    stem.samples, event["expected_transient_sample"]
+                )
+                - sfx_delivery._window_rms_dbfs(
+                    dialogue.samples, event["expected_transient_sample"]
+                )
+            )
+            for event in plan["events"]
+        }
+
+    def test_without_a_duck_the_stem_talks_over_the_dialogue(self) -> None:
+        # The starting position, pinned so the fix below is not measuring
+        # its own success: at the authored -12 dB these events are louder
+        # than a -28 dBFS dialogue allows.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, stem_path = self._stage(root)
+            dialogue = self._dialogue(root, plan["sfx_stem_sample_count"], -28.0)
+            relative = self._relative_db(plan, stem_path, dialogue)
+            self.assertTrue(
+                any(
+                    value > -sfx_delivery.DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB
+                    for value in relative.values()
+                ),
+                relative,
+            )
+
+    def test_every_event_is_ducked_under_the_dialogue_it_will_be_mixed_with(
+        self,
+    ) -> None:
+        for level in self.LEVELS:
+            with self.subTest(dialogue_dbfs=level):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    reference, _stem = self._stage(root / "reference")
+                    dialogue = self._dialogue(
+                        root, reference["sfx_stem_sample_count"], level
+                    )
+                    plan, stem_path = self._stage(
+                        root / "ducked", dialogue_probe=dialogue
+                    )
+                    relative = self._relative_db(plan, stem_path, dialogue)
+                    for event_id, value in relative.items():
+                        self.assertLessEqual(
+                            value,
+                            -sfx_delivery.DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB,
+                            f"{event_id}: {value:.3f} dB relative to dialogue",
+                        )
+
+    def test_the_duck_is_a_separate_field_from_the_gain_the_studio_owns(self) -> None:
+        # The authored gain stays in the range the Studio offers a human, so
+        # a ducked plan is still a plan the editor can open and edit. The
+        # attenuation the mixer decided lives beside it, and only there.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference, _stem = self._stage(root / "reference")
+            dialogue = self._dialogue(root, reference["sfx_stem_sample_count"], -28.0)
+            plan, _stem_path = self._stage(root / "ducked", dialogue_probe=dialogue)
+            self.assertFalse(contract_registry.validate_artifact("audio_event_plan", plan))
+            self.assertTrue(any(event["dialogue_duck_db"] < 0 for event in plan["events"]))
+            for event in plan["events"]:
+                self.assertEqual(event["gain_db"], -12)
+                self.assertGreaterEqual(
+                    event["dialogue_duck_db"], sfx_delivery.DIALOGUE_DUCK_FLOOR_DB
+                )
+                self.assertLessEqual(event["dialogue_duck_db"], 0)
+
+    def test_a_dialogue_too_quiet_to_be_active_ducks_nothing(self) -> None:
+        # Below the active threshold there is no dialogue to protect, and
+        # attenuating anyway would quietly throw away the sound design the
+        # cut asked for.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference, reference_stem = self._stage(root / "reference")
+            silence = self._dialogue(
+                root,
+                reference["sfx_stem_sample_count"],
+                sfx_delivery.DIALOGUE_PRIORITY_THRESHOLD_DBFS - 6.0,
+            )
+            plan, stem_path = self._stage(root / "quiet", dialogue_probe=silence)
+            self.assertTrue(
+                all(event["dialogue_duck_db"] == 0 for event in plan["events"])
+            )
+            self.assertEqual(stem_path.read_bytes(), reference_stem.read_bytes())
+
+    def test_a_ducked_delivery_still_verifies_against_an_independent_rebuild(
+        self,
+    ) -> None:
+        # The verifier rebuilds the stem from the plan alone, on purpose,
+        # without borrowing the producer's arithmetic. A duck the rebuild
+        # does not know about reads as a forged stem — which is exactly how
+        # a real cut failed with "decoded PCM is not the independent
+        # deterministic saturating sum" once the ducking went in.
+        evidence = SfxDeliveryTests.multi_event_visual_evidence()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference, _stem = self._stage(root / "reference")
+            dialogue = self._dialogue(root, reference["sfx_stem_sample_count"], -28.0)
+            staged = sfx_delivery.stage_multi_event_delivery(
+                root / "ducked", evidence, "a" * 64, "b" * 64, dialogue_probe=dialogue
+            )
+            plan = json.loads(staged[0].read_text(encoding="utf-8"))
+            self.assertTrue(any(event["dialogue_duck_db"] < 0 for event in plan["events"]))
+            priority_paths = SfxDeliveryTests.write_priority_stems(
+                root, plan["sfx_stem_sample_count"], -38.0, -52.0
+            )
+            report = sfx_delivery.verify_delivery(
+                *staged, evidence, "a" * 64, "b" * 64,
+                dialogue_priority_dialogue_path=priority_paths[0],
+                dialogue_priority_sfx_path=priority_paths[1],
+            )
+            self.assertEqual(report["status"], "pass", report["failures"])
+
+    def test_a_forged_duck_outside_the_mixers_range_is_refused(self) -> None:
+        evidence = SfxDeliveryTests.multi_event_visual_evidence()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged = sfx_delivery.stage_multi_event_delivery(
+                root / "plain", evidence, "a" * 64, "b" * 64
+            )
+            plan = json.loads(staged[0].read_text(encoding="utf-8"))
+            plan["events"][0]["dialogue_duck_db"] = (
+                sfx_delivery.DIALOGUE_DUCK_FLOOR_DB - 1.0
+            )
+            staged[0].write_text(json.dumps(plan), encoding="utf-8")
+            priority_paths = SfxDeliveryTests.write_priority_stems(
+                root, plan["sfx_stem_sample_count"], -38.0, -52.0
+            )
+            report = sfx_delivery.verify_delivery(
+                *staged, evidence, "a" * 64, "b" * 64,
+                dialogue_priority_dialogue_path=priority_paths[0],
+                dialogue_priority_sfx_path=priority_paths[1],
+            )
+            self.assertEqual(report["status"], "fail")
+            self.assertTrue(
+                any("duck" in failure for failure in report["failures"]),
+                report["failures"],
+            )
+
+    def test_the_ducked_plan_is_reproducible_from_the_same_dialogue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference, _stem = self._stage(root / "reference")
+            dialogue = self._dialogue(root, reference["sfx_stem_sample_count"], -28.0)
+            first_plan, first_stem = self._stage(root / "first", dialogue_probe=dialogue)
+            second_plan, second_stem = self._stage(
+                root / "second", dialogue_probe=dialogue
+            )
+            self.assertEqual(first_plan["events"], second_plan["events"])
+            self.assertEqual(first_stem.read_bytes(), second_stem.read_bytes())
+
+
+if __name__ == "__main__":
+    unittest.main()

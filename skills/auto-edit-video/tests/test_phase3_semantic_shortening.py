@@ -378,5 +378,230 @@ class ShorteningRetryTests(unittest.TestCase):
             caption_delivery.validate_for_render(self.project, state, manifest)
 
 
+class ShorteningRoundIsRevalidatedTests(ShorteningRetryTests):
+    """The second question earns the same second chance as the first.
+
+    The provider is a 7B local model sampling a new answer every time, and
+    the first round already knows that: a violation is fed back and asked
+    again, twice, before the delivery fails closed. The shortening round was
+    a single roll of that same die — and the moment the fit measurement was
+    taken of the right frame, real cuts started dying there instead:
+    `translation_wrong_language`, answered in simplified Chinese, on a
+    caption whose first-round answer had been correct English. Same rules,
+    same ceiling, same fail-closed; only the second chance was missing.
+
+    Narrowly that one code, though. An answer that bought its budget by
+    dropping the brand or converting the unit is not sampling noise, it is
+    the trade-off §4 refuses, and `ShorteningRetryPreservationTests` pins
+    that those still cost exactly one round and then fail closed.
+    """
+
+    WRONG_LANGUAGE = "这个阶段它代表商品价格持续上涨"
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_violated_shortening_answer_is_asked_again(self) -> None:
+        artifact, prompts = self._create(
+            [LONG_TRANSLATION, self.WRONG_LANGUAGE, SHORT_TRANSLATION]
+        )
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("translation_wrong_language", prompts[2])
+        # Still a shortening ask: the budget travels with the second chance.
+        instance_id = artifact["items"][0]["caption_instance_id"]
+        budget = artifact["provider_receipt"]["shortening_character_budgets"][instance_id]
+        self.assertIn(str(budget), prompts[2])
+        self.assertEqual(artifact["items"][0]["translated_text"], SHORT_TRANSLATION)
+        self.assertEqual(artifact["provider_receipt"]["shortening_rounds"], 1)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_shortening_round_still_fails_closed_at_the_ceiling(self) -> None:
+        with self.assertRaises(caption_delivery.CaptionDeliveryError) as caught:
+            self._create([LONG_TRANSLATION, self.WRONG_LANGUAGE])
+        self.assertEqual(caught.exception.code, "translation_wrong_language")
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_shortening_answer_that_passes_costs_no_extra_round(self) -> None:
+        _artifact, prompts = self._create([LONG_TRANSLATION, SHORT_TRANSLATION])
+        self.assertEqual(len(prompts), 2)
+
+
+class DeliveryMeasuresTheFrameTheRenderWillCutTests(unittest.TestCase):
+    """SPEC §3 v1.2 gap: delivery must measure the frame render actually cuts.
+
+    A caption wraps to the director's `max_width` until the platform's own
+    margins narrow it, and the narrowing happens on the render path. Measuring
+    the fit at the declared width answers a question about a frame nobody will
+    ever draw: the twelve-caption Tainan cut had every translation reported as
+    fitting, then died at render with a third line "even at the 36px floor",
+    because the two measurements were taken of different columns. The delivery
+    measures with the render's own numbers or its verdict means nothing.
+    """
+
+    # Twelve of these wrap into two lines at max_width 84 and need three at
+    # TikTok's 78 — the whole width of the gap between the two measurements.
+    SAFE_AREA_ONLY_OVERFLOW = " ".join(["overlong"] * 12)
+    FITS_EVEN_NARROWED = " ".join(["overlong"] * 9)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="phase3-safe-area-fit-")
+        self.project = Path(self._tmp.name)
+        (self.project / "working").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _state(self, platform_id: str | None) -> dict:
+        canvas = {"width": 1080, "height": 1920}
+        if platform_id:
+            canvas["platform_id"] = platform_id
+        return {
+            "canvas": canvas,
+            "overlays": [
+                {
+                    "id": "caption-0001",
+                    "type": "caption",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "text": "看到 想到 為什麼",
+                    "caption_source_id": "caption-source-0001",
+                    "visible": True,
+                    "source": "working/transcript_words.json",
+                    "style": {"font_size": 52, "max_width": 84},
+                },
+            ],
+        }
+
+    def _budgets(self, platform_id: str | None, translation: str) -> dict:
+        state = self._state(platform_id)
+        instances = [
+            {
+                "caption_instance_id": "caption-instance-0001",
+                "caption_source_id": "caption-source-0001",
+            }
+        ]
+        return caption_delivery._overflowing_budgets(
+            self.project, state, instances, [translation]
+        )
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_translation_only_the_platform_margin_overflows_is_still_measured(
+        self,
+    ) -> None:
+        budgets = self._budgets("tiktok", self.SAFE_AREA_ONLY_OVERFLOW)
+        self.assertIn("caption-instance-0001", budgets)
+        self.assertGreater(budgets["caption-instance-0001"], 0)
+        self.assertLess(
+            budgets["caption-instance-0001"], len(self.SAFE_AREA_ONLY_OVERFLOW)
+        )
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_budget_is_the_one_the_narrowed_column_holds(self) -> None:
+        # Not the declared column's budget: a budget measured 6% too wide
+        # buys back a translation the frame rejects a second time.
+        state = self._state("tiktok")
+        overlay = state["overlays"][0]
+        declared = cc.translation_fit(
+            self.project,
+            {**overlay, "style": {**overlay["style"], "max_width": 84}},
+            state["canvas"],
+            1.0,
+            state,
+            translation=self.SAFE_AREA_ONLY_OVERFLOW,
+        )
+        narrowed = cc.translation_fit(
+            self.project,
+            {**overlay, "style": {**overlay["style"], "max_width": 78}},
+            state["canvas"],
+            1.0,
+            state,
+            translation=self.SAFE_AREA_ONLY_OVERFLOW,
+        )
+        self.assertTrue(declared["fits"])
+        self.assertFalse(narrowed["fits"])
+        budgets = self._budgets("tiktok", self.SAFE_AREA_ONLY_OVERFLOW)
+        self.assertEqual(
+            budgets["caption-instance-0001"], narrowed["character_budget"]
+        )
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_translation_that_fits_the_narrowed_column_is_left_alone(self) -> None:
+        self.assertEqual(self._budgets("tiktok", self.FITS_EVEN_NARROWED), {})
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_platform_that_narrows_nothing_measures_exactly_as_before(self) -> None:
+        # Instagram Reels leaves 84 clear and the caption asks for 84. No
+        # narrowing means no new verdict, and no provider round it never
+        # needed: the regression this fix must not cause.
+        self.assertEqual(self._budgets("instagram-reels", LONG_TRANSLATION).keys(),
+                         {"caption-instance-0001"})
+        self.assertEqual(self._budgets("instagram-reels", SHORT_TRANSLATION), {})
+        self.assertEqual(self._budgets(None, SHORT_TRANSLATION), {})
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_fit_is_measured_with_the_scale_the_render_will_use(self) -> None:
+        import render_editor_timeline
+
+        state = self._state("tiktok")
+        state["canvas"]["width"] = 1081
+        seen: list[tuple[float, float]] = []
+        original = cc.translation_fit
+
+        def recording(project_dir, overlay, canvas, render_scale=1.0, st=None, **kw):
+            seen.append(
+                (float((overlay.get("style") or {}).get("max_width", 0)), render_scale)
+            )
+            return original(project_dir, overlay, canvas, render_scale, st, **kw)
+
+        cc.translation_fit = recording
+        self.addCleanup(setattr, cc, "translation_fit", original)
+        caption_delivery._overflowing_budgets(
+            self.project,
+            state,
+            [
+                {
+                    "caption_instance_id": "caption-instance-0001",
+                    "caption_source_id": "caption-source-0001",
+                }
+            ],
+            [SHORT_TRANSLATION],
+        )
+        expected_scale = render_editor_timeline.even(1081) / 1081
+        self.assertEqual(seen, [(78.0, expected_scale)])
+
+
+class ShorteningTriggersOnTheRenderedWidthTests(ShorteningRetryTests):
+    """The same delivery, on a platform whose margins narrow the column.
+
+    Inherits every rule of the delivery above and changes one thing: the
+    project targets TikTok, so the render wraps at 78 rather than 84. A
+    translation that only overflows because of that narrowing has to reach
+    the provider's second round here exactly as an obviously long one does.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.state["canvas"]["platform_id"] = "tiktok"
+        self._write_project()
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_the_platform_margin_overflow_is_asked_again_with_a_budget(self) -> None:
+        overflow = DeliveryMeasuresTheFrameTheRenderWillCutTests.SAFE_AREA_ONLY_OVERFLOW
+        artifact, prompts = self._create([overflow, SHORT_TRANSLATION])
+        self.assertEqual(len(prompts), 2)
+        receipt = artifact["provider_receipt"]
+        self.assertEqual(receipt["shortening_rounds"], 1)
+        budget = receipt["shortening_character_budgets"][
+            artifact["items"][0]["caption_instance_id"]
+        ]
+        self.assertIn(str(budget), prompts[1])
+        self.assertEqual(artifact["items"][0]["translated_text"], SHORT_TRANSLATION)
+
+    @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
+    def test_a_translation_the_narrowed_column_holds_costs_no_second_round(
+        self,
+    ) -> None:
+        fits = DeliveryMeasuresTheFrameTheRenderWillCutTests.FITS_EVEN_NARROWED
+        artifact, prompts = self._create([fits])
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(artifact["provider_receipt"]["shortening_rounds"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

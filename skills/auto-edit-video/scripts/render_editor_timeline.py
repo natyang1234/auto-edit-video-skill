@@ -1539,6 +1539,122 @@ def resolve_active_highlight(
     return matches[0]
 
 
+def dialogue_filter_chain(
+    segments: list[tuple[float, float]], duration: float
+) -> list[str]:
+    """The cut dialogue track, from source input 0 to `[adialogue]`.
+
+    Pause trimming always leaves more than one cut, so the SFX mix has to
+    take a cut dialogue track. Build it exactly as the non-SFX route does —
+    same CFR-normalised trim/concat, same order — and then bound it to the
+    final duration, so that what reaches `[adialogue]` is one continuous
+    final-domain track starting at 0. Cue times are already final-domain
+    (Phase 0d 48 kHz round-half-up timebase) and the stem enters unshifted,
+    so no cue moves when the dialogue is joined: the join changes what is
+    under a cue, never where the cue is.
+
+    It is one function because it has two callers — the render itself and
+    the probe the mixer ducks against — and a duck measured against a
+    differently-cut dialogue is a duck measured against a track nobody
+    hears.
+    """
+    if len(segments) <= 1:
+        return [
+            "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[adialogue]"
+        ]
+    segment_count = len(segments)
+    filters = [
+        "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        f"asplit={segment_count}"
+        + "".join(f"[ain{i}]" for i in range(segment_count))
+    ]
+    for i, (segment_start, segment_end) in enumerate(segments):
+        filters.append(
+            f"[ain{i}]atrim=start={segment_start:.6f}:end={segment_end:.6f},"
+            f"asetpts=PTS-STARTPTS[aseg{i}]"
+        )
+    filters.append(
+        "".join(f"[aseg{i}]" for i in range(segment_count))
+        + f"concat=n={segment_count}:v=0:a=1[adialogue_cat]"
+    )
+    filters.append(
+        f"[adialogue_cat]atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[adialogue]"
+    )
+    return filters
+
+
+def build_dialogue_probe_command(
+    project_dir: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    output: Path,
+    clip: dict[str, Any] | None = None,
+) -> list[str]:
+    """Write this cut's dialogue, at the stage the SFX is mixed against it.
+
+    The same chain, the same bounding, the same s24 evidence encoding the
+    render's own dialogue sidecar uses — audio only, so the mixer can hear
+    what it is about to duck under before a single frame is drawn.
+    """
+    source_duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+    clip_start, clip_end = 0.0, source_duration
+    if clip is not None:
+        clip_start = float(clip.get("start"))
+        clip_end = float(clip.get("end"))
+    segments = effective_segments(
+        state_segments(state, source_duration), clip_start, clip_end
+    )
+    if len(segments) > 1:
+        duration = sum(end - start for start, end in segments)
+    else:
+        clip_start, clip_end = segments[0]
+        duration = clip_end - clip_start
+    source = project_dir / str(manifest.get("source", {}).get("staged_path", ""))
+    if not source.is_file():
+        raise ValueError(f"source media missing: {source}")
+    sample_count = sfx_delivery.seconds_to_samples(f"{duration:.3f}")
+    command = [ffmpeg_path(), "-y"]
+    if len(segments) <= 1 and clip_start > 0:
+        command.extend(["-ss", f"{clip_start:.3f}"])
+    command.extend(["-i", str(source)])
+    filters = dialogue_filter_chain(segments, duration)
+    filters.append(
+        f"[adialogue]apad=whole_len={sample_count},"
+        f"atrim=end_sample={sample_count}[adialogue_probe]"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", "[adialogue_probe]", "-vn",
+        "-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2", "-f", "wav", str(output),
+    ])
+    return command
+
+
+def write_dialogue_probe(
+    project_dir: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    output: Path,
+    clip: dict[str, Any] | None = None,
+) -> Path | None:
+    """Render the dialogue probe, or None when this host cannot.
+
+    A probe that fails to render is not a reason to fail a cut: without it
+    the events keep their authored level and the render's own
+    dialogue-priority check has the last word, exactly as before.
+    """
+    command = build_dialogue_probe_command(project_dir, state, manifest, output, clip)
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=30 * 60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not output.is_file():
+        return None
+    return output
+
+
 def build_render_command(
     project_dir: Path,
     state: dict[str, Any],
@@ -2190,37 +2306,7 @@ def build_render_command(
     if sfx_stem is not None:
         if not has_audio_stream or sfx_input_index is None:
             raise ValueError("kinetic SFX delivery requires dialogue audio")
-        if multi_segment:
-            # Pause trimming always leaves more than one cut, so the SFX mix
-            # has to take a cut dialogue track.  Build it exactly as the
-            # non-SFX route does — same CFR-normalised trim/concat, same
-            # order — and then bound it to the final duration, so that what
-            # reaches [adialogue] is one continuous final-domain track
-            # starting at 0.  Cue times are already final-domain (Phase 0d
-            # 48 kHz round-half-up timebase) and the stem enters unshifted,
-            # so no cue moves when the dialogue is joined: the join changes
-            # what is under a cue, never where the cue is.
-            filters.append(
-                "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                f"asplit={segment_count}"
-                + "".join(f"[ain{i}]" for i in range(segment_count))
-            )
-            for i, (segment_start, segment_end) in enumerate(segments):
-                filters.append(
-                    f"[ain{i}]atrim=start={segment_start:.6f}:end={segment_end:.6f},"
-                    f"asetpts=PTS-STARTPTS[aseg{i}]"
-                )
-            filters.append(
-                "".join(f"[aseg{i}]" for i in range(segment_count))
-                + f"concat=n={segment_count}:v=0:a=1[adialogue_cat]"
-            )
-            filters.append(
-                f"[adialogue_cat]atrim=0:{duration:.6f},"
-                "asetpts=PTS-STARTPTS[adialogue]"
-            )
-        else:
-            filters.append("[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                           f"atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[adialogue]")
+        filters.extend(dialogue_filter_chain(segments, duration))
         filters.append(f"[{sfx_input_index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[asfx]")
         filters.append(
             "[adialogue]asplit=3[adialogue_mix][adialogue_key][adialogue_evidence_raw]"
@@ -2666,8 +2752,19 @@ def render_project(
         if direct_final and state.get("director_style") == "kinetic-explainer":
             if direct_stage is None or render_id is None or raw_visual_evidence is None:
                 raise RuntimeError("kinetic SFX staging lacks direct delivery identity")
+            # What the events will be mixed under, measured before they are
+            # baked. The probe is working material, not a delivery artifact:
+            # it never enters the staging directory the envelope hashes.
+            dialogue_probe = write_dialogue_probe(
+                project_dir,
+                state,
+                manifest,
+                project_dir / "working/sfx_dialogue_probe.wav",
+                clip,
+            )
             staged_sfx = stage_phase0d_sfx(
-                project_dir, state, render_id, direct_stage, raw_visual_evidence
+                project_dir, state, render_id, direct_stage, raw_visual_evidence,
+                dialogue_probe=dialogue_probe,
             )
             dialogue_priority_paths = (
                 direct_stage / "dialogue_priority_dialogue.wav",
@@ -3060,12 +3157,14 @@ def stage_phase0d_sfx(
     render_id: str,
     stage: delivery_envelope.StagingAttempt,
     visual_evidence: dict[str, Any],
+    dialogue_probe: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """Stage core-owned multi-event artifacts against live final bindings."""
     timeline_revision = editor_base_state_revision(state)
     cut_hash = sfx_delivery.effective_cut_map_sha256(project_dir, state)
     staged = sfx_delivery.stage_multi_event_delivery(
         Path(stage), visual_evidence, timeline_revision, cut_hash,
+        dialogue_probe=dialogue_probe,
     )
     if not isinstance(staged, tuple) or len(staged) != 3:
         raise ValueError("core SFX staging returned invalid artifact bindings")

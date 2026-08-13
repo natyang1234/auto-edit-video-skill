@@ -90,6 +90,18 @@ CONTRACT_VIOLATION_CODES = frozenset(
         "translation_wrong_language",
     }
 )
+# Which rejection of a *shortened* answer is worth one more sample. Not the
+# preservation codes: dropping the brand or converting the unit to make the
+# budget is the trade-off §4 deliberately fails closed on, and re-asking
+# mostly re-rolls the same trade-off — the shortening round stays "once,
+# never twice" for those. Writing the answer in the source language is not
+# that trade-off at all. It is the model losing the target entirely, on a
+# caption whose first-round answer was correct English, which is what a real
+# cut died of the moment the fit measurement started using the render's own
+# frame. That one is sampling noise, and sampling noise is what a resample
+# is for; the resampled answer faces the identical validator and the last
+# verdict still fails the delivery closed.
+SHORTENING_REASK_CODES = frozenset({"translation_wrong_language"})
 # Whether an answer had to be re-asked caption by caption is, like the round
 # counts, a record of how this one delivery went rather than part of who the
 # provider is — a delivery that needed it must not read as a swapped
@@ -1348,6 +1360,17 @@ def _revalidation_prompt(
     # the model started returning the Chinese source untranslated. The task
     # has not changed, so the wording of the task does not change either —
     # only what went wrong is added, in front.
+    return _revalidation_preface(errors, target) + _translation_prompt(instances, target)
+
+
+def _revalidation_preface(errors: list[CaptionDeliveryError], target: str) -> str:
+    """What went wrong, in front of whichever question is being repeated.
+
+    Both questions this delivery asks — translate, then translate shorter —
+    face the same validator and are answered by the same 7B model, so both
+    are re-asked the same way: the rejection named, the rules restated, the
+    question itself unchanged behind it.
+    """
     rejected = "; ".join(
         f"{error.code} ({error.detail})" if error.detail else error.code
         for error in errors
@@ -1366,7 +1389,6 @@ def _revalidation_prompt(
         "may appear that the source does not contain; repeat each "
         "caption_instance_id back exactly as given, including when only one "
         "caption is listed.\n\n"
-        + _translation_prompt(instances, target)
     )
 
 
@@ -1382,6 +1404,45 @@ def _receipt_identity(receipt: Any) -> Any:
         return receipt
     bookkeeping = set(SHORTENING_RECEIPT_KEYS) | set(VALIDATION_RECEIPT_KEYS)
     return {key: value for key, value in receipt.items() if key not in bookkeeping}
+
+
+def _rendered_frame(
+    state: dict[str, Any], overlays: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], float]:
+    """The captions and the scale the render will actually measure with.
+
+    A caption is authored at the director's own `max_width` and cut at the
+    narrower of that and what the platform leaves clear, and the narrowing
+    happens on the render path — after this delivery has been paid for and
+    hashed. Measuring the fit at the authored width therefore answers a
+    question about a frame nobody draws: the twelve-caption Tainan cut
+    reported every translation as fitting at 86 and then died at render with
+    a third line "even at the 36px floor", because Reels leaves 84. The two
+    measurements are taken of one column here, with one scale, or the
+    shortening round §3 exists to spend is never spent.
+
+    A host without the render module cannot narrow anything, so it measures
+    what it has: the same verdict as before this existed, never a wider one.
+    """
+    try:
+        from editor_server import platform_safe_area
+        from render_editor_timeline import constrain_caption_wrap_to_safe_area, even
+    except ImportError:  # pragma: no cover - host-dependent
+        return overlays, 1.0
+    canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
+    try:
+        width = int(canvas.get("width", 1080))
+    except (TypeError, ValueError):
+        width = 1080
+    # The deliverable is the final render, whose width is the canvas rounded
+    # up to an even number of pixels — the one scale a shipped caption is
+    # ever drawn at. A preview is cut smaller and is not what is being
+    # guarded.
+    scale = even(width) / width if width > 0 else 1.0
+    return (
+        constrain_caption_wrap_to_safe_area(overlays, platform_safe_area(state)),
+        scale,
+    )
 
 
 def _overflowing_budgets(
@@ -1404,9 +1465,9 @@ def _overflowing_budgets(
         return {}
     if not caption_compositor.compositor_available():
         return {}
+    rendered, render_scale = _rendered_frame(state, _caption_overlays(state))
     overlays = {
-        str(overlay.get("caption_source_id") or ""): overlay
-        for overlay in _caption_overlays(state)
+        str(overlay.get("caption_source_id") or ""): overlay for overlay in rendered
     }
     canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
     budgets: dict[str, int] = {}
@@ -1416,7 +1477,7 @@ def _overflowing_budgets(
             continue
         try:
             fit = caption_compositor.translation_fit(
-                project_dir, overlay, canvas, 1.0, state, translation=text
+                project_dir, overlay, canvas, render_scale, state, translation=text
             )
         except (OSError, ValueError, RuntimeError, KeyError):
             # Measuring failed, so nothing was learned about this caption.
@@ -2047,47 +2108,74 @@ def _translate_and_adopt(
             for instance in expected["instances"]
             if instance["caption_instance_id"] in budgets
         ]
-        try:
-            retry_response = model_call(
-                _shortening_prompt(retry_instances, target, budgets),
-                "caption_translation",
-                model=model,
-                timeout=timeout,
-            )
-        except CaptionDeliveryError:
-            raise
-        except Exception as exc:
-            raise CaptionDeliveryError("translation_provider_failed", str(exc)[:500]) from exc
-        _verify_project_trust(trust)
-        if not isinstance(retry_response, dict):
-            raise CaptionDeliveryError(
-                "translation_invalid", "provider response must be an object"
-            )
-        # The shorter answer earns no exemption: same validation, same
-        # identity rules. A retry is where a provider is most tempted to
-        # drop the unit to make the length.
-        # The shortening round is a second question to the same provider,
-        # which drops ids the same way, so it gets the same treatment for
-        # the same reason: an id-less answer is asked again one caption at a
-        # time rather than placed on the order it came back in.
-        if _answers_carry_no_ids(retry_instances, retry_response):
-            retry_response = _reask_each_caption_individually(
-                retry_instances,
-                prompt_for=lambda instance: _shortening_prompt(
-                    [instance],
-                    target,
-                    {instance["caption_instance_id"]: budgets[instance["caption_instance_id"]]},
-                ),
-                model_call=model_call,
-                model=model,
-                timeout=timeout,
-                trust=trust,
-                attempt=0,
-            )
-            individual_reask = True
-        shortened = _validate_translations(
-            retry_instances, retry_response, glossary, target=target
-        )
+        shortening_prompt = _shortening_prompt(retry_instances, target, budgets)
+        shortening_rounds = 0
+        while True:
+            try:
+                retry_response = model_call(
+                    shortening_prompt,
+                    "caption_translation",
+                    model=model,
+                    timeout=timeout,
+                )
+            except CaptionDeliveryError:
+                raise
+            except Exception as exc:
+                raise CaptionDeliveryError("translation_provider_failed", str(exc)[:500]) from exc
+            _verify_project_trust(trust)
+            if not isinstance(retry_response, dict):
+                raise CaptionDeliveryError(
+                    "translation_invalid", "provider response must be an object"
+                )
+            # The shorter answer earns no exemption: same validation, same
+            # identity rules. A retry is where a provider is most tempted to
+            # drop the unit to make the length.
+            # The shortening round is a second question to the same provider,
+            # which drops ids the same way, so it gets the same treatment for
+            # the same reason: an id-less answer is asked again one caption at a
+            # time rather than placed on the order it came back in.
+            if _answers_carry_no_ids(retry_instances, retry_response):
+                retry_response = _reask_each_caption_individually(
+                    retry_instances,
+                    prompt_for=lambda instance: _shortening_prompt(
+                        [instance],
+                        target,
+                        {
+                            instance["caption_instance_id"]: budgets[
+                                instance["caption_instance_id"]
+                            ]
+                        },
+                    ),
+                    model_call=model_call,
+                    model=model,
+                    timeout=timeout,
+                    trust=trust,
+                    attempt=0,
+                )
+                individual_reask = True
+            try:
+                shortened = _validate_translations(
+                    retry_instances, retry_response, glossary, target=target
+                )
+                break
+            except CaptionDeliveryError as exc:
+                # The same second chance the first round gets, for the same
+                # reason and under the same ceiling: this is one sample from a
+                # 7B model, and the first delivery to reach this branch on real
+                # material came back in simplified Chinese — for a caption
+                # whose first-round answer had been correct English. Nothing is
+                # relaxed; the resampled answer faces this identical validator,
+                # and the last verdict still fails the delivery closed.
+                if (
+                    exc.code not in SHORTENING_REASK_CODES
+                    or shortening_rounds >= VALIDATION_MAX_ROUNDS
+                ):
+                    raise
+                shortening_rounds += 1
+                shortening_prompt = _revalidation_preface(
+                    [exc], target
+                ) + _shortening_prompt(retry_instances, target, budgets)
+        validation_rounds += shortening_rounds
         by_instance = {
             instance["caption_instance_id"]: value
             for instance, value in zip(retry_instances, shortened, strict=True)

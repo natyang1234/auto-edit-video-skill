@@ -269,6 +269,7 @@
             ]
           },
           "gain_db": {"type": "number", "minimum": -24, "maximum": -6},
+          "dialogue_duck_db": {"type": "number", "minimum": -36, "maximum": 0},
           "fades": {
             "type": "object",
             "required": ["in_samples", "out_samples"],

@@ -18,6 +18,7 @@ import editor_server  # noqa: E402
 import sfx_delivery  # noqa: E402
 from render_editor_timeline import (  # noqa: E402
     adopt_fresh_motion_receipt,
+    build_dialogue_probe_command,
     build_render_command,
     font_path,
     fresh_sfx_bindings,
@@ -940,3 +941,90 @@ class DirectActiveHighlightRenderTests(unittest.TestCase):
                     json.dumps(self.state), encoding="utf-8"
                 )
                 self._assert_active_id_rejected()
+
+
+class DialogueProbeTests(unittest.TestCase):
+    """The mixer ducks against the dialogue the render will actually mix.
+
+    Two ffmpeg invocations, one dialogue: the probe exists so the SFX gain
+    can be decided before the render, and the only way that decision means
+    anything is if it was taken of the same cut, at the same stage, bounded
+    to the same sample count. So the probe does not describe the dialogue —
+    it emits the render's own chain, and this pins that it stays that way.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="renderer-probe-")
+        self.project = Path(self.temp.name)
+        (self.project / "source").mkdir()
+        (self.project / "working").mkdir()
+        (self.project / "source/source.mp4").write_bytes(b"source")
+        self.stem = self.project / "working/stem.wav"
+        self.stem.write_bytes(b"stem")
+        self.manifest = {
+            "source": {
+                "staged_path": "source/source.mp4",
+                "duration_s": 2.0,
+                "has_audio": True,
+            }
+        }
+        self.state = {
+            "canvas": {"width": 1080, "height": 1920, "fps": 30},
+            "segments": [
+                {"source_start": 0.0, "source_end": 0.8},
+                {"source_start": 1.0, "source_end": 1.8},
+            ],
+            "overlays": [],
+        }
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _probe_graph(self) -> str:
+        command = build_dialogue_probe_command(
+            self.project,
+            self.state,
+            self.manifest,
+            self.project / "working/probe.wav",
+        )
+        return command[command.index("-filter_complex") + 1]
+
+    @patch("render_editor_timeline.source_has_audible_signal", return_value=True)
+    def test_the_probe_emits_the_renders_own_dialogue_chain(self, _audible: object) -> None:
+        render = build_render_command(
+            self.project,
+            self.state,
+            self.manifest,
+            self.project / "out.mp4",
+            "final",
+            sfx_stem=self.stem,
+            dialogue_priority_dialogue=self.project / "working/d.wav",
+            dialogue_priority_sfx=self.project / "working/s.wav",
+        )
+        render_graph = render[render.index("-filter_complex") + 1]
+        probe_graph = self._probe_graph()
+        chain = [item for item in probe_graph.split(";") if "[adialogue_probe]" not in item]
+        self.assertGreater(len(chain), 1)
+        for filter_step in chain:
+            self.assertIn(filter_step, render_graph)
+        # Bounded to the same sample count the render's evidence sidecar is,
+        # so a window measured on one lands on the other.
+        self.assertIn("[adialogue_evidence_raw]apad=whole_len=76800", render_graph)
+        self.assertIn("[adialogue]apad=whole_len=76800", probe_graph)
+        self.assertIn("atrim=end_sample=76800[adialogue_probe]", probe_graph)
+
+    def test_the_probe_writes_audio_only_s24_evidence(self) -> None:
+        command = build_dialogue_probe_command(
+            self.project,
+            self.state,
+            self.manifest,
+            self.project / "working/probe.wav",
+        )
+        self.assertIn("-vn", command)
+        self.assertIn("pcm_s24le", command)
+        self.assertEqual(command[-1], str(self.project / "working/probe.wav"))
+        self.assertEqual(command.count("-i"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

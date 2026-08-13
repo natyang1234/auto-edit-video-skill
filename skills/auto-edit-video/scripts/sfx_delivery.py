@@ -72,6 +72,16 @@ DIALOGUE_PRIORITY_SILENCE_DBFS = -120.0
 DIALOGUE_PRIORITY_AUTHORITY = (
     "same-render pre-final-loudnorm dialogue and post-sidechain pre-amix SFX"
 )
+# How far the mixer may pull an event down to make room for speech, and how
+# much room it leaves under the required reduction. The floor is deep enough
+# to clear a barely-active dialogue (a whisper at -44 dBFS still has to sit 6
+# dB above the effects under it) and bounded so a runaway measurement cannot
+# silently delete the sound design instead of ducking it. The margin absorbs
+# the difference between this integer bake and what the render's own
+# sidechain stage measures — which only ever attenuates further.
+DIALOGUE_DUCK_FLOOR_DB = -36.0
+DIALOGUE_DUCK_MARGIN_DB = 1.0
+DIALOGUE_DUCK_MAX_ROUNDS = 8
 
 STARTER_PACK_ID = "phase1-local-procedural"
 STARTER_ASSET_IDS = (
@@ -1566,6 +1576,142 @@ def _pack_s24_integer(value: int) -> bytes:
     return integer.to_bytes(SAMPLE_WIDTH, "little", signed=True)
 
 
+def _event_level_db(event: dict[str, Any]) -> float:
+    """The dB an event is actually baked at: the authored gain plus the duck.
+
+    Two numbers, one level. `gain_db` is the sound designer's, inside the
+    range the Studio offers a human; `dialogue_duck_db` is the mixer's answer
+    to what the dialogue under this event turned out to be, which no human
+    authored and which the Studio must not silently adopt as a level.
+    """
+    gain_db = event.get("gain_db")
+    if (
+        isinstance(gain_db, bool)
+        or not isinstance(gain_db, (int, float))
+        or not math.isfinite(float(gain_db))
+        or not -24.0 <= float(gain_db) <= -6.0
+    ):
+        raise SfxDeliveryError("multi-event stem event gain is invalid")
+    duck_db = event.get("dialogue_duck_db", 0.0)
+    if (
+        isinstance(duck_db, bool)
+        or not isinstance(duck_db, (int, float))
+        or not math.isfinite(float(duck_db))
+        or not DIALOGUE_DUCK_FLOOR_DB <= float(duck_db) <= 0.0
+    ):
+        raise SfxDeliveryError("multi-event stem event dialogue duck is invalid")
+    return float(gain_db) + float(duck_db)
+
+
+def _asset_frames(asset_paths: dict[str, Path]) -> dict[str, list[tuple[int, int]]]:
+    """Every catalog asset as integer s24 frames, decoded once."""
+    frames: dict[str, list[tuple[int, int]]] = {}
+    for asset_id, path in asset_paths.items():
+        decoded = decode_s24le_wav(path)
+        frames[asset_id] = [
+            (round(left * 8388608.0), round(right * 8388608.0))
+            for left, right in decoded.samples
+        ]
+    return frames
+
+
+def _window_stem_rms_dbfs(
+    events: list[dict[str, Any]],
+    ducks: dict[str, float],
+    frames: dict[str, list[tuple[int, int]]],
+    expected_sample: int,
+) -> float:
+    """The RMS the baked stem will show in one event's measurement window.
+
+    The same arithmetic `_write_multi_event_stem` performs — per-sample
+    rounded gain, clamped, summed, clamped — restricted to the twelve
+    thousand frames the dialogue-priority rule looks at. Measuring the window
+    instead of writing the whole stem is what makes an answer per round
+    affordable; measuring it any other way would be a second ruler.
+    """
+    half_window = DIALOGUE_PRIORITY_WINDOW_SAMPLES // 2
+    window_start = expected_sample - half_window
+    window_end = expected_sample + half_window
+    mixed: dict[int, list[int]] = {}
+    for event in events:
+        start = int(event["event_start_sample"])
+        duration = int(event["duration_samples"])
+        first = max(start, window_start)
+        last = min(start + duration, window_end)
+        if last <= first:
+            continue
+        gain = 10 ** ((_event_level_db(event) + ducks[event["id"]]) / 20.0)
+        payload = frames[event["asset_id"]]
+        for position in range(first, last):
+            source = payload[position - start]
+            slot = mixed.setdefault(position, [0, 0])
+            for channel in range(CHANNELS):
+                scaled = max(-8388608, min(8388607, int(round(source[channel] * gain))))
+                slot[channel] = max(-8388608, min(8388607, slot[channel] + scaled))
+    sums = [0.0, 0.0]
+    for slot in mixed.values():
+        for channel in range(CHANNELS):
+            value = slot[channel] / 8388608.0
+            sums[channel] += value * value
+    rms = max(math.sqrt(value / DIALOGUE_PRIORITY_WINDOW_SAMPLES) for value in sums)
+    return DIALOGUE_PRIORITY_SILENCE_DBFS if rms <= 0.0 else 20.0 * math.log10(rms)
+
+
+def dialogue_priority_ducks(
+    events: list[dict[str, Any]],
+    asset_paths: dict[str, Path],
+    dialogue: DecodedWav,
+) -> dict[str, float]:
+    """Per-event attenuation that puts the stem under this cut's dialogue.
+
+    SPEC Phase 0d dialogue priority. The sidechain compressor in the render
+    graph shapes the duck; it does not promise a depth, and a real cut proved
+    it: two of four events came back 2.18 and 7.96 dB *over* the speech they
+    were supposed to sit under, and the delivery failed closed after the
+    render had already been paid for. So the depth is decided here, against
+    the dialogue this cut actually carries, with the measurement the check
+    itself uses.
+
+    Every event heard inside a failing window is pulled down by the same
+    amount, because that is the only move that changes the window's RMS by a
+    known number: they are all scaled together, so the mix drops exactly as
+    far as each of them does. A window whose dialogue is below the active
+    threshold is not ducked at all — there is nothing there to protect, and
+    attenuating anyway would throw away sound design nobody asked to lose.
+    """
+    ducks = {str(event["id"]): 0.0 for event in events}
+    frames = _asset_frames(asset_paths)
+    for _round in range(DIALOGUE_DUCK_MAX_ROUNDS):
+        deficits: list[tuple[int, float]] = []
+        for event in events:
+            expected = int(event["expected_transient_sample"])
+            dialogue_db = _window_rms_dbfs(dialogue.samples, expected)
+            if dialogue_db <= DIALOGUE_PRIORITY_THRESHOLD_DBFS:
+                continue
+            ceiling = (
+                dialogue_db
+                - DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB
+                - DIALOGUE_DUCK_MARGIN_DB
+            )
+            stem_db = _window_stem_rms_dbfs(events, ducks, frames, expected)
+            if stem_db > ceiling:
+                deficits.append((expected, stem_db - ceiling))
+        if not deficits:
+            break
+        half_window = DIALOGUE_PRIORITY_WINDOW_SAMPLES // 2
+        for expected, deficit in deficits:
+            for event in events:
+                start = int(event["event_start_sample"])
+                last = start + int(event["duration_samples"])
+                if last <= expected - half_window or start >= expected + half_window:
+                    continue
+                event_id = str(event["id"])
+                ducks[event_id] = round(
+                    max(DIALOGUE_DUCK_FLOOR_DB, ducks[event_id] - deficit), 6
+                )
+    return ducks
+
+
 def _write_multi_event_stem(
     path: Path,
     *,
@@ -1587,15 +1733,7 @@ def _write_multi_event_stem(
         asset = decode_s24le_wav(asset_path)
         if len(asset.samples) != duration or start < 0 or start + duration > total_samples:
             raise SfxDeliveryError("multi-event stem payload extends beyond final output")
-        gain_db = event.get("gain_db")
-        if (
-            isinstance(gain_db, bool)
-            or not isinstance(gain_db, (int, float))
-            or not math.isfinite(float(gain_db))
-            or not -24.0 <= float(gain_db) <= -6.0
-        ):
-            raise SfxDeliveryError("multi-event stem event gain is invalid")
-        baked_pcm = _bake_s24_pcm(asset.pcm, float(gain_db))
+        baked_pcm = _bake_s24_pcm(asset.pcm, _event_level_db(event))
         for frame_index in range(duration):
             destination = (start + frame_index) * CHANNELS
             source = frame_index * CHANNELS * SAMPLE_WIDTH
@@ -1624,6 +1762,7 @@ def stage_multi_event_delivery(
     visual_evidence: dict[str, Any],
     timeline_revision: str,
     cut_map_sha256: str,
+    dialogue_probe: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """Stage a schema-v2 deterministic multi-event plan, catalog and stem."""
     stage = Path(stage_dir)
@@ -1670,6 +1809,7 @@ def stage_multi_event_delivery(
             "expected_transient_sample": resolved_event["expected_transient_sample"],
             "role": resolved_event["role"],
             "gain_db": -12,
+            "dialogue_duck_db": 0.0,
             "fades": {"in_samples": 0, "out_samples": 0},
             "duck_group": "dialogue_priority",
             "evidence": evidence,
@@ -1685,6 +1825,16 @@ def stage_multi_event_delivery(
         asset_id: stage / STARTER_ASSET_FILENAMES[asset_id]
         for asset_id in STARTER_ASSET_IDS
     }
+    if dialogue_probe is not None:
+        # The dialogue this cut carries, measured before a frame is
+        # rendered. Without it the events keep the level they were authored
+        # at and the render's own dialogue-priority check has the last word,
+        # exactly as it did before this existed.
+        ducks = dialogue_priority_ducks(
+            events, asset_paths, decode_s24le_wav(Path(dialogue_probe))
+        )
+        for event in events:
+            event["dialogue_duck_db"] = ducks[event["id"]]
     stem_path = stage / "sfx_stem.wav"
     decoded = _write_multi_event_stem(
         stem_path,
@@ -2561,6 +2711,30 @@ def _verify_multi_event_delivery(
                 "reason": f"faithful {resolved_event['role']}",
                 "review_state": "approved_generated",
             })
+        # The duck is the one number in an event this comparison cannot
+        # derive: it is a function of the dialogue this cut carries, and the
+        # renderer evidence rebuilt here carries pictures, not speech. So the
+        # declared value is adopted after being checked for range, and its
+        # correctness is left to the measurement that can actually judge it —
+        # the dialogue-priority evidence below, where a duck that is too
+        # shallow shows up as the event failing under active dialogue.
+        declared_events = plan.get("events") if isinstance(plan, dict) else None
+        if isinstance(declared_events, list) and len(declared_events) == len(expected_events):
+            for expected_event, declared in zip(expected_events, declared_events):
+                if not isinstance(declared, dict) or "dialogue_duck_db" not in declared:
+                    continue
+                duck = declared["dialogue_duck_db"]
+                if (
+                    isinstance(duck, bool)
+                    or not isinstance(duck, (int, float))
+                    or not math.isfinite(float(duck))
+                    or not DIALOGUE_DUCK_FLOOR_DB <= float(duck) <= 0.0
+                ):
+                    failures.append(
+                        "audio_event_plan: dialogue duck is outside the mixer's range"
+                    )
+                    continue
+                expected_event["dialogue_duck_db"] = duck
         declared_studio = plan.get("studio_edits") if isinstance(plan, dict) else None
         declared_studio_hash = (
             plan.get("studio_edits_sha256") if isinstance(plan, dict) else None
@@ -2657,7 +2831,22 @@ def _verify_multi_event_delivery(
             if len(decoded_asset.samples) != duration or start < 0 or start + duration > current_total_samples:
                 failures.append("sfx_stem: independently reconstructed event is outside final output")
                 continue
-            baked_pcm = _bake_s24_pcm(decoded_asset.pcm, float(event["gain_db"]))
+            # The level is the authored gain plus the duck the mixer decided,
+            # spelled out here rather than borrowed from the producer's helper
+            # for the same reason the summing loop is: a forged plan must not
+            # be able to make both sides agree by sharing one function.
+            duck = event.get("dialogue_duck_db", 0.0)
+            if (
+                isinstance(duck, bool)
+                or not isinstance(duck, (int, float))
+                or not math.isfinite(float(duck))
+                or not DIALOGUE_DUCK_FLOOR_DB <= float(duck) <= 0.0
+            ):
+                failures.append("sfx_stem: independently reconstructed event duck is invalid")
+                continue
+            baked_pcm = _bake_s24_pcm(
+                decoded_asset.pcm, float(event["gain_db"]) + float(duck)
+            )
             for frame_index in range(duration):
                 destination = (start + frame_index) * CHANNELS
                 source = frame_index * CHANNELS * SAMPLE_WIDTH
