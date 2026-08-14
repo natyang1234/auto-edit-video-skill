@@ -300,6 +300,46 @@ class StudioServer(ThreadingHTTPServer):
             return True
         return any(str(segment.get("text", "")).strip() for segment in segments)
 
+    def highlight_review_message(self, project_dir: Path) -> str:
+        """What the panel says once proposals exist.
+
+        A source shorter than a finished clip is delivered whole. That is a
+        delivery, not a shortfall, and it is reported as one: the earlier
+        wording ("沒有足夠語音內容") described a video with eleven seconds of
+        real speech as if it had none.
+        """
+
+        default = "已產生精華提案；請人工確認片段、字幕與時間線。"
+        try:
+            plan = json.loads(
+                (project_dir / "working/highlight_plan.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return default
+        if not isinstance(plan, dict) or plan.get("whole_source_delivery") is not True:
+            return default
+        captions = 0
+        try:
+            transcript = json.loads(
+                (project_dir / "working/transcript_words.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            transcript = {}
+        if isinstance(transcript, dict):
+            segments = transcript.get("caption_segments")
+            if not isinstance(segments, list):
+                segments = transcript.get("segments")
+            if isinstance(segments, list):
+                captions = sum(
+                    1
+                    for segment in segments
+                    if isinstance(segment, dict) and str(segment.get("text", "")).strip()
+                )
+        return (
+            f"短片來源：整支交付，共 {captions} 段字幕。"
+            "請人工確認字幕與時間線。"
+        )
+
     def pipeline_worker(
         self,
         project_dir: Path,
@@ -436,7 +476,7 @@ class StudioServer(ThreadingHTTPServer):
             write_status(
                 "needs_review",
                 "human_review",
-                "已產生精華提案；請人工確認片段、字幕與時間線。",
+                self.highlight_review_message(project_dir),
             )
         except (OSError, RuntimeError) as exc:
             if self.stop_event.is_set():

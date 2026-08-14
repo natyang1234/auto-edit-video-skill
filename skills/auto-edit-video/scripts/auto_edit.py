@@ -46,6 +46,7 @@ from contextual_semantic_calibration import (
 )
 from highlight_planner import (
     DIRECTOR_PROFILES as HIGHLIGHT_DIRECTOR_PROFILES,
+    WHOLE_SOURCE_MAX_SECONDS,
     build_highlight_plan,
     validate_highlight_plan,
 )
@@ -6316,7 +6317,12 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument("--out", required=True, help="where the clips go")
     cut.add_argument("--project-dir", default="", help="defaults to <out>/.project")
     cut.add_argument("--clips", type=int, default=3, help="how many clips to cut")
-    cut.add_argument("--seconds", type=float, default=30.0, help="roughly how long each")
+    cut.add_argument(
+        "--seconds",
+        type=float,
+        default=WHOLE_SOURCE_MAX_SECONDS,
+        help="roughly how long each clip should be",
+    )
     cut.add_argument(
         "--keep-pauses", action="store_true",
         help="leave dead air in place instead of cutting it out",

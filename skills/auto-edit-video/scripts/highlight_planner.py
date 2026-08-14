@@ -131,8 +131,42 @@ CONNECTOR_START_RE = re.compile(r"^(但是|可是|所以|因為|然後|而且|�
 SENSITIVE_RE = re.compile(r"爆料|指控|犯罪|詐騙|政治|政府|選舉|死亡|受傷|內幕")
 
 
+# How long a source may be and still simply BE the clip. `cut --seconds`
+# defaults to this same number, and both routes read it from here: the CLI
+# collapses its plan to the whole source below this length, and the planner
+# proposes the whole source below this length, so Studio and the command line
+# cannot disagree about what "short" means.
+WHOLE_SOURCE_MAX_SECONDS = 30.0
+
+
 def now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def source_is_the_clip(manifest: dict[str, Any], duration_s: float) -> bool:
+    """Whether this source may be proposed whole when nothing could be chosen.
+
+    Two conditions, both required. Nobody asked for a particular length —
+    explicit numeric bounds mean an operator or `--seconds` named one, and
+    that is honoured however short the source is. And the source is no longer
+    than a clip, so there is nothing to choose between: an eleven second video
+    has no ten-second window to pick out of it, which is exactly how a Studio
+    run with four real spoken segments proposed nothing at all.
+    """
+    target = manifest.get("output_target") if isinstance(manifest.get("output_target"), dict) else {}
+    bounds = [target.get("min_seconds"), target.get("target_seconds"), target.get("max_seconds")]
+    if any(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        for value in bounds
+    ):
+        return False
+    try:
+        available = float(duration_s)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(available) and 0 < available <= WHOLE_SOURCE_MAX_SECONDS
 
 
 def canonical_hash(value: Any) -> str:
@@ -367,6 +401,77 @@ def frame_bounds(start: float, end: float, fps: float, duration_s: float) -> tup
     return round(max(0.0, aligned_start), 3), round(min(duration_s, aligned_end), 3)
 
 
+def candidate_from_clauses(
+    group: list[dict[str, Any]],
+    *,
+    start: float,
+    end: float,
+    raw_start: float,
+    raw_end: float,
+    preferred: float,
+    fps: float,
+    brief: str,
+    profile: dict[str, Any],
+    stable_seed: dict[str, Any],
+) -> dict[str, Any]:
+    """One proposal built from a run of clauses, scored and evidenced.
+
+    Windowed selection and whole-source delivery both come through here, so a
+    clip that spans the entire source carries the same evidence, score and
+    review fields as one the picker chose out of something longer.
+    """
+    evidence = join_transcript_parts([str(item["text"]) for item in group])
+    signals = candidate_signals(evidence, end - start, preferred, brief, profile)
+    score = sum(float(profile["weights"][key]) * value for key, value in signals.items())
+    segment_ids = list(dict.fromkeys(identifier for item in group for identifier in item["segment_ids"] if identifier))
+    word_ids = list(dict.fromkeys(identifier for item in group for identifier in item["word_ids"] if identifier))
+    known_confidence = [value for item in group for value in item["confidence"]]
+    risk_flags: list[str] = []
+    if EVIDENCE_RE.search(evidence):
+        risk_flags.append("numeric_or_evidence_claim_requires_fact_check")
+    if SENSITIVE_RE.search(evidence):
+        risk_flags.append("sensitive_claim_requires_fact_check")
+    if known_confidence and sum(known_confidence) / len(known_confidence) < 0.55:
+        risk_flags.append("low_asr_confidence")
+    title = transcript_title_excerpt(evidence)
+    item_id = "highlight-" + canonical_hash(
+        {
+            **stable_seed,
+            "start": start,
+            "end": end,
+            "text": evidence,
+        }
+    )[:12]
+    return {
+        "id": item_id,
+        "start": start,
+        "end": end,
+        "duration_s": round(end - start, 3),
+        "title": title,
+        "title_source": "transcript_extract",
+        "evidence": {
+            "text": evidence,
+            "segment_ids": segment_ids,
+            "word_ids": word_ids,
+            "exact_transcript_extract": True,
+        },
+        "boundary": {
+            "raw_start": round(raw_start, 3),
+            "raw_end": round(raw_end, 3),
+            "frame_aligned": bool(fps > 0),
+            "starts_on_unit": True,
+            "ends_on_unit": True,
+        },
+        "score": round(score, 6),
+        "score_components": {key: round(value, 6) for key, value in signals.items()},
+        "selection_tags": [key.replace("_", "-") for key, value in signals.items() if value >= 0.65],
+        "risk_flags": risk_flags,
+        "review_status": "pending",
+        "review": {"confirmed_by": None, "confirmed_at": None, "user_title": None},
+        "export_status": "not_rendered",
+    }
+
+
 def candidate_windows(
     clauses: list[dict[str, Any]],
     *,
@@ -402,56 +507,19 @@ def candidate_windows(
             start, end = frame_bounds(raw_start, raw_end, fps, duration_s)
             if end <= start:
                 continue
-            signals = candidate_signals(evidence, end - start, preferred, brief, profile)
-            score = sum(float(profile["weights"][key]) * value for key, value in signals.items())
-            segment_ids = list(dict.fromkeys(identifier for item in group for identifier in item["segment_ids"] if identifier))
-            word_ids = list(dict.fromkeys(identifier for item in group for identifier in item["word_ids"] if identifier))
-            known_confidence = [value for item in group for value in item["confidence"]]
-            risk_flags: list[str] = []
-            if EVIDENCE_RE.search(evidence):
-                risk_flags.append("numeric_or_evidence_claim_requires_fact_check")
-            if SENSITIVE_RE.search(evidence):
-                risk_flags.append("sensitive_claim_requires_fact_check")
-            if known_confidence and sum(known_confidence) / len(known_confidence) < 0.55:
-                risk_flags.append("low_asr_confidence")
-            title = transcript_title_excerpt(evidence)
-            item_id = "highlight-" + canonical_hash(
-                {
-                    **stable_seed,
-                    "start": start,
-                    "end": end,
-                    "text": evidence,
-                }
-            )[:12]
             candidates.append(
-                {
-                    "id": item_id,
-                    "start": start,
-                    "end": end,
-                    "duration_s": round(end - start, 3),
-                    "title": title,
-                    "title_source": "transcript_extract",
-                    "evidence": {
-                        "text": evidence,
-                        "segment_ids": segment_ids,
-                        "word_ids": word_ids,
-                        "exact_transcript_extract": True,
-                    },
-                    "boundary": {
-                        "raw_start": round(raw_start, 3),
-                        "raw_end": round(raw_end, 3),
-                        "frame_aligned": bool(fps > 0),
-                        "starts_on_unit": True,
-                        "ends_on_unit": True,
-                    },
-                    "score": round(score, 6),
-                    "score_components": {key: round(value, 6) for key, value in signals.items()},
-                    "selection_tags": [key.replace("_", "-") for key, value in signals.items() if value >= 0.65],
-                    "risk_flags": risk_flags,
-                    "review_status": "pending",
-                    "review": {"confirmed_by": None, "confirmed_at": None, "user_title": None},
-                    "export_status": "not_rendered",
-                }
+                candidate_from_clauses(
+                    list(group),
+                    start=start,
+                    end=end,
+                    raw_start=raw_start,
+                    raw_end=raw_end,
+                    preferred=preferred,
+                    fps=fps,
+                    brief=brief,
+                    profile=profile,
+                    stable_seed=stable_seed,
+                )
             )
             if len(candidates) >= 5000:
                 return candidates
@@ -593,6 +661,45 @@ def build_highlight_plan(
                 stable_seed=stable_seed,
             )
             warnings.append("source was shorter than the requested minimum; proposed actual spoken length without padding")
+    if not candidates and clauses and source_is_the_clip(manifest, duration_s):
+        # Nothing could be chosen, and there was nothing to choose between:
+        # the source is no longer than one finished clip and nobody asked for
+        # a particular length, so it ships whole. This is the Studio case that
+        # reported eleven seconds of real speech as "not enough speech" —
+        # every window failed the ten-second default minimum because two
+        # natural pauses split the transcript into four short runs.
+        start, end = frame_bounds(0.0, duration_s, fps, duration_s)
+        whole = candidate_from_clauses(
+            clauses,
+            start=start,
+            end=end,
+            raw_start=0.0,
+            raw_end=round(duration_s, 3),
+            preferred=preferred,
+            fps=fps,
+            brief=brief,
+            profile=profile,
+            stable_seed=stable_seed,
+        )
+        whole["rank"] = 1
+        whole["selection_tags"] = list(dict.fromkeys([*whole["selection_tags"], "whole-source"]))
+        warnings.append(
+            "短片來源不長於一支成品，已整支交付，未做任何裁切"
+            " (short source delivered whole, nothing was cut away)"
+        )
+        plan = {
+            "schema_version": SCHEMA_VERSION,
+            "generator": "deterministic-local-highlight-planner-v1",
+            "status": "needs_review",
+            "source": source_contract,
+            "configuration": configuration,
+            "generated_at": now_utc(),
+            "warnings": warnings,
+            "whole_source_delivery": True,
+            "items": [whole],
+        }
+        plan["plan_revision"] = canonical_hash({key: value for key, value in plan.items() if key not in {"generated_at", "plan_revision"}})
+        return plan
     selected = select_mmr(candidates, requested_count, float(profile["dedupe_lambda"]))
     if len(selected) < requested_count:
         warnings.append(f"only {len(selected)} distinct transcript-grounded highlights were available; no filler clips were added")
