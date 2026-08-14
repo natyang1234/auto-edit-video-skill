@@ -2630,9 +2630,113 @@ def _spread_collapsed_cluster(
         cursor = boundary
 
 
+# A caption carrying one dangling word is not a line anyone reads: on the
+# 日本旅遊 batch the particle 「了」 was flushed alone by the duration cap and
+# reached the screen — and the translator, given one character of context,
+# rendered it "was".  The chunker therefore refuses to emit such a caption.
+#
+# Where a fragment goes is decided by time, not by grammar: it joins whichever
+# neighbour is closer, and a tie goes backwards, because a stray particle
+# belongs to the sentence it just fell off.  Merging deliberately outranks the
+# duration and unit caps above — one over-long line beats one unreadable one.
+CAPTION_FRAGMENT_MERGE_MAX_GAP_S = 1.5
+# Under a quarter second nothing is legible regardless of how many characters
+# it holds; the 133ms 「然後回去掃」 from batch B was a full phrase and still a
+# flash.
+CAPTION_FRAGMENT_MIN_DURATION_S = 0.25
+CAPTION_FRAGMENT_CJK_RE = re.compile(r"[㐀-鿿]")
+CAPTION_FRAGMENT_STRIP_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def caption_is_fragment(text: str, duration_s: float) -> bool:
+    """A caption too small to carry meaning on its own.
+
+    Chinese counts characters — one character is a fragment, two ("好喔") is a
+    complete answer and stays.  Scripts that space their words get two
+    characters of room, so "ok" merges while "yes" stands.
+    """
+    core = CAPTION_FRAGMENT_STRIP_RE.sub("", text)
+    if not core:
+        return True
+    if duration_s < CAPTION_FRAGMENT_MIN_DURATION_S:
+        return True
+    if CAPTION_FRAGMENT_CJK_RE.search(core):
+        return len(core) <= 1
+    return len(core) <= 2
+
+
+def _absorb_caption_words(
+    target: dict[str, Any],
+    extra: list[dict[str, Any]],
+    *,
+    before: bool,
+) -> None:
+    merged = extra + target["_words"] if before else target["_words"] + extra
+    target["_words"] = merged
+    target["start"] = round(float(merged[0]["start"]), 3)
+    target["end"] = round(float(merged[-1]["end"]), 3)
+    target["text"] = join_caption_words(merged)
+    target["word_ids"] = [str(item["id"]) for item in merged]
+
+
+def merge_caption_fragments(
+    captions: list[dict[str, Any]],
+    dropped: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    items = [dict(caption) for caption in captions]
+    kept: list[dict[str, Any]] = []
+    discarded: list[dict[str, Any]] = []
+    for index, caption in enumerate(items):
+        duration = float(caption["end"]) - float(caption["start"])
+        if not caption_is_fragment(str(caption["text"]), duration):
+            kept.append(caption)
+            continue
+        previous = kept[-1] if kept else None
+        following = items[index + 1] if index + 1 < len(items) else None
+        gap_before = (
+            max(0.0, float(caption["start"]) - float(previous["end"]))
+            if previous is not None
+            else None
+        )
+        gap_after = (
+            max(0.0, float(following["start"]) - float(caption["end"]))
+            if following is not None
+            else None
+        )
+        joins_before = gap_before is not None and gap_before <= CAPTION_FRAGMENT_MERGE_MAX_GAP_S
+        joins_after = gap_after is not None and gap_after <= CAPTION_FRAGMENT_MERGE_MAX_GAP_S
+        if joins_before and (not joins_after or gap_before <= gap_after):
+            _absorb_caption_words(previous, caption["_words"], before=False)
+        elif joins_after:
+            _absorb_caption_words(following, caption["_words"], before=True)
+        else:
+            discarded.append(
+                {
+                    "text": str(caption["text"]),
+                    "start": float(caption["start"]),
+                    "end": float(caption["end"]),
+                    "word_ids": list(caption["word_ids"]),
+                    "reason": "isolated_fragment",
+                }
+            )
+    if not kept:
+        # Everything was a fragment with nowhere to go.  Dropping the lot would
+        # hand the delivery an empty transcript, which fails much further down
+        # and says nothing useful; keep what there is instead.
+        kept = items
+        discarded = []
+    for position, caption in enumerate(kept, start=1):
+        caption["id"] = f"caption-segment-{position:04d}"
+        caption.pop("_words", None)
+    if dropped is not None:
+        dropped.extend(discarded)
+    return kept
+
+
 def readable_caption_segments(
     segments: list[dict[str, Any]],
     words: list[dict[str, Any]],
+    dropped: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if not words:
         return [dict(segment) for segment in segments]
@@ -2649,6 +2753,7 @@ def readable_caption_segments(
                 "end": round(float(current[-1]["end"]), 3),
                 "text": join_caption_words(current),
                 "word_ids": [str(item["id"]) for item in current],
+                "_words": list(current),
             }
         )
         current.clear()
@@ -2683,7 +2788,7 @@ def readable_caption_segments(
         elif re.search(r"[，,；;：:]\s*$", text) and duration >= 2.4:
             flush()
     flush()
-    return captions
+    return merge_caption_fragments(captions, dropped)
 
 
 def build_transcript_review(
@@ -2849,7 +2954,8 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
             }
         )
 
-    caption_segments = readable_caption_segments(segments, flat_words)
+    dropped_fragments: list[dict[str, Any]] = []
+    caption_segments = readable_caption_segments(segments, flat_words, dropped_fragments)
     transcript = {
         "schema_version": SCHEMA_VERSION,
         # Provenance follows the engine that produced this, not the format it
@@ -2865,6 +2971,14 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
     }
     if timestamp_normalization["clusters"]:
         transcript["timestamp_normalization"] = timestamp_normalization
+    if dropped_fragments:
+        # Words the chunker refused to show: they had no neighbour close enough
+        # to join, so nothing on screen carries them.  Recorded so a review can
+        # see what the caption track is missing.
+        transcript["dropped_fragments"] = {
+            "count": len(dropped_fragments),
+            "items": dropped_fragments,
+        }
     return transcript, compatibility
 
 

@@ -12,16 +12,18 @@
       "required": ["name", "version", "config"],
       "properties": {
         "name": {"const": "readable_caption_segments"},
-        "version": {"const": 1},
+        "version": {"const": 2},
         "config": {
           "type": "object",
-          "required": ["gap_us", "max_duration_us", "max_display_units", "sentence_flush_min_us", "clause_flush_min_us"],
+          "required": ["gap_us", "max_duration_us", "max_display_units", "sentence_flush_min_us", "clause_flush_min_us", "fragment_merge_max_gap_us", "fragment_min_duration_us"],
           "properties": {
             "gap_us": {"type": "integer", "minimum": 1},
             "max_duration_us": {"type": "integer", "minimum": 1},
             "max_display_units": {"type": "integer", "minimum": 1},
             "sentence_flush_min_us": {"type": "integer", "minimum": 1},
-            "clause_flush_min_us": {"type": "integer", "minimum": 1}
+            "clause_flush_min_us": {"type": "integer", "minimum": 1},
+            "fragment_merge_max_gap_us": {"type": "integer", "minimum": 1},
+            "fragment_min_duration_us": {"type": "integer", "minimum": 1}
           },
           "additionalProperties": false
         }

@@ -42,13 +42,18 @@ PCM_FORMAT = {
 }
 CHUNKER = {
     "name": "readable_caption_segments",
-    "version": 1,
+    # v2 (2026-08-14): single-word fragments are merged into the nearer
+    # neighbour or dropped, so the same words segment differently than under
+    # v1 and every caption id derived from them is expected to move.
+    "version": 2,
     "config": {
         "gap_us": 700000,
         "max_duration_us": 5500000,
         "max_display_units": 56,
         "sentence_flush_min_us": 800000,
         "clause_flush_min_us": 2400000,
+        "fragment_merge_max_gap_us": 1500000,
+        "fragment_min_duration_us": 250000,
     },
 }
 IDENTITY_REASONS = {"brand", "proper_name", "code", "number_unit"}
