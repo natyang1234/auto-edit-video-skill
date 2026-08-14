@@ -1708,6 +1708,8 @@ h2 {
 .studio-import-page {
   min-height: 100vh;
   overflow-x: hidden;
+  /* 全站 body 為工作站版型鎖了 overflow:hidden；導入頁是長表單，必須恢復直向捲動 */
+  overflow-y: auto;
   color: var(--paper-ink, #2d2722);
   background:
     radial-gradient(circle at 14% 12%, oklch(0.94 0.035 72 / 0.72), transparent 34rem),
