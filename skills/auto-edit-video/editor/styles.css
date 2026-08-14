@@ -1745,8 +1745,10 @@ h2 {
   padding: clamp(2rem, 6vw, 5.5rem) 0;
   display: grid;
   grid-template-columns: minmax(0, 0.85fr) minmax(430px, 1.15fr);
-  gap: clamp(2rem, 6vw, 5.5rem);
-  align-items: center;
+  column-gap: clamp(2rem, 6vw, 5.5rem);
+  /* 兩張 import-card 疊在右欄；列距縮小，資料夾卡才會緊貼表單卡下方 */
+  row-gap: 1.25rem;
+  align-items: start;
 }
 
 .import-intro h2 {
@@ -1888,8 +1890,13 @@ h2 {
 .import-submit:disabled { opacity: 0.45; cursor: not-allowed; }
 .import-privacy { margin: 0.8rem 0 0; color: oklch(0.55 0.018 65); text-align: center; font-size: 0.7rem; line-height: 1.55; }
 
+.import-workspace > .import-card + .import-card {
+  grid-column: 2; /* 資料夾匯入卡固定右欄，接在主表單卡下方 */
+}
+
 @media (max-width: 900px) {
   .import-workspace { grid-template-columns: 1fr; padding-top: 2.5rem; }
+  .import-workspace > .import-card + .import-card { grid-column: auto; }
   .import-intro h2 { max-width: 15ch; }
 }
 
