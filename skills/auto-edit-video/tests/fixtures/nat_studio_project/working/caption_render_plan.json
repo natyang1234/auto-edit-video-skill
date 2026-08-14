@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "caption_revision": "7927ec900b86542955a801d9a02bdc30eec89593f31f7996e570d81ac137402c",
+  "grapheme_contract": "grapheme_cluster_v1",
+  "items": [],
+  "receipt": {
+    "shaping_engine": "macos-coretext",
+    "shaping_engine_version": "macos-26.5",
+    "fonts": {
+      "font-system-emoji": {
+        "path": "system:Apple Color Emoji",
+        "sha256": ""
+      }
+    },
+    "disallowed_fallbacks": []
+  },
+  "revision": "1cfdbdcdacfeec7062ec6d7b21aeb9a8584c8049e926569c8654e5bbf5e85caf"
+}

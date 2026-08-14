@@ -1,0 +1,610 @@
+{
+  "schema_version": 1,
+  "engine": "openai-whisper",
+  "language": "zh",
+  "duration_s": 11.34,
+  "text": "我總不能過太久 再說一遍然後他的訓室隨便我是因為你米跟那個同不太可惜對 因為那會",
+  "segments": [
+    {
+      "id": "segment-0001",
+      "start": 0.0,
+      "end": 2.02,
+      "text": "我總不能過太久再說一遍",
+      "words": [
+        {
+          "id": "word-00001",
+          "text": "我",
+          "start": 0.0,
+          "end": 0.05,
+          "confidence": 0.0941,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00002",
+          "text": "總",
+          "start": 0.05,
+          "end": 0.1,
+          "confidence": 0.1711,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00003",
+          "text": "不能",
+          "start": 0.1,
+          "end": 0.36,
+          "confidence": 0.9943,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00004",
+          "text": "過",
+          "start": 0.36,
+          "end": 0.54,
+          "confidence": 0.9138,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00005",
+          "text": "太",
+          "start": 0.54,
+          "end": 0.7,
+          "confidence": 0.8353,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00006",
+          "text": "久",
+          "start": 0.7,
+          "end": 0.86,
+          "confidence": 0.9879,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00007",
+          "text": "再",
+          "start": 0.96,
+          "end": 1.02,
+          "confidence": 0.1929,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00008",
+          "text": "說",
+          "start": 1.02,
+          "end": 1.22,
+          "confidence": 0.1169,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00009",
+          "text": "一",
+          "start": 1.22,
+          "end": 1.42,
+          "confidence": 0.8643,
+          "segment_id": "segment-0001"
+        },
+        {
+          "id": "word-00010",
+          "text": "遍",
+          "start": 1.42,
+          "end": 2.02,
+          "confidence": 0.5484,
+          "segment_id": "segment-0001"
+        }
+      ]
+    },
+    {
+      "id": "segment-0002",
+      "start": 2.02,
+      "end": 4.38,
+      "text": "然後他的訓室隨便",
+      "words": [
+        {
+          "id": "word-00011",
+          "text": "然後",
+          "start": 2.02,
+          "end": 2.2,
+          "confidence": 0.0526,
+          "segment_id": "segment-0002"
+        },
+        {
+          "id": "word-00012",
+          "text": "他的",
+          "start": 2.2,
+          "end": 2.64,
+          "confidence": 0.4101,
+          "segment_id": "segment-0002"
+        },
+        {
+          "id": "word-00013",
+          "text": "訓",
+          "start": 2.64,
+          "end": 3.78,
+          "confidence": 0.4801,
+          "segment_id": "segment-0002"
+        },
+        {
+          "id": "word-00014",
+          "text": "室",
+          "start": 3.78,
+          "end": 3.98,
+          "confidence": 0.5616,
+          "segment_id": "segment-0002"
+        },
+        {
+          "id": "word-00015",
+          "text": "隨",
+          "start": 3.98,
+          "end": 4.22,
+          "confidence": 0.1088,
+          "segment_id": "segment-0002"
+        },
+        {
+          "id": "word-00016",
+          "text": "便",
+          "start": 4.22,
+          "end": 4.38,
+          "confidence": 0.9514,
+          "segment_id": "segment-0002"
+        }
+      ]
+    },
+    {
+      "id": "segment-0003",
+      "start": 5.0,
+      "end": 8.46,
+      "text": "我是因為你米跟那個同不太可惜",
+      "words": [
+        {
+          "id": "word-00017",
+          "text": "我是",
+          "start": 4.9,
+          "end": 5.1,
+          "confidence": 0.1336,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00018",
+          "text": "因為",
+          "start": 5.1,
+          "end": 5.88,
+          "confidence": 0.9659,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00019",
+          "text": "你",
+          "start": 5.88,
+          "end": 6.08,
+          "confidence": 0.9245,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00020",
+          "text": "米",
+          "start": 6.08,
+          "end": 6.34,
+          "confidence": 0.7545,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00021",
+          "text": "跟",
+          "start": 6.34,
+          "end": 6.58,
+          "confidence": 0.8193,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00022",
+          "text": "那個",
+          "start": 6.58,
+          "end": 6.86,
+          "confidence": 0.5476,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00023",
+          "text": "同",
+          "start": 6.86,
+          "end": 7.18,
+          "confidence": 0.3248,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00024",
+          "text": "不",
+          "start": 7.18,
+          "end": 7.64,
+          "confidence": 0.1922,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00025",
+          "text": "太",
+          "start": 7.64,
+          "end": 7.84,
+          "confidence": 0.97,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00026",
+          "text": "可",
+          "start": 7.84,
+          "end": 8.12,
+          "confidence": 0.7762,
+          "segment_id": "segment-0003"
+        },
+        {
+          "id": "word-00027",
+          "text": "惜",
+          "start": 8.12,
+          "end": 8.46,
+          "confidence": 0.3558,
+          "segment_id": "segment-0003"
+        }
+      ]
+    },
+    {
+      "id": "segment-0004",
+      "start": 10.18,
+      "end": 11.32,
+      "text": "對因為那會",
+      "words": [
+        {
+          "id": "word-00028",
+          "text": "對",
+          "start": 10.18,
+          "end": 10.58,
+          "confidence": 0.1673,
+          "segment_id": "segment-0004"
+        },
+        {
+          "id": "word-00029",
+          "text": "因為",
+          "start": 10.76,
+          "end": 10.94,
+          "confidence": 0.9875,
+          "segment_id": "segment-0004"
+        },
+        {
+          "id": "word-00030",
+          "text": "那",
+          "start": 10.94,
+          "end": 11.12,
+          "confidence": 0.3026,
+          "segment_id": "segment-0004"
+        },
+        {
+          "id": "word-00031",
+          "text": "會",
+          "start": 11.12,
+          "end": 11.32,
+          "confidence": 0.823,
+          "segment_id": "segment-0004"
+        }
+      ]
+    }
+  ],
+  "caption_segments": [
+    {
+      "id": "caption-segment-0001",
+      "start": 0.0,
+      "end": 2.02,
+      "text": "我總不能過太久再說一遍",
+      "word_ids": [
+        "word-00001",
+        "word-00002",
+        "word-00003",
+        "word-00004",
+        "word-00005",
+        "word-00006",
+        "word-00007",
+        "word-00008",
+        "word-00009",
+        "word-00010"
+      ]
+    },
+    {
+      "id": "caption-segment-0002",
+      "start": 2.02,
+      "end": 4.38,
+      "text": "然後他的訓室隨便",
+      "word_ids": [
+        "word-00011",
+        "word-00012",
+        "word-00013",
+        "word-00014",
+        "word-00015",
+        "word-00016"
+      ]
+    },
+    {
+      "id": "caption-segment-0003",
+      "start": 4.9,
+      "end": 8.46,
+      "text": "我是因為你米跟那個同不太可惜",
+      "word_ids": [
+        "word-00017",
+        "word-00018",
+        "word-00019",
+        "word-00020",
+        "word-00021",
+        "word-00022",
+        "word-00023",
+        "word-00024",
+        "word-00025",
+        "word-00026",
+        "word-00027"
+      ]
+    },
+    {
+      "id": "caption-segment-0004",
+      "start": 10.18,
+      "end": 11.32,
+      "text": "對因為那會",
+      "word_ids": [
+        "word-00028",
+        "word-00029",
+        "word-00030",
+        "word-00031"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "id": "word-00001",
+      "text": "我",
+      "start": 0.0,
+      "end": 0.05,
+      "confidence": 0.0941,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00002",
+      "text": "總",
+      "start": 0.05,
+      "end": 0.1,
+      "confidence": 0.1711,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00003",
+      "text": "不能",
+      "start": 0.1,
+      "end": 0.36,
+      "confidence": 0.9943,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00004",
+      "text": "過",
+      "start": 0.36,
+      "end": 0.54,
+      "confidence": 0.9138,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00005",
+      "text": "太",
+      "start": 0.54,
+      "end": 0.7,
+      "confidence": 0.8353,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00006",
+      "text": "久",
+      "start": 0.7,
+      "end": 0.86,
+      "confidence": 0.9879,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00007",
+      "text": "再",
+      "start": 0.96,
+      "end": 1.02,
+      "confidence": 0.1929,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00008",
+      "text": "說",
+      "start": 1.02,
+      "end": 1.22,
+      "confidence": 0.1169,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00009",
+      "text": "一",
+      "start": 1.22,
+      "end": 1.42,
+      "confidence": 0.8643,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00010",
+      "text": "遍",
+      "start": 1.42,
+      "end": 2.02,
+      "confidence": 0.5484,
+      "segment_id": "segment-0001"
+    },
+    {
+      "id": "word-00011",
+      "text": "然後",
+      "start": 2.02,
+      "end": 2.2,
+      "confidence": 0.0526,
+      "segment_id": "segment-0002"
+    },
+    {
+      "id": "word-00012",
+      "text": "他的",
+      "start": 2.2,
+      "end": 2.64,
+      "confidence": 0.4101,
+      "segment_id": "segment-0002"
+    },
+    {
+      "id": "word-00013",
+      "text": "訓",
+      "start": 2.64,
+      "end": 3.78,
+      "confidence": 0.4801,
+      "segment_id": "segment-0002"
+    },
+    {
+      "id": "word-00014",
+      "text": "室",
+      "start": 3.78,
+      "end": 3.98,
+      "confidence": 0.5616,
+      "segment_id": "segment-0002"
+    },
+    {
+      "id": "word-00015",
+      "text": "隨",
+      "start": 3.98,
+      "end": 4.22,
+      "confidence": 0.1088,
+      "segment_id": "segment-0002"
+    },
+    {
+      "id": "word-00016",
+      "text": "便",
+      "start": 4.22,
+      "end": 4.38,
+      "confidence": 0.9514,
+      "segment_id": "segment-0002"
+    },
+    {
+      "id": "word-00017",
+      "text": "我是",
+      "start": 4.9,
+      "end": 5.1,
+      "confidence": 0.1336,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00018",
+      "text": "因為",
+      "start": 5.1,
+      "end": 5.88,
+      "confidence": 0.9659,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00019",
+      "text": "你",
+      "start": 5.88,
+      "end": 6.08,
+      "confidence": 0.9245,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00020",
+      "text": "米",
+      "start": 6.08,
+      "end": 6.34,
+      "confidence": 0.7545,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00021",
+      "text": "跟",
+      "start": 6.34,
+      "end": 6.58,
+      "confidence": 0.8193,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00022",
+      "text": "那個",
+      "start": 6.58,
+      "end": 6.86,
+      "confidence": 0.5476,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00023",
+      "text": "同",
+      "start": 6.86,
+      "end": 7.18,
+      "confidence": 0.3248,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00024",
+      "text": "不",
+      "start": 7.18,
+      "end": 7.64,
+      "confidence": 0.1922,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00025",
+      "text": "太",
+      "start": 7.64,
+      "end": 7.84,
+      "confidence": 0.97,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00026",
+      "text": "可",
+      "start": 7.84,
+      "end": 8.12,
+      "confidence": 0.7762,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00027",
+      "text": "惜",
+      "start": 8.12,
+      "end": 8.46,
+      "confidence": 0.3558,
+      "segment_id": "segment-0003"
+    },
+    {
+      "id": "word-00028",
+      "text": "對",
+      "start": 10.18,
+      "end": 10.58,
+      "confidence": 0.1673,
+      "segment_id": "segment-0004"
+    },
+    {
+      "id": "word-00029",
+      "text": "因為",
+      "start": 10.76,
+      "end": 10.94,
+      "confidence": 0.9875,
+      "segment_id": "segment-0004"
+    },
+    {
+      "id": "word-00030",
+      "text": "那",
+      "start": 10.94,
+      "end": 11.12,
+      "confidence": 0.3026,
+      "segment_id": "segment-0004"
+    },
+    {
+      "id": "word-00031",
+      "text": "會",
+      "start": 11.12,
+      "end": 11.32,
+      "confidence": 0.823,
+      "segment_id": "segment-0004"
+    }
+  ],
+  "timestamp_normalization": {
+    "collapsed_words": 1,
+    "clusters": 1,
+    "adjusted_words": 2
+  },
+  "orthography_variant": "zh-TW"
+}

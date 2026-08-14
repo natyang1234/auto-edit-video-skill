@@ -1,0 +1,226 @@
+{
+  "schema_version": 2,
+  "updated_at": "2026-08-14T08:51:02+00:00",
+  "project_id": "20260814t085038z-2025-11-25-1149-img-7766-ce64b1b0-ffd4",
+  "source_sha256": "ce64b1b0ed0a070d9878c1f2b0b464dade3aa94bf19cc6a24d8ccb434e4c7011",
+  "caption_generation": {
+    "enabled": true,
+    "reason": "no analysis yet; assuming the source is unsubtitled"
+  },
+  "segments": [
+    {
+      "id": "segment-8deca5a7c28a",
+      "source_start": 0.0,
+      "source_end": 11.34,
+      "origin": "default_full_source"
+    }
+  ],
+  "variants": [],
+  "rights": {
+    "asserted": false,
+    "assertion_revision": null
+  },
+  "highlight_plan_revision": "f8dc56f6266162f208f29763574ecf8491d35dd94e363bb0e7c352a0d77abdb6",
+  "active_highlight_id": null,
+  "highlights": [],
+  "asset_digests": {},
+  "canvas": {
+    "platform_id": "instagram-reels",
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "fit": "contain",
+    "show_safe_zones": true
+  },
+  "director_style": "teacher-punch",
+  "visual_quality_mode": "designed",
+  "graphic_package_style": "craft-stack",
+  "style_pack": {
+    "project_default": "dark-data-presenter",
+    "per_highlight": {}
+  },
+  "video_template": {
+    "id": "dynamic-craft",
+    "frame": {
+      "x": 50,
+      "y": 40,
+      "width": 93,
+      "height": 33,
+      "fit": "cover"
+    },
+    "subject": {
+      "x": 50,
+      "y": 54,
+      "scale": 1.0,
+      "feather": 2,
+      "mask_stride": 3
+    },
+    "background": {
+      "color": "#17251d",
+      "source": null,
+      "fit": "cover",
+      "blur": 0
+    }
+  },
+  "editing_brief": "",
+  "caption_defaults": {
+    "font_family": "PingFang TC",
+    "font_size": 58,
+    "font_weight": 800,
+    "color": "#f7f2e8",
+    "emphasis_color": "#ffd447",
+    "stroke_color": "#17130f",
+    "stroke_width": 5,
+    "x": 50,
+    "y": 76,
+    "max_width": 86,
+    "animation": "pop"
+  },
+  "overlays": [
+    {
+      "id": "caption-0001",
+      "type": "caption",
+      "start": 0.0,
+      "end": 2.02,
+      "text": "我總不能過太久再說一遍",
+      "emphasis": [],
+      "effect_spans": [],
+      "visible": true,
+      "locked": false,
+      "z_index": 20,
+      "style": {
+        "font_family": "PingFang TC",
+        "font_size": 58,
+        "font_weight": 800,
+        "color": "#f7f2e8",
+        "emphasis_color": "#ffd447",
+        "stroke_color": "#17130f",
+        "stroke_width": 5,
+        "x": 50,
+        "y": 76,
+        "max_width": 86,
+        "animation": "pop"
+      },
+      "source": "working/transcript_words.json",
+      "provenance": "local-whisper draft; requires transcript review",
+      "semantic_review": {
+        "status": "checked",
+        "unit_id": "caption-segment-0001",
+        "candidates": []
+      }
+    },
+    {
+      "id": "caption-0002",
+      "type": "caption",
+      "start": 2.02,
+      "end": 4.38,
+      "text": "然後他的訓室隨便",
+      "emphasis": [],
+      "effect_spans": [],
+      "visible": true,
+      "locked": false,
+      "z_index": 20,
+      "style": {
+        "font_family": "PingFang TC",
+        "font_size": 58,
+        "font_weight": 800,
+        "color": "#f7f2e8",
+        "emphasis_color": "#ffd447",
+        "stroke_color": "#17130f",
+        "stroke_width": 5,
+        "x": 50,
+        "y": 76,
+        "max_width": 86,
+        "animation": "pop"
+      },
+      "source": "working/transcript_words.json",
+      "provenance": "local-whisper draft; requires transcript review",
+      "semantic_review": {
+        "status": "checked",
+        "unit_id": "caption-segment-0002",
+        "candidates": []
+      }
+    },
+    {
+      "id": "caption-0003",
+      "type": "caption",
+      "start": 4.9,
+      "end": 8.46,
+      "text": "我是因為你米跟那個同不太可惜",
+      "emphasis": [],
+      "effect_spans": [],
+      "visible": true,
+      "locked": false,
+      "z_index": 20,
+      "style": {
+        "font_family": "PingFang TC",
+        "font_size": 58,
+        "font_weight": 800,
+        "color": "#f7f2e8",
+        "emphasis_color": "#ffd447",
+        "stroke_color": "#17130f",
+        "stroke_width": 5,
+        "x": 50,
+        "y": 76,
+        "max_width": 86,
+        "animation": "pop"
+      },
+      "source": "working/transcript_words.json",
+      "provenance": "local-whisper draft; requires transcript review",
+      "semantic_review": {
+        "status": "checked",
+        "unit_id": "caption-segment-0003",
+        "candidates": []
+      }
+    },
+    {
+      "id": "caption-0004",
+      "type": "caption",
+      "start": 10.18,
+      "end": 11.32,
+      "text": "對因為那會",
+      "emphasis": [],
+      "effect_spans": [],
+      "visible": true,
+      "locked": false,
+      "z_index": 20,
+      "style": {
+        "font_family": "PingFang TC",
+        "font_size": 58,
+        "font_weight": 800,
+        "color": "#f7f2e8",
+        "emphasis_color": "#ffd447",
+        "stroke_color": "#17130f",
+        "stroke_width": 5,
+        "x": 50,
+        "y": 76,
+        "max_width": 86,
+        "animation": "pop"
+      },
+      "source": "working/transcript_words.json",
+      "provenance": "local-whisper draft; requires transcript review",
+      "semantic_review": {
+        "status": "checked",
+        "unit_id": "caption-segment-0004",
+        "candidates": []
+      }
+    }
+  ],
+  "publishing": {
+    "platform_id": "instagram-reels",
+    "draft_status": "not_generated",
+    "title": "",
+    "body": "",
+    "hashtags": [],
+    "cover": {
+      "time": 1.0,
+      "text": "",
+      "output": null
+    }
+  },
+  "review": {
+    "selected_overlay_id": "caption-0001",
+    "warnings_acknowledged": []
+  },
+  "revision": "684a3c78af209a982b9b7869cb75bf96c810cc640f0a7d2d8c0435801852bf1c"
+}

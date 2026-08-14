@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "status": "not_configured",
+  "rule_count": 0,
+  "correction_count": 0,
+  "human_review_required": true,
+  "artifact": "working/transcript_calibration.json",
+  "rules": [],
+  "corrections": [],
+  "generated_at": "2026-08-14T08:51:02+00:00"
+}

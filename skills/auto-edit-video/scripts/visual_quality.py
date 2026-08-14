@@ -28,6 +28,102 @@ ROLE_KICKERS = {
     "memory": "記憶技巧",
     "recap": "一秒複習",
 }
+# Choosing a director is choosing an editing language, not a colour swatch:
+# the card copy and the card motion belong to the profile, so switching to
+# ``minimal`` cannot leave a classroom kicker like "30 秒重點課" on screen.
+DIRECTOR_ROLE_KICKERS = {
+    "teacher-punch": dict(ROLE_KICKERS),
+    "high-energy": {
+        "hook": "先別滑走",
+        "concept": "重點在這",
+        "rule": "關鍵一句",
+        "memory": "記住這招",
+        "recap": "三秒收尾",
+    },
+    "documentary": {
+        "hook": "事件開場",
+        "concept": "背景是這樣",
+        "rule": "爭議焦點",
+        "memory": "值得記住",
+        "recap": "重點回顧",
+    },
+    "editorial-clean": {
+        "hook": "開場",
+        "concept": "重點",
+        "rule": "關鍵",
+        "memory": "補充",
+        "recap": "收尾",
+    },
+    "minimal": {
+        "hook": "現場",
+        "concept": "這裡",
+        "rule": "重點",
+        "memory": "順帶一提",
+        "recap": "收工",
+    },
+    "kinetic-explainer": {
+        "hook": "開場動畫",
+        "concept": "概念拆解",
+        "rule": "核心規則",
+        "memory": "記憶點",
+        "recap": "快速複習",
+    },
+}
+# Motion intensity mirrors the registry envelope: low-motion profiles get one
+# calm entry for every card, high-motion profiles keep the punchy entries.
+DIRECTOR_MOTION = {
+    "teacher-punch": None,
+    "high-energy": {"hook": "pop", "concept": "pop", "rule": "pop", "memory": "pop", "recap": "pop"},
+    "documentary": {
+        "hook": "fade",
+        "concept": "fade",
+        "rule": "fade",
+        "memory": "fade",
+        "recap": "fade",
+    },
+    "editorial-clean": {
+        "hook": "fade",
+        "concept": "fade",
+        "rule": "fade",
+        "memory": "fade",
+        "recap": "fade",
+    },
+    "minimal": {
+        "hook": "fade",
+        "concept": "fade",
+        "rule": "fade",
+        "memory": "fade",
+        "recap": "fade",
+    },
+    "kinetic-explainer": {
+        "hook": "slide-up",
+        "concept": "slide-up",
+        "rule": "pop",
+        "memory": "slide-up",
+        "recap": "pop",
+    },
+}
+
+
+def director_role_kickers(director_style: str) -> dict[str, str]:
+    """Return one director's card vocabulary, falling back to the default."""
+    return dict(DIRECTOR_ROLE_KICKERS.get(director_style) or ROLE_KICKERS)
+
+
+def director_role_animation(director_style: str, role: str, fallback: str) -> str:
+    """Return one director's card entry animation for a designed role."""
+    overrides = DIRECTOR_MOTION.get(director_style)
+    if not overrides:
+        return fallback
+    return str(overrides.get(role) or fallback)
+
+
+def director_overlay_animation(director_style: str, overlay_type: str, fallback: str) -> str:
+    """Return one director's entry animation for a plan-derived overlay."""
+    role = {"title": "hook", "card": "concept", "animation": "rule"}.get(overlay_type)
+    if role is None:
+        return fallback
+    return director_role_animation(director_style, role, fallback)
 ROLE_TYPES = {
     "hook": "title",
     "concept": "card",
@@ -118,6 +214,7 @@ def _role_style(
         "recap": (27, "pop", max(70, base_size + 10)),
     }
     y, animation, font_size = role_positions[role]
+    animation = director_role_animation(director_style, role, animation)
     style.update(
         {
             "font_size": font_size,
@@ -164,6 +261,7 @@ def build_highlight_design_overlays(
         "recap": 1.0,
     }
     highlight_id = str(highlight.get("id") or "highlight")
+    kickers = director_role_kickers(director_style)
     overlays: list[dict[str, Any]] = []
     for index, role in enumerate(DESIGN_ROLES, start=1):
         start_fraction, end_fraction = ROLE_WINDOWS[role]
@@ -183,7 +281,7 @@ def build_highlight_design_overlays(
                 "start": round(start, 3),
                 "end": round(min(clip_end, end), 3),
                 "text": text,
-                "kicker": ROLE_KICKERS[role],
+                "kicker": kickers[role],
                 "detail": _sample_segment_text(
                     segments,
                     min(1.0, sample_fractions[role] + 0.12),

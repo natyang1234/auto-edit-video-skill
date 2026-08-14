@@ -2931,7 +2931,7 @@ function bindEvents() {
   });
   elements["template-background-button"].addEventListener("click", () => elements["template-background-input"].click());
   elements["template-background-input"].addEventListener("change", () => uploadTemplateBackground(elements["template-background-input"].files[0]));
-  elements["director-select"].addEventListener("change", () => {
+  elements["director-select"].addEventListener("change", async () => {
     const id = elements["director-select"].value;
     const preset = projectPayload.director_presets[id];
     if (!isDirectorAvailable(preset)) {
@@ -2939,17 +2939,44 @@ function bindEvents() {
       showToast(directorUnavailableReason(preset), "error");
       return;
     }
-    pushHistory();
-    state.director_style = id;
-    state.caption_defaults = deepCopy(preset.caption);
-    state.overlays.filter((overlay) => ["caption", "emphasis", "title", "card", "animation"].includes(overlay.type)).forEach((overlay) => {
-      overlay.style = { ...overlay.style, ...deepCopy(preset.caption) };
-      if (["title", "card", "animation"].includes(overlay.type)) overlay.style.box = true;
-    });
-    markDirty("剪輯導演風格已套用");
-    renderDirectorCards();
-    renderInspector();
-    showToast(`已套用「${preset.label}」到文字圖層`, "success");
+    if (id === state.director_style) return;
+    // Picking a director picks a whole editing language, so the panel says
+    // out loud what regenerates and what stays: the cut and the transcript.
+    const confirmed = window.confirm(`切換導演將以「${preset.label}」重新生成字卡與動態，字幕與剪點不變。繼續？`);
+    if (!confirmed) {
+      elements["director-select"].value = state.director_style;
+      renderDirectorCards();
+      return;
+    }
+    const previousDirector = state.director_style;
+    elements["director-select"].disabled = true;
+    setSaveState(`正在以「${preset.label}」重新生成字卡與動態…`, "saving");
+    try {
+      await saveState(false);
+      if (stateDirty) throw new Error("目前編輯內容尚未成功儲存");
+      const result = await request("/api/director", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ director: id, expected_revision: state.revision }),
+      });
+      pushHistory();
+      state = result.state;
+      projectPayload.approval_revisions = result.approval_revisions;
+      if (result.director_presets) projectPayload.director_presets = result.director_presets;
+      selectedOverlayId = state.review?.selected_overlay_id || state.overlays[0]?.id || null;
+      elements["approve-timeline"].textContent = "核可時間軸";
+      renderAll();
+      updateScrubberBounds();
+      setSaveState("已重新生成", "saved");
+      showToast(`已改用「${preset.label}」重新生成字卡與動態`, "success");
+    } catch (error) {
+      elements["director-select"].value = previousDirector;
+      renderDirectorCards();
+      setSaveState("導演切換失敗", "error");
+      showToast(`切換導演失敗：${error.message}`, "error");
+    } finally {
+      elements["director-select"].disabled = false;
+    }
   });
   document.querySelectorAll("[data-add-type]").forEach((button) => button.addEventListener("click", () => addOverlay(button.dataset.addType)));
   elements["asset-upload-button"].addEventListener("click", () => elements["asset-input"].click());

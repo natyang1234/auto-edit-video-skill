@@ -42,6 +42,7 @@ from local_http_security import (
     is_loopback_host,
     mutation_origin_allowed,
 )
+import visual_quality
 from visual_quality import (
     ROLE_LAYOUTS,
     build_highlight_design_overlays,
@@ -65,7 +66,9 @@ import qa_video
 from director_resolver import (
     DirectorResolutionError,
     enforce_runtime_capabilities,
+    persist_director_selection,
     resolve_director_profile,
+    resolve_director_selection,
 )
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -2118,6 +2121,7 @@ def artifact_plan_overlays(
     project_dir: Path,
     caption_style: dict[str, Any],
     duration_s: float,
+    director_style: str = "teacher-punch",
 ) -> list[dict[str, Any]]:
     """Convert reviewed-plan artifacts into editable timeline proposals."""
     overlays: list[dict[str, Any]] = []
@@ -2140,7 +2144,9 @@ def artifact_plan_overlays(
                 "color": style.get("emphasis_color", "#ffd447"),
                 "y": max(18, float(style.get("y", 76)) - 14),
                 "max_width": min(78, float(style.get("max_width", 86))),
-                "animation": "pop",
+                "animation": visual_quality.director_role_animation(
+                    director_style, "rule", "pop"
+                ),
                 "box": False,
             }
         )
@@ -2196,7 +2202,11 @@ def artifact_plan_overlays(
                     "x": 50,
                     "y": 39 if overlay_type == "title" else 46,
                     "max_width": 82,
-                    "animation": "slide-up" if overlay_type == "title" else "fade",
+                    "animation": visual_quality.director_overlay_animation(
+                        director_style,
+                        overlay_type,
+                        "slide-up" if overlay_type == "title" else "fade",
+                    ),
                     "box": True,
                     "box_color": "#201b17",
                 }
@@ -2620,6 +2630,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
                 project_dir,
                 caption_style,
                 float(manifest.get("source", {}).get("duration_s", 0.0)),
+                director_id,
             )
         )
     state = {
@@ -2679,6 +2690,102 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
     state["asset_digests"] = referenced_asset_digests(project_dir, state)
     state["revision"] = editor_state_revision(state)
     atomic_write_json(project_dir / STATE_REL, state)
+    return state
+
+
+DIRECTOR_DERIVED_OVERLAY_SOURCES = frozenset(
+    {
+        "working/highlight_visual_plan.json",
+        "working/visual_plan.json",
+        "working/emphasis_plan.json",
+    }
+)
+
+
+def director_owns_overlay(overlay: dict[str, Any]) -> bool:
+    """True when this layer was derived from the director, not from a person."""
+    if not isinstance(overlay, dict):
+        return False
+    if overlay.get("design_role"):
+        return True
+    return str(overlay.get("source") or "") in DIRECTOR_DERIVED_OVERLAY_SOURCES
+
+
+def apply_director_to_state(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+    director_id: str,
+) -> dict[str, Any]:
+    """Re-derive every director-owned layer while the approved cut stays put.
+
+    Choosing a director chooses an editing language: card copy, card motion and
+    caption typography all belong to it.  What it must never touch is the work
+    a person already approved -- the segments, the highlight selection, and the
+    transcript-grounded caption text and timing.
+    """
+    director = DIRECTOR_PRESETS[director_id]
+    caption_style = dict(director["caption"])
+    transcript = read_json(project_dir / "working/transcript_words.json", {}) or {}
+    highlight_plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
+    retained: list[dict[str, Any]] = []
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict) or director_owns_overlay(overlay):
+            continue
+        if overlay.get("type") in {"caption", "emphasis", "title", "card", "animation"}:
+            style = {**(overlay.get("style") or {}), **caption_style}
+            if overlay.get("type") in {"title", "card", "animation"}:
+                style["box"] = True
+            overlay["style"] = style
+        retained.append(overlay)
+    highlights = [item for item in state.get("highlights", []) if isinstance(item, dict)]
+    derived: list[dict[str, Any]] = []
+    if highlights:
+        for highlight in highlights:
+            derived.extend(
+                build_highlight_design_overlays(
+                    transcript,
+                    highlight,
+                    caption_style,
+                    director_id,
+                )
+            )
+        atomic_write_json(
+            project_dir / "working/highlight_visual_plan.json",
+            {
+                "schema_version": 1,
+                "generator": "highlight-scoped-designed-cards-v1",
+                "highlight_plan_revision": highlight_plan.get("plan_revision"),
+                "items": derived,
+            },
+        )
+    else:
+        derived = artifact_plan_overlays(
+            project_dir,
+            caption_style,
+            float(manifest.get("source", {}).get("duration_s", 0.0)),
+            director_id,
+        )
+    state["overlays"] = retained + derived
+    state["director_style"] = director_id
+    state["caption_defaults"] = caption_style
+    style_pack = state.get("style_pack")
+    if not isinstance(style_pack, dict):
+        style_pack = {"project_default": "dark-data-presenter", "per_highlight": {}}
+        state["style_pack"] = style_pack
+    style_pack["project_default"] = DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
+        director_id, "dark-data-presenter"
+    )
+    review = state.get("review")
+    if isinstance(review, dict):
+        overlay_ids = {str(item.get("id")) for item in state["overlays"]}
+        if str(review.get("selected_overlay_id")) not in overlay_ids:
+            review["selected_overlay_id"] = (
+                state["overlays"][0]["id"] if state["overlays"] else None
+            )
+    state["updated_at"] = now_utc()
+    state["asset_digests"] = referenced_asset_digests(project_dir, state)
+    state["revision"] = editor_state_revision(state)
     return state
 
 
@@ -5169,6 +5276,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/plan-highlights":
             self.handle_plan_highlights()
             return
+        if path == "/api/director":
+            self.handle_director_switch()
+            return
         if path == "/api/captions/snap":
             self.handle_caption_snap()
             return
@@ -5282,6 +5392,85 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         draft = copy_draft(platform_id, transcript_text(self.server.project_dir))
         self.send_json({"ok": True, "draft": draft})
+
+    def handle_director_switch(self) -> None:
+        """Re-cut the derived layers for a new director, keeping the cut."""
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        director = str(body.get("director", ""))
+        expected_revision = str(body.get("expected_revision", ""))
+        if director not in DIRECTOR_PRESETS:
+            self.send_json({"ok": False, "error": "unsupported director profile"}, status=422)
+            return
+        try:
+            resolved, selection_request = resolve_director_selection(director=director)
+            enforce_runtime_capabilities(resolved)
+        except DirectorResolutionError as exc:
+            payload: dict[str, Any] = {
+                "ok": False,
+                "error_code": exc.code,
+                "error": (
+                    "missing director capabilities: " + ", ".join(exc.missing_capabilities)
+                    if exc.code == "capability_missing"
+                    else exc.code
+                ),
+            }
+            if exc.missing_capabilities:
+                payload["missing_capabilities"] = exc.missing_capabilities
+            self.send_json(payload, status=422)
+            return
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            self.send_json({"ok": False, "error": "expected_revision is required"}, status=409)
+            return
+        with self.server.project_lock:
+            state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+            current_revision = editor_state_revision(state)
+            if expected_revision != current_revision:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "editor state changed before the director switch",
+                        "current_revision": current_revision,
+                    },
+                    status=409,
+                )
+                return
+            manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+            try:
+                updated = apply_director_to_state(
+                    self.server.project_dir, manifest, state, director
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=422)
+                return
+            errors = validate_editor_state(
+                updated, float(manifest.get("source", {}).get("duration_s", 0.0))
+            )
+            if errors:
+                self.send_json({"ok": False, "error": "; ".join(errors[:5])}, status=422)
+                return
+            try:
+                persist_director_selection(
+                    self.server.project_dir, resolved, selection_request
+                )
+            except DirectorResolutionError as exc:
+                self.send_json(
+                    {"ok": False, "error_code": exc.code, "error": exc.code}, status=422
+                )
+                return
+            atomic_write_json(self.server.project_dir / STATE_REL, updated)
+            revisions = approval_revisions(self.server.project_dir, updated)
+        self.send_json(
+            {
+                "ok": True,
+                "state": updated,
+                "director_presets": DIRECTOR_PRESETS,
+                "approval_revisions": revisions,
+            }
+        )
 
     def handle_plan_highlights(self) -> None:
         try:

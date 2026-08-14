@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "generator": "deterministic-local-emphasis-v1",
+  "generated_at": "2026-08-14T08:51:02+00:00",
+  "items": [
+    {
+      "id": "em-0001",
+      "start": 0.367,
+      "end": 0.735,
+      "text": "不能",
+      "reason": "contrast or conclusion",
+      "treatment": "accent-pop",
+      "scope": "phrase",
+      "transcript_evidence": "我總不能過太久再說一遍",
+      "provenance": "deterministic local transcript proposal",
+      "review_status": "pending"
+    }
+  ]
+}

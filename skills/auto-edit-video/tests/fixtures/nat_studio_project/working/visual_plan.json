@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "generator": "deterministic-local-card-v1",
+  "generated_at": "2026-08-14T08:51:02+00:00",
+  "items": [
+    {
+      "id": "visual-0001",
+      "start": 0.0,
+      "end": 2.2,
+      "type": "title_card",
+      "text": "我總不能過太久再說一遍",
+      "purpose": "opening hook from the first spoken idea",
+      "transcript_evidence": "我總不能過太久再說一遍",
+      "source": null,
+      "provenance": "generated local text card from unverified transcript",
+      "fallback": "keep subtitle only",
+      "review_status": "pending"
+    }
+  ]
+}

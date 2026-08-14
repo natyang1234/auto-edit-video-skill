@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "status": "complete_needs_review",
+  "coverage_status": "complete",
+  "provider": "ollama",
+  "model": "qwen2.5:7b",
+  "context_radius": 2,
+  "document_context_unit_count": 4,
+  "minimum_confidence": 0.92,
+  "reviewed_unit_ids": [
+    "caption-segment-0001",
+    "caption-segment-0002",
+    "caption-segment-0003",
+    "caption-segment-0004"
+  ],
+  "reviewed_unit_count": 4,
+  "total_unit_count": 4,
+  "accepted_count": 0,
+  "pending_count": 0,
+  "rejected_count": 1,
+  "accepted": [],
+  "pending": [],
+  "rejected": [
+    {
+      "unit_id": "caption-segment-0003",
+      "source": "米跟那個同不太可惜",
+      "replacement": "未跟那個同不太可惜",
+      "category": "typo",
+      "reason": "上下文依據，應為完整成語「未跟那個同不太可惜」",
+      "confidence": 0.95,
+      "verifier_decision": "accept",
+      "verifier_confidence": 0.95,
+      "reject_reason": "patch_contains_unchanged_context"
+    }
+  ],
+  "rules": [],
+  "model_errors": [],
+  "human_review_required": true,
+  "generated_at": "2026-08-14T08:51:02+00:00",
+  "applied_correction_count": 0,
+  "active_rule_count": 0
+}

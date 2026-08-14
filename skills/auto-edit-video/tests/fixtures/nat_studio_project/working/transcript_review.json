@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "status": "needs_review",
+  "risk_status": "semantic_review_required",
+  "human_review_required": true,
+  "source_language_mode": "auto",
+  "glossary": [],
+  "mechanical_issue_count": 0,
+  "issue_count": 0,
+  "issues": [],
+  "semantic_calibration": {
+    "status": "not_configured",
+    "rule_count": 0,
+    "correction_count": 0,
+    "human_review_required": true,
+    "artifact": "working/transcript_calibration.json"
+  },
+  "generated_at": "2026-08-14T08:51:02+00:00",
+  "contextual_semantic_calibration": {
+    "status": "complete_needs_review",
+    "coverage_status": "complete",
+    "reviewed_unit_count": 4,
+    "total_unit_count": 4,
+    "accepted_count": 0,
+    "pending_count": 0,
+    "rejected_count": 1,
+    "applied_correction_count": 0,
+    "human_review_required": true,
+    "artifact": "working/transcript_semantic_review.json"
+  }
+}

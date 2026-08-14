@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "generator": "deterministic-local-highlight-planner-v1",
+  "status": "needs_transcript",
+  "source": {
+    "artifact": "working/transcript_words.json",
+    "sha256": "06e942bab23b051d19ed2789ad1a8e583ec7edd59474beb7fdc270e403dccbbb",
+    "source_sha256": "ce64b1b0ed0a070d9878c1f2b0b464dade3aa94bf19cc6a24d8ccb434e4c7011",
+    "timebase": "source_media",
+    "media": "source/original.mov",
+    "duration_s": 11.34
+  },
+  "configuration": {
+    "director_profile": "teacher-punch",
+    "director_label": "專業教學",
+    "requested_count": 10,
+    "platform": "instagram-reels",
+    "duration_profile": "full",
+    "duration_bounds_s": {
+      "min": 10.0,
+      "target": 11.34,
+      "max": 11.34
+    },
+    "preferred_duration_s": 11.152,
+    "editing_brief": "",
+    "brief_sha256": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+    "planner_version": 1
+  },
+  "generated_at": "2026-08-14T08:51:02+00:00",
+  "warnings": [
+    "output target had no numeric duration bounds; used local editorial defaults",
+    "source was shorter than the requested minimum; proposed actual spoken length without padding",
+    "only 0 distinct transcript-grounded highlights were available; no filler clips were added"
+  ],
+  "items": [],
+  "plan_revision": "f8dc56f6266162f208f29763574ecf8491d35dd94e363bb0e7c352a0d77abdb6"
+}

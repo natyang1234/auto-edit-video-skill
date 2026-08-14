@@ -4539,6 +4539,7 @@ def sync_plans_to_editor(project_dir: Path, duration_s: float) -> int:
         project_dir,
         dict(state.get("caption_defaults") or {}),
         duration_s,
+        str(state.get("director_style") or "teacher-punch"),
     )
     state["overlays"] = retained + generated
     state["updated_at"] = now_utc()
