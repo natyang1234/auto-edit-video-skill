@@ -953,6 +953,18 @@ def apply_transcription_calibrations(
     return corrections
 
 
+# The initial prompt is the one thing whisper is guaranteed to have "heard"
+# before the audio starts, so silence makes it the likeliest hallucination.
+# The filter downstream compares against these same constants: change a prompt
+# here and the leak filter follows it without a second edit.
+TRANSCRIPTION_PROMPT_ZH_TW = "繁體中文，台灣用語。中英逐字稿。英文請保留拼寫，不要中文音譯。"
+TRANSCRIPTION_PROMPT_ZH = "中英逐字稿。英文請保留拼寫，不要中文音譯。"
+TRANSCRIPTION_PROMPT_EN = "Verbatim transcript. Preserve original spelling."
+TRANSCRIPTION_PROMPT_TEXTS = (
+    TRANSCRIPTION_PROMPT_ZH_TW,
+    TRANSCRIPTION_PROMPT_ZH,
+    TRANSCRIPTION_PROMPT_EN,
+)
 TRANSCRIPTION_PROMPT_MAX_CHARS = 180
 TRANSCRIPTION_PROMPT_MAX_TERMS = 12
 
@@ -981,12 +993,12 @@ def transcription_initial_prompt(source_language: str, glossary: list[str]) -> s
         # detect and repair afterwards. zh-TW asks for Taiwanese wording;
         # anything else only asks for verbatim Chinese-English handling.
         if source_language in {"zh-TW", "zh-en"}:
-            prompt = "繁體中文，台灣用語。中英逐字稿。英文請保留拼寫，不要中文音譯。"
+            prompt = TRANSCRIPTION_PROMPT_ZH_TW
         else:
-            prompt = "中英逐字稿。英文請保留拼寫，不要中文音譯。"
+            prompt = TRANSCRIPTION_PROMPT_ZH
         glossary_prefix = "英文詞彙："
     else:
-        prompt = "Verbatim transcript. Preserve original spelling."
+        prompt = TRANSCRIPTION_PROMPT_EN
         glossary_prefix = " Terms: "
     prompt_terms = compact_transcription_prompt_terms(glossary)
     selected: list[str] = []
@@ -2872,10 +2884,151 @@ def build_transcript_review(
     }
 
 
+# A segment this short cannot carry enough evidence to tell an echo from a
+# real utterance, so short lines are always believed.  "英文" and "中文" are
+# ordinary words; "英文請保留拼寫" is not something a speaker says out loud.
+PROMPT_LEAK_MIN_CHARS = 4
+PROMPT_LEAK_FUZZY_MIN_CHARS = 6
+PROMPT_LEAK_OVERLAP_THRESHOLD = 0.6
+# Single shared characters are noise in Chinese; only runs of two or more count
+# towards the overlap, which is what keeps a natural sentence that happens to
+# mention 英文 or 拼寫 out of the drop list.
+PROMPT_LEAK_MIN_RUN = 2
+# Share of segments that have to be echo before the whole decode is treated as
+# prompt-dominated and worth running again without the hint.
+PROMPT_LEAK_DOMINANCE_RATIO = 0.8
+
+
+def normalize_prompt_comparison_text(text: str) -> str:
+    """Strip punctuation, whitespace and case so wording alone is compared."""
+
+    return re.sub(r"[\W_]+", "", str(text), flags=re.UNICODE).casefold()
+
+
+def prompt_leak_overlap(text: str, prompt: str) -> float:
+    """Fraction of ``text`` built out of runs that also occur in ``prompt``.
+
+    Runs are counted wherever they appear rather than once in order, because
+    the observed hallucination repeats the prompt two or three times inside a
+    single segment; an in-order diff scores that repetition as half a match
+    and lets the loudest possible leak through.
+    """
+
+    if not text or not prompt:
+        return 0.0
+    covered = 0
+    index = 0
+    while index < len(text):
+        run = 0
+        for end in range(len(text), index + PROMPT_LEAK_MIN_RUN - 1, -1):
+            if text[index:end] in prompt:
+                run = end - index
+                break
+        if run >= PROMPT_LEAK_MIN_RUN:
+            covered += run
+            index += run
+        else:
+            index += 1
+    return covered / len(text)
+
+
+def transcription_prompt_leak_match(text: str) -> tuple[str, float] | None:
+    """Return the prompt this text echoes, with its overlap, or ``None``."""
+
+    normalized = normalize_prompt_comparison_text(text)
+    if len(normalized) < PROMPT_LEAK_MIN_CHARS:
+        return None
+    best: tuple[str, float] | None = None
+    for prompt in TRANSCRIPTION_PROMPT_TEXTS:
+        normalized_prompt = normalize_prompt_comparison_text(prompt)
+        if not normalized_prompt:
+            continue
+        if normalized in normalized_prompt:
+            # An exact substring of the prompt is the prompt, not speech.
+            return prompt, 1.0
+        if len(normalized) < PROMPT_LEAK_FUZZY_MIN_CHARS:
+            continue
+        overlap = prompt_leak_overlap(normalized, normalized_prompt)
+        if overlap < PROMPT_LEAK_OVERLAP_THRESHOLD:
+            continue
+        if best is None or overlap > best[1]:
+            best = (prompt, round(overlap, 4))
+    return best
+
+
+def is_transcription_prompt_leak(text: str) -> bool:
+    return transcription_prompt_leak_match(text) is not None
+
+
+def drop_transcription_prompt_leaks(
+    raw_segments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Remove recogniser output that is really the initial prompt coming back.
+
+    Whisper hears its own prompt when there is nothing else to hear.  Dropping
+    the echo here — before anything is numbered, chunked or translated — keeps
+    every later stage from treating instructions to the recogniser as things
+    the speaker said.
+    """
+
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for raw_segment in raw_segments:
+        text = str(raw_segment.get("text", "")).strip()
+        match = transcription_prompt_leak_match(text)
+        if match is None:
+            kept.append(raw_segment)
+            continue
+        prompt, overlap = match
+        dropped.append(
+            {
+                "text": text,
+                "start": round(float(raw_segment.get("start", 0.0)), 3),
+                "end": round(float(raw_segment.get("end", 0.0)), 3),
+                "reason": "transcription_prompt_leak",
+                "matched_prompt": prompt,
+                "overlap": overlap,
+            }
+        )
+    return kept, dropped
+
+
+def whisper_transcript_is_prompt_dominated(whisper_json: Path) -> bool:
+    """True when a finished decode is mostly the recogniser's own prompt.
+
+    "Mostly" rather than "entirely": a leak that has swallowed every segment
+    with speech in it is the same defect whether or not one stray line
+    survived, and the retry costs one more pass over an already-loaded model.
+    """
+
+    if not whisper_json.is_file():
+        return False
+    try:
+        data = json.loads(whisper_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    texts = [
+        str(segment.get("text", "")).strip()
+        for segment in data.get("segments", [])
+        if isinstance(segment, dict) and str(segment.get("text", "")).strip()
+    ]
+    if not texts:
+        return False
+    leaked = sum(1 for text in texts if is_transcription_prompt_leak(text))
+    return leaked >= max(1, math.ceil(len(texts) * PROMPT_LEAK_DOMINANCE_RATIO))
+
+
 def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     segments: list[dict[str, Any]] = []
     flat_words: list[dict[str, Any]] = []
-    for segment_index, raw_segment in enumerate(data.get("segments", []), start=1):
+    # The prompt echo is removed before anything is numbered, so ids stay
+    # contiguous and no later stage has to know the leak ever existed.
+    raw_segments, prompt_leaks = drop_transcription_prompt_leaks(
+        list(data.get("segments", []))
+    )
+    for segment_index, raw_segment in enumerate(raw_segments, start=1):
         raw_words = raw_segment.get("words", [])
         words: list[dict[str, Any]] = []
         for raw_word in raw_words:
@@ -2971,6 +3124,17 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
     }
     if timestamp_normalization["clusters"]:
         transcript["timestamp_normalization"] = timestamp_normalization
+    if prompt_leaks:
+        # The recogniser's whole-file text still carries the echo, so it is
+        # rebuilt from what survived; otherwise a caller reading `text` would
+        # get the prompt back after the captions were cleaned.
+        transcript["text"] = "".join(
+            str(segment.get("text", "")) for segment in segments
+        ).strip()
+        transcript["prompt_leak_dropped"] = {
+            "count": len(prompt_leaks),
+            "items": prompt_leaks,
+        }
     if dropped_fragments:
         # Words the chunker refused to show: they had no neighbour close enough
         # to join, so nothing on screen carries them.  Recorded so a review can
@@ -3912,6 +4076,42 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
         return die("local Whisper transcription failed")
     whisper_json = run_dir / f"{source.stem}.json"
     whisper_srt = run_dir / f"{source.stem}.srt"
+    prompt_leak_recovery: str | None = None
+    if initial_prompt and whisper_transcript_is_prompt_dominated(whisper_json):
+        # The prompt is a vocabulary hint, not an instruction the recogniser
+        # obeys: when the decode comes back as nothing but the hint, the hint
+        # is what has to go.  Measured on a real 11s clip, the same audio and
+        # the same model return the actual conversation once the prompt is
+        # dropped, on both base and large-v3.
+        retry_dir = manifest_path.parent / "working/whisper-local" / uuid.uuid4().hex
+        retry_dir.mkdir(parents=True, exist_ok=False)
+        retry_command = [
+            argument
+            for index, argument in enumerate(command)
+            if argument != "--initial_prompt"
+            and command[index - 1] != "--initial_prompt"
+        ]
+        retry_command[retry_command.index(str(run_dir))] = str(retry_dir)
+        try:
+            retry = subprocess.run(
+                retry_command,
+                text=True,
+                capture_output=True,
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            retry = None
+        retry_json = retry_dir / f"{source.stem}.json"
+        if retry is not None and retry.returncode == 0 and retry_json.is_file():
+            run_dir = retry_dir
+            whisper_json = retry_json
+            whisper_srt = retry_dir / f"{source.stem}.srt"
+            prompt_leak_recovery = "retranscribed_without_prompt"
+        else:
+            # Keeping the leaked take would be worse than saying so: the
+            # intake filter still strips it, and the manifest records why the
+            # transcript is thin.
+            prompt_leak_recovery = "retranscription_failed"
     try:
         payload = import_whisper_artifacts(
             manifest_path,
@@ -3922,6 +4122,14 @@ def cmd_transcribe_local(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         return die(str(exc))
+    if prompt_leak_recovery:
+        manifest = read_json(manifest_path)
+        manifest.setdefault("transcription", {})["prompt_leak_recovery"] = (
+            prompt_leak_recovery
+        )
+        manifest["updated_at"] = now_utc()
+        write_json(manifest_path, manifest)
+        payload["prompt_leak_recovery"] = prompt_leak_recovery
     payload["local"] = True
     emit(payload)
     return 0

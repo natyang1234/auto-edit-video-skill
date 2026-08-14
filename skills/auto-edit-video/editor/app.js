@@ -2777,12 +2777,22 @@ function switchInspectorTab(tab) {
   if (publish) renderPublishing();
 }
 
+// Fallback wording per pipeline error_code, so a status that stops the run
+// never reaches the operator as the generic "需要處理".
+const PIPELINE_ERROR_COPY = {
+  no_speech_detected: "此影片無可用語音；沒有可製作的字幕與字卡。",
+};
+
+function pipelineMessage(pipeline, fallback) {
+  return pipeline?.message || PIPELINE_ERROR_COPY[pipeline?.error_code] || fallback;
+}
+
 function renderSourceWarning() {
   const report = projectPayload.qa?.report || projectPayload.qa || {};
   const warnings = [];
   const pipeline = projectPayload.pipeline_status || {};
-  if (["pending", "running"].includes(pipeline.state)) warnings.push(pipeline.message || "本機自動處理中");
-  if (["failed", "needs_attention", "stopped"].includes(pipeline.state)) warnings.push(pipeline.message || "本機自動處理需要處理");
+  if (["pending", "running"].includes(pipeline.state)) warnings.push(pipelineMessage(pipeline, "本機自動處理中"));
+  if (["failed", "needs_attention", "stopped"].includes(pipeline.state)) warnings.push(pipelineMessage(pipeline, "本機自動處理需要處理"));
   if (!Object.keys(report).length) warnings.push("來源 QA 尚未載入");
   if (report.dead_border?.border_flag || report.border_flag) warnings.push("來源有黑邊");
   if (report.loudness?.ok === false) warnings.push(`音量 ${report.loudness.lufs} LUFS`);
@@ -2818,7 +2828,7 @@ function pollPipelineStatus() {
       }
       clearInterval(pipelinePollTimer);
       if (["failed", "needs_attention", "stopped"].includes(status.state)) {
-        showToast(status.message || "本機自動處理需要處理", "error");
+        showToast(pipelineMessage(status, "本機自動處理需要處理"), "error");
       }
     } catch (error) {
       clearInterval(pipelinePollTimer);

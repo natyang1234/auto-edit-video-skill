@@ -275,6 +275,31 @@ class StudioServer(ThreadingHTTPServer):
             with self.pipeline_lock:
                 self.pipeline_processes.discard(process)
 
+    @staticmethod
+    def transcript_has_speech(project_dir: Path) -> bool:
+        """True when the transcript still carries something a person said.
+
+        An empty caption track after a successful transcription means either
+        real silence or a whisper prompt echo that the intake filter removed;
+        either way there is nothing for the rest of the pipeline to edit.
+        """
+
+        transcript_path = project_dir / "working/transcript_words.json"
+        if not transcript_path.is_file():
+            return True
+        try:
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # An unreadable transcript is a different failure; leave it to the
+            # step that actually needs to parse it.
+            return True
+        if not isinstance(transcript, dict):
+            return True
+        segments = transcript.get("caption_segments")
+        if not isinstance(segments, list):
+            return True
+        return any(str(segment.get("text", "")).strip() for segment in segments)
+
     def pipeline_worker(
         self,
         project_dir: Path,
@@ -369,6 +394,19 @@ class StudioServer(ThreadingHTTPServer):
                 write_status("running", phase, message)
                 result = self.run_pipeline_command(project_dir, arguments, timeout=timeout)
                 if result.returncode == 0:
+                    if phase == "transcribe" and not self.transcript_has_speech(
+                        project_dir
+                    ):
+                        # An operator watching Studio only ever sees this
+                        # status, so silence is reported as silence here
+                        # rather than as a missing highlight three steps on.
+                        write_status(
+                            "needs_attention",
+                            phase,
+                            "此影片無可用語音；沒有可製作的字幕與字卡，原始影片已完整保留。",
+                            error_code="no_speech_detected",
+                        )
+                        return
                     continue
                 if phase == "highlight_plan" and result.returncode == 3:
                     write_status(
