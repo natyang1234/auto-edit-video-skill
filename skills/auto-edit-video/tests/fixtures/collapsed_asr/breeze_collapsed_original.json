@@ -1,0 +1,1415 @@
+{
+  "text": "然後看把這邊拿掉或把這邊拿掉都可以那最下面這個不確定會不會倒所以我會認為說可以去做一個嘗試到這個 equal road 的部分那目前是比較看空去尊重先前的下降的走勢那 bmb 這個我覺得不錯的地方是因為它先前也是走一個看空然後回去掃先前也是走一個看空然後回去掃那這邊的結構的話我會認為說這邊的差增其實還蠻不錯所以我會認為說可以去做一個嘗試到這個 equal road 的部分那目前我關注的這幾個 b 大概就是這些啦就是 bmb 啊好那我們今天 8 月 19 號我是 Lewis那由我來幫大家上這個第三階段 smc 我們第三階段課程好那我們在第二階段的時候我們在第二階段的時候我們有學過我們的結構策略核心嘛就是 sweep 和 ss然後再去",
+  "segments": [
+    {
+      "id": 0,
+      "start": 1.5,
+      "end": 4.2,
+      "text": "然後看把這邊拿掉或把這邊拿掉都可以",
+      "words": [
+        {
+          "word": "然後",
+          "start": 1.5,
+          "end": 1.86,
+          "probability": null
+        },
+        {
+          "word": "看",
+          "start": 1.86,
+          "end": 2.22,
+          "probability": null
+        },
+        {
+          "word": "把",
+          "start": 2.22,
+          "end": 2.36,
+          "probability": null
+        },
+        {
+          "word": "這邊",
+          "start": 2.36,
+          "end": 2.54,
+          "probability": null
+        },
+        {
+          "word": "拿",
+          "start": 2.54,
+          "end": 2.76,
+          "probability": null
+        },
+        {
+          "word": "掉",
+          "start": 2.76,
+          "end": 2.86,
+          "probability": null
+        },
+        {
+          "word": "或",
+          "start": 2.86,
+          "end": 3.0,
+          "probability": null
+        },
+        {
+          "word": "把",
+          "start": 3.0,
+          "end": 3.16,
+          "probability": null
+        },
+        {
+          "word": "這邊",
+          "start": 3.16,
+          "end": 3.32,
+          "probability": null
+        },
+        {
+          "word": "拿",
+          "start": 3.32,
+          "end": 3.52,
+          "probability": null
+        },
+        {
+          "word": "掉",
+          "start": 3.52,
+          "end": 3.62,
+          "probability": null
+        },
+        {
+          "word": "都",
+          "start": 3.62,
+          "end": 3.82,
+          "probability": null
+        },
+        {
+          "word": "可以",
+          "start": 3.82,
+          "end": 4.2,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "start": 4.2,
+      "end": 4.62,
+      "text": "那最下面這個不確定會不會倒",
+      "words": [
+        {
+          "word": "那",
+          "start": 4.2,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "最",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "下面",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "這個",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "不",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "確",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "定",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "會",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "不會",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "倒",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "start": 4.62,
+      "end": 4.62,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 3,
+      "start": 4.62,
+      "end": 4.62,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 4,
+      "start": 4.62,
+      "end": 4.62,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 5,
+      "start": 4.62,
+      "end": 4.64,
+      "text": "所以我會認為說可以去做一個嘗試到這個 equal road 的部分",
+      "words": [
+        {
+          "word": "所以",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "我",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "會",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "認為",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "說",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "可以",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "去",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "做",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "一個",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "嘗",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "試",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "到",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "這個",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": " equal",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": " road",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": " 的",
+          "start": 4.62,
+          "end": 4.62,
+          "probability": null
+        },
+        {
+          "word": "部分",
+          "start": 4.62,
+          "end": 4.64,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "start": 6.2,
+      "end": 12.12,
+      "text": "那目前是比較看空去尊重先前的下降的走勢",
+      "words": [
+        {
+          "word": "那",
+          "start": 6.2,
+          "end": 6.84,
+          "probability": null
+        },
+        {
+          "word": "目前",
+          "start": 6.84,
+          "end": 7.36,
+          "probability": null
+        },
+        {
+          "word": "是",
+          "start": 7.36,
+          "end": 7.66,
+          "probability": null
+        },
+        {
+          "word": "比較",
+          "start": 7.66,
+          "end": 8.02,
+          "probability": null
+        },
+        {
+          "word": "看",
+          "start": 8.02,
+          "end": 8.28,
+          "probability": null
+        },
+        {
+          "word": "空",
+          "start": 8.28,
+          "end": 8.38,
+          "probability": null
+        },
+        {
+          "word": "去",
+          "start": 8.38,
+          "end": 9.28,
+          "probability": null
+        },
+        {
+          "word": "尊",
+          "start": 9.28,
+          "end": 9.46,
+          "probability": null
+        },
+        {
+          "word": "重",
+          "start": 9.46,
+          "end": 9.66,
+          "probability": null
+        },
+        {
+          "word": "先",
+          "start": 9.66,
+          "end": 9.98,
+          "probability": null
+        },
+        {
+          "word": "前",
+          "start": 9.98,
+          "end": 10.1,
+          "probability": null
+        },
+        {
+          "word": "的",
+          "start": 10.1,
+          "end": 10.42,
+          "probability": null
+        },
+        {
+          "word": "下",
+          "start": 10.42,
+          "end": 10.7,
+          "probability": null
+        },
+        {
+          "word": "降",
+          "start": 10.7,
+          "end": 10.76,
+          "probability": null
+        },
+        {
+          "word": "的",
+          "start": 10.76,
+          "end": 11.36,
+          "probability": null
+        },
+        {
+          "word": "走",
+          "start": 11.36,
+          "end": 11.36,
+          "probability": null
+        },
+        {
+          "word": "勢",
+          "start": 11.36,
+          "end": 12.12,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "start": 13.56,
+      "end": 17.34,
+      "text": "那 bmb 這個我覺得不錯的地方是因為它先前也是走一個看空然後回去掃",
+      "words": [
+        {
+          "word": "那",
+          "start": 13.56,
+          "end": 14.2,
+          "probability": null
+        },
+        {
+          "word": " b",
+          "start": 14.2,
+          "end": 14.26,
+          "probability": null
+        },
+        {
+          "word": "mb",
+          "start": 14.26,
+          "end": 14.46,
+          "probability": null
+        },
+        {
+          "word": " 這個",
+          "start": 14.46,
+          "end": 14.76,
+          "probability": null
+        },
+        {
+          "word": "我覺得",
+          "start": 14.76,
+          "end": 15.2,
+          "probability": null
+        },
+        {
+          "word": "不錯",
+          "start": 15.2,
+          "end": 15.56,
+          "probability": null
+        },
+        {
+          "word": "的",
+          "start": 15.56,
+          "end": 15.82,
+          "probability": null
+        },
+        {
+          "word": "地方",
+          "start": 15.82,
+          "end": 15.96,
+          "probability": null
+        },
+        {
+          "word": "是",
+          "start": 15.96,
+          "end": 16.44,
+          "probability": null
+        },
+        {
+          "word": "因為",
+          "start": 16.44,
+          "end": 16.9,
+          "probability": null
+        },
+        {
+          "word": "它",
+          "start": 16.9,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "先",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "前",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "也是",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "走",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "一個",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "看",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "空",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "然後",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "回去",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        },
+        {
+          "word": "掃",
+          "start": 17.34,
+          "end": 17.34,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "start": 17.34,
+      "end": 17.34,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 9,
+      "start": 17.34,
+      "end": 17.34,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 10,
+      "start": 17.34,
+      "end": 17.34,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 11,
+      "start": 17.34,
+      "end": 20.72,
+      "text": "先前也是走一個看空然後回去掃",
+      "words": [
+        {
+          "word": "先",
+          "start": 17.34,
+          "end": 17.74,
+          "probability": null
+        },
+        {
+          "word": "前",
+          "start": 17.74,
+          "end": 17.88,
+          "probability": null
+        },
+        {
+          "word": "也是",
+          "start": 17.88,
+          "end": 18.48,
+          "probability": null
+        },
+        {
+          "word": "走",
+          "start": 18.48,
+          "end": 18.76,
+          "probability": null
+        },
+        {
+          "word": "一個",
+          "start": 18.76,
+          "end": 19.18,
+          "probability": null
+        },
+        {
+          "word": "看",
+          "start": 19.18,
+          "end": 19.52,
+          "probability": null
+        },
+        {
+          "word": "空",
+          "start": 19.52,
+          "end": 19.66,
+          "probability": null
+        },
+        {
+          "word": "然後",
+          "start": 19.66,
+          "end": 20.02,
+          "probability": null
+        },
+        {
+          "word": "回去",
+          "start": 20.02,
+          "end": 20.3,
+          "probability": null
+        },
+        {
+          "word": "掃",
+          "start": 20.3,
+          "end": 20.72,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "start": 20.72,
+      "end": 25.64,
+      "text": "那這邊的結構的話我會認為說這邊的差增其實還蠻不錯",
+      "words": [
+        {
+          "word": "那",
+          "start": 20.72,
+          "end": 21.34,
+          "probability": null
+        },
+        {
+          "word": "這邊",
+          "start": 21.34,
+          "end": 21.46,
+          "probability": null
+        },
+        {
+          "word": "的",
+          "start": 21.46,
+          "end": 21.6,
+          "probability": null
+        },
+        {
+          "word": "結",
+          "start": 21.6,
+          "end": 21.84,
+          "probability": null
+        },
+        {
+          "word": "構",
+          "start": 21.84,
+          "end": 21.92,
+          "probability": null
+        },
+        {
+          "word": "的話",
+          "start": 21.92,
+          "end": 22.26,
+          "probability": null
+        },
+        {
+          "word": "我",
+          "start": 22.26,
+          "end": 22.56,
+          "probability": null
+        },
+        {
+          "word": "會",
+          "start": 22.56,
+          "end": 22.72,
+          "probability": null
+        },
+        {
+          "word": "認為",
+          "start": 22.72,
+          "end": 22.86,
+          "probability": null
+        },
+        {
+          "word": "說",
+          "start": 22.86,
+          "end": 23.06,
+          "probability": null
+        },
+        {
+          "word": "這邊",
+          "start": 23.06,
+          "end": 23.3,
+          "probability": null
+        },
+        {
+          "word": "的",
+          "start": 23.3,
+          "end": 24.2,
+          "probability": null
+        },
+        {
+          "word": "差",
+          "start": 24.2,
+          "end": 24.4,
+          "probability": null
+        },
+        {
+          "word": "增",
+          "start": 24.4,
+          "end": 24.46,
+          "probability": null
+        },
+        {
+          "word": "其實",
+          "start": 24.46,
+          "end": 24.96,
+          "probability": null
+        },
+        {
+          "word": "還",
+          "start": 24.96,
+          "end": 25.16,
+          "probability": null
+        },
+        {
+          "word": "蠻",
+          "start": 25.16,
+          "end": 25.32,
+          "probability": null
+        },
+        {
+          "word": "不錯",
+          "start": 25.32,
+          "end": 25.64,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "start": 25.64,
+      "end": 29.0,
+      "text": "所以我會認為說可以去做一個嘗試到這個 equal road 的部分",
+      "words": [
+        {
+          "word": "所以",
+          "start": 25.64,
+          "end": 26.02,
+          "probability": null
+        },
+        {
+          "word": "我",
+          "start": 26.02,
+          "end": 26.18,
+          "probability": null
+        },
+        {
+          "word": "會",
+          "start": 26.18,
+          "end": 26.34,
+          "probability": null
+        },
+        {
+          "word": "認為",
+          "start": 26.34,
+          "end": 26.44,
+          "probability": null
+        },
+        {
+          "word": "說",
+          "start": 26.44,
+          "end": 26.66,
+          "probability": null
+        },
+        {
+          "word": "可以",
+          "start": 26.66,
+          "end": 26.82,
+          "probability": null
+        },
+        {
+          "word": "去",
+          "start": 26.82,
+          "end": 27.0,
+          "probability": null
+        },
+        {
+          "word": "做",
+          "start": 27.0,
+          "end": 27.14,
+          "probability": null
+        },
+        {
+          "word": "一個",
+          "start": 27.14,
+          "end": 27.38,
+          "probability": null
+        },
+        {
+          "word": "嘗",
+          "start": 27.38,
+          "end": 27.62,
+          "probability": null
+        },
+        {
+          "word": "試",
+          "start": 27.62,
+          "end": 27.76,
+          "probability": null
+        },
+        {
+          "word": "到",
+          "start": 27.76,
+          "end": 28.0,
+          "probability": null
+        },
+        {
+          "word": "這個",
+          "start": 28.0,
+          "end": 28.26,
+          "probability": null
+        },
+        {
+          "word": " equal",
+          "start": 28.26,
+          "end": 28.52,
+          "probability": null
+        },
+        {
+          "word": " road",
+          "start": 28.52,
+          "end": 28.66,
+          "probability": null
+        },
+        {
+          "word": " 的",
+          "start": 28.66,
+          "end": 28.72,
+          "probability": null
+        },
+        {
+          "word": "部分",
+          "start": 28.72,
+          "end": 29.0,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "start": 29.8,
+      "end": 30.44,
+      "text": "那目前我關注的這幾個 b 大概就是這些啦就是 bmb 啊",
+      "words": [
+        {
+          "word": "那",
+          "start": 29.8,
+          "end": 30.26,
+          "probability": null
+        },
+        {
+          "word": "目前",
+          "start": 30.26,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "我",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "關",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "注",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "的",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "這",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "幾",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": "個",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": " b",
+          "start": 30.3,
+          "end": 30.3,
+          "probability": null
+        },
+        {
+          "word": " 大",
+          "start": 30.3,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": "概",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": "就是",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": "這些",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": "啦",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": "就是",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": " b",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": "mb",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        },
+        {
+          "word": " 啊",
+          "start": 30.44,
+          "end": 30.44,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "start": 30.44,
+      "end": 30.44,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 16,
+      "start": 30.44,
+      "end": 30.44,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 17,
+      "start": 30.44,
+      "end": 30.44,
+      "text": "",
+      "words": []
+    },
+    {
+      "id": 18,
+      "start": 52.96,
+      "end": 57.14,
+      "text": "好那我們今天 8 月 19 號我是 Lewis",
+      "words": [
+        {
+          "word": "好",
+          "start": 52.96,
+          "end": 53.56,
+          "probability": null
+        },
+        {
+          "word": "那我們",
+          "start": 53.56,
+          "end": 54.16,
+          "probability": null
+        },
+        {
+          "word": "今天",
+          "start": 54.16,
+          "end": 55.3,
+          "probability": null
+        },
+        {
+          "word": " 8",
+          "start": 55.3,
+          "end": 55.78,
+          "probability": null
+        },
+        {
+          "word": " 月",
+          "start": 55.8,
+          "end": 55.8,
+          "probability": null
+        },
+        {
+          "word": " 19",
+          "start": 55.8,
+          "end": 56.1,
+          "probability": null
+        },
+        {
+          "word": " 號",
+          "start": 56.36,
+          "end": 56.36,
+          "probability": null
+        },
+        {
+          "word": "我是",
+          "start": 56.36,
+          "end": 56.76,
+          "probability": null
+        },
+        {
+          "word": " Lewis",
+          "start": 56.76,
+          "end": 57.14,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "start": 57.14,
+      "end": 63.2,
+      "text": "那由我來幫大家上這個第三階段 smc 我們第三階段課程",
+      "words": [
+        {
+          "word": "那",
+          "start": 57.14,
+          "end": 57.96,
+          "probability": null
+        },
+        {
+          "word": "由",
+          "start": 57.96,
+          "end": 58.04,
+          "probability": null
+        },
+        {
+          "word": "我",
+          "start": 58.04,
+          "end": 58.18,
+          "probability": null
+        },
+        {
+          "word": "來",
+          "start": 58.18,
+          "end": 58.36,
+          "probability": null
+        },
+        {
+          "word": "幫",
+          "start": 58.36,
+          "end": 58.54,
+          "probability": null
+        },
+        {
+          "word": "大家",
+          "start": 58.54,
+          "end": 59.14,
+          "probability": null
+        },
+        {
+          "word": "上",
+          "start": 59.14,
+          "end": 59.6,
+          "probability": null
+        },
+        {
+          "word": "這個",
+          "start": 59.6,
+          "end": 59.96,
+          "probability": null
+        },
+        {
+          "word": "第三",
+          "start": 59.96,
+          "end": 60.36,
+          "probability": null
+        },
+        {
+          "word": "階",
+          "start": 60.36,
+          "end": 60.62,
+          "probability": null
+        },
+        {
+          "word": "段",
+          "start": 60.62,
+          "end": 60.82,
+          "probability": null
+        },
+        {
+          "word": " sm",
+          "start": 60.82,
+          "end": 61.2,
+          "probability": null
+        },
+        {
+          "word": "c",
+          "start": 61.2,
+          "end": 61.3,
+          "probability": null
+        },
+        {
+          "word": " 我們",
+          "start": 61.3,
+          "end": 61.54,
+          "probability": null
+        },
+        {
+          "word": "第三",
+          "start": 61.54,
+          "end": 61.84,
+          "probability": null
+        },
+        {
+          "word": "階",
+          "start": 61.84,
+          "end": 62.0,
+          "probability": null
+        },
+        {
+          "word": "段",
+          "start": 62.0,
+          "end": 62.12,
+          "probability": null
+        },
+        {
+          "word": "課",
+          "start": 62.12,
+          "end": 62.36,
+          "probability": null
+        },
+        {
+          "word": "程",
+          "start": 62.36,
+          "end": 63.2,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "start": 64.38,
+      "end": 67.66,
+      "text": "好那我們在第二階段的時候",
+      "words": [
+        {
+          "word": "好",
+          "start": 64.38,
+          "end": 64.98,
+          "probability": null
+        },
+        {
+          "word": "那我們",
+          "start": 64.98,
+          "end": 65.58,
+          "probability": null
+        },
+        {
+          "word": "在",
+          "start": 65.58,
+          "end": 66.12,
+          "probability": null
+        },
+        {
+          "word": "第二",
+          "start": 66.12,
+          "end": 66.82,
+          "probability": null
+        },
+        {
+          "word": "階",
+          "start": 66.82,
+          "end": 67.02,
+          "probability": null
+        },
+        {
+          "word": "段",
+          "start": 67.02,
+          "end": 67.14,
+          "probability": null
+        },
+        {
+          "word": "的時候",
+          "start": 67.14,
+          "end": 67.66,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "start": 67.66,
+      "end": 72.24,
+      "text": "我們在第二階段的時候我們有學過我們的結構策略核心嘛",
+      "words": [
+        {
+          "word": "我們",
+          "start": 67.66,
+          "end": 68.0,
+          "probability": null
+        },
+        {
+          "word": "在",
+          "start": 68.0,
+          "end": 68.08,
+          "probability": null
+        },
+        {
+          "word": "第二",
+          "start": 68.08,
+          "end": 68.4,
+          "probability": null
+        },
+        {
+          "word": "階",
+          "start": 68.4,
+          "end": 68.56,
+          "probability": null
+        },
+        {
+          "word": "段",
+          "start": 68.56,
+          "end": 68.62,
+          "probability": null
+        },
+        {
+          "word": "的時候",
+          "start": 68.62,
+          "end": 68.88,
+          "probability": null
+        },
+        {
+          "word": "我們",
+          "start": 68.88,
+          "end": 69.04,
+          "probability": null
+        },
+        {
+          "word": "有",
+          "start": 69.04,
+          "end": 69.26,
+          "probability": null
+        },
+        {
+          "word": "學",
+          "start": 69.26,
+          "end": 69.42,
+          "probability": null
+        },
+        {
+          "word": "過",
+          "start": 69.42,
+          "end": 69.7,
+          "probability": null
+        },
+        {
+          "word": "我們的",
+          "start": 69.7,
+          "end": 70.88,
+          "probability": null
+        },
+        {
+          "word": "結",
+          "start": 70.88,
+          "end": 71.38,
+          "probability": null
+        },
+        {
+          "word": "構",
+          "start": 71.38,
+          "end": 71.42,
+          "probability": null
+        },
+        {
+          "word": "策",
+          "start": 71.42,
+          "end": 71.64,
+          "probability": null
+        },
+        {
+          "word": "略",
+          "start": 71.64,
+          "end": 71.64,
+          "probability": null
+        },
+        {
+          "word": "核",
+          "start": 71.64,
+          "end": 71.9,
+          "probability": null
+        },
+        {
+          "word": "心",
+          "start": 71.9,
+          "end": 71.96,
+          "probability": null
+        },
+        {
+          "word": "嘛",
+          "start": 71.96,
+          "end": 72.24,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "start": 72.24,
+      "end": 74.46,
+      "text": "就是 sweep 和 ss",
+      "words": [
+        {
+          "word": "就是",
+          "start": 72.24,
+          "end": 72.74,
+          "probability": null
+        },
+        {
+          "word": " sweep",
+          "start": 72.74,
+          "end": 73.24,
+          "probability": null
+        },
+        {
+          "word": " 和",
+          "start": 73.84,
+          "end": 73.84,
+          "probability": null
+        },
+        {
+          "word": " s",
+          "start": 73.84,
+          "end": 74.16,
+          "probability": null
+        },
+        {
+          "word": "s",
+          "start": 74.16,
+          "end": 74.46,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "start": 74.46,
+      "end": 74.98,
+      "text": "然後再去",
+      "words": [
+        {
+          "word": "然後",
+          "start": 74.46,
+          "end": 74.98,
+          "probability": null
+        },
+        {
+          "word": "再",
+          "start": 74.98,
+          "end": 74.98,
+          "probability": null
+        },
+        {
+          "word": "去",
+          "start": 74.98,
+          "end": 74.98,
+          "probability": null
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "start": 74.98,
+      "end": 75.0,
+      "text": "",
+      "words": []
+    }
+  ],
+  "language": "zh",
+  "engine": "breeze-asr-25"
+}

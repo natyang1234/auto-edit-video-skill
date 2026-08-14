@@ -2486,6 +2486,150 @@ def join_caption_words(words: list[dict[str, Any]]) -> str:
     return text_joining.join_tokens(word.get("text", "") for word in words)
 
 
+class TranscriptTimestampError(ValueError):
+    """A transcript arrived with word timestamps no chunker can rescue."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+# A word the recogniser stamped as zero-length gets at least this much room
+# when the surrounding gap allows it.
+COLLAPSE_MIN_WORD_S = 0.08
+# Collapsed clusters sometimes sit in front of a long silence.  Spreading the
+# cluster across the whole silence would invent slow speech that is not on the
+# tape, so a repaired word never claims more than this.
+COLLAPSE_MAX_WORD_S = 0.5
+# Timestamps are stored rounded to milliseconds; two repaired words must be at
+# least one stored tick apart to stay ordered.
+COLLAPSE_TICK_S = 0.001
+
+
+def normalize_collapsed_word_timestamps(
+    segments: list[dict[str, Any]],
+    words: list[dict[str, Any]],
+    duration_s: float,
+) -> dict[str, int]:
+    """Give zero-length recogniser words real duration, in place.
+
+    Some engines (Breeze ASR-25 on long single-speaker screen recordings, for
+    one) return runs of words stamped ``start == end``: 58 of 203 words on the
+    recording that motivated this, 25 of them stacked on the same instant.
+    Every downstream stage treats a word span as an interval, so the defect
+    surfaced far from its origin — as "caption end must exceed start" inside
+    caption delivery, blaming segmentation for the recogniser's arithmetic.
+
+    The repair is deterministic and local: each run of collapsed words is
+    spread across the room between its legal neighbours, weighted by character
+    count, never crossing a neighbouring word.  A run whose neighbour starts on
+    the same instant absorbs that neighbour, because the neighbour is part of
+    the same degenerate point.  Nothing here touches the recogniser's own
+    bytes: the raw source revision is captured before this runs, so this shows
+    up as chunking, not as a different transcription.
+    """
+    collapsed_words = 0
+    clusters = 0
+    adjusted_words = 0
+    count = len(words)
+    index = 0
+    while index < count:
+        if float(words[index]["end"]) > float(words[index]["start"]):
+            index += 1
+            continue
+        end_index = index
+        while end_index < count and float(words[end_index]["end"]) <= float(
+            words[end_index]["start"]
+        ):
+            end_index += 1
+        collapsed_words += end_index - index
+        clusters += 1
+        lower = float(words[index]["start"])
+        if index > 0:
+            lower = max(lower, float(words[index - 1]["end"]))
+
+        def upper_bound(stop: int) -> float:
+            if stop < count:
+                return float(words[stop]["start"])
+            return max(float(duration_s), lower)
+
+        upper = upper_bound(end_index)
+        # A following word that starts inside the degenerate instant belongs to
+        # the same collapse; without absorbing it there is literally no room.
+        while (
+            end_index < count
+            and upper - lower < (end_index - index) * COLLAPSE_TICK_S
+        ):
+            end_index += 1
+            upper = upper_bound(end_index)
+        cluster = words[index:end_index]
+        _spread_collapsed_cluster(cluster, lower, upper)
+        adjusted_words += len(cluster)
+        index = end_index
+
+    if clusters:
+        for segment in segments:
+            segment_words = segment.get("words") or []
+            if not segment_words:
+                continue
+            if float(segment["end"]) > float(segment["start"]):
+                continue
+            segment["start"] = round(
+                min(float(word["start"]) for word in segment_words), 3
+            )
+            segment["end"] = round(
+                max(float(word["end"]) for word in segment_words), 3
+            )
+
+    return {
+        "collapsed_words": collapsed_words,
+        "clusters": clusters,
+        "adjusted_words": adjusted_words,
+    }
+
+
+def _spread_collapsed_cluster(
+    cluster: list[dict[str, Any]],
+    lower: float,
+    upper: float,
+) -> None:
+    room = upper - lower
+    if len(cluster) == 1:
+        span = min(room, COLLAPSE_MIN_WORD_S)
+    else:
+        span = min(room, len(cluster) * COLLAPSE_MAX_WORD_S)
+    if span < len(cluster) * COLLAPSE_TICK_S:
+        raise TranscriptTimestampError(
+            "transcript_timestamps_collapsed",
+            "the recogniser returned word timestamps collapsed onto a single "
+            f"instant near {lower:.3f}s with no room to separate "
+            f"{len(cluster)} words; re-run transcription or use an engine that "
+            "reports word timing",
+        )
+    weights = [max(1, len(str(word.get("text", "")))) for word in cluster]
+    total_weight = float(sum(weights))
+    cursor = round(lower, 3)
+    consumed = 0.0
+    for position, word in enumerate(cluster):
+        consumed += weights[position]
+        if position == len(cluster) - 1:
+            boundary = round(lower + span, 3)
+        else:
+            boundary = round(lower + span * consumed / total_weight, 3)
+        boundary = max(boundary, round(cursor + COLLAPSE_TICK_S, 3))
+        if boundary > round(upper, 3) + 1e-9:
+            raise TranscriptTimestampError(
+                "transcript_timestamps_collapsed",
+                "the recogniser returned word timestamps collapsed onto a "
+                f"single instant near {lower:.3f}s with no room to separate "
+                f"{len(cluster)} words; re-run transcription or use an engine "
+                "that reports word timing",
+            )
+        word["start"] = cursor
+        word["end"] = boundary
+        cursor = boundary
+
+
 def readable_caption_segments(
     segments: list[dict[str, Any]],
     words: list[dict[str, Any]],
@@ -2659,6 +2803,15 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
             }
         )
 
+    # Repair collapsed recogniser timing before anything reads a word as an
+    # interval.  The raw source revision was already captured upstream, so this
+    # is chunking, not a second transcription.
+    timestamp_normalization = normalize_collapsed_word_timestamps(
+        segments,
+        flat_words,
+        duration_s,
+    )
+
     compatibility: list[dict[str, Any]] = []
     cursor = 0.0
     for word in flat_words:
@@ -2710,6 +2863,8 @@ def whisper_payload(data: dict[str, Any], duration_s: float) -> tuple[dict[str, 
         "caption_segments": caption_segments,
         "words": flat_words,
     }
+    if timestamp_normalization["clusters"]:
+        transcript["timestamp_normalization"] = timestamp_normalization
     return transcript, compatibility
 
 
