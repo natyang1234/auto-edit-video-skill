@@ -515,12 +515,27 @@ h2 {
   min-height: 0;
   align-items: center;
   justify-content: center;
+  /* Size container so the stage frame can fit the zone's HEIGHT as well as its
+     width. Without this the frame only knew the available width, and the
+     `max-height` clamp below silently squashed the aspect ratio into a
+     near-square box (a 9:16 source then rendered letterboxed on all four
+     sides). The zone's own height comes from the shell grid, never from its
+     contents, so size containment is safe here. */
+  container-type: size;
 }
 
 .stage-frame {
   --canvas-ratio: 9 / 16;
+  --canvas-w: 9;
+  --canvas-h: 16;
+  --stage-cap: 52vh;
   position: relative;
-  width: min(100%, 52vh);
+  /* Fit both axes: never wider than the zone, never taller than the zone.
+     The height term is what keeps the aspect ratio intact when the zone is
+     shorter than `--stage-cap`. The first declaration is the fallback for
+     engines without container query units. */
+  width: min(100%, var(--stage-cap));
+  width: min(100%, var(--stage-cap), 100cqh * var(--canvas-w) / var(--canvas-h));
   max-height: 100%;
   overflow: hidden;
   aspect-ratio: var(--canvas-ratio);
@@ -1631,7 +1646,7 @@ h2 {
   }
 
   .stage-frame {
-    width: min(100%, 48vh);
+    --stage-cap: 48vh;
   }
 }
 
@@ -1682,7 +1697,7 @@ h2 {
   }
 
   .stage-frame {
-    width: min(100%, 44vh);
+    --stage-cap: 44vh;
   }
 
   .transport {
@@ -2440,7 +2455,7 @@ body {
 }
 
 .stage-frame {
-  width: min(100%, 46vh);
+  --stage-cap: 46vh;
   border: 1px solid var(--stage-line);
   box-shadow: 0 22px 52px oklch(7% 0.014 55 / 0.48);
 }
@@ -3187,7 +3202,7 @@ body {
 
   .left-rail,
   .inspector { max-height: 720px; }
-  .stage-frame { width: min(100%, 50vh); }
+  .stage-frame { --stage-cap: 50vh; }
 }
 
 @media (max-width: 760px) {
@@ -3216,7 +3231,7 @@ body {
   .left-rail,
   .inspector { max-height: none; }
   .preview-workspace { padding: 12px; }
-  .stage-frame { width: min(100%, 46vh); }
+  .stage-frame { --stage-cap: 46vh; }
   .director-grid { grid-template-columns: 1fr; }
   .director-card:last-child:nth-child(odd) { grid-column: auto; }
   .timeline-scroll { margin-inline: 8px; }

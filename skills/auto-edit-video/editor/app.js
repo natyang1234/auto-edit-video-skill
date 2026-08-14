@@ -31,6 +31,22 @@ let projectFontInfo = null;
 const loadedProjectFontIds = new Set();
 const loadingProjectFontIds = new Set();
 let projectFontPreviewError = "";
+// Last state both sides agreed on. Diffing against this is what lets a save
+// conflict be replayed: it says which top-level sections *this* window changed,
+// so the background pipeline's writes can be kept and ours re-applied on top.
+let lastSyncedState = null;
+let pipelineBusy = false;
+// Top-level keys the server owns; never treat them as a local edit to replay.
+const SERVER_OWNED_STATE_KEYS = Object.freeze([
+  "revision",
+  "updated_at",
+  "source_sha256",
+  "highlight_plan_revision",
+  "project_id",
+  "schema_version",
+]);
+const PIPELINE_BUSY_STATES = Object.freeze(["pending", "running"]);
+const DIRECTOR_PIPELINE_BUSY_NOTE = "字幕校準中，完成後可切換";
 const PROVIDER_AVAILABILITY_MESSAGES = Object.freeze({
   svg_rasterizer_unavailable: "SVG 匯入目前不可用：本機安全轉檔引擎未就緒。",
   provider_disabled: "此素材來源目前已停用。",
@@ -85,7 +101,8 @@ function cacheElements() {
     "template-capability-note", "template-background-image", "template-background-video",
     "render-button", "source-file-name", "source-file-detail", "source-preview-button",
     "transcript-calibration-status", "transcript-calibration-title", "transcript-calibration-copy",
-    "highlight-count", "highlight-list", "editing-brief", "director-grid", "candidate-count",
+    "highlight-count", "highlight-list", "editing-brief", "director-grid", "director-pipeline-note",
+    "candidate-count",
     "highlight-editor", "highlight-title", "highlight-start", "highlight-end", "replan-highlights",
     "keep-highlight", "reject-highlight", "approve-highlights",
     "candidate-list", "approve-cuts", "layer-list", "layer-count",
@@ -132,7 +149,12 @@ async function request(url, options = {}) {
   }
   if (!response.ok) {
     const message = payload.error || (payload.errors || []).join("；") || `請求失敗（${response.status}）`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    // Callers need to tell a compare-and-swap conflict (recoverable: reload and
+    // replay) apart from a validation failure (not recoverable by retrying).
+    error.code = payload && typeof payload.error_code === "string" ? payload.error_code : null;
+    throw error;
   }
   if (payload && typeof payload.csrf_token === "string") {
     csrfToken = payload.csrf_token;
@@ -622,17 +644,79 @@ async function pollCaptionPreviews(attempt = 0, generation = editGeneration) {
   }
 }
 
+function markStateSynced() {
+  lastSyncedState = deepCopy(state);
+}
+
+function changedStateKeys(before, after) {
+  if (!before || !after) return [];
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const changed = [];
+  keys.forEach((key) => {
+    if (SERVER_OWNED_STATE_KEYS.includes(key)) return;
+    if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
+  });
+  return changed;
+}
+
+/**
+ * A background pipeline write (semantic caption calibration and friends) bumps
+ * the revision under us, so our compare-and-swap save 409s. Reload the server's
+ * copy, replay the sections this window actually changed on top of it, and only
+ * fall back to "we reloaded, your change to that section is gone" for sections
+ * both sides touched. Returns true when the save can be retried.
+ */
+async function reconcileStateConflict() {
+  const payload = await request("/api/project");
+  const fresh = payload.state;
+  if (!fresh || typeof fresh !== "object") return false;
+  const localChanges = changedStateKeys(lastSyncedState, state);
+  const serverChanges = changedStateKeys(lastSyncedState, fresh);
+  // Without a synced baseline there is no honest diff, so never guess: adopt
+  // the server copy and say so, rather than replaying the whole local state
+  // over somebody else's work.
+  const collisions = lastSyncedState
+    ? localChanges.filter((key) => serverChanges.includes(key))
+    : ["*"];
+  const replayable = localChanges.filter((key) => !serverChanges.includes(key));
+  const merged = deepCopy(fresh);
+  replayable.forEach((key) => { merged[key] = deepCopy(state[key]); });
+  projectPayload = payload;
+  state = merged;
+  lastSyncedState = deepCopy(fresh);
+  selectedOverlayId = state.overlays.some((overlay) => overlay.id === selectedOverlayId)
+    ? selectedOverlayId
+    : state.review?.selected_overlay_id || state.overlays[0]?.id || null;
+  renderAll();
+  // The writer is usually the local pipeline; keep watching it so the panel
+  // refreshes itself (and re-enables the director) when it finishes.
+  if (PIPELINE_BUSY_STATES.includes(payload.pipeline_status?.state)) pollPipelineStatus();
+  if (collisions.length) {
+    showToast("背景處理中，已重載最新版", "error");
+    return false;
+  }
+  return true;
+}
+
 async function saveState(showConfirmation = true) {
   clearTimeout(saveTimer);
   saveTimer = null;
   try {
-    const payload = await request("/api/editor-state", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      // CAS: the server 409s if someone else saved since our last sync,
-      // instead of silently clobbering their edits.
-      body: JSON.stringify({ ...state, x_expected_revision: state.revision || null }),
-    });
+    let payload;
+    try {
+      payload = await putEditorState();
+    } catch (error) {
+      if (error.code !== "revision_conflict") throw error;
+      // Somebody (almost always the local pipeline) wrote while we were editing.
+      const retryable = await reconcileStateConflict();
+      if (!retryable) {
+        stateDirty = false;
+        setSaveState("已重載最新版", "saved");
+        return;
+      }
+      payload = await putEditorState();
+      showToast("背景處理已更新專案，你的變更已重新套用", "info");
+    }
     state.updated_at = payload.updated_at;
     state.revision = payload.revision;
     projectPayload.approval_revisions = payload.approval_revisions || projectPayload.approval_revisions;
@@ -657,17 +741,28 @@ async function saveState(showConfirmation = true) {
       if (projectPayload?.approval_current) projectPayload.approval_current.final = false;
       renderDeliveryQa();
     }
+    markStateSynced();
     setSaveState("已儲存", "saved");
     pollCaptionPreviews();
     if (showConfirmation) showToast("時間軸已儲存", "success");
   } catch (error) {
     setSaveState("儲存失敗", "error");
-    if (String(error.message).includes("reload before saving")) {
-      showToast("另一個視窗已修改此專案；請重新整理頁面後再編輯", "error");
+    if (error.code === "revision_conflict") {
+      showToast("背景處理中，已重載最新版", "error");
     } else {
       showToast(`儲存失敗：${error.message}`, "error");
     }
   }
+}
+
+function putEditorState() {
+  return request("/api/editor-state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    // CAS: the server 409s if someone else saved since our last sync,
+    // instead of silently clobbering their edits.
+    body: JSON.stringify({ ...state, x_expected_revision: state.revision || null }),
+  });
 }
 
 function populatePresets() {
@@ -763,6 +858,10 @@ function renderDirectorCards() {
       check.textContent = "✓";
       button.append(icon, copy, check);
       button.addEventListener("click", () => {
+        if (pipelineBusy) {
+          showToast(DIRECTOR_PIPELINE_BUSY_NOTE, "error");
+          return;
+        }
         if (!isDirectorAvailable(preset)) {
           showToast(directorUnavailableReason(preset), "error");
           return;
@@ -772,6 +871,7 @@ function renderDirectorCards() {
       });
       elements["director-grid"].append(button);
     });
+  applyPipelineBusyState();
 }
 
 function templateStateDefaults(templateId) {
@@ -826,6 +926,7 @@ function renderTemplatePicker() {
       button.setAttribute("role", "radio");
       button.setAttribute("aria-checked", String(id === currentId));
       button.disabled = preset.available === false;
+      button.dataset.templateId = id;
       const motion = preset.camera_motion === "none" ? "固定" : preset.camera_motion === "punch" ? "推近" : "重構";
       const marker = document.createElement("span");
       marker.className = "template-card-marker";
@@ -942,8 +1043,14 @@ function applyTemplatePreview() {
 
 function applyCanvas() {
   const preset = projectPayload.platform_presets[state.canvas.platform_id];
-  const ratio = `${state.canvas.width} / ${state.canvas.height}`;
+  const canvasWidth = Math.max(1, Number(state.canvas.width) || 1080);
+  const canvasHeight = Math.max(1, Number(state.canvas.height) || 1920);
+  const ratio = `${canvasWidth} / ${canvasHeight}`;
   elements["stage-frame"].style.setProperty("--canvas-ratio", ratio);
+  // The stage frame also has to fit the zone's height; styles.css derives that
+  // from these two numbers, so the aspect ratio survives a short viewport.
+  elements["stage-frame"].style.setProperty("--canvas-w", String(canvasWidth));
+  elements["stage-frame"].style.setProperty("--canvas-h", String(canvasHeight));
   applyTemplatePreview();
   elements["canvas-resolution"].textContent = `${state.canvas.width} × ${state.canvas.height} · ${preset.aspect}`;
   elements["safe-zone"].style.setProperty("--safe-top", `${preset.safe.top}%`);
@@ -2812,6 +2919,59 @@ function renderSourceWarning() {
     : "來源 QA 已通過，仍需人工檢查字幕與畫面。";
 }
 
+/**
+ * While the local pipeline is still writing the project (semantic caption
+ * calibration and friends) a director switch would race it: the switch saves
+ * first, and that save loses the compare-and-swap. Say so on the cards instead
+ * of letting the click fail.
+ */
+function applyPipelineBusyState() {
+  const status = projectPayload?.pipeline_status || {};
+  pipelineBusy = PIPELINE_BUSY_STATES.includes(status.state);
+  const note = elements["director-pipeline-note"];
+  if (note) {
+    note.hidden = !pipelineBusy;
+    note.textContent = pipelineBusy ? DIRECTOR_PIPELINE_BUSY_NOTE : "";
+  }
+  elements["director-select"].disabled = pipelineBusy;
+  elements["director-grid"].querySelectorAll(".director-card").forEach((card) => {
+    const preset = projectPayload?.director_presets?.[card.dataset.directorId];
+    const available = preset ? isDirectorAvailable(preset) : true;
+    card.disabled = pipelineBusy || !available;
+    card.setAttribute("aria-disabled", String(card.disabled));
+    if (pipelineBusy) card.title = DIRECTOR_PIPELINE_BUSY_NOTE;
+  });
+}
+
+/**
+ * Pull the pipeline's own writes into the open panel once it finishes, so the
+ * user sees the calibrated captions without hunting for a refresh button. A
+ * dirty panel keeps its edits: the merge path in ``saveState`` owns that case.
+ */
+async function refreshAfterPipeline() {
+  // No baseline means no safe diff; leave unsaved work alone.
+  if (stateDirty && !lastSyncedState) return;
+  try {
+    const payload = await request("/api/project");
+    const fresh = payload.state;
+    if (!fresh || typeof fresh !== "object") return;
+    const localChanges = changedStateKeys(lastSyncedState, state);
+    const merged = deepCopy(fresh);
+    localChanges.forEach((key) => { merged[key] = deepCopy(state[key]); });
+    projectPayload = payload;
+    state = merged;
+    lastSyncedState = deepCopy(fresh);
+    selectedOverlayId = state.overlays.some((overlay) => overlay.id === selectedOverlayId)
+      ? selectedOverlayId
+      : state.review?.selected_overlay_id || state.overlays[0]?.id || null;
+    renderAll();
+    applyPipelineBusyState();
+    showToast("本機自動處理已完成，已載入最新內容", "success");
+  } catch (error) {
+    showToast(`無法載入最新內容：${error.message}`, "error");
+  }
+}
+
 function pollPipelineStatus() {
   clearInterval(pipelinePollTimer);
   pipelinePollTimer = setInterval(async () => {
@@ -2819,17 +2979,14 @@ function pollPipelineStatus() {
       const status = await request("/api/pipeline-status");
       projectPayload.pipeline_status = status;
       renderSourceWarning();
-      if (["pending", "running"].includes(status.state)) return;
-      if (status.state === "needs_review") {
-        if (stateDirty) return;
-        clearInterval(pipelinePollTimer);
-        window.location.reload();
-        return;
-      }
+      applyPipelineBusyState();
+      if (PIPELINE_BUSY_STATES.includes(status.state)) return;
       clearInterval(pipelinePollTimer);
       if (["failed", "needs_attention", "stopped"].includes(status.state)) {
         showToast(pipelineMessage(status, "本機自動處理需要處理"), "error");
+        return;
       }
+      await refreshAfterPipeline();
     } catch (error) {
       clearInterval(pipelinePollTimer);
       showToast(`無法讀取自動處理進度：${error.message}`, "error");
@@ -2849,6 +3006,7 @@ function renderAll() {
   renderPreviewOverlays(true);
   renderSourceWarning();
   renderDeliveryQa();
+  applyPipelineBusyState();
 }
 
 function bindEvents() {
@@ -2934,6 +3092,11 @@ function bindEvents() {
   elements["director-select"].addEventListener("change", async () => {
     const id = elements["director-select"].value;
     const preset = projectPayload.director_presets[id];
+    if (pipelineBusy) {
+      elements["director-select"].value = state.director_style;
+      showToast(DIRECTOR_PIPELINE_BUSY_NOTE, "error");
+      return;
+    }
     if (!isDirectorAvailable(preset)) {
       elements["director-select"].value = state.director_style;
       showToast(directorUnavailableReason(preset), "error");
@@ -2961,6 +3124,7 @@ function bindEvents() {
       });
       pushHistory();
       state = result.state;
+      markStateSynced();
       projectPayload.approval_revisions = result.approval_revisions;
       if (result.director_presets) projectPayload.director_presets = result.director_presets;
       selectedOverlayId = state.review?.selected_overlay_id || state.overlays[0]?.id || null;
@@ -2976,6 +3140,7 @@ function bindEvents() {
       showToast(`切換導演失敗：${error.message}`, "error");
     } finally {
       elements["director-select"].disabled = false;
+      applyPipelineBusyState();
     }
   });
   document.querySelectorAll("[data-add-type]").forEach((button) => button.addEventListener("click", () => addOverlay(button.dataset.addType)));
@@ -3090,6 +3255,7 @@ async function initialize() {
     projectPayload = await request("/api/project");
     renderFormulaPanel(projectPayload);
     state = projectPayload.state;
+    markStateSynced();
     selectedOverlayId = state.review?.selected_overlay_id || state.overlays[0]?.id || null;
     sourceMediaUrl = projectPayload.media_url;
     elements["project-name"].textContent = projectPayload.manifest.project_id || "未命名專案";
@@ -3125,7 +3291,7 @@ async function initialize() {
       setRenderBusy(true);
       pollRenderStatus(isBatch ? "batch" : "single");
     }
-    if (["pending", "running"].includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();
+    if (PIPELINE_BUSY_STATES.includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();
   } catch (error) {
     elements["stage-empty"].innerHTML = "";
     const message = document.createElement("p");
