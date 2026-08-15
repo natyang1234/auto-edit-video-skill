@@ -43,6 +43,7 @@ from local_http_security import (
     mutation_origin_allowed,
 )
 import visual_quality
+from tool_output import summarize_tool_failure
 from visual_quality import (
     ROLE_LAYOUTS,
     build_highlight_design_overlays,
@@ -4488,7 +4489,13 @@ class EditorHandler(BaseHTTPRequestHandler):
                     timeout=2 * 60 * 60,
                 )
                 if result.returncode != 0:
-                    raise RuntimeError((result.stderr or result.stdout).strip()[-800:])
+                    raise RuntimeError(
+                        summarize_tool_failure(
+                            f"{result.stderr or ''}\n{result.stdout or ''}",
+                            fallback="variant render failed",
+                            limit=800,
+                        )
+                    )
                 status_payload = {
                     "state": "done",
                     "message": f"變體 {variant_id} 輸出完成",
@@ -6215,8 +6222,10 @@ class EditorHandler(BaseHTTPRequestHandler):
                 or not ffprobe_has_visual_stream(temporary)
             ):
                 raise RuntimeError(
-                    (result.stderr or result.stdout or "batch clip render failed")
-                    .strip()[-1200:]
+                    summarize_tool_failure(
+                        f"{result.stderr or ''}\n{result.stdout or ''}",
+                        fallback="batch clip render failed",
+                    )
                 )
 
             qa_command = [
@@ -6294,8 +6303,11 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "delivery QA failed: "
                     + (
                         detail
-                        or (qa_result.stderr or qa_result.stdout or "batch clip QA failed")
-                        .strip()[-1100:]
+                        or summarize_tool_failure(
+                            f"{qa_result.stderr or ''}\n{qa_result.stdout or ''}",
+                            fallback="batch clip QA failed",
+                            limit=1100,
+                        )
                     )
                 )
 
@@ -6841,7 +6853,12 @@ class EditorHandler(BaseHTTPRequestHandler):
             except subprocess.TimeoutExpired:
                 result = subprocess.CompletedProcess(command, 124, "", "render timed out")
             if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
-                raise RuntimeError((result.stderr or result.stdout or "render failed").strip()[-1200:])
+                raise RuntimeError(
+                    summarize_tool_failure(
+                        f"{result.stderr or ''}\n{result.stdout or ''}",
+                        fallback="render failed",
+                    )
+                )
             qa_payload: dict[str, Any] | None = None
             qa_report: Path | None = None
             qa_contact: Path | None = None
@@ -6930,7 +6947,10 @@ class EditorHandler(BaseHTTPRequestHandler):
                     self.server.render_status = {
                         "state": "qa_failed",
                         "message": detail
-                        or (qa_result.stderr or qa_result.stdout or "delivery QA failed").strip()[-1200:],
+                        or summarize_tool_failure(
+                            f"{qa_result.stderr or ''}\n{qa_result.stdout or ''}",
+                            fallback="delivery QA failed",
+                        ),
                         "quality": quality,
                         "clip_id": clip_id,
                         "render_id": render_id,
@@ -7155,7 +7175,13 @@ class EditorHandler(BaseHTTPRequestHandler):
         )
         if result.returncode != 0 or not output.is_file():
             self.send_json(
-                {"ok": False, "error": (result.stderr or result.stdout or "cover failed")[-1200:]},
+                {
+                    "ok": False,
+                    "error": summarize_tool_failure(
+                        f"{result.stderr or ''}\n{result.stdout or ''}",
+                        fallback="cover failed",
+                    ),
+                },
                 status=500,
             )
             return

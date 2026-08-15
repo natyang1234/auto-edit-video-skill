@@ -40,6 +40,7 @@ from editor_server import (
     resolve_studio_audio_plan,
 )
 from graphic_package import ensure_graphic_package
+from tool_output import summarize_tool_failure
 from visual_quality import (
     DESIGN_ROLES,
     overlays_for_clip,
@@ -2793,7 +2794,13 @@ def render_project(
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("ffmpeg render timed out") from exc
         if result.returncode != 0 or not temporary.is_file() or not ffprobe_has_visual_stream(temporary):
-            raise RuntimeError((result.stderr or result.stdout or "ffmpeg render failed")[-5000:])
+            raise RuntimeError(
+                summarize_tool_failure(
+                    f"{result.stderr or ''}\n{result.stdout or ''}",
+                    fallback="ffmpeg render failed",
+                    limit=5000,
+                )
+            )
         if raw_visual_evidence is not None and render_id is not None:
             if visual_authority is not None:
                 visual_authority.revalidate()
@@ -3341,7 +3348,11 @@ def qa_unpublished_output(
         contact_path.unlink(missing_ok=True)
         raise RuntimeError(
             f"{delivery_label} QA failed; final output was NOT published: "
-            + (qa_result.stderr or qa_result.stdout)[-2000:]
+            + summarize_tool_failure(
+                f"{qa_result.stderr or ''}\n{qa_result.stdout or ''}",
+                fallback="delivery QA failed",
+                limit=2000,
+            )
         )
     report = read_json(report_path, {}) or {}
     visual_delivery = report.get("visual_delivery")
@@ -3711,7 +3722,13 @@ def render_cover(
     ]
     result = subprocess.run(command, text=True, capture_output=True)
     if result.returncode != 0 or not output.is_file():
-        raise RuntimeError((result.stderr or result.stdout or "cover render failed")[-5000:])
+        raise RuntimeError(
+            summarize_tool_failure(
+                f"{result.stderr or ''}\n{result.stdout or ''}",
+                fallback="cover render failed",
+                limit=5000,
+            )
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

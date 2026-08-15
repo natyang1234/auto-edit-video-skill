@@ -17,6 +17,7 @@ import copy
 from pathlib import Path
 from typing import Any
 
+from tool_output import summarize_tool_failure
 from visual_quality import DESIGN_ROLES, overlays_for_clip
 from template_catalog import (
     DEFAULT_VIDEO_TEMPLATE_ID,
@@ -640,14 +641,34 @@ def _has_video(path: Path) -> bool:
         return False
     try:
         result = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                str(path),
+            ],
             text=True,
             capture_output=True,
             timeout=30,
         )
     except subprocess.TimeoutExpired:
         return False
-    return result.returncode == 0 and result.stdout.strip() == "video"
+    if result.returncode != 0:
+        return False
+    # JSON, not CSV: ffprobe 8 emits an empty SIDE_DATA section for the same
+    # stream, which turns a one-field CSV row into "video," and would read as
+    # a missing stream on a perfectly good file.
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (AttributeError, json.JSONDecodeError):
+        return False
+    return bool(streams and streams[0].get("codec_type") == "video")
 
 
 def _signature(
@@ -799,8 +820,14 @@ def _stage_input_video(
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(timeout_message) from exc
     if result.returncode != 0 or not _has_video(output):
-        detail = result.stderr or result.stdout or "graphic source staging failed"
-        raise RuntimeError(detail[-5000:])
+        detail = f"{result.stderr or ''}\n{result.stdout or ''}"
+        raise RuntimeError(
+            summarize_tool_failure(
+                detail,
+                fallback="graphic source staging failed",
+                limit=5000,
+            )
+        )
     return engine
 
 

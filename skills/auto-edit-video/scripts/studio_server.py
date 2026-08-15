@@ -54,6 +54,7 @@ from director_resolver import (
     persist_director_selection,
     resolve_director_selection,
 )
+from tool_output import summarize_tool_failure
 from local_http_security import (
     csrf_token_matches,
     host_header_allowed,
@@ -462,7 +463,10 @@ class StudioServer(ThreadingHTTPServer):
                         phase,
                         "全文語意校準未完整覆蓋；已保留完成部分，請先檢查校準紀錄。",
                         error_code="semantic_calibration_partial",
-                        detail=(result.stderr or result.stdout or "").strip(),
+                        detail=summarize_tool_failure(
+                            f"{result.stderr or ''}\n{result.stdout or ''}",
+                            fallback="",
+                        ),
                     )
                     return
                 write_status(
@@ -470,7 +474,10 @@ class StudioServer(ThreadingHTTPServer):
                     phase,
                     "本機自動處理未完成；原始影片與專案已安全保留。",
                     error_code=f"{phase}_failed",
-                    detail=(result.stderr or result.stdout or "").strip(),
+                    detail=summarize_tool_failure(
+                        f"{result.stderr or ''}\n{result.stdout or ''}",
+                        fallback="",
+                    ),
                 )
                 return
             write_status(
