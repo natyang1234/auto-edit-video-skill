@@ -6106,6 +6106,96 @@ def cmd_studio(args: argparse.Namespace) -> int:
         return 130
 
 
+
+
+def cmd_export_capcut(args: argparse.Namespace) -> int:
+    from capcut_draft import (
+        CapcutDraftError,
+        build_draft,
+        parse_srt,
+        probe_media,
+        write_draft,
+    )
+
+    from render_editor_timeline import state_segments
+
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    manifest_path = project_dir / "project.json"
+    if not manifest_path.is_file():
+        return die(f"project manifest not found: {manifest_path}")
+    try:
+        manifest = read_json(manifest_path)
+    except ValueError as exc:
+        return die(str(exc))
+
+    source = manifest.get("source", {})
+    staged = str(source.get("staged_path") or "").strip()
+    source_path = (project_dir / staged).resolve() if staged else None
+    if source_path is None or not source_path.is_file():
+        fallback = Path(str(source.get("original_path") or "")).expanduser()
+        if fallback.is_file():
+            source_path = fallback.resolve()
+        else:
+            return die("source video not found (staged_path and original_path both missing)")
+
+    try:
+        probe = probe_media(source_path)
+    except CapcutDraftError as exc:
+        return die(str(exc))
+    duration_s = probe["duration_us"] / 1_000_000
+
+    state_path = project_dir / "working/editor_state.json"
+    try:
+        state = read_json(state_path) if state_path.is_file() else {}
+    except ValueError as exc:
+        return die(str(exc))
+    try:
+        segments = [
+            (start, min(end, duration_s))
+            for start, end in state_segments(state, duration_s)
+        ]
+    except ValueError as exc:
+        return die(f"editor_state segments are invalid: {exc}")
+
+    cues = []
+    srt_path = Path(args.srt).expanduser() if args.srt else project_dir / "subtitles/source.srt"
+    if not args.no_captions and srt_path.is_file():
+        try:
+            cues = parse_srt(srt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            return die(f"could not read captions from {srt_path}: {exc}")
+
+    canvas = None
+    state_canvas = state.get("canvas") or {}
+    try:
+        width = int(state_canvas.get("width") or 0)
+        height = int(state_canvas.get("height") or 0)
+        if width > 0 and height > 0:
+            canvas = (width, height)
+    except (TypeError, ValueError):
+        canvas = None
+
+    name = args.name or f"{project_dir.parent.name}-{manifest.get('project_id', 'draft')[:8]}"
+    try:
+        draft = build_draft(source_path, probe, segments, cues, canvas=canvas, draft_name=name)
+        draft_root = Path(args.draft_root).expanduser() if args.draft_root else None
+        target = write_draft(draft, name, draft_root=draft_root, force=args.force)
+    except CapcutDraftError as exc:
+        return die(str(exc))
+    emit(
+        {
+            "draft_dir": str(target),
+            "draft_name": name,
+            "segments": len(segments),
+            "captions": len(cues),
+            "duration_us": draft.get("duration"),
+            "canvas": draft.get("canvas_config"),
+            "next": "open CapCut and look for the draft on the home screen",
+        }
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -6492,6 +6582,17 @@ def build_parser() -> argparse.ArgumentParser:
     editor.add_argument("--allow-remote", action="store_true")
     editor.set_defaults(func=cmd_editor)
 
+    export_capcut = sub.add_parser(
+        "export-capcut",
+        help="Export the cut timeline and captions as a Mac CapCut draft project",
+    )
+    export_capcut.add_argument("project_dir", help="Project dir containing project.json")
+    export_capcut.add_argument("--name", default="", help="Draft name (default: derived from project)")
+    export_capcut.add_argument("--srt", default="", help="Caption SRT path (default: subtitles/source.srt)")
+    export_capcut.add_argument("--no-captions", action="store_true", help="Skip the caption text track")
+    export_capcut.add_argument("--draft-root", default="", help="Override the CapCut draft root (testing)")
+    export_capcut.add_argument("--force", action="store_true", help="Replace an existing draft of the same name")
+    export_capcut.set_defaults(func=cmd_export_capcut)
     studio = sub.add_parser("studio", help="Launch the loopback-only new-project importer")
     studio.add_argument("--projects-root", required=True)
     studio.add_argument("--host", default="127.0.0.1")
