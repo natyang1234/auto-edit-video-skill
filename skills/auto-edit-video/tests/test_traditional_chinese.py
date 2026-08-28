@@ -95,5 +95,22 @@ class TaiwanTraditionalChineseTests(unittest.TestCase):
         self.assertFalse(should_normalize_taiwan_traditional(manifest, "en"))
 
 
+class AlreadyTraditionalSkipTest(unittest.TestCase):
+    """2026-08-17 defect: s2twp must not mangle already-Traditional text."""
+
+    def test_traditional_text_passes_through_unchanged(self) -> None:
+        # Real regression case: Whisper emitted 無厘頭, s2twp turned it into 無釐頭.
+        self.assertEqual(to_taiwan_traditional("無厘頭"), "無厘頭")
+        self.assertEqual(to_taiwan_traditional("聯繫方式"), "聯繫方式")
+        self.assertEqual(
+            to_taiwan_traditional("Hello 123，繁體照舊。"), "Hello 123，繁體照舊。"
+        )
+
+    def test_simplified_text_still_converts(self) -> None:
+        self.assertEqual(to_taiwan_traditional("无厘头"), "無厘頭")
+        self.assertEqual(to_taiwan_traditional("鼠标和内存"), "滑鼠和記憶體")
+        self.assertEqual(to_taiwan_traditional("这是简体测试"), "這是簡體測試")
+
+
 if __name__ == "__main__":
     unittest.main()

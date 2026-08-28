@@ -3476,6 +3476,11 @@ def import_whisper_artifacts(
             "changed_characters": 0,
         }
     )
+    # 2026-08-17 defect: calibration rules targeting typos that only appear
+    # AFTER orthography conversion could never match when calibrations ran
+    # first. Re-apply the same rules once more post-conversion.
+    if orthography_enabled:
+        semantic_corrections += apply_transcription_calibrations(data, calibrations)
     contextual_corrections = apply_transcription_calibrations(
         data,
         contextual_rules,
@@ -3731,6 +3736,8 @@ def contextual_semantic_baseline(
     apply_glossary_corrections(data, glossary)
     if should_normalize_taiwan_traditional(manifest, data.get("language")):
         normalize_whisper_orthography(data)
+        # Same post-conversion re-application as the main pipeline (2026-08-17).
+        apply_transcription_calibrations(data, calibrations)
     duration_s = float(manifest.get("source", {}).get("duration_s", 0.0))
     transcript, _compatibility = whisper_payload(data, duration_s)
     return whisper_path, transcript

@@ -98,14 +98,60 @@ def _repair_mixed_script_phrases(text: str) -> str:
     return "".join(output)
 
 
+@lru_cache(maxsize=1)
+def _simplified_only_characters() -> frozenset[str]:
+    """Characters that the ST (Simplified→Traditional) stage would rewrite.
+
+    Built from the vendored ``STCharacters.txt``: a character is
+    Simplified-only when its first mapped Traditional variant differs from
+    itself. Used to detect whether text still contains Simplified content.
+    """
+
+    keys: dict[str, str] = {}
+    traditional_values: set[str] = set()
+    path = Path(__file__).resolve().parent / "vendor/opencc/dictionary/STCharacters.txt"
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        key, variants = parts[0], parts[1].split(" ")
+        if key and variants:
+            keys[key] = variants[0]
+            traditional_values.update(variants)
+    # A key that also appears among Traditional variants (e.g. 厘 → 釐 厘)
+    # is valid Traditional in its own right and must not trip the probe.
+    return frozenset(
+        key
+        for key, first in keys.items()
+        if key != first and key not in traditional_values
+    )
+
+
+def _is_already_traditional(text: str) -> bool:
+    """True when the text contains no Simplified-only characters.
+
+    2026-08-17 defect: unconditionally applying ``s2twp`` to text Whisper
+    already emitted in Traditional mangled valid words through the TW phrase
+    dictionary (無厘頭 → 無釐頭). Simplified→Traditional conversion must not
+    be forced onto text that is already Traditional.
+    """
+
+    simplified = _simplified_only_characters()
+    return not any(ch in simplified for ch in text)
+
+
 def to_taiwan_traditional(text: str) -> str:
     """Convert Simplified/standard Chinese to Taiwan Traditional Chinese.
 
     OpenCC only rewrites matching Chinese words and characters, so Latin text,
-    punctuation, numbers, and timestamp data pass through unchanged.
+    punctuation, numbers, and timestamp data pass through unchanged. Text that
+    is already fully Traditional is returned unchanged (see
+    ``_is_already_traditional``).
     """
 
     value = _repair_mixed_script_phrases(str(text))
+    if _is_already_traditional(value):
+        return value
     return _converter().convert(value)
 
 
