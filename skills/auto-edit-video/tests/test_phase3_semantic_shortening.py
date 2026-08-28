@@ -15,6 +15,7 @@ budget, it is a guess that fails closed later.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
@@ -33,6 +35,40 @@ import contract_registry  # noqa: E402
 
 def monospace(width_per_char: float = 1.0):
     return lambda text: len(text) * width_per_char
+
+
+@contextlib.contextmanager
+def pinned_glyph_widths(width_per_point: float = 0.5):
+    """Replace CoreText glyph measurement with a fixed width-per-point ruler.
+
+    The safe-area-narrowing scenario below is authored around a *width gap*
+    between a caption's declared column and the platform's narrower one
+    (84% vs TikTok's 78%): a fixture translation is picked whose measured
+    width lands inside that gap, so it fits the wide column and overflows
+    the narrow one. That gap is only a handful of percent of the frame, and
+    the live system font (`PingFang.ttc`, resolved by asset hash from
+    `/System/Library/AssetsV2`) is free to change with any macOS update —
+    it already has once, silently widening or narrowing "overlong" enough
+    that the fixture no longer lands in the gap it was picked for. Pinning
+    the ruler here keeps the scenario deterministic across machines and
+    macOS versions instead of re-tuning a word count against whatever font
+    happens to be installed.
+    """
+    original = cc._measure_context
+
+    def patched(project_dir, overlay, canvas, render_scale, state=None):
+        context = original(project_dir, overlay, canvas, render_scale, state)
+        return {**context, "measure_at": monospace_at_size(width_per_point)}
+
+    with mock.patch.object(cc, "_measure_context", side_effect=patched):
+        yield
+
+
+def monospace_at_size(width_per_point: float):
+    def measure_at(size: float):
+        return lambda text: len(text) * size * width_per_point
+
+    return measure_at
 
 
 class MeasuredCharacterBudgetTests(unittest.TestCase):
@@ -616,7 +652,8 @@ class DeliveryMeasuresTheFrameTheRenderWillCutTests(unittest.TestCase):
     def test_a_translation_only_the_platform_margin_overflows_is_still_measured(
         self,
     ) -> None:
-        budgets = self._budgets("tiktok", self.SAFE_AREA_ONLY_OVERFLOW)
+        with pinned_glyph_widths():
+            budgets = self._budgets("tiktok", self.SAFE_AREA_ONLY_OVERFLOW)
         self.assertIn("caption-instance-0001", budgets)
         self.assertGreater(budgets["caption-instance-0001"], 0)
         self.assertLess(
@@ -629,25 +666,26 @@ class DeliveryMeasuresTheFrameTheRenderWillCutTests(unittest.TestCase):
         # buys back a translation the frame rejects a second time.
         state = self._state("tiktok")
         overlay = state["overlays"][0]
-        declared = cc.translation_fit(
-            self.project,
-            {**overlay, "style": {**overlay["style"], "max_width": 84}},
-            state["canvas"],
-            1.0,
-            state,
-            translation=self.SAFE_AREA_ONLY_OVERFLOW,
-        )
-        narrowed = cc.translation_fit(
-            self.project,
-            {**overlay, "style": {**overlay["style"], "max_width": 78}},
-            state["canvas"],
-            1.0,
-            state,
-            translation=self.SAFE_AREA_ONLY_OVERFLOW,
-        )
-        self.assertTrue(declared["fits"])
-        self.assertFalse(narrowed["fits"])
-        budgets = self._budgets("tiktok", self.SAFE_AREA_ONLY_OVERFLOW)
+        with pinned_glyph_widths():
+            declared = cc.translation_fit(
+                self.project,
+                {**overlay, "style": {**overlay["style"], "max_width": 84}},
+                state["canvas"],
+                1.0,
+                state,
+                translation=self.SAFE_AREA_ONLY_OVERFLOW,
+            )
+            narrowed = cc.translation_fit(
+                self.project,
+                {**overlay, "style": {**overlay["style"], "max_width": 78}},
+                state["canvas"],
+                1.0,
+                state,
+                translation=self.SAFE_AREA_ONLY_OVERFLOW,
+            )
+            self.assertTrue(declared["fits"])
+            self.assertFalse(narrowed["fits"])
+            budgets = self._budgets("tiktok", self.SAFE_AREA_ONLY_OVERFLOW)
         self.assertEqual(
             budgets["caption-instance-0001"], narrowed["character_budget"]
         )
@@ -715,7 +753,8 @@ class ShorteningTriggersOnTheRenderedWidthTests(ShorteningRetryTests):
     @unittest.skipUnless(cc.compositor_available(), "needs macOS CoreText")
     def test_the_platform_margin_overflow_is_asked_again_with_a_budget(self) -> None:
         overflow = DeliveryMeasuresTheFrameTheRenderWillCutTests.SAFE_AREA_ONLY_OVERFLOW
-        artifact, prompts = self._create([overflow, SHORT_TRANSLATION])
+        with pinned_glyph_widths():
+            artifact, prompts = self._create([overflow, SHORT_TRANSLATION])
         self.assertEqual(len(prompts), 2)
         receipt = artifact["provider_receipt"]
         self.assertEqual(receipt["shortening_rounds"], 1)
