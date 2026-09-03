@@ -88,6 +88,13 @@ from sfx_mapping import (
     STARTER_ASSET_IDS,
     STARTER_ASSET_ROLES,
     STARTER_ASSET_FILENAMES,
+    ROLE_TO_CATEGORY,
+    SFX_CATEGORIES,
+    V2_PROCEDURAL_ASSET_IDS,
+    V2_PROCEDURAL_ASSET_ROLES,
+    V2_PROCEDURAL_ASSET_FILENAMES,
+    V2_PROCEDURAL_ASSET_CATEGORIES,
+    category_rate_limit_window_samples,
 )
 _DENSITY_ROLE_ASSETS = {
     "title_enter": "soft-ui-tick-v1",
@@ -148,6 +155,21 @@ _STARTER_ASSET_SPECS = {
         "audible_seconds": 0.42,
     },
 }
+_V2_EXTRA_ASSET_SPECS = {
+    "coin-blip-v1": {
+        "name": "coin_blip",
+        "recipe": "double_sine_ping",
+        "kind": "coin",
+        "audible_seconds": 0.18,
+    },
+    "glitch-buzz-v1": {
+        "name": "glitch_buzz",
+        "recipe": "square_burst_exponential_decay",
+        "kind": "glitch",
+        "audible_seconds": 0.16,
+    },
+}
+_V2_PROCEDURAL_ASSET_SPECS = {**_STARTER_ASSET_SPECS, **_V2_EXTRA_ASSET_SPECS}
 
 
 class SfxDeliveryError(ValueError):
@@ -857,7 +879,7 @@ def generate_soft_ui_tick(path: Path) -> dict[str, Any]:
 
 def _generate_local_procedural_asset(path: Path, asset_id: str) -> dict[str, Any]:
     """Generate one deterministic Phase 1 starter asset from a local recipe."""
-    spec = _STARTER_ASSET_SPECS[asset_id]
+    spec = _V2_PROCEDURAL_ASSET_SPECS[asset_id]
     leading_silence = WINDOW_SAMPLES
     audible_frames = int(SAMPLE_RATE * spec["audible_seconds"])
     trailing_silence = 1200
@@ -903,6 +925,18 @@ def _generate_local_procedural_asset(path: Path, asset_id: str) -> dict[str, Any
                 second_t = max(0.0, t - 0.075)
                 second = 0.24 * math.exp(-18 * second_t) * math.sin(2 * math.pi * 1320 * second_t)
                 value = first + second
+            elif kind == "coin":
+                gap_t = max(0.0, t - 0.06)
+                first = 0.72 * math.exp(-45 * t) * math.sin(2 * math.pi * 1050.0 * t)
+                second = 0.68 * math.exp(-45 * gap_t) * math.sin(2 * math.pi * 1575.0 * gap_t)
+                value = first + second
+            elif kind == "glitch":
+                gate_seconds = spec["audible_seconds"] / 3
+                gate_index = min(2, int(t / gate_seconds))
+                gate_t = t - gate_index * gate_seconds
+                gated = 1.0 if gate_t < gate_seconds * 0.55 else 0.0
+                square = 1.0 if math.sin(2 * math.pi * 220 * t) >= 0 else -1.0
+                value = 0.70 * gated * math.exp(-55 * t) * square
             else:  # pragma: no cover - recipes are fixed by the local table
                 raise SfxDeliveryError(f"unknown procedural starter recipe: {kind}")
         pcm.extend(_pack_s24(value))
@@ -923,7 +957,7 @@ def _generate_local_procedural_asset(path: Path, asset_id: str) -> dict[str, Any
     return {
         "asset_id": asset_id,
         "pack": STARTER_PACK_ID,
-        "role": STARTER_ASSET_ROLES[asset_id],
+        "role": V2_PROCEDURAL_ASSET_ROLES[asset_id],
         "generator": {"name": spec["name"], "version": 1, "recipe": spec["recipe"]},
         "duration_samples": len(decoded.samples),
         "transient_anchor_sample": metrics["transient_anchor_sample"],
@@ -951,6 +985,28 @@ def _generate_starter_assets(directory: Path) -> tuple[dict[str, dict[str, Any]]
         else:
             asset = _generate_local_procedural_asset(path, asset_id)
         assets[asset_id] = asset
+        decoded[asset_id] = decode_s24le_wav(path)
+    return assets, decoded
+
+
+def _generate_v2_procedural_assets(directory: Path) -> tuple[dict[str, dict[str, Any]], dict[str, DecodedWav]]:
+    """Build the nine-asset Phase 2 procedural catalog: starters plus fill-ins.
+
+    Every asset gains an explicit ``category`` field, which the v1 starter
+    pack never has, so this can never be mistaken for v1 catalog output.
+    """
+    starter_assets, starter_decoded = _generate_starter_assets(directory)
+    assets: dict[str, dict[str, Any]] = {
+        asset_id: {**asset, "category": V2_PROCEDURAL_ASSET_CATEGORIES[asset_id]}
+        for asset_id, asset in starter_assets.items()
+    }
+    decoded: dict[str, DecodedWav] = dict(starter_decoded)
+    for asset_id in V2_PROCEDURAL_ASSET_IDS:
+        if asset_id in assets:
+            continue
+        path = Path(directory) / V2_PROCEDURAL_ASSET_FILENAMES[asset_id]
+        asset = _generate_local_procedural_asset(path, asset_id)
+        assets[asset_id] = {**asset, "category": V2_PROCEDURAL_ASSET_CATEGORIES[asset_id]}
         decoded[asset_id] = decode_s24le_wav(path)
     return assets, decoded
 
@@ -1000,6 +1056,46 @@ def validate_catalog(catalog: dict[str, Any]) -> bool:
 
 def validate_plan(plan: dict[str, Any]) -> bool:
     return isinstance(plan, dict) and not _contract_errors("audio_event_plan", plan)
+
+
+def select_asset(
+    category: str,
+    catalog: dict[str, Any],
+    *,
+    event_index: int,
+    prefer: str = "external",
+) -> str:
+    """Deterministically choose one catalog asset_id for a semantic category.
+
+    Candidates are every catalog asset whose ``category`` field matches,
+    kept in a stable ``asset_id`` order. ``prefer="external"`` moves
+    externally-licensed candidates ahead of local ones without disturbing
+    that order otherwise; multiple remaining candidates rotate by
+    ``event_index`` so repeated cues in one plan do not all pick the same
+    asset. There is no silent fallback to a different category: an empty
+    candidate set is a hard error.
+    """
+    if not isinstance(category, str) or category not in SFX_CATEGORIES:
+        raise SfxDeliveryError(f"select_asset category is invalid: {category!r}")
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("assets"), list):
+        raise SfxDeliveryError("select_asset catalog must be an object with an assets array")
+    if type(event_index) is not int or event_index < 0:
+        raise SfxDeliveryError("select_asset event_index must be a non-negative integer")
+
+    candidates = [
+        asset for asset in catalog["assets"]
+        if isinstance(asset, dict) and asset.get("category") == category
+    ]
+    if not candidates:
+        raise SfxDeliveryError(f"select_asset has no candidates for category: {category}")
+    candidates.sort(key=lambda asset: asset.get("asset_id") or "")
+    if prefer == "external":
+        candidates.sort(key=lambda asset: asset.get("pack") != "external-licensed")
+    chosen = candidates[event_index % len(candidates)]
+    asset_id = chosen.get("asset_id")
+    if not isinstance(asset_id, str) or not asset_id:
+        raise SfxDeliveryError("select_asset candidate is missing asset_id")
+    return asset_id
 
 
 def canonical_trigger(visual_evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1152,7 +1248,7 @@ def plan_role_events(visual_evidence: dict[str, Any]) -> list[dict[str, Any]]:
     return proposals
 
 
-def _density_catalog_by_asset_id(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _density_catalog_by_asset_id_v1(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate and index the complete Phase 1 catalog without changing it."""
     if not isinstance(catalog, dict):
         raise SfxDeliveryError("density policy catalog must be an object")
@@ -1184,6 +1280,52 @@ def _density_catalog_by_asset_id(catalog: dict[str, Any]) -> dict[str, dict[str,
                 f"density policy catalog asset is not the deterministic starter asset: {asset_id}"
             )
     return by_asset_id
+
+
+def _density_catalog_by_asset_id_v2(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate and index the Phase 2 procedural catalog without changing it."""
+    if not isinstance(catalog, dict):
+        raise SfxDeliveryError("density policy catalog must be an object")
+    catalog_errors = _contract_errors("sfx_catalog", catalog)
+    if catalog_errors:
+        raise SfxDeliveryError(f"density policy catalog contract failed: {catalog_errors[0]}")
+    assets = catalog.get("assets")
+    if not isinstance(assets, list):
+        raise SfxDeliveryError("density policy requires the Phase 2 procedural catalog")
+
+    by_asset_id: dict[str, dict[str, Any]] = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise SfxDeliveryError("density policy catalog asset must be an object")
+        if asset.get("pack") == "external-licensed":
+            raise SfxDeliveryError("external assets not yet supported in verifier")
+        asset_id = asset.get("asset_id")
+        if not isinstance(asset_id, str) or asset_id in by_asset_id:
+            raise SfxDeliveryError("density policy catalog has duplicate asset id")
+        by_asset_id[asset_id] = asset
+    if set(by_asset_id) != set(V2_PROCEDURAL_ASSET_IDS):
+        raise SfxDeliveryError("density policy catalog is not the complete Phase 2 procedural pack")
+    try:
+        with tempfile.TemporaryDirectory(prefix="sfx-density-catalog-v2-") as directory:
+            expected_assets, _ = _generate_v2_procedural_assets(Path(directory))
+    except Exception as exc:
+        raise SfxDeliveryError(f"density policy procedural catalog cannot be rebuilt: {exc}") from exc
+    for asset_id in V2_PROCEDURAL_ASSET_IDS:
+        if by_asset_id[asset_id] != expected_assets[asset_id]:
+            raise SfxDeliveryError(
+                f"density policy catalog asset is not the deterministic procedural asset: {asset_id}"
+            )
+    return by_asset_id
+
+
+def _density_catalog_by_asset_id(
+    catalog: dict[str, Any], *, catalog_profile: str = "v1"
+) -> dict[str, dict[str, Any]]:
+    if catalog_profile == "v2":
+        return _density_catalog_by_asset_id_v2(catalog)
+    if catalog_profile != "v1":
+        raise SfxDeliveryError(f"unknown SFX catalog profile: {catalog_profile!r}")
+    return _density_catalog_by_asset_id_v1(catalog)
 
 
 def _resolve_density_proposal(
@@ -1338,7 +1480,7 @@ def _density_would_exceed_overlap(
     return False
 
 
-def apply_density_policy(
+def _apply_density_policy_v1(
     proposals: list[dict[str, Any]],
     catalog: dict[str, Any],
     total_samples: int,
@@ -1355,7 +1497,7 @@ def apply_density_policy(
     if not isinstance(proposals, list):
         raise SfxDeliveryError("density policy proposals must be an array")
 
-    catalog_by_asset_id = _density_catalog_by_asset_id(catalog)
+    catalog_by_asset_id = _density_catalog_by_asset_id_v1(catalog)
     seen_trigger_ids: set[str] = set()
     resolved = [
         _resolve_density_proposal(
@@ -1427,6 +1569,112 @@ def apply_density_policy(
         "dropped": copy.deepcopy(dropped),
         "policy_evidence": policy_evidence,
     }
+
+
+def _apply_density_policy_v2(
+    proposals: list[dict[str, Any]],
+    catalog: dict[str, Any],
+    total_samples: int,
+) -> dict[str, Any]:
+    if type(total_samples) is not int or total_samples <= 0:
+        raise SfxDeliveryError("density policy total_samples must be a positive integer")
+    if not isinstance(proposals, list):
+        raise SfxDeliveryError("density policy proposals must be an array")
+
+    catalog_by_asset_id = _density_catalog_by_asset_id_v2(catalog)
+    seen_trigger_ids: set[str] = set()
+    resolved = [
+        _resolve_density_proposal(
+            proposal, catalog_by_asset_id, total_samples, seen_trigger_ids
+        )
+        for proposal in proposals
+    ]
+    candidates = sorted(
+        resolved,
+        key=lambda event: (_DENSITY_PRIORITY[event["role"]], event["trigger_onset_sample"], event["trigger_id"]),
+    )
+    density_cap = (total_samples * _DENSITY_MAX_CUES_PER_MINUTE) // (60 * SAMPLE_RATE)
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        reason: str | None = None
+        candidate_category = ROLE_TO_CATEGORY[candidate["role"]]
+        if any(
+            abs(
+                candidate["expected_transient_sample"]
+                - event["expected_transient_sample"]
+            )
+            < _DENSITY_MIN_ONSET_SAMPLES
+            for event in kept
+        ):
+            reason = "adjacent_onset"
+        elif _density_would_exceed_overlap(candidate, kept):
+            reason = "overlap_limit"
+        elif any(
+            ROLE_TO_CATEGORY[event["role"]] == candidate_category
+            and abs(candidate["expected_transient_sample"] - event["expected_transient_sample"])
+            < category_rate_limit_window_samples(candidate_category)
+            for event in kept
+        ):
+            reason = "category_rate_limit"
+        elif len(kept) >= density_cap:
+            reason = "clip_density_limit"
+
+        if reason is None:
+            kept.append(candidate)
+            continue
+        dropped.append({
+            **copy.deepcopy(candidate),
+            "reason": reason,
+            "resolved_event": copy.deepcopy(candidate),
+        })
+
+    kept.sort(key=lambda event: (event["trigger_onset_sample"], event["trigger_id"]))
+    dropped_reasons: dict[str, int] = {}
+    for item in dropped:
+        dropped_reasons[item["reason"]] = dropped_reasons.get(item["reason"], 0) + 1
+    policy_evidence = {
+        "total_samples": total_samples,
+        "sample_rate": SAMPLE_RATE,
+        "adjacent_onset_samples": _DENSITY_MIN_ONSET_SAMPLES,
+        "adjacent_onset_authority": "expected_transient_sample",
+        "max_overlap": _DENSITY_MAX_OVERLAP,
+        "max_cues_per_minute": _DENSITY_MAX_CUES_PER_MINUTE,
+        "density_cap": density_cap,
+        "priority_order": [
+            "title_enter",
+            "transition",
+            "grid_fill",
+            "complete",
+            "count_tick",
+            "row_reveal",
+            "typing",
+        ],
+        "candidate_order": [event["trigger_id"] for event in candidates],
+        "kept_trigger_ids": [event["trigger_id"] for event in kept],
+        "dropped_trigger_ids": [event["trigger_id"] for event in dropped],
+        "dropped_reasons": dropped_reasons,
+    }
+    return {
+        "kept": copy.deepcopy(kept),
+        "dropped": copy.deepcopy(dropped),
+        "policy_evidence": policy_evidence,
+    }
+
+
+def apply_density_policy(
+    proposals: list[dict[str, Any]],
+    catalog: dict[str, Any],
+    total_samples: int,
+    *,
+    catalog_profile: str = "v1",
+) -> dict[str, Any]:
+    if catalog_profile == "v1":
+        return _apply_density_policy_v1(proposals, catalog, total_samples)
+    if catalog_profile == "v2":
+        return _apply_density_policy_v2(proposals, catalog, total_samples)
+    raise SfxDeliveryError(f"unknown SFX catalog profile: {catalog_profile!r}")
 
 
 def _canonical_hash(value: Any) -> str:
@@ -1732,7 +1980,7 @@ def _write_multi_event_stem(
     return decode_s24le_wav(path)
 
 
-def stage_multi_event_delivery(
+def _stage_multi_event_delivery_v1(
     stage_dir: Path,
     visual_evidence: dict[str, Any],
     timeline_revision: str,
@@ -1842,6 +2090,148 @@ def stage_multi_event_delivery(
     _write_json(catalog_path, catalog)
     _write_json(plan_path, plan)
     return plan_path, catalog_path, stem_path
+
+
+def _stage_multi_event_delivery_v2(
+    stage_dir: Path,
+    visual_evidence: dict[str, Any],
+    timeline_revision: str,
+    cut_map_sha256: str,
+    dialogue_probe: Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Stage a schema-v3 deterministic multi-event plan from the v2 SFX catalog."""
+    stage = Path(stage_dir)
+    stage.mkdir(parents=True, exist_ok=True)
+    timeline_revision = _require_sha256(timeline_revision, "timeline_revision")
+    cut_map_sha256 = _require_sha256(cut_map_sha256, "cut_map_sha256")
+    try:
+        evidence_snapshot = copy.deepcopy(visual_evidence)
+    except Exception as exc:
+        raise SfxDeliveryError("renderer visual evidence cannot be copied") from exc
+    proposals = plan_role_events(evidence_snapshot)
+    total_samples = _duration_samples_from_evidence(evidence_snapshot)
+    motion_hash = canonical_motion_plan_hash(evidence_snapshot)
+
+    generated_assets, _ = _generate_v2_procedural_assets(stage)
+    catalog = {
+        "schema_version": 2,
+        "sample_rate": SAMPLE_RATE,
+        "channels": CHANNELS,
+        "sample_width_bytes": SAMPLE_WIDTH,
+        "assets": [generated_assets[asset_id] for asset_id in V2_PROCEDURAL_ASSET_IDS],
+    }
+    catalog_errors = _contract_errors("sfx_catalog", catalog)
+    if catalog_errors:
+        raise SfxDeliveryError(f"sfx_catalog contract failed: {catalog_errors[0]}")
+
+    selected_proposals = []
+    for index, proposal in enumerate(proposals):
+        category = ROLE_TO_CATEGORY[proposal["role"]]
+        role_catalog = {
+            "assets": [
+                asset for asset in catalog["assets"] if asset.get("role") == proposal["role"]
+            ],
+        }
+        asset_id = select_asset(category, role_catalog, event_index=index)
+        selected_proposals.append({**proposal, "asset_id": asset_id})
+
+    density = _apply_density_policy_v2(selected_proposals, catalog, total_samples)
+    kept = sorted(
+        density["kept"],
+        key=lambda event: (event["trigger_onset_sample"], event["trigger_id"]),
+    )
+    if not kept:
+        raise SfxDeliveryError("multi-event density policy kept no events")
+    events: list[dict[str, Any]] = []
+    for index, resolved_event in enumerate(kept, start=1):
+        evidence = _normalized_renderer_event_evidence(resolved_event)
+        events.append({
+            "id": f"sfx-event-{index:04d}",
+            "trigger_id": resolved_event["trigger_id"],
+            "trigger_onset_sample": resolved_event["trigger_onset_sample"],
+            "event_start_sample": resolved_event["event_start_sample"],
+            "duration_samples": resolved_event["duration_samples"],
+            "asset_id": resolved_event["asset_id"],
+            "asset_transient_anchor_sample": resolved_event["asset_transient_anchor_sample"],
+            "expected_transient_sample": resolved_event["expected_transient_sample"],
+            "role": resolved_event["role"],
+            "category": ROLE_TO_CATEGORY[resolved_event["role"]],
+            "gain_db": -12,
+            "dialogue_duck_db": 0.0,
+            "fades": {"in_samples": 0, "out_samples": 0},
+            "duck_group": "dialogue_priority",
+            "evidence": evidence,
+            "reason": f"faithful {resolved_event['role']}",
+            "review_state": "approved_generated",
+        })
+
+    density_evidence = {
+        **density["policy_evidence"],
+        "dropped": [_normalized_density_drop(item) for item in density["dropped"]],
+    }
+    asset_paths = {
+        asset_id: stage / V2_PROCEDURAL_ASSET_FILENAMES[asset_id]
+        for asset_id in V2_PROCEDURAL_ASSET_IDS
+    }
+    if dialogue_probe is not None:
+        ducks = dialogue_priority_ducks(
+            events, asset_paths, decode_s24le_wav(Path(dialogue_probe))
+        )
+        for event in events:
+            event["dialogue_duck_db"] = ducks[event["id"]]
+    stem_path = stage / "sfx_stem.wav"
+    decoded = _write_multi_event_stem(
+        stem_path,
+        total_samples=total_samples,
+        events=events,
+        asset_paths=asset_paths,
+    )
+    stem_bytes = stem_path.read_bytes()
+    plan = {
+        "schema_version": 3,
+        "timeline_revision": timeline_revision,
+        "cut_map_sha256": cut_map_sha256,
+        "resolved_motion_plan_hash": motion_hash,
+        "sample_rate": SAMPLE_RATE,
+        "channels": CHANNELS,
+        "sample_width_bytes": SAMPLE_WIDTH,
+        "alignment_tolerance_samples": ALIGNMENT_TOLERANCE,
+        "sfx_stem_sha256": sha256_bytes(stem_bytes),
+        "sfx_stem_decoded_pcm_sha256": sha256_bytes(decoded.pcm),
+        "sfx_stem_sample_count": len(decoded.samples),
+        "mix_mode": "deterministic_s24_saturating_sum_v1",
+        "density": density_evidence,
+        "catalog_revision_sha256": _canonical_hash(catalog),
+        "events": events,
+    }
+    plan_errors = _contract_errors("audio_event_plan", plan)
+    if plan_errors:
+        raise SfxDeliveryError(f"audio_event_plan contract failed: {plan_errors[0]}")
+    catalog_path = stage / "audio_catalog.json"
+    plan_path = stage / "audio_event_plan.json"
+    _write_json(catalog_path, catalog)
+    _write_json(plan_path, plan)
+    return plan_path, catalog_path, stem_path
+
+
+def stage_multi_event_delivery(
+    stage_dir: Path,
+    visual_evidence: dict[str, Any],
+    timeline_revision: str,
+    cut_map_sha256: str,
+    dialogue_probe: Path | None = None,
+    *,
+    catalog_profile: str = "v1",
+) -> tuple[Path, Path, Path]:
+    if catalog_profile == "v1":
+        return _stage_multi_event_delivery_v1(
+            stage_dir, visual_evidence, timeline_revision, cut_map_sha256, dialogue_probe
+        )
+    if catalog_profile == "v2":
+        return _stage_multi_event_delivery_v2(
+            stage_dir, visual_evidence, timeline_revision, cut_map_sha256, dialogue_probe
+        )
+    raise SfxDeliveryError(f"unknown SFX catalog profile: {catalog_profile!r}")
 
 
 def stage_one_cue_delivery(
@@ -2116,6 +2506,19 @@ def verify_delivery(
             dialogue_priority_dialogue_path,
             dialogue_priority_sfx_path,
             plan_snapshot=(probe_plan, probe_plan_bytes, probe_plan_error),
+            expected_studio_edits_sha256=expected_studio_edits_sha256,
+        )
+    if type(probe_version) is int and probe_version == 3:
+        return _verify_multi_event_delivery_v2(
+            Path(plan_path),
+            Path(catalog_path),
+            Path(stem_path),
+            visual_evidence,
+            expected_timeline_revision,
+            expected_cut_map_sha256,
+            candidate_path,
+            dialogue_priority_dialogue_path,
+            dialogue_priority_sfx_path,
             expected_studio_edits_sha256=expected_studio_edits_sha256,
         )
     failures: list[str] = []
@@ -3048,3 +3451,172 @@ def _verify_multi_event_delivery(
         ),
         "dialogue_priority_evidence": dialogue_priority,
     }
+    return report
+
+
+def _verify_multi_event_delivery_v2(
+    plan_path: Path,
+    catalog_path: Path,
+    stem_path: Path,
+    visual_evidence: dict[str, Any],
+    expected_timeline_revision: str,
+    expected_cut_map_sha256: str,
+    candidate_path: Path | None = None,
+    dialogue_priority_dialogue_path: Path | None = None,
+    dialogue_priority_sfx_path: Path | None = None,
+    expected_studio_edits_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Independently verify a frozen v2-catalog plan: rebuild from the catalog, do not re-select."""
+    failures: list[str] = []
+    warnings: list[str] = []
+    if any(
+        value is not None
+        for value in (
+            dialogue_priority_dialogue_path,
+            dialogue_priority_sfx_path,
+            candidate_path,
+            expected_studio_edits_sha256,
+        )
+    ):
+        failures.append(
+            "audio_event_plan v3 catalog-driven plan does not yet support "
+            "candidate/dialogue-priority/studio-edit verification"
+        )
+
+    plan, plan_bytes, plan_error = _read_json_once(Path(plan_path))
+    catalog, catalog_bytes, catalog_error = _read_json_once(Path(catalog_path))
+    try:
+        stem_bytes = Path(stem_path).read_bytes()
+    except OSError as exc:
+        stem_bytes = None
+        failures.append(f"{Path(stem_path).name}: unreadable ({exc})")
+    for error in (plan_error, catalog_error):
+        if error:
+            failures.append(error)
+    if plan is not None:
+        failures.extend(f"audio_event_plan: {error}" for error in _contract_errors("audio_event_plan", plan))
+    if catalog is not None:
+        failures.extend(f"sfx_catalog: {error}" for error in _contract_errors("sfx_catalog", catalog))
+
+    observed_hashes: dict[str, Any] = {
+        "plan_file_sha256": sha256_bytes(plan_bytes) if plan_bytes is not None else None,
+        "catalog_file_sha256": sha256_bytes(catalog_bytes) if catalog_bytes is not None else None,
+        "stem_file_sha256": sha256_bytes(stem_bytes) if stem_bytes is not None else None,
+        "stem_decoded_pcm_sha256": None,
+        "catalog_revision_sha256": None,
+        "resolved_motion_plan_hash": None,
+    }
+    if stem_bytes is not None:
+        try:
+            decoded_stem = decode_s24le_wav_bytes(stem_bytes, source=str(stem_path))
+            observed_hashes["stem_decoded_pcm_sha256"] = sha256_bytes(decoded_stem.pcm)
+        except SfxDeliveryError as exc:
+            failures.append(f"sfx_stem: {exc}")
+
+    if isinstance(catalog, dict) and not failures:
+        try:
+            _density_catalog_by_asset_id_v2(catalog)
+        except SfxDeliveryError as exc:
+            failures.append(str(exc))
+
+    if isinstance(catalog, dict):
+        catalog_revision_sha256 = _canonical_hash(catalog)
+        observed_hashes["catalog_revision_sha256"] = catalog_revision_sha256
+        declared_catalog_revision = plan.get("catalog_revision_sha256") if isinstance(plan, dict) else None
+        if declared_catalog_revision is not None and declared_catalog_revision != catalog_revision_sha256:
+            failures.append("audio_event_plan.catalog_revision_sha256 does not match the staged catalog")
+
+    events = plan.get("events") if isinstance(plan, dict) else None
+    expected_count = len(events) if isinstance(events, list) else 0
+    delivered_events: list[dict[str, Any]] = []
+    catalog_by_asset_id: dict[str, dict[str, Any]] = {}
+    if isinstance(catalog, dict) and isinstance(catalog.get("assets"), list):
+        for asset in catalog["assets"]:
+            if isinstance(asset, dict) and isinstance(asset.get("asset_id"), str):
+                catalog_by_asset_id[asset["asset_id"]] = asset
+
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                failures.append("audio_event_plan.events: event must be an object")
+                continue
+            asset_id = event.get("asset_id")
+            role = event.get("role")
+            category = event.get("category")
+            if asset_id not in catalog_by_asset_id:
+                failures.append(f"audio_event_plan.events: asset_id not found in staged catalog: {asset_id}")
+                continue
+            expected_category = ROLE_TO_CATEGORY.get(role)
+            if expected_category is not None and category != expected_category:
+                failures.append(
+                    f"audio_event_plan.events: category does not match ROLE_TO_CATEGORY for role {role!r}"
+                )
+                continue
+            delivered_events.append(event)
+
+    rebuilt_hashes: dict[str, Any] = {"sfx_stem_sha256": None, "sfx_stem_decoded_pcm_sha256": None}
+    total_samples = plan.get("sfx_stem_sample_count") if isinstance(plan, dict) else None
+    if not failures and isinstance(events, list) and type(total_samples) is int and total_samples > 0:
+        try:
+            with tempfile.TemporaryDirectory(prefix="sfx-verify-v2-") as directory:
+                _generate_v2_procedural_assets(Path(directory))
+                asset_paths = {
+                    asset_id: Path(directory) / V2_PROCEDURAL_ASSET_FILENAMES[asset_id]
+                    for asset_id in V2_PROCEDURAL_ASSET_IDS
+                }
+                rebuilt_path = Path(directory) / "rebuilt_sfx_stem.wav"
+                rebuilt = _write_multi_event_stem(
+                    rebuilt_path,
+                    total_samples=total_samples,
+                    events=events,
+                    asset_paths=asset_paths,
+                )
+                rebuilt_hashes["sfx_stem_sha256"] = sha256_bytes(rebuilt_path.read_bytes())
+                rebuilt_hashes["sfx_stem_decoded_pcm_sha256"] = sha256_bytes(rebuilt.pcm)
+        except SfxDeliveryError as exc:
+            failures.append(f"sfx_stem rebuild: {exc}")
+        if rebuilt_hashes["sfx_stem_sha256"] is not None:
+            if rebuilt_hashes["sfx_stem_sha256"] != observed_hashes["stem_file_sha256"]:
+                failures.append("sfx_stem: staged stem bytes do not match the frozen catalog rebuild")
+            declared_stem_sha256 = plan.get("sfx_stem_sha256") if isinstance(plan, dict) else None
+            if declared_stem_sha256 is not None and declared_stem_sha256 != rebuilt_hashes["sfx_stem_sha256"]:
+                failures.append("audio_event_plan.sfx_stem_sha256 does not match the frozen catalog rebuild")
+            declared_pcm_sha256 = (
+                plan.get("sfx_stem_decoded_pcm_sha256") if isinstance(plan, dict) else None
+            )
+            if declared_pcm_sha256 is not None and declared_pcm_sha256 != rebuilt_hashes["sfx_stem_decoded_pcm_sha256"]:
+                failures.append(
+                    "audio_event_plan.sfx_stem_decoded_pcm_sha256 does not match the frozen catalog rebuild"
+                )
+
+    if isinstance(plan, dict) and plan.get("timeline_revision") != expected_timeline_revision:
+        failures.append("audio_event_plan.timeline_revision does not match expected value")
+    if isinstance(plan, dict) and plan.get("cut_map_sha256") != expected_cut_map_sha256:
+        failures.append("audio_event_plan.cut_map_sha256 does not match expected value")
+
+    try:
+        evidence_snapshot = copy.deepcopy(visual_evidence)
+        motion_hash = canonical_motion_plan_hash(evidence_snapshot)
+        observed_hashes["resolved_motion_plan_hash"] = motion_hash
+        if isinstance(plan, dict) and plan.get("resolved_motion_plan_hash") != motion_hash:
+            failures.append("audio_event_plan.resolved_motion_plan_hash does not match renderer evidence")
+    except Exception as exc:  # pragma: no cover - defensive evidence boundary
+        failures.append(f"visual evidence motion hash: {exc}")
+
+    if failures:
+        delivered_events = []
+    report = {
+        "schema_version": 1,
+        "source": "independent_sfx_evidence_v2",
+        "status": "fail" if failures else "pass",
+        "failures": failures,
+        "warnings": warnings,
+        "expected_event_count": expected_count,
+        "delivered_event_count": len(delivered_events),
+        "events": delivered_events,
+        "observed_hash_evidence": observed_hashes,
+        "rebuilt_hash_evidence": rebuilt_hashes,
+        "expected_timeline_revision": expected_timeline_revision,
+        "expected_cut_map_sha256": expected_cut_map_sha256,
+    }
+    return report

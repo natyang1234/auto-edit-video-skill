@@ -162,7 +162,7 @@
                 "additionalProperties": false
               },
               "reason": {
-                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit"]
+                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit", "category_rate_limit"]
               }
             },
             "additionalProperties": false
@@ -204,6 +204,7 @@
       "additionalProperties": false
     },
     "studio_edits_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "catalog_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "events": {
       "type": "array",
       "minItems": 1,

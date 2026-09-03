@@ -102,3 +102,37 @@ V2_PROCEDURAL_ASSET_CATEGORIES = {
     **STARTER_ASSET_CATEGORIES,
     **V2_EXTRA_ASSET_CATEGORIES,
 }
+
+V2_EXTRA_ASSET_ROLES = {
+    "coin-blip-v1": "content_hint",
+    "glitch-buzz-v1": "content_hint",
+}
+
+V2_PROCEDURAL_ASSET_ROLES = {
+    **STARTER_ASSET_ROLES,
+    **V2_EXTRA_ASSET_ROLES,
+}
+
+V2_EXTRA_ASSET_FILENAMES = {
+    "coin-blip-v1": "generated-coin-blip-v1.wav",
+    "glitch-buzz-v1": "generated-glitch-buzz-v1.wav",
+}
+
+V2_PROCEDURAL_ASSET_FILENAMES = {
+    **STARTER_ASSET_FILENAMES,
+    **V2_EXTRA_ASSET_FILENAMES,
+}
+
+# Category-level rate limiting for the v2 density policy.  Whoosh cues are
+# scene-transition-scale and stay rare; every other category shares the
+# tighter default window.  Kept here (not in sfx_delivery.py or
+# contract_registry.py) so the producer and the independent verifier check
+# the exact same numbers instead of two hand-copied rulers.
+CATEGORY_RATE_LIMIT_WINDOW_SAMPLES = {
+    "whoosh": 480000,
+}
+DEFAULT_CATEGORY_RATE_LIMIT_WINDOW_SAMPLES = 240000
+
+
+def category_rate_limit_window_samples(category: str) -> int:
+    return CATEGORY_RATE_LIMIT_WINDOW_SAMPLES.get(category, DEFAULT_CATEGORY_RATE_LIMIT_WINDOW_SAMPLES)

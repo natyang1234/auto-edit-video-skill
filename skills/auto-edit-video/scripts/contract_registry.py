@@ -28,6 +28,7 @@ from sfx_mapping import (
     V2_PROCEDURAL_ASSET_CATEGORIES,
     V2_PROCEDURAL_ASSET_GENERATORS,
     V2_PROCEDURAL_ASSET_IDS,
+    category_rate_limit_window_samples,
 )
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -1306,6 +1307,15 @@ def semantic_audio_event_plan(artifact) -> list[str]:
     elif "mix_mode" not in artifact or "density" not in artifact:
         errors.append("$: schema v2 requires mix_mode and density evidence")
 
+    catalog_revision_sha256 = artifact.get("catalog_revision_sha256")
+    if catalog_revision_sha256 is not None:
+        if (
+            not isinstance(catalog_revision_sha256, str)
+            or len(catalog_revision_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in catalog_revision_sha256)
+        ):
+            errors.append("$.catalog_revision_sha256: must be 64 lowercase hex characters")
+
     role_priority = {
         "title_enter": 0,
         "transition": 0,
@@ -1739,6 +1749,16 @@ def semantic_audio_event_plan(artifact) -> list[str]:
                 if active > 2:
                     expected_reason = "overlap_limit"
                     break
+        if expected_reason is None and "catalog_revision_sha256" in artifact:
+            candidate_category = ROLE_TO_CATEGORY.get(candidate.get("role"))
+            if candidate_category is not None and type(candidate_expected) is int and any(
+                ROLE_TO_CATEGORY.get(item.get("role")) == candidate_category
+                and type(item.get("expected_transient_sample")) is int
+                and abs(candidate_expected - item["expected_transient_sample"])
+                < category_rate_limit_window_samples(candidate_category)
+                for item in simulated_kept
+            ):
+                expected_reason = "category_rate_limit"
         if expected_reason is None and len(simulated_kept) >= density.get("density_cap", 0):
             expected_reason = "clip_density_limit"
         if candidate_id in set(kept_ids):
