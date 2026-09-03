@@ -156,6 +156,10 @@ repeated, stretched, or speed-adjusted merely to hit the target.
   timed text/media layers, and social canvas presets.
 - Deterministic single/batch MP4 and cover rendering, mechanical QA, contact
   sheets, and approval-gated ZIP download.
+- A six-category SFX layer (`cash_coin`, `click_pop`, `whoosh`, `impact_hit`,
+  `success_ding`, `error_glitch`) with a procedural-only `v1` catalog and an
+  optional `v2` catalog adding 12 hash-verified, Pixabay-licensed assets, plus
+  explicit `sfx_hints.json` placement and advisory keyword-based suggestions.
 - Optional Edge, Rumi/Fish, HyperFrames, premium captions, and visual-card integrations when those tools are already installed.
 
 The skill never invokes CapCut. It does not include API keys, private voices, media, creator profiles, or machine-specific configuration.

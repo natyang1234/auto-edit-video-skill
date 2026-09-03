@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.9.0 (2026-09-04)
+
+### Six-category SFX layer with v1/v2 catalogs and explicit/advisory placement
+
+- Add `sfx_mapping.py` as the single source of truth for the six semantic
+  categories (`cash_coin`, `click_pop`, `whoosh`, `impact_hit`,
+  `success_ding`, `error_glitch`) and the fixed trigger-role-to-category
+  mapping, plus `sfx_catalog` v2 and `audio_event_plan` v3 contract schemas.
+- Add catalog v2 version dispatch and `select_asset` semantic selection, and
+  two additional procedural fallback assets (`coin-blip-v1`,
+  `glitch-buzz-v1`) so every category has coverage without external assets.
+- Add `scripts/sfx_import.py` (`import`/`verify`/`list`) and a 12-asset
+  Pixabay-licensed library (two per category) under `assets/sfx/`, each
+  record carrying source provenance, a three-hash chain, a license snapshot,
+  and approval metadata.
+- Add an independent verification chain that re-checks every external
+  asset's record hash, delivered-WAV hash, decoded-PCM hash, and
+  license-evidence hash on every load, rejecting symlinks and path escapes
+  before an external asset can reach a delivery.
+- Add a director_mode `experience.sfx.catalog_profile` switch (`v1`/`v2`);
+  `v2` merges the 9 procedural assets with the 12 external assets, `v1`
+  reproduces the original 7-asset procedural-only catalog, and `v2` is
+  rejected when `sfx.mode` is `disabled`.
+- Add the `sfx_hints` contract for explicit, project-level cue placement
+  (`working/sfx_hints.json`, strictly increasing post-cut onset samples) and
+  an advisory `scripts/sfx_suggest.py` that scans final captions against a
+  keyword table to propose, but never auto-apply, candidate cues.
+- Add category-level density limits for catalog v2 (`whoosh` at most once
+  per 10 seconds, other categories at most once per 5 seconds) on top of the
+  existing 120ms/2-overlap/40-per-minute limits.
+- Document the SFX layer in `SKILL.md`, `references/ROUTING.md`,
+  `references/sfx_keywords.json`, and both READMEs.
+
 ## 1.8.0 - 2026-07-15
 
 ### Approval-bound batch highlight export

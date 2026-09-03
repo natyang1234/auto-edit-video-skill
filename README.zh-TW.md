@@ -71,6 +71,9 @@ SVG 搜尋會顯示 Heroicons、Lucide、Tabler 與 Wikimedia 的中繼資料。
 - 中英混合辨識、專案詞彙表、可稽核同音字校準，以及分離的機械／語義審核狀態。
 - loopback Studio 匯入、本機頁面編輯器、語意精華、定時文字／媒體圖層與社群畫布。
 - 單段／批次 MP4 與封面確定性輸出、機械 QA、contact sheet 與核可後 ZIP 下載。
+- 六類音效層（`cash_coin`／`click_pop`／`whoosh`／`impact_hit`／`success_ding`／
+  `error_glitch`）：`v1` 為純程序化合成音，`v2` 額外加入 12 顆已驗證雜湊、
+  Pixabay 授權的素材，並支援明確指定的 `sfx_hints.json` 與關鍵詞建議清單。
 - 已安裝時才啟用 Edge、Rumi/Fish、HyperFrames、進階字幕與視覺字卡整合。
 
 本 Skill 永不呼叫 CapCut，也不包含 API 金鑰、私有聲音、影片素材、創作者個資或單機路徑設定。

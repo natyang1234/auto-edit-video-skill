@@ -29,8 +29,22 @@ competing final timeline.
 | Existing cut + SRT + mixed HTML/screenshots | optional `chengfeng-narration-to-video` | Use its storyboard/timeline gates |
 | Synthetic motion insert | optional HyperFrames workflow | Render as an asset or selected primary composition |
 | Default Chinese voice | optional Rumi safe catalog | Use only when discovered and explicitly approved |
-| Other TTS/BGM/SFX | Edge or optional `hyperframes-media` | No implicit downloads or vendored provider code |
+| Other TTS/BGM | Edge or optional `hyperframes-media` | No implicit downloads or vendored provider code |
+| SFX cue selection | bundled `sfx_mapping.py`/`sfx_delivery.py`; `catalog_profile` v1 or v2 | Trigger-role events always resolve to their pinned procedural asset in both profiles |
 | Final QA | bundled `qa_video.py` | Studio binds report/contact/output hashes; human inspection still required |
+
+### SFX catalog profile
+
+- Use `catalog_profile: "v1"` when the delivery must stay fully deterministic
+  and reproducible from procedural generation alone, or for regression tests
+  against the original 7/9-asset catalog shape.
+- Use `catalog_profile: "v2"` when the content benefits from more varied,
+  realistic timbres, when the director profile is `kinetic-explainer` (its
+  default), or when `working/sfx_hints.json`/`sfx_suggest.py` name categories
+  better served by the wider external-asset pool.
+- Both profiles resolve the 7 fixed trigger roles to the same pinned
+  procedural asset; `catalog_profile` only changes what non-trigger
+  content-hint events can select from.
 
 When destructive cutting is required, perform it before overlay/card rendering.
 The page-editor renderer intentionally rejects a final render when approved
