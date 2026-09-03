@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_width_bytes": 3,
+  "assets": [
+    {
+      "asset_id": "soft-ui-tick-v1",
+      "pack": "phase1-local-procedural",
+      "role": "title_enter",
+      "category": "click_pop",
+      "generator": {
+        "name": "soft_ui_tick",
+        "version": 1,
+        "recipe": "two_sine_exponential_decay"
+      },
+      "duration_samples": 7200,
+      "transient_anchor_sample": 240,
+      "noise_floor_dbfs": -120.0,
+      "rms_dbfs": -18.879128,
+      "peak_dbfs": -4.41845,
+      "wav_sha256": "8fb12da2752ba36d56e3e02165bb58f43ba01e6c039364cd3151056756d17ba9",
+      "decoded_pcm_sha256": "3a8158ac82139965b191dd76f612d4cd61426060f08544ab8899f6a3b4b28f31",
+      "provenance": "original local procedural generation; no external/reference audio",
+      "review_state": "approved_generated"
+    },
+    {
+      "asset_id": "coin-blip-v1",
+      "pack": "phase1-local-procedural",
+      "role": "content_hint",
+      "category": "cash_coin",
+      "generator": {
+        "name": "coin_blip",
+        "version": 1,
+        "recipe": "double_sine_ping"
+      },
+      "duration_samples": 5760,
+      "transient_anchor_sample": 200,
+      "noise_floor_dbfs": -110.0,
+      "rms_dbfs": -20.0,
+      "peak_dbfs": -3.5,
+      "wav_sha256": "a6958cf583dd3a1857e09abf6961ea125d3ccafc59d276987fd3d0be9b8a7823",
+      "decoded_pcm_sha256": "95ba8ee81ab7a262f2d6eaa89f144c48aca8dcf777158e0eda961a9bedd07c82",
+      "provenance": "original local procedural generation; no external/reference audio",
+      "review_state": "approved_generated"
+    },
+    {
+      "asset_id": "glitch-buzz-v1",
+      "pack": "phase1-local-procedural",
+      "role": "content_hint",
+      "category": "error_glitch",
+      "generator": {
+        "name": "glitch_buzz",
+        "version": 1,
+        "recipe": "square_burst_exponential_decay"
+      },
+      "duration_samples": 4800,
+      "transient_anchor_sample": 100,
+      "noise_floor_dbfs": -105.0,
+      "rms_dbfs": -16.0,
+      "peak_dbfs": -2.0,
+      "wav_sha256": "407cbe79f6f1b7e86bdc5f8bc86914bdb6a4465cebe5faec2c3f07cc1fa76514",
+      "decoded_pcm_sha256": "d7b1338eb5f30144b99d4f0cd40aa533feee28a0bd9a4a1fff863de085f9800c",
+      "provenance": "original local procedural generation; no external/reference audio",
+      "review_state": "approved_generated"
+    }
+  ]
+}

@@ -83,25 +83,12 @@ DIALOGUE_DUCK_FLOOR_DB = -36.0
 DIALOGUE_DUCK_MARGIN_DB = 1.0
 DIALOGUE_DUCK_MAX_ROUNDS = 8
 
-STARTER_PACK_ID = "phase1-local-procedural"
-STARTER_ASSET_IDS = (
-    "soft-ui-tick-v1",
-    "short-pop-v1",
-    "short-whoosh-v1",
-    "soft-impact-v1",
-    "short-riser-v1",
-    "typing-tick-v1",
-    "completion-chime-v1",
+from sfx_mapping import (
+    STARTER_PACK_ID,
+    STARTER_ASSET_IDS,
+    STARTER_ASSET_ROLES,
+    STARTER_ASSET_FILENAMES,
 )
-STARTER_ASSET_ROLES = {
-    "soft-ui-tick-v1": "title_enter",
-    "short-pop-v1": "row_reveal",
-    "short-whoosh-v1": "transition",
-    "soft-impact-v1": "grid_fill",
-    "short-riser-v1": "count_tick",
-    "typing-tick-v1": "typing",
-    "completion-chime-v1": "complete",
-}
 _DENSITY_ROLE_ASSETS = {
     "title_enter": "soft-ui-tick-v1",
     "transition": "short-whoosh-v1",
@@ -123,18 +110,6 @@ _DENSITY_PRIORITY = {
 _DENSITY_MIN_ONSET_SAMPLES = 5760  # 120 ms at 48 kHz
 _DENSITY_MAX_OVERLAP = 2
 _DENSITY_MAX_CUES_PER_MINUTE = 40
-# Keep the Phase 0d filename stable because existing renderer/integration
-# callers open it directly.  New assets are deliberately explicit rather
-# than derived from a lossy role or a filesystem glob.
-STARTER_ASSET_FILENAMES = {
-    "soft-ui-tick-v1": "generated-soft-ui-tick.wav",
-    "short-pop-v1": "generated-short-pop-v1.wav",
-    "short-whoosh-v1": "generated-short-whoosh-v1.wav",
-    "soft-impact-v1": "generated-soft-impact-v1.wav",
-    "short-riser-v1": "generated-short-riser-v1.wav",
-    "typing-tick-v1": "generated-typing-tick-v1.wav",
-    "completion-chime-v1": "generated-completion-chime-v1.wav",
-}
 _STARTER_ASSET_SPECS = {
     "short-pop-v1": {
         "name": "short_pop",

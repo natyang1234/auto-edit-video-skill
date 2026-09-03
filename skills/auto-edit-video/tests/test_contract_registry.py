@@ -135,21 +135,23 @@ class ArtifactParsingTests(unittest.TestCase):
         fixture_dir = SKILL_DIR / "contracts" / "fixtures" / "audio_event_plan"
         valid_v1 = load_artifact_text((fixture_dir / "valid_1.json").read_text("utf-8"))
         valid_v2 = load_artifact_text((fixture_dir / "valid_v2.json").read_text("utf-8"))
+        valid_v3 = load_artifact_text((fixture_dir / "valid_v3_hint.json").read_text("utf-8"))
         self.assertEqual(validate_artifact("audio_event_plan", valid_v1), [])
         self.assertEqual(validate_artifact("audio_event_plan", valid_v2), [])
+        self.assertEqual(validate_artifact("audio_event_plan", valid_v3), [])
 
-        for version in (True, 1.0, 2.0, "2", 3, None):
+        for version in (True, 1.0, 2.0, "2", None):
             with self.subTest(version=version):
                 malformed = json.loads(json.dumps(valid_v1))
                 malformed["schema_version"] = version
                 self.assertTrue(validate_artifact("audio_event_plan", malformed))
                 self.assertEqual(
                     semantic_audio_event_plan(malformed),
-                    ["$.schema_version: must be exact integer 1 or 2"],
+                    ["$.schema_version: must be exact integer 1, 2 or 3"],
                 )
                 self.assertEqual(
                     semantic_audio_event_plan({"schema_version": version}),
-                    ["$.schema_version: must be exact integer 1 or 2"],
+                    ["$.schema_version: must be exact integer 1, 2 or 3"],
                 )
 
         missing = json.loads(json.dumps(valid_v1))
@@ -157,7 +159,7 @@ class ArtifactParsingTests(unittest.TestCase):
         self.assertTrue(validate_artifact("audio_event_plan", missing))
         self.assertEqual(
             semantic_audio_event_plan(missing),
-            ["$.schema_version: must be exact integer 1 or 2"],
+            ["$.schema_version: must be exact integer 1, 2 or 3"],
         )
 
         float_fixture = load_artifact_text(

@@ -495,8 +495,16 @@ class SfxDeliveryTests(unittest.TestCase):
                     )
                     self.assertEqual(report["status"], "fail", report["failures"])
                     self.assertEqual(report["delivered_event_count"], 0)
+                    expected_struct_error = (
+                        "expected type integer"
+                        if field == "schema_version"
+                        else "expected const 1"
+                    )
                     self.assertTrue(
-                        any("expected const 1" in failure for failure in report["failures"]),
+                        any(
+                            expected_struct_error in failure
+                            for failure in report["failures"]
+                        ),
                         report["failures"],
                     )
                     if field == "generator.version":

@@ -18,7 +18,7 @@
     "events"
   ],
   "properties": {
-    "schema_version": {"type": "integer", "enum": [1, 2]},
+    "schema_version": {"type": "integer", "enum": [1, 2, 3]},
     "timeline_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "cut_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "resolved_motion_plan_hash": {
@@ -74,7 +74,8 @@
               "complete",
               "count_tick",
               "row_reveal",
-              "typing"
+              "typing",
+              "content_hint"
             ]
           }
         },
@@ -118,18 +119,11 @@
               "asset_transient_anchor_sample": {"type": "integer", "minimum": 0},
               "expected_transient_sample": {"type": "integer", "minimum": 0},
               "role": {
-                "enum": ["title_enter", "transition", "row_reveal", "count_tick", "grid_fill", "typing", "complete"]
+                "enum": ["title_enter", "transition", "row_reveal", "count_tick", "grid_fill", "typing", "complete", "content_hint"]
               },
               "asset_id": {
-                "enum": [
-                  "soft-ui-tick-v1",
-                  "short-whoosh-v1",
-                  "short-pop-v1",
-                  "short-riser-v1",
-                  "soft-impact-v1",
-                  "typing-tick-v1"
-                  ,"completion-chime-v1"
-                ]
+                "type": "string",
+                "pattern": "^[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$"
               },
               "evidence": {
                 "type": "object",
@@ -239,15 +233,8 @@
           "event_start_sample": {"type": "integer", "minimum": 0},
           "duration_samples": {"type": "integer", "minimum": 1},
           "asset_id": {
-            "enum": [
-              "soft-ui-tick-v1",
-              "short-pop-v1",
-              "short-whoosh-v1",
-              "soft-impact-v1",
-              "short-riser-v1",
-              "typing-tick-v1",
-              "completion-chime-v1"
-            ]
+            "type": "string",
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$"
           },
           "asset_transient_anchor_sample": {
             "type": "integer",
@@ -265,8 +252,12 @@
               "grid_fill",
               "count_tick",
               "typing",
-              "complete"
+              "complete",
+              "content_hint"
             ]
+          },
+          "category": {
+            "enum": ["cash_coin", "click_pop", "whoosh", "impact_hit", "success_ding", "error_glitch"]
           },
           "gain_db": {"type": "number", "minimum": -24, "maximum": -6},
           "dialogue_duck_db": {"type": "number", "minimum": -36, "maximum": 0},
@@ -282,8 +273,20 @@
           "duck_group": {"const": "dialogue_priority"},
           "evidence": {
             "type": "object",
-            "required": ["trigger"],
             "properties": {
+              "hint": {
+                "type": "object",
+                "required": ["onset_sample", "category", "reason", "source_state_revision"],
+                "properties": {
+                  "onset_sample": {"type": "integer", "minimum": 0},
+                  "category": {
+                    "enum": ["cash_coin", "click_pop", "whoosh", "impact_hit", "success_ding", "error_glitch"]
+                  },
+                  "reason": {"type": "string", "minLength": 1},
+                  "source_state_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                },
+                "additionalProperties": false
+              },
               "trigger": {
                 "type": "object",
                 "required": ["id", "onset_sample", "kind", "motion"],

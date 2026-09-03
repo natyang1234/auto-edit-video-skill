@@ -23,6 +23,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from sfx_mapping import (
+    ROLE_TO_CATEGORY,
+    V2_PROCEDURAL_ASSET_CATEGORIES,
+    V2_PROCEDURAL_ASSET_GENERATORS,
+    V2_PROCEDURAL_ASSET_IDS,
+)
+
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = SKILL_DIR / "contracts" / "schemas"
 FIXTURE_DIR = SKILL_DIR / "contracts" / "fixtures"
@@ -1119,11 +1126,19 @@ def semantic_sfx_catalog(artifact) -> list[str]:
     errors: list[str] = []
     if not isinstance(artifact, dict):
         return errors
-    if type(artifact.get("schema_version")) is not int or artifact.get("schema_version") != 1:
+    version = artifact.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
         errors.append("$.schema_version: must be exact integer 1")
     assets = artifact.get("assets")
     if not isinstance(assets, list):
         return errors
+    if version == 2:
+        return _semantic_sfx_catalog_v2(assets, errors)
+    return _semantic_sfx_catalog_v1(assets, errors)
+
+
+def _semantic_sfx_catalog_v1(assets, errors: list[str]) -> list[str]:
+    """Schema v1 legacy/seven-asset starter pack rules — unchanged since Phase 0d."""
     expected_roles = {
         "soft-ui-tick-v1": "title_enter",
         "short-pop-v1": "row_reveal",
@@ -1202,14 +1217,83 @@ def semantic_sfx_catalog(artifact) -> list[str]:
     return errors
 
 
+def _semantic_sfx_catalog_v2(assets, errors: list[str]) -> list[str]:
+    """Schema v2 wide catalog: procedural starter/extra assets plus external-licensed assets.
+
+    Phase 1 does not require the six SFX_CATEGORIES to be complete; it only
+    requires each present asset to be internally consistent for its pack.
+    """
+    seen_ids: set[str] = set()
+    for index, asset in enumerate(assets):
+        path = f"$.assets[{index}]"
+        if not isinstance(asset, dict):
+            continue
+        asset_id = asset.get("asset_id")
+        if asset_id in seen_ids:
+            errors.append(f"{path}.asset_id: duplicate asset id")
+        seen_ids.add(asset_id)
+
+        duration = asset.get("duration_samples")
+        anchor = asset.get("transient_anchor_sample")
+        if type(duration) is int and type(anchor) is int and not 0 <= anchor < duration:
+            errors.append(f"{path}.transient_anchor_sample: must be below duration_samples")
+
+        provenance = asset.get("provenance")
+        if not isinstance(provenance, str) or not provenance.strip():
+            errors.append(f"{path}.provenance: must be non-empty")
+
+        pack = asset.get("pack")
+        category = asset.get("category")
+        generator = asset.get("generator")
+        review_state = asset.get("review_state")
+
+        if pack == "external-licensed":
+            if generator is not None:
+                errors.append(f"{path}.generator: external-licensed assets must not declare a generator")
+            if category is None:
+                errors.append(f"{path}.category: external-licensed assets must declare category")
+            if not isinstance(asset.get("license"), dict):
+                errors.append(f"{path}.license: external-licensed assets must declare license")
+            if not isinstance(asset.get("library_record_sha256"), str):
+                errors.append(
+                    f"{path}.library_record_sha256: external-licensed assets must declare library_record_sha256"
+                )
+            if not isinstance(asset.get("source_sha256"), str):
+                errors.append(f"{path}.source_sha256: external-licensed assets must declare source_sha256")
+            if review_state != "approved_licensed":
+                errors.append(f"{path}.review_state: external-licensed asset must be approved_licensed")
+        else:
+            if review_state != "approved_generated":
+                errors.append(f"{path}.review_state: generated asset must be approved_generated")
+            if asset.get("license") is not None:
+                errors.append(f"{path}.license: procedural assets must not declare license")
+            expected_generator = V2_PROCEDURAL_ASSET_GENERATORS.get(asset_id)
+            if expected_generator is None:
+                errors.append(f"{path}.asset_id: unknown procedural starter asset id")
+            else:
+                if not isinstance(generator, dict):
+                    errors.append(f"{path}.generator: procedural asset must declare generator")
+                else:
+                    if generator.get("name") != expected_generator[0]:
+                        errors.append(f"{path}.generator.name: does not match asset id")
+                    if generator.get("recipe") != expected_generator[1]:
+                        errors.append(f"{path}.generator.recipe: does not match asset id")
+                    if type(generator.get("version")) is not int or generator.get("version") != 1:
+                        errors.append(f"{path}.generator.version: must be exact integer 1")
+                expected_category = V2_PROCEDURAL_ASSET_CATEGORIES.get(asset_id)
+                if category is not None and expected_category is not None and category != expected_category:
+                    errors.append(f"{path}.category: must match {expected_category}")
+    return errors
+
+
 def semantic_audio_event_plan(artifact) -> list[str]:
     """Validate final-domain event arithmetic and renderer evidence binding."""
     errors: list[str] = []
     if not isinstance(artifact, dict):
         return errors
     version = artifact.get("schema_version")
-    if type(version) is not int or version not in {1, 2}:
-        errors.append("$.schema_version: must be exact integer 1 or 2")
+    if type(version) is not int or version not in {1, 2, 3}:
+        errors.append("$.schema_version: must be exact integer 1, 2 or 3")
         return errors
     events = artifact.get("events")
     if not isinstance(events, list):
@@ -1406,6 +1490,61 @@ def semantic_audio_event_plan(artifact) -> list[str]:
             errors.append(f"{path}: role/asset does not match normalized renderer evidence")
         return trigger, (start, start + duration, trigger_id) if type(start) is int and type(duration) is int else None
 
+    def validate_hint_event(event, path: str) -> tuple[int, int, str] | None:
+        """Schema v3 content_hint events: no renderer trigger, evidence is a hint."""
+        if not isinstance(event, dict):
+            return None
+        trigger_id = event.get("trigger_id")
+        start = event.get("event_start_sample")
+        anchor = event.get("asset_transient_anchor_sample")
+        expected = event.get("expected_transient_sample")
+        trigger_onset = event.get("trigger_onset_sample")
+        if all(type(value) is int for value in (start, anchor, expected)):
+            if expected != start + anchor:
+                errors.append(
+                    f"{path}.expected_transient_sample: must equal event_start_sample + asset_transient_anchor_sample"
+                )
+        if all(type(value) is int for value in (expected, trigger_onset)):
+            if abs(expected - trigger_onset) > 3840:
+                errors.append(f"{path}: expected transient is outside 3840-sample trigger tolerance")
+        duration = event.get("duration_samples")
+        stem_count = artifact.get("sfx_stem_sample_count")
+        if all(type(value) is int for value in (start, duration, stem_count)):
+            if start < 0 or duration <= 0 or start + duration > stem_count:
+                errors.append(f"{path}: event is outside sfx stem bounds")
+        if all(type(value) is int for value in (anchor, duration)) and not 0 <= anchor < duration:
+            errors.append(f"{path}.asset_transient_anchor_sample: must be below duration_samples")
+        fades = event.get("fades")
+        if isinstance(fades, dict) and isinstance(duration, int):
+            fade_in = fades.get("in_samples")
+            fade_out = fades.get("out_samples")
+            if all(type(value) is int for value in (fade_in, fade_out)) and fade_in + fade_out > duration:
+                errors.append(f"{path}.fades: fades exceed event duration")
+        gain = event.get("gain_db")
+        if (
+            isinstance(gain, bool)
+            or not isinstance(gain, (int, float))
+            or not math.isfinite(float(gain))
+            or not -24 <= float(gain) <= -6
+        ):
+            errors.append(f"{path}.gain_db: schema v2 requires finite -24..-6 dB")
+        elif "studio_edits" not in artifact and float(gain) != -12.0:
+            errors.append(f"{path}.gain_db: schema v2 without studio edits requires -12")
+        if event.get("duck_group") != "dialogue_priority":
+            errors.append(f"{path}.duck_group: schema v2 requires dialogue_priority")
+        if event.get("fades") != {"in_samples": 0, "out_samples": 0}:
+            errors.append(f"{path}.fades: schema v2 requires zero fades")
+        evidence = event.get("evidence")
+        hint = evidence.get("hint") if isinstance(evidence, dict) else None
+        if not isinstance(hint, dict):
+            return None
+        if hint.get("onset_sample") != trigger_onset:
+            errors.append(f"{path}.evidence.hint.onset_sample: does not match trigger_onset_sample")
+        category = event.get("category")
+        if category != hint.get("category"):
+            errors.append(f"{path}.category: must match evidence.hint.category")
+        return (start, start + duration, trigger_id) if type(start) is int and type(duration) is int else None
+
     seen_ids: set[str] = set()
     seen_triggers: set[str] = set()
     intervals: list[tuple[int, int, str]] = []
@@ -1415,7 +1554,7 @@ def semantic_audio_event_plan(artifact) -> list[str]:
             continue
         event_id = event.get("id")
         trigger_id = event.get("trigger_id")
-        if version == 2 and event.get("id") != f"sfx-event-{index + 1:04d}":
+        if version in (2, 3) and event.get("id") != f"sfx-event-{index + 1:04d}":
             errors.append(f"{path}.id: schema v2 event id must be canonical sequence")
         if event_id in seen_ids:
             errors.append(f"{path}.id: duplicate event id")
@@ -1423,11 +1562,30 @@ def semantic_audio_event_plan(artifact) -> list[str]:
         if trigger_id in seen_triggers:
             errors.append(f"{path}.trigger_id: duplicate trigger id")
         seen_triggers.add(trigger_id)
-        _, interval = validate_event(event, path, is_v2=version == 2)
+        if version == 3:
+            evidence = event.get("evidence")
+            has_trigger = isinstance(evidence, dict) and "trigger" in evidence
+            has_hint = isinstance(evidence, dict) and "hint" in evidence
+            role = event.get("role")
+            if has_trigger == has_hint:
+                errors.append(f"{path}.evidence: must contain exactly one of trigger or hint")
+            if has_hint and role != "content_hint":
+                errors.append(f"{path}.role: hint evidence requires role content_hint")
+            if has_trigger and role == "content_hint":
+                errors.append(f"{path}.role: content_hint requires hint evidence")
+            if has_hint:
+                interval = validate_hint_event(event, path)
+            else:
+                category = event.get("category")
+                if category is not None and role in role_priority and category != ROLE_TO_CATEGORY.get(role):
+                    errors.append(f"{path}.category: must match ROLE_TO_CATEGORY[role]")
+                _, interval = validate_event(event, path, is_v2=True)
+        else:
+            _, interval = validate_event(event, path, is_v2=version == 2)
         if interval is not None:
             intervals.append(interval)
 
-    if version != 2:
+    if version == 1:
         return errors
 
     studio_edits = artifact.get("studio_edits")

@@ -1,0 +1,143 @@
+{
+  "schema_version": 3,
+  "timeline_revision": "8566abbe60aa539217d4354445a43d23a56f236cc933c7ec911de7b808562715",
+  "cut_map_sha256": "3e413332753193903153178d30a746ea7e34ad0eefac608c272cc3d29427bf76",
+  "resolved_motion_plan_hash": "f3fdf9a0db05503f1b803c20c70b8b7d369468b4f2ea9dedddf99100ea0c9c4b",
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_width_bytes": 3,
+  "alignment_tolerance_samples": 3840,
+  "sfx_stem_sha256": "427c8d9ad5c3505ce088babf54ef41e1695e5da911bd49f53cfc39b6a3e58e36",
+  "sfx_stem_decoded_pcm_sha256": "c1f8ebd3500c0592ea3b50b4fa2196081ff8a32de445de83a181405b9fb3039d",
+  "sfx_stem_sample_count": 240000,
+  "mix_mode": "deterministic_s24_saturating_sum_v1",
+  "density": {
+    "total_samples": 240000,
+    "sample_rate": 48000,
+    "adjacent_onset_samples": 5760,
+    "adjacent_onset_authority": "expected_transient_sample",
+    "max_overlap": 2,
+    "max_cues_per_minute": 40,
+    "density_cap": 3,
+    "priority_order": [
+      "title_enter",
+      "transition",
+      "grid_fill",
+      "complete",
+      "count_tick",
+      "row_reveal",
+      "typing"
+    ],
+    "candidate_order": [
+      "title-1",
+      "row-1",
+      "coin-1"
+    ],
+    "kept_trigger_ids": [
+      "title-1",
+      "row-1",
+      "coin-1"
+    ],
+    "dropped_trigger_ids": [],
+    "dropped_reasons": {},
+    "dropped": []
+  },
+  "events": [
+    {
+      "id": "sfx-event-0001",
+      "trigger_id": "title-1",
+      "trigger_onset_sample": 12000,
+      "event_start_sample": 11760,
+      "duration_samples": 7200,
+      "asset_id": "soft-ui-tick-v1",
+      "asset_transient_anchor_sample": 240,
+      "expected_transient_sample": 12000,
+      "role": "title_enter",
+      "gain_db": -12,
+      "fades": {
+        "in_samples": 0,
+        "out_samples": 0
+      },
+      "duck_group": "dialogue_priority",
+      "evidence": {
+        "trigger": {
+          "id": "title-1",
+          "onset_sample": 12000,
+          "kind": "title",
+          "component_id": "title-lockup",
+          "motion": {
+            "requested": "slide-up",
+            "delivered": "slide-up",
+            "faithful": true,
+            "status": "native"
+          }
+        },
+        "renderer_trigger_sha256": "bc7d8dad8ec51c24aad270cc3293dad30bf6154364456daf84405cbe58561de9"
+      },
+      "reason": "faithful title_enter",
+      "review_state": "approved_generated"
+    },
+    {
+      "id": "sfx-event-0002",
+      "trigger_id": "row-1",
+      "trigger_onset_sample": 72000,
+      "event_start_sample": 71760,
+      "duration_samples": 6240,
+      "asset_id": "short-pop-v1",
+      "asset_transient_anchor_sample": 240,
+      "expected_transient_sample": 72000,
+      "role": "row_reveal",
+      "gain_db": -12,
+      "fades": {
+        "in_samples": 0,
+        "out_samples": 0
+      },
+      "duck_group": "dialogue_priority",
+      "evidence": {
+        "trigger": {
+          "id": "row-1",
+          "onset_sample": 72000,
+          "kind": "dynamic_list",
+          "component_id": "dynamic-list",
+          "motion": {
+            "requested": "staggered-reveal",
+            "delivered": "staggered-reveal",
+            "faithful": true,
+            "status": "rendered"
+          }
+        },
+        "renderer_trigger_sha256": "46bf6bc60549568f8cc9621ed7243c3809049504b09922f48ec3c0cf817b2140"
+      },
+      "reason": "faithful row_reveal",
+      "review_state": "approved_generated"
+    },
+    {
+      "id": "sfx-event-0003",
+      "trigger_id": "coin-1",
+      "trigger_onset_sample": 132000,
+      "event_start_sample": 131760,
+      "duration_samples": 6240,
+      "asset_id": "coin-blip-v1",
+      "asset_transient_anchor_sample": 240,
+      "expected_transient_sample": 132000,
+      "role": "row_reveal",
+      "category": "cash_coin",
+      "gain_db": -12,
+      "fades": {
+        "in_samples": 0,
+        "out_samples": 0
+      },
+      "duck_group": "dialogue_priority",
+      "evidence": {
+        "hint": {
+          "onset_sample": 132000,
+          "category": "cash_coin",
+          "reason": "detected a coin/cash-register cue in the raw footage audio",
+          "source_state_revision": "d16fdd85e4926ac50b435aaa8be41f8f28bc4cc274cb6ceee3b3d0c2dfda71c1"
+        }
+      },
+      "reason": "content hint from raw footage audio detection",
+      "review_state": "approved_generated"
+    }
+  ]
+}

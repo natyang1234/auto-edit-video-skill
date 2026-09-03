@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_width_bytes": 3,
+  "assets": [
+    {
+      "asset_id": "vendor-cash-register-v1",
+      "pack": "external-licensed",
+      "role": "content_hint",
+      "category": "cash_coin",
+      "license": {
+        "name": "Acme SFX Library Standard License",
+        "source_url": "https://example.com/sfx/cash-register",
+        "commercial_ok": true,
+        "attribution_required": false
+      },
+      "library_record_sha256": "6775b4552d0f01f27cb67c529b4adfeb4e1b1c584e65b2d4e4ac8e684a118b08",
+      "source_sha256": "24f8c5b4af69ab7ad41df2fc01cdc184b84ae91fdee7ca7f5f1014c3da3e857b",
+      "duration_samples": 9600,
+      "transient_anchor_sample": 300,
+      "noise_floor_dbfs": -90.0,
+      "rms_dbfs": -19.5,
+      "peak_dbfs": -3.0,
+      "wav_sha256": "ccd484e54b25b7ae8cc1174d99e829476b79878553797f2ce0b543dcf095b5f7",
+      "decoded_pcm_sha256": "344afead19b37acaa77311764be3089a0ec8b28d9b6696c03e2f4eb97ea3851d",
+      "provenance": "licensed from Acme SFX Library, commercial license on file",
+      "review_state": "approved_licensed"
+    }
+  ]
+}
