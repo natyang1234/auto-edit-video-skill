@@ -79,7 +79,8 @@
         "properties": {
          "mode": {"type": "string", "minLength": 1},
          "pack": {"type": ["null", "string"], "minLength": 1},
-         "cue_coverage_policy": {"type": "string", "minLength": 1}
+         "cue_coverage_policy": {"type": "string", "minLength": 1},
+         "catalog_profile": {"type": "string", "enum": ["v1", "v2"]}
         },
         "required": ["cue_coverage_policy", "mode", "pack"],
         "additionalProperties": false

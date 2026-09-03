@@ -212,7 +212,8 @@
     "sfx": {
      "mode": "paired",
      "pack": "kinetic-local-starter",
-     "cue_coverage_policy": "required"
+     "cue_coverage_policy": "required",
+     "catalog_profile": "v2"
     }
    },
    "required_capabilities": {

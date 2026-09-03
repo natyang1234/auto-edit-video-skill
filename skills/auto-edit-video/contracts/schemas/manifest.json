@@ -11,6 +11,7 @@
   "content_analysis",
   "delivery_envelope",
   "sfx_catalog",
+  "sfx_hints",
   "audio_event_plan",
   "director_mode",
   "editor_state_v2",

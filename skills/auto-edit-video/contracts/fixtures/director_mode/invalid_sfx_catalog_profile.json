@@ -1,0 +1,76 @@
+{
+    "schema_version": 1,
+    "modes": [
+        {
+            "id": "kinetic-explainer",
+            "version": 1,
+            "envelope": {
+                "cut_density": "high",
+                "motion_intensity": "high",
+                "caption_style_scope": [
+                    "track",
+                    "bilingual"
+                ]
+            },
+            "constraints": {
+                "label": "\u52d5\u756b\u89e3\u8aaa",
+                "description": "\u4ee5\u8a9e\u610f\u7ae0\u7bc0\u3001\u52d5\u756b\u5716\u5361\u3001\u4e2d\u82f1\u5b57\u5e55\u8207\u914d\u5c0d\u97f3\u6548\u7d44\u6210\u9ad8\u5bc6\u5ea6\u89e3\u8aaa\u9ad4\u9a57\u3002",
+                "caption": {
+                    "font_family": "PingFang TC",
+                    "font_size": 58,
+                    "font_weight": 800,
+                    "color": "#f7f2e8",
+                    "emphasis_color": "#ffd447",
+                    "stroke_color": "#17130f",
+                    "stroke_width": 5,
+                    "x": 50,
+                    "y": 76,
+                    "max_width": 86,
+                    "animation": "pop"
+                },
+                "visual_density": "dense"
+            },
+            "experience": {
+                "caption_delivery": {
+                    "mode": "bilingual",
+                    "required": true,
+                    "artifact_version": 2,
+                    "primary_language": "zh-TW",
+                    "secondary_language": "en"
+                },
+                "translation": {
+                    "required": true,
+                    "target_language": "en",
+                    "provider": "approved-provider-required",
+                    "consent_policy": "provider-specific-prior-consent"
+                },
+                "scene_pack": "kinetic-explainer-v1",
+                "style_pack": "kinetic-social",
+                "stage_layout": "split-graphic-presenter",
+                "visual_density": "dense",
+                "motion_intensity": "high",
+                "sfx": {
+                    "mode": "disabled",
+                    "pack": null,
+                    "cue_coverage_policy": "not_applicable",
+                    "catalog_profile": "v2"
+                }
+            },
+            "required_capabilities": {
+                "ids": [
+                    "approved-translation-provider",
+                    "audio-event-mixer-v1",
+                    "caption-delivery-v2",
+                    "kinetic-scene-director-v1",
+                    "unified-delivery-envelope-v1"
+                ],
+                "translation_consent_policy": "provider-specific-prior-consent"
+            },
+            "auto_select_rules": [
+                "explicit_profile",
+                "explicit_kinetic_bundle",
+                "reference_style_match"
+            ]
+        }
+    ]
+}

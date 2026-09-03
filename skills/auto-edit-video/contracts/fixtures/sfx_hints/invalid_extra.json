@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "hints": [
+    {"onset_sample": 4800, "category": "cash_coin", "reason": "cash register sound in source clip", "confidence": 0.9}
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "$id": "sfx_hints",
+  "title": "Project-level explicit SFX content hints (director_mode catalog v2)",
+  "x_schema_version": 1,
+  "type": "object",
+  "required": ["schema_version", "hints"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "hints": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "required": ["onset_sample", "category", "reason"],
+        "properties": {
+          "onset_sample": {"type": "integer", "minimum": 0},
+          "category": {"enum": ["cash_coin", "click_pop", "whoosh", "impact_hit", "success_ding", "error_glitch"]},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 200}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

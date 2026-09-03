@@ -924,6 +924,11 @@ def semantic_director_mode(artifact) -> list[str]:
                 errors.append(
                     f"{path}.experience.visual_density must match constraints.visual_density"
                 )
+            sfx = experience.get("sfx")
+            if isinstance(sfx, dict) and sfx.get("mode") == "disabled" and sfx.get("catalog_profile") == "v2":
+                errors.append(
+                    f"{path}.experience.sfx.catalog_profile: v2 requires sfx.mode != disabled"
+                )
 
         if has_capabilities:
             capability_ids = mode["required_capabilities"].get("ids", [])
@@ -1894,6 +1899,25 @@ def semantic_caption_delivery(artifact) -> list[str]:
     return errors
 
 
+def semantic_sfx_hints(artifact) -> list[str]:
+    """Hints must fire in strictly increasing onset order."""
+    errors: list[str] = []
+    if not isinstance(artifact, dict):
+        return errors
+    previous_onset = None
+    for index, hint in enumerate(artifact.get("hints", [])):
+        if not isinstance(hint, dict):
+            continue
+        onset = hint.get("onset_sample")
+        if type(onset) is int:
+            if previous_onset is not None and onset <= previous_onset:
+                errors.append(
+                    f"$.hints[{index}].onset_sample: must be strictly increasing"
+                )
+            previous_onset = onset
+    return errors
+
+
 SEMANTIC_VALIDATORS = {
     "card_plan": semantic_card_plan,
     "visual_plan": lambda artifact: semantic_visual_plan(artifact),
@@ -1911,6 +1935,7 @@ SEMANTIC_VALIDATORS = {
     "transcript_source": semantic_transcript_source,
     "caption_segmentation": semantic_caption_segmentation,
     "caption_delivery": semantic_caption_delivery,
+    "sfx_hints": semantic_sfx_hints,
 }
 
 

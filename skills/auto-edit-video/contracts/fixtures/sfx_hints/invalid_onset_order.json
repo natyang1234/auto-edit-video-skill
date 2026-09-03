@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "hints": [
+    {"onset_sample": 96000, "category": "whoosh", "reason": "camera whip pan at 0:02"},
+    {"onset_sample": 96000, "category": "cash_coin", "reason": "cash register sound at same sample"}
+  ]
+}
