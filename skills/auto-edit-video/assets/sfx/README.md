@@ -44,3 +44,25 @@ All current assets use the Pixabay Content License
 `licenses/pixabay-content-license-2026-09-03.md`. Content is used mixed into
 video deliveries, not redistributed standalone; attribution is not required
 but the source author is still recorded in each record's `source.author`.
+
+## How this library reaches a delivered video (sfx_catalog v2)
+
+`scripts/sfx_delivery.load_sfx_library()` re-verifies every record's full
+evidence chain (record hash, delivered-wav hash, decoded-PCM hash, license
+evidence hash; rejects symlinks and path escapes) on every load — it never
+trusts `LIBRARY.json` at face value. `stage_multi_event_delivery(...,
+catalog_profile="v2")` then merges these 12 external-licensed assets with the
+9 built-in procedural assets into one `sfx_catalog` (each entry tagged with
+one of the six semantic categories), copies the wavs into the stage
+directory, and `verify_delivery(...)` independently re-checks every staged
+external wav's bytes and decoded PCM against the catalog before accepting the
+delivery. Pass `include_external=False` to reproduce the Phase-2-only
+9-procedural-asset catalog (used by v1-shape regression tests).
+
+Note: the 7 fixed trigger-role events (e.g. `transition` -> `short-whoosh-v1`)
+still always resolve to their pinned procedural asset — `role_for_trigger`'s
+one-role/one-asset invariant in `contract_registry.py` is unchanged by this
+library. External assets are present in the catalog and selectable via
+`select_asset(category, prefer="external")` for non-trigger (content-hint)
+events; wiring them into the fixed trigger-role events would require
+relaxing that invariant, which is out of scope here.
