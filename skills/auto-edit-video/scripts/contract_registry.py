@@ -1292,7 +1292,7 @@ def _semantic_sfx_catalog_v2(assets, errors: list[str]) -> list[str]:
     return errors
 
 
-def semantic_audio_event_plan(artifact) -> list[str]:
+def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
     """Validate final-domain event arithmetic and renderer evidence binding."""
     errors: list[str] = []
     if not isinstance(artifact, dict):
@@ -1427,8 +1427,11 @@ def semantic_audio_event_plan(artifact) -> list[str]:
                 errors.append(f"{path}: expected transient is outside 3840-sample trigger tolerance")
         duration = event.get("duration_samples")
         stem_count = artifact.get("sfx_stem_sample_count")
+        is_out_of_range_hint_drop = event.get("role") == "content_hint" and event.get("reason") == "hint_out_of_range"
         if all(type(value) is int for value in (start, duration, stem_count)):
-            if start < 0 or duration <= 0 or start + duration > stem_count:
+            if start < 0 or duration <= 0:
+                errors.append(f"{path}: event is outside sfx stem bounds")
+            elif start + duration > stem_count and not is_out_of_range_hint_drop:
                 errors.append(f"{path}: event is outside sfx stem bounds")
         if is_v2 and all(type(value) is int for value in (anchor, duration)) and not 0 <= anchor < duration:
             errors.append(f"{path}.asset_transient_anchor_sample: must be below duration_samples")
@@ -1501,6 +1504,21 @@ def semantic_audio_event_plan(artifact) -> list[str]:
         expected_role_asset = role_for_trigger(trigger)
         if expected_role_asset is None:
             errors.append(f"{path}.evidence.trigger: no approved role mapping")
+        elif version == 3:
+            if event.get("role") != expected_role_asset[0]:
+                errors.append(f"{path}: role does not match normalized renderer evidence")
+            asset_id = event.get("asset_id")
+            if not isinstance(asset_id, str) or not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+", asset_id):
+                errors.append(f"{path}.asset_id: does not match expected asset id pattern")
+            elif catalog is not None:
+                catalog_asset = next(
+                    (a for a in catalog.get("assets", []) if isinstance(a, dict) and a.get("asset_id") == asset_id),
+                    None,
+                )
+                if catalog_asset is None:
+                    errors.append(f"{path}.asset_id: not found in catalog")
+                elif catalog_asset.get("category") != event.get("category"):
+                    errors.append(f"{path}.asset_id: catalog asset category does not match event category")
         elif (event.get("role"), event.get("asset_id")) != expected_role_asset:
             errors.append(f"{path}: role/asset does not match normalized renderer evidence")
         return trigger, (start, start + duration, trigger_id) if type(start) is int and type(duration) is int else None
@@ -1592,7 +1610,7 @@ def semantic_audio_event_plan(artifact) -> list[str]:
                 interval = validate_hint_event(event, path)
             else:
                 category = event.get("category")
-                if category is not None and role in role_priority and category != ROLE_TO_CATEGORY.get(role):
+                if role in role_priority and category != ROLE_TO_CATEGORY.get(role):
                     errors.append(f"{path}.category: must match ROLE_TO_CATEGORY[role]")
                 _, interval = validate_event(event, path, is_v2=True)
         else:
@@ -1735,7 +1753,18 @@ def semantic_audio_event_plan(artifact) -> list[str]:
             continue
         expected_reason = None
         candidate_expected = candidate.get("expected_transient_sample")
-        if type(candidate_expected) is int and any(
+        candidate_start = candidate.get("event_start_sample")
+        candidate_duration = candidate.get("duration_samples")
+        total_samples = density.get("total_samples")
+        if (
+            candidate.get("role") == "content_hint"
+            and type(candidate_start) is int
+            and type(candidate_duration) is int
+            and type(total_samples) is int
+            and candidate_start + candidate_duration > total_samples
+        ):
+            expected_reason = "hint_out_of_range"
+        elif type(candidate_expected) is int and any(
             type(item.get("expected_transient_sample")) is int
             and abs(candidate_expected - item["expected_transient_sample"]) < 5760
             for item in simulated_kept
@@ -1755,9 +1784,9 @@ def semantic_audio_event_plan(artifact) -> list[str]:
                     expected_reason = "overlap_limit"
                     break
         if expected_reason is None and "catalog_revision_sha256" in artifact:
-            candidate_category = ROLE_TO_CATEGORY.get(candidate.get("role"))
+            candidate_category = ROLE_TO_CATEGORY.get(candidate.get("role")) or candidate.get("category")
             if candidate_category is not None and type(candidate_expected) is int and any(
-                ROLE_TO_CATEGORY.get(item.get("role")) == candidate_category
+                (ROLE_TO_CATEGORY.get(item.get("role")) or item.get("category")) == candidate_category
                 and type(item.get("expected_transient_sample")) is int
                 and abs(candidate_expected - item["expected_transient_sample"])
                 < category_rate_limit_window_samples(candidate_category)
@@ -1965,6 +1994,12 @@ def validate_bundle(artifacts: dict[str, dict]) -> list[str]:
         errors.extend(
             f"visual_plan: {error}"
             for error in semantic_visual_plan(visual_plan, artifacts["structured_layer"])
+        )
+    audio_event_plan = artifacts.get("audio_event_plan")
+    if audio_event_plan is not None and "sfx_catalog" in artifacts:
+        errors.extend(
+            f"audio_event_plan: {error}"
+            for error in semantic_audio_event_plan(audio_event_plan, artifacts["sfx_catalog"])
         )
     return errors
 

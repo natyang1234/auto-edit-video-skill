@@ -59,10 +59,17 @@ external wav's bytes and decoded PCM against the catalog before accepting the
 delivery. Pass `include_external=False` to reproduce the Phase-2-only
 9-procedural-asset catalog (used by v1-shape regression tests).
 
-Note: the 7 fixed trigger-role events (e.g. `transition` -> `short-whoosh-v1`)
-still always resolve to their pinned procedural asset — `role_for_trigger`'s
-one-role/one-asset invariant in `contract_registry.py` is unchanged by this
-library. External assets are present in the catalog and selectable via
-`select_asset(category, prefer="external")` for non-trigger (content-hint)
-events; wiring them into the fixed trigger-role events would require
-relaxing that invariant, which is out of scope here.
+Note: in `catalog_profile="v2"`, the 7 trigger-role events (e.g.
+`transition` -> the `whoosh` category) now resolve via
+`select_asset(category, catalog, event_index=..., prefer="external")` over
+the full catalog, so an external-licensed asset is chosen whenever one is
+available for that role's category — `role_for_trigger`'s invariant in
+`contract_registry.py` was relaxed from a fixed `(role, asset_id)` pin to a
+`(role, category)` pin to allow this. Explicit `sfx_hints` (director-mode
+content hints, e.g. a detected cash-register cue) are staged the same way as
+`role="content_hint"` events, each resolving its own asset via
+`select_asset(hint.category, catalog, ..., prefer="external")`. In
+`catalog_profile="v1"` (schema_version 2) none of this applies: the 7
+trigger-role events still resolve to their exact pinned procedural asset id
+as before, `sfx_hints` are silently ignored, and the staged bytes are
+unchanged.

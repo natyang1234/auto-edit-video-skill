@@ -117,6 +117,7 @@ _DENSITY_PRIORITY = {
     "complete": 1,
     "row_reveal": 2,
     "typing": 3,
+    "content_hint": 4,
 }
 _DENSITY_MIN_ONSET_SAMPLES = 5760  # 120 ms at 48 kHz
 _DENSITY_MAX_OVERLAP = 2
@@ -1496,11 +1497,77 @@ def _density_catalog_by_asset_id(
     return _density_catalog_by_asset_id_v1(catalog)
 
 
+def _resolve_hint_density_proposal(
+    proposal: dict[str, Any],
+    catalog_by_asset_id: dict[str, dict[str, Any]],
+    total_samples: int,
+    trigger_id: str,
+    trigger_onset: int,
+    role: str,
+    asset_id: str,
+    evidence: dict[str, Any],
+    evidence_hint: dict[str, Any],
+    *,
+    allow_hint_out_of_range: bool,
+) -> dict[str, Any]:
+    """Validate one content-hint proposal and resolve its final-domain interval."""
+    if role != "content_hint":
+        raise SfxDeliveryError("density policy hint evidence requires role content_hint")
+    if evidence.get("trigger") is not None:
+        raise SfxDeliveryError("density policy hint evidence must not also carry trigger evidence")
+    category = proposal.get("category")
+    if not isinstance(category, str) or category not in SFX_CATEGORIES:
+        raise SfxDeliveryError("density policy hint proposal category is invalid")
+    if evidence_hint.get("onset_sample") != trigger_onset:
+        raise SfxDeliveryError("density policy hint evidence onset does not match proposal")
+    if evidence_hint.get("category") != category:
+        raise SfxDeliveryError("density policy hint evidence category does not match proposal")
+
+    asset = catalog_by_asset_id.get(asset_id)
+    if asset is None:
+        raise SfxDeliveryError(f"density policy asset is unavailable: {asset_id}")
+    if asset.get("category") != category:
+        raise SfxDeliveryError(f"density policy hint asset category mismatch: {asset_id}")
+    duration = asset.get("duration_samples")
+    anchor = asset.get("transient_anchor_sample")
+    if type(duration) is not int or duration <= 0 or type(anchor) is not int or not 0 <= anchor < duration:
+        raise SfxDeliveryError(f"density policy catalog timing is invalid for {asset_id}")
+
+    event_start = max(0, trigger_onset - anchor)
+    expected_transient = event_start + anchor
+    event_end = event_start + duration
+    out_of_range = event_end > total_samples
+    if out_of_range and not allow_hint_out_of_range:
+        raise SfxDeliveryError("density policy SFX payload extends beyond final output")
+
+    try:
+        evidence_copy = copy.deepcopy(evidence)
+    except Exception as exc:
+        raise SfxDeliveryError("density policy proposal evidence cannot be copied") from exc
+    return {
+        "trigger_id": trigger_id,
+        "trigger_onset_sample": trigger_onset,
+        "event_start_sample": event_start,
+        "expected_transient_sample": expected_transient,
+        "duration_samples": duration,
+        "event_end_sample": event_end,
+        "asset_transient_anchor_sample": anchor,
+        "role": role,
+        "asset_id": asset_id,
+        "category": category,
+        "evidence": evidence_copy,
+        "out_of_range": out_of_range,
+    }
+
+
 def _resolve_density_proposal(
     proposal: dict[str, Any],
     catalog_by_asset_id: dict[str, dict[str, Any]],
     total_samples: int,
     seen_trigger_ids: set[str],
+    *,
+    role_asset_binding: str = "fixed",
+    allow_hint_out_of_range: bool = False,
 ) -> dict[str, Any]:
     """Validate one tracer-2 proposal and resolve its final-domain interval."""
     if not isinstance(proposal, dict):
@@ -1534,14 +1601,44 @@ def _resolve_density_proposal(
     asset_id = proposal["asset_id"]
     if not isinstance(role, str) or not isinstance(asset_id, str):
         raise SfxDeliveryError("density policy proposal role and asset_id must be strings")
-    expected_asset_id = _DENSITY_ROLE_ASSETS.get(role)
-    if expected_asset_id is None or asset_id != expected_asset_id:
-        raise SfxDeliveryError(
-            f"density policy role/asset mapping is invalid: {role!r} -> {asset_id!r}"
-        )
     evidence = proposal["evidence"]
     if not isinstance(evidence, dict):
         raise SfxDeliveryError("density policy proposal evidence must be an object")
+    evidence_hint = evidence.get("hint")
+    if evidence_hint is not None:
+        if not isinstance(evidence_hint, dict):
+            raise SfxDeliveryError("density policy evidence.hint must be an object")
+        return _resolve_hint_density_proposal(
+            proposal,
+            catalog_by_asset_id,
+            total_samples,
+            trigger_id,
+            trigger_onset,
+            role,
+            asset_id,
+            evidence,
+            evidence_hint,
+            allow_hint_out_of_range=allow_hint_out_of_range,
+        )
+
+    if role_asset_binding == "fixed":
+        expected_asset_id = _DENSITY_ROLE_ASSETS.get(role)
+        if expected_asset_id is None or asset_id != expected_asset_id:
+            raise SfxDeliveryError(
+                f"density policy role/asset mapping is invalid: {role!r} -> {asset_id!r}"
+            )
+        category = ROLE_TO_CATEGORY.get(role)
+    elif role_asset_binding == "category":
+        category = ROLE_TO_CATEGORY.get(role)
+        if category is None:
+            raise SfxDeliveryError(f"density policy role has no category: {role!r}")
+        pinned_asset = catalog_by_asset_id.get(asset_id)
+        if pinned_asset is None or pinned_asset.get("category") != category:
+            raise SfxDeliveryError(
+                f"density policy role/asset category mismatch: {role!r} -> {asset_id!r}"
+            )
+    else:
+        raise SfxDeliveryError(f"unknown density policy role_asset_binding: {role_asset_binding!r}")
     evidence_trigger = evidence.get("trigger")
     if not isinstance(evidence_trigger, dict):
         raise SfxDeliveryError("density policy evidence.trigger must be an object")
@@ -1562,7 +1659,16 @@ def _resolve_density_proposal(
             "density policy renderer evidence must produce exactly one proposal"
         )
     try:
-        proposal_matches_evidence = proposal == authoritative_proposals[0]
+        if role_asset_binding == "fixed":
+            proposal_matches_evidence = proposal == authoritative_proposals[0]
+        else:
+            comparable_proposal = {
+                key: value for key, value in proposal.items() if key not in ("asset_id", "category")
+            }
+            comparable_authoritative = {
+                key: value for key, value in authoritative_proposals[0].items() if key != "asset_id"
+            }
+            proposal_matches_evidence = comparable_proposal == comparable_authoritative
     except Exception as exc:  # pragma: no cover - defensive comparison boundary
         raise SfxDeliveryError(
             f"density policy proposal cannot be compared with renderer evidence: {exc}"
@@ -1628,7 +1734,9 @@ def _resolve_density_proposal(
         "asset_transient_anchor_sample": anchor,
         "role": role,
         "asset_id": asset_id,
+        "category": category,
         "evidence": evidence_copy,
+        "out_of_range": False,
     }
 
 
@@ -1752,7 +1860,14 @@ def _apply_density_policy_v2(
     catalog_by_asset_id = _density_catalog_by_asset_id_v2(catalog)
     seen_trigger_ids: set[str] = set()
     resolved = [
-        _resolve_density_proposal(proposal, catalog_by_asset_id, total_samples, seen_trigger_ids)
+        _resolve_density_proposal(
+            proposal,
+            catalog_by_asset_id,
+            total_samples,
+            seen_trigger_ids,
+            role_asset_binding="category",
+            allow_hint_out_of_range=True,
+        )
         for proposal in proposals
     ]
     candidates = sorted(
@@ -1765,8 +1880,10 @@ def _apply_density_policy_v2(
 
     for candidate in candidates:
         reason: str | None = None
-        candidate_category = ROLE_TO_CATEGORY[candidate["role"]]
-        if any(
+        candidate_category = candidate.get("category")
+        if candidate.get("out_of_range"):
+            reason = "hint_out_of_range"
+        elif any(
             abs(
                 candidate["expected_transient_sample"]
                 - event["expected_transient_sample"]
@@ -1778,7 +1895,7 @@ def _apply_density_policy_v2(
         elif _density_would_exceed_overlap(candidate, kept):
             reason = "overlap_limit"
         elif any(
-            ROLE_TO_CATEGORY[event["role"]] == candidate_category
+            event.get("category") == candidate_category
             and abs(candidate["expected_transient_sample"] - event["expected_transient_sample"])
             < category_rate_limit_window_samples(candidate_category)
             for event in kept
@@ -1944,9 +2061,38 @@ def _normalized_renderer_event_evidence(resolved_event: dict[str, Any]) -> dict[
     }
 
 
+def _normalized_hint_event_evidence(resolved_event: dict[str, Any]) -> dict[str, Any]:
+    """Reduce one hint-shaped density proposal to strict v3 evidence."""
+    evidence = resolved_event.get("evidence")
+    hint = evidence.get("hint") if isinstance(evidence, dict) else None
+    if not isinstance(hint, dict):
+        raise SfxDeliveryError("multi-event hint evidence is required")
+    onset = hint.get("onset_sample")
+    category = hint.get("category")
+    reason = hint.get("reason")
+    source_state_revision = hint.get("source_state_revision")
+    if type(onset) is not int or onset < 0:
+        raise SfxDeliveryError("multi-event hint evidence onset_sample must be a non-negative integer")
+    if category not in SFX_CATEGORIES:
+        raise SfxDeliveryError("multi-event hint evidence category is invalid")
+    if not isinstance(reason, str) or not reason.strip():
+        raise SfxDeliveryError("multi-event hint evidence reason is required")
+    _require_sha256(source_state_revision, "hint evidence source_state_revision")
+    return {
+        "hint": {
+            "onset_sample": onset,
+            "category": category,
+            "reason": reason,
+            "source_state_revision": source_state_revision,
+        }
+    }
+
+
 def _normalized_density_drop(resolved_event: dict[str, Any]) -> dict[str, Any]:
     """Serialize only deterministic, hash-bound fields for one dropped event."""
-    return {
+    evidence = resolved_event.get("evidence")
+    is_hint = isinstance(evidence, dict) and evidence.get("hint") is not None
+    normalized = {
         "trigger_id": resolved_event.get("trigger_id"),
         "trigger_onset_sample": resolved_event.get("trigger_onset_sample"),
         "event_start_sample": resolved_event.get("event_start_sample"),
@@ -1955,9 +2101,16 @@ def _normalized_density_drop(resolved_event: dict[str, Any]) -> dict[str, Any]:
         "expected_transient_sample": resolved_event.get("expected_transient_sample"),
         "role": resolved_event.get("role"),
         "asset_id": resolved_event.get("asset_id"),
-        "evidence": _normalized_renderer_event_evidence(resolved_event),
+        "evidence": (
+            _normalized_hint_event_evidence(resolved_event)
+            if is_hint
+            else _normalized_renderer_event_evidence(resolved_event)
+        ),
         "reason": resolved_event.get("reason"),
     }
+    if is_hint:
+        normalized["category"] = resolved_event.get("category")
+    return normalized
 
 
 def _pack_s24_integer(value: int) -> bytes:
@@ -2266,6 +2419,8 @@ def _stage_multi_event_delivery_v2(
     dialogue_probe: Path | None = None,
     *,
     include_external: bool = True,
+    sfx_hints: dict[str, Any] | None = None,
+    source_state_revision: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Stage a schema-v3 deterministic multi-event plan from the v2 SFX catalog."""
     stage = Path(stage_dir)
@@ -2309,15 +2464,42 @@ def _stage_multi_event_delivery_v2(
     selected_proposals = []
     for index, proposal in enumerate(proposals):
         category = ROLE_TO_CATEGORY[proposal["role"]]
-        role_catalog = {
-            "assets": [
-                asset for asset in catalog["assets"] if asset.get("role") == proposal["role"]
-            ],
-        }
-        asset_id = select_asset(category, role_catalog, event_index=index)
+        asset_id = select_asset(category, catalog, event_index=index, prefer="external")
         selected_proposals.append({**proposal, "asset_id": asset_id})
 
-    density = _apply_density_policy_v2(selected_proposals, catalog, total_samples)
+    hint_list: list[Any] = []
+    if sfx_hints is not None:
+        hint_errors = _contract_errors("sfx_hints", sfx_hints)
+        if hint_errors:
+            raise SfxDeliveryError(f"sfx_hints contract failed: {hint_errors[0]}")
+        hint_list = sfx_hints.get("hints", [])
+    if hint_list and source_state_revision is None:
+        raise SfxDeliveryError("sfx_hints requires source_state_revision")
+    if source_state_revision is not None:
+        source_state_revision = _require_sha256(source_state_revision, "source_state_revision")
+
+    hint_proposals = []
+    for index, hint in enumerate(hint_list):
+        onset = hint["onset_sample"]
+        category = hint["category"]
+        asset_id = select_asset(category, catalog, event_index=index, prefer="external")
+        hint_proposals.append({
+            "trigger_id": f"sfx-hint-{index:04d}",
+            "trigger_onset_sample": onset,
+            "role": "content_hint",
+            "asset_id": asset_id,
+            "category": category,
+            "evidence": {
+                "hint": {
+                    "onset_sample": onset,
+                    "category": category,
+                    "reason": hint["reason"],
+                    "source_state_revision": source_state_revision,
+                }
+            },
+        })
+
+    density = _apply_density_policy_v2(selected_proposals + hint_proposals, catalog, total_samples)
     kept = sorted(
         density["kept"],
         key=lambda event: (event["trigger_onset_sample"], event["trigger_id"]),
@@ -2326,7 +2508,12 @@ def _stage_multi_event_delivery_v2(
         raise SfxDeliveryError("multi-event density policy kept no events")
     events: list[dict[str, Any]] = []
     for index, resolved_event in enumerate(kept, start=1):
-        evidence = _normalized_renderer_event_evidence(resolved_event)
+        is_hint = resolved_event["role"] == "content_hint"
+        evidence = (
+            _normalized_hint_event_evidence(resolved_event)
+            if is_hint
+            else _normalized_renderer_event_evidence(resolved_event)
+        )
         events.append({
             "id": f"sfx-event-{index:04d}",
             "trigger_id": resolved_event["trigger_id"],
@@ -2337,13 +2524,17 @@ def _stage_multi_event_delivery_v2(
             "asset_transient_anchor_sample": resolved_event["asset_transient_anchor_sample"],
             "expected_transient_sample": resolved_event["expected_transient_sample"],
             "role": resolved_event["role"],
-            "category": ROLE_TO_CATEGORY[resolved_event["role"]],
+            "category": resolved_event["category"],
             "gain_db": -12,
             "dialogue_duck_db": 0.0,
             "fades": {"in_samples": 0, "out_samples": 0},
             "duck_group": "dialogue_priority",
             "evidence": evidence,
-            "reason": f"faithful {resolved_event['role']}",
+            "reason": (
+                f"content_hint {resolved_event['category']}"
+                if is_hint
+                else f"faithful {resolved_event['role']}"
+            ),
             "review_state": "approved_generated",
         })
 
@@ -2406,8 +2597,14 @@ def stage_multi_event_delivery(
     *,
     catalog_profile: str = "v1",
     include_external: bool = True,
+    sfx_hints: dict[str, Any] | None = None,
+    source_state_revision: str | None = None,
+    result_meta: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, Path]:
     if catalog_profile == "v1":
+        if result_meta is not None:
+            hints = sfx_hints.get("hints") if isinstance(sfx_hints, dict) else None
+            result_meta["ignored_hints"] = len(hints) if isinstance(hints, list) else 0
         return _stage_multi_event_delivery_v1(
             stage_dir, visual_evidence, timeline_revision, cut_map_sha256, dialogue_probe
         )
@@ -2415,6 +2612,8 @@ def stage_multi_event_delivery(
         return _stage_multi_event_delivery_v2(
             stage_dir, visual_evidence, timeline_revision, cut_map_sha256, dialogue_probe,
             include_external=include_external,
+            sfx_hints=sfx_hints,
+            source_state_revision=source_state_revision,
         )
     raise SfxDeliveryError(f"unknown SFX catalog profile: {catalog_profile!r}")
 
@@ -3757,11 +3956,22 @@ def _verify_multi_event_delivery_v2(
             if asset_id not in catalog_by_asset_id:
                 failures.append(f"audio_event_plan.events: asset_id not found in staged catalog: {asset_id}")
                 continue
-            expected_category = ROLE_TO_CATEGORY.get(role)
-            if expected_category is not None and category != expected_category:
-                failures.append(
-                    f"audio_event_plan.events: category does not match ROLE_TO_CATEGORY for role {role!r}"
-                )
+            if role == "content_hint":
+                evidence = event.get("evidence")
+                hint = evidence.get("hint") if isinstance(evidence, dict) else None
+                expected_category = hint.get("category") if isinstance(hint, dict) else None
+                if expected_category is None or category != expected_category:
+                    failures.append("audio_event_plan.events: content_hint category does not match evidence.hint.category")
+                    continue
+            else:
+                expected_category = ROLE_TO_CATEGORY.get(role)
+                if expected_category is not None and category != expected_category:
+                    failures.append(
+                        f"audio_event_plan.events: category does not match ROLE_TO_CATEGORY for role {role!r}"
+                    )
+                    continue
+            if catalog_by_asset_id[asset_id].get("category") != category:
+                failures.append(f"audio_event_plan.events: catalog asset category does not match event category: {asset_id}")
                 continue
             delivered_events.append(event)
 

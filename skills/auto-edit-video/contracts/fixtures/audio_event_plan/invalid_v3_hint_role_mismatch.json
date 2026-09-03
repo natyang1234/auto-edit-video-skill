@@ -75,7 +75,8 @@
         "renderer_trigger_sha256": "bc7d8dad8ec51c24aad270cc3293dad30bf6154364456daf84405cbe58561de9"
       },
       "reason": "faithful title_enter",
-      "review_state": "approved_generated"
+      "review_state": "approved_generated",
+      "category": "click_pop"
     },
     {
       "id": "sfx-event-0002",
@@ -109,7 +110,8 @@
         "renderer_trigger_sha256": "46bf6bc60549568f8cc9621ed7243c3809049504b09922f48ec3c0cf817b2140"
       },
       "reason": "faithful row_reveal",
-      "review_state": "approved_generated"
+      "review_state": "approved_generated",
+      "category": "click_pop"
     },
     {
       "id": "sfx-event-0003",

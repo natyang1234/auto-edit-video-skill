@@ -125,9 +125,11 @@
                 "type": "string",
                 "pattern": "^[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$"
               },
+              "category": {
+                "enum": ["cash_coin", "click_pop", "whoosh", "impact_hit", "success_ding", "error_glitch"]
+              },
               "evidence": {
                 "type": "object",
-                "required": ["trigger", "renderer_trigger_sha256"],
                 "properties": {
                   "trigger": {
                     "type": "object",
@@ -157,12 +159,28 @@
                   "renderer_trigger_sha256": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "hint": {
+                    "type": "object",
+                    "required": ["onset_sample", "category", "reason", "source_state_revision"],
+                    "properties": {
+                      "onset_sample": {"type": "integer", "minimum": 0},
+                      "category": {
+                        "enum": ["cash_coin", "click_pop", "whoosh", "impact_hit", "success_ding", "error_glitch"]
+                      },
+                      "reason": {"type": "string", "minLength": 1},
+                      "source_state_revision": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "additionalProperties": false
                   }
                 },
                 "additionalProperties": false
               },
               "reason": {
-                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit", "category_rate_limit"]
+                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit", "category_rate_limit", "hint_out_of_range"]
               }
             },
             "additionalProperties": false
