@@ -32,6 +32,11 @@
   existing 120ms/2-overlap/40-per-minute limits.
 - Document the SFX layer in `SKILL.md`, `references/ROUTING.md`,
   `references/sfx_keywords.json`, and both READMEs.
+- Reject rendering when a project mixes `catalog_profile: "v2"` with existing
+  Studio `audio_event_edits`, instead of silently building an incomplete
+  starter-asset path map or fail-closing only at the independent verifier;
+  Studio audio-event edits remain fully supported under `catalog_profile:
+  "v1"`.
 
 ## 1.8.0 - 2026-07-15
 

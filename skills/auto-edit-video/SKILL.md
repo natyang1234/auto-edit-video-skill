@@ -502,6 +502,12 @@ at most 2 overlapping cues, and at most 40 cues per minute. Catalog v2
 additionally caps `whoosh` to at most 1 cue per 10 seconds and every other
 category to at most 1 cue per 5 seconds.
 
+Studio audio-event edits (`audio_event_edits`, moving or re-gaining a cue in
+the Studio timing editor) are only supported under `catalog_profile: "v1"`.
+A project with `catalog_profile: "v2"` (the `kinetic-explainer` default)
+rejects rendering with existing `audio_event_edits`; clear the edits or move
+the project to a v1-catalog director before rendering.
+
 ### 8. Render and verify
 
 Render original-resolution assets with the bundled page-editor FFmpeg renderer,

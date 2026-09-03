@@ -382,6 +382,28 @@ def _partial_correlation(
     return max(-1.0, min(1.0, correlation))
 
 
+def _subtract_intervals(
+    lower_bound: int, upper_bound: int, exclusions: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Return the parts of [lower_bound, upper_bound) outside every exclusion."""
+    if lower_bound >= upper_bound:
+        return []
+    merged = sorted(
+        (max(lower_bound, lower), min(upper_bound, upper))
+        for lower, upper in exclusions
+        if lower < upper_bound and upper > lower_bound
+    )
+    safe: list[tuple[int, int]] = []
+    cursor = lower_bound
+    for lower, upper in merged:
+        if lower > cursor:
+            safe.append((cursor, lower))
+        cursor = max(cursor, upper)
+    if cursor < upper_bound:
+        safe.append((cursor, upper_bound))
+    return safe
+
+
 def _estimate_dialogue_pipeline_lag(
     output_samples: list[tuple[float, float]],
     dialogue_samples: list[tuple[float, float]],
@@ -410,14 +432,25 @@ def _estimate_dialogue_pipeline_lag(
             max(0, start - 2 * max_lag_samples),
             min(common_length, start + duration + 2 * max_lag_samples),
         ))
+    safe_ranges = _subtract_intervals(
+        max_lag_samples, common_length - max_lag_samples, exclusions
+    )
+    safe_sample_count = sum(upper - lower for lower, upper in safe_ranges)
+    if safe_sample_count < _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES:
+        return None
+    # A real SFX asset can run long enough that its exclusion neighborhood
+    # eats most of a short final clip.  Keep the default stride when the
+    # untouched span can afford it, and only pack samples closer together
+    # when it cannot, so the minimum-evidence floor stays the same number of
+    # independent measurements rather than being waived.
+    stride = max(
+        1,
+        min(_PIPELINE_LAG_DIALOGUE_STRIDE, safe_sample_count // _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES),
+    )
     dialogue_indices = [
         index
-        for index in range(
-            max_lag_samples,
-            common_length - max_lag_samples,
-            _PIPELINE_LAG_DIALOGUE_STRIDE,
-        )
-        if not any(lower <= index < upper for lower, upper in exclusions)
+        for lower, upper in safe_ranges
+        for index in range(lower, upper, stride)
     ]
     if len(dialogue_indices) < _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES:
         return None

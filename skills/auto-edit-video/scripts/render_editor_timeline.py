@@ -3180,6 +3180,12 @@ def stage_phase0d_sfx(
         raise ValueError(
             f"catalog_profile v2 is rejected when experience.sfx.mode is disabled ({director_id})"
         )
+    if catalog_profile == "v2" and isinstance(state.get("audio_event_edits"), dict):
+        raise ValueError(
+            "Studio audio event edits are not supported under catalog_profile v2 "
+            f"({director_id}); switch the project to a v1-catalog director or clear "
+            "audio_event_edits before rendering"
+        )
 
     hints_path = project_dir / "working/sfx_hints.json"
     sfx_hints: dict[str, Any] | None = None
