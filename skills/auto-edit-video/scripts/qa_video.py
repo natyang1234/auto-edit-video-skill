@@ -839,7 +839,7 @@ def validate_sfx_report(sfx_report: Any) -> dict[str, Any]:
     schema_version = sfx_report.get("schema_version")
     if type(schema_version) is not int or schema_version not in {1, 2}:
         raise ValueError("SFX report schema_version must be 1 or 2")
-    if sfx_report.get("source") != "independent_sfx_evidence":
+    if sfx_report.get("source") not in sfx_delivery.INDEPENDENT_SFX_EVIDENCE_SOURCES:
         raise ValueError("SFX report source must be independent_sfx_evidence")
     status = sfx_report.get("status")
     if status not in {"pass", "fail"}:

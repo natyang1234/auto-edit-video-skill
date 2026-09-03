@@ -204,7 +204,7 @@ class Phase0dSfxIntegrationTests(unittest.TestCase):
         report = json.loads((self.project / artifacts["qa_report"]["path"]).read_text("utf-8"))
         self.assertEqual(report["schema_version"], 3)
         sfx_report = report["sfx_delivery"]
-        self.assertEqual(sfx_report["source"], "independent_sfx_evidence")
+        self.assertEqual(sfx_report["source"], "independent_sfx_evidence_v2")
         self.assertEqual(sfx_report["status"], "pass")
         self.assertEqual(sfx_report["candidate_output_sha256"], self.sha256(output))
         self.assertEqual(

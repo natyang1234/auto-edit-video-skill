@@ -1321,6 +1321,15 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
         ):
             errors.append("$.catalog_revision_sha256: must be 64 lowercase hex characters")
 
+    sfx_hints_sha256 = artifact.get("sfx_hints_sha256")
+    if sfx_hints_sha256 is not None:
+        if (
+            not isinstance(sfx_hints_sha256, str)
+            or len(sfx_hints_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in sfx_hints_sha256)
+        ):
+            errors.append("$.sfx_hints_sha256: must be 64 lowercase hex characters")
+
     role_priority = {
         "title_enter": 0,
         "transition": 0,

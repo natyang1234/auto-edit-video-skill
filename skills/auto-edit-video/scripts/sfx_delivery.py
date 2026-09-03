@@ -30,6 +30,10 @@ CHANNELS = 2
 SAMPLE_WIDTH = 3
 WINDOW_SAMPLES = 240  # 5ms
 ALIGNMENT_TOLERANCE = 3840
+INDEPENDENT_SFX_EVIDENCE_SOURCES = frozenset({
+    "independent_sfx_evidence",
+    "independent_sfx_evidence_v2",
+})
 # Final candidate cue evidence must meet this signed correlation threshold.
 # Schema-v2 first binds one pipeline lag using cue-excluded private dialogue,
 # then checks every cue only at that independent lag.
@@ -2578,6 +2582,8 @@ def _stage_multi_event_delivery_v2(
         "catalog_revision_sha256": _canonical_hash(catalog),
         "events": events,
     }
+    if sfx_hints is not None:
+        plan["sfx_hints_sha256"] = _canonical_hash(sfx_hints)
     plan_errors = _contract_errors("audio_event_plan", plan)
     if plan_errors:
         raise SfxDeliveryError(f"audio_event_plan contract failed: {plan_errors[0]}")
@@ -3853,19 +3859,6 @@ def _verify_multi_event_delivery_v2(
     """Independently verify a frozen v2-catalog plan: rebuild from the catalog, do not re-select."""
     failures: list[str] = []
     warnings: list[str] = []
-    if any(
-        value is not None
-        for value in (
-            dialogue_priority_dialogue_path,
-            dialogue_priority_sfx_path,
-            candidate_path,
-            expected_studio_edits_sha256,
-        )
-    ):
-        failures.append(
-            "audio_event_plan v3 catalog-driven plan does not yet support "
-            "candidate/dialogue-priority/studio-edit verification"
-        )
 
     plan, plan_bytes, plan_error = _read_json_once(Path(plan_path))
     catalog, catalog_bytes, catalog_error = _read_json_once(Path(catalog_path))
@@ -3882,6 +3875,11 @@ def _verify_multi_event_delivery_v2(
     if catalog is not None:
         failures.extend(f"sfx_catalog: {error}" for error in _contract_errors("sfx_catalog", catalog))
 
+    expected_sample_count = (
+        plan.get("sfx_stem_sample_count")
+        if isinstance(plan, dict) and type(plan.get("sfx_stem_sample_count")) is int
+        else None
+    )
     observed_hashes: dict[str, Any] = {
         "plan_file_sha256": sha256_bytes(plan_bytes) if plan_bytes is not None else None,
         "catalog_file_sha256": sha256_bytes(catalog_bytes) if catalog_bytes is not None else None,
@@ -3896,6 +3894,29 @@ def _verify_multi_event_delivery_v2(
             observed_hashes["stem_decoded_pcm_sha256"] = sha256_bytes(decoded_stem.pcm)
         except SfxDeliveryError as exc:
             failures.append(f"sfx_stem: {exc}")
+
+    candidate_output_sha256: str | None = None
+    candidate_audio: DecodedWav | None = None
+    candidate_sample_count_delta: int | None = None
+    if candidate_path is not None:
+        candidate_path = Path(candidate_path)
+        try:
+            candidate_bytes = candidate_path.read_bytes()
+            candidate_output_sha256 = sha256_bytes(candidate_bytes)
+            candidate_audio = _decode_candidate_audio_bytes(
+                candidate_bytes, source=str(candidate_path)
+            )
+            if expected_sample_count is None:
+                failures.append("candidate output: expected SFX sample count is unavailable")
+            else:
+                candidate_sample_count_delta = len(candidate_audio.samples) - expected_sample_count
+                if not candidate_sample_count_within_tolerance(candidate_sample_count_delta):
+                    failures.append(
+                        "candidate output: decoded sample count differs from planned SFX stem "
+                        f"by {candidate_sample_count_delta} samples"
+                    )
+        except (OSError, SfxDeliveryError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"candidate output audio evidence: {exc}")
 
     if isinstance(catalog, dict) and not failures:
         try:
@@ -3976,7 +3997,7 @@ def _verify_multi_event_delivery_v2(
             delivered_events.append(event)
 
     rebuilt_hashes: dict[str, Any] = {"sfx_stem_sha256": None, "sfx_stem_decoded_pcm_sha256": None}
-    total_samples = plan.get("sfx_stem_sample_count") if isinstance(plan, dict) else None
+    total_samples = expected_sample_count
     if not failures and isinstance(events, list) and type(total_samples) is int and total_samples > 0:
         try:
             with tempfile.TemporaryDirectory(prefix="sfx-verify-v2-") as directory:
@@ -4031,10 +4052,131 @@ def _verify_multi_event_delivery_v2(
     except Exception as exc:  # pragma: no cover - defensive evidence boundary
         failures.append(f"visual evidence motion hash: {exc}")
 
+    declared_studio = plan.get("studio_edits") if isinstance(plan, dict) else None
+    declared_studio_hash = plan.get("studio_edits_sha256") if isinstance(plan, dict) else None
+    if expected_studio_edits_sha256 is None:
+        if declared_studio is not None or declared_studio_hash is not None:
+            failures.append("audio_event_plan: studio edits were not authorized by current state")
+    else:
+        failures.append(
+            "audio_event_plan v3 catalog-driven plan does not support studio-edit resolution"
+        )
+
+    events_list = events if isinstance(events, list) else []
+    dialogue_priority: dict[str, Any] | None = None
+    dialogue_control: DecodedWav | None = None
+    post_sidechain_sfx: DecodedWav | None = None
+    priority_paths = (dialogue_priority_dialogue_path, dialogue_priority_sfx_path)
+    dialogue_priority_requested = any(path is not None for path in priority_paths)
+    if dialogue_priority_requested:
+        if not all(path is not None for path in priority_paths):
+            failures.append("audio_event_plan v3 requires dialogue-priority evidence stems")
+        else:
+            (
+                dialogue_priority,
+                priority_failures,
+                dialogue_control,
+                post_sidechain_sfx,
+            ) = _dialogue_priority_evidence(
+                events_list,
+                expected_sample_count,
+                Path(dialogue_priority_dialogue_path),
+                Path(dialogue_priority_sfx_path),
+            )
+            failures.extend(priority_failures)
+
+    observed_cues: list[dict[str, Any]] = []
+    if candidate_audio is not None:
+        pipeline_lag: int | None = None
+        dialogue_gain: float | None = None
+        if dialogue_control is not None:
+            lag_match = _estimate_dialogue_pipeline_lag(
+                candidate_audio.samples,
+                dialogue_control.samples,
+                events_list,
+            )
+            if lag_match is not None and lag_match[0] >= CANDIDATE_CORRELATION_THRESHOLD:
+                pipeline_lag = lag_match[1]
+                dialogue_gain = lag_match[2]
+            else:
+                failures.append(
+                    "candidate output: dialogue-controlled pipeline lag unavailable"
+                )
+        for event in events_list:
+            if not isinstance(event, dict):
+                continue
+            output_cue: dict[str, Any] = {
+                "event_id": event.get("id"),
+                "trigger_onset_sample": event.get("trigger_onset_sample"),
+                "expected_transient_sample": event.get("expected_transient_sample"),
+                "observed_transient_sample": None,
+                "delta_samples": None,
+                "aligned": False,
+                "correlation": None,
+                "window_peak_dbfs": None,
+                "status": "fail",
+                "evidence_source": "candidate_output_audio",
+            }
+            start = event.get("event_start_sample")
+            duration = event.get("duration_samples")
+            expected = event.get("expected_transient_sample")
+            if (
+                dialogue_control is not None
+                and post_sidechain_sfx is not None
+                and pipeline_lag is not None
+                and dialogue_gain is not None
+                and type(start) is int
+                and type(duration) is int
+                and type(expected) is int
+            ):
+                match = _cue_template_partial_correlation(
+                    candidate_audio.samples,
+                    post_sidechain_sfx.samples,
+                    dialogue_control.samples,
+                    start,
+                    duration,
+                    pipeline_lag_samples=pipeline_lag,
+                    dialogue_gain=dialogue_gain,
+                )
+                if match is not None:
+                    correlation, lag, complete = match
+                    observed_output = expected + lag
+                    trigger_onset = event.get("trigger_onset_sample")
+                    output_cue.update({
+                        "observed_transient_sample": observed_output,
+                        "delta_samples": (
+                            observed_output - trigger_onset
+                            if type(trigger_onset) is int else None
+                        ),
+                        "aligned": (
+                            type(trigger_onset) is int
+                            and alignment_ok(trigger_onset, observed_output)
+                        ),
+                        "correlation": round(correlation, 6),
+                        "window_peak_dbfs": _candidate_window_peak_dbfs(
+                            candidate_audio.samples, expected
+                        ),
+                    })
+                    if (
+                        correlation >= CANDIDATE_CORRELATION_THRESHOLD
+                        and complete
+                        and output_cue["aligned"]
+                    ):
+                        output_cue["status"] = "pass"
+                    else:
+                        failures.append(
+                            "candidate output: deterministic SFX cue correlation/alignment failed"
+                        )
+                else:
+                    failures.append("candidate output: deterministic SFX cue correlation unavailable")
+            else:
+                failures.append("candidate output: event timing invalid audio evidence")
+            observed_cues.append(output_cue)
+
     if failures:
         delivered_events = []
-    report = {
-        "schema_version": 1,
+    report: dict[str, Any] = {
+        "schema_version": 2 if dialogue_priority_requested else 1,
         "source": "independent_sfx_evidence_v2",
         "status": "fail" if failures else "pass",
         "failures": failures,
@@ -4046,5 +4188,26 @@ def _verify_multi_event_delivery_v2(
         "rebuilt_hash_evidence": rebuilt_hashes,
         "expected_timeline_revision": expected_timeline_revision,
         "expected_cut_map_sha256": expected_cut_map_sha256,
+        "expected_studio_edits_sha256": expected_studio_edits_sha256,
+        "candidate_output_sha256": candidate_output_sha256,
+        "output_audio_evidence": (
+            {
+                "sample_rate": candidate_audio.sample_rate,
+                "channels": candidate_audio.channels,
+                "sample_width_bytes": candidate_audio.sample_width,
+                "sample_count": len(candidate_audio.samples),
+                "expected_sample_count": expected_sample_count,
+                "sample_count_delta": candidate_sample_count_delta,
+                "sample_count_tolerance_samples": CANDIDATE_SAMPLE_COUNT_TOLERANCE,
+                "sample_count_tolerance_trailing_samples": (
+                    CANDIDATE_SAMPLE_COUNT_TOLERANCE_TRAILING
+                ),
+                "decoded_pcm_sha256": sha256_bytes(candidate_audio.pcm),
+            }
+            if candidate_audio is not None else None
+        ),
+        "observed_cue_evidence": observed_cues,
     }
+    if dialogue_priority_requested:
+        report["dialogue_priority_evidence"] = dialogue_priority
     return report

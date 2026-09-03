@@ -2980,7 +2980,7 @@ def render_project(
                     dialogue_priority_sfx_path=dialogue_priority_paths[1],
                     expected_studio_edits_sha256=expected_studio_edits_hash,
                 )
-                if verification.get("source") != "independent_sfx_evidence" or verification.get("status") != "pass":
+                if verification.get("source") not in sfx_delivery.INDEPENDENT_SFX_EVIDENCE_SOURCES or verification.get("status") != "pass":
                     raise RuntimeError("staged SFX verification did not pass before publication")
                 assert_sfx_candidate_binding(verification, report_payload, temporary)
                 staged_sources.update({
@@ -3063,7 +3063,7 @@ def render_project(
                     dialogue_priority_sfx_path=dialogue_priority_paths[1],
                     expected_studio_edits_sha256=expected_studio_edits_hash,
                 )
-                if verification.get("source") != "independent_sfx_evidence" or verification.get("status") != "pass":
+                if verification.get("source") not in sfx_delivery.INDEPENDENT_SFX_EVIDENCE_SOURCES or verification.get("status") != "pass":
                     raise RuntimeError("staged SFX verification did not pass before publication")
                 assert_sfx_candidate_binding(verification, report_payload, temporary)
                 # Verification can be expensive.  Re-read the independent
@@ -3167,12 +3167,54 @@ def stage_phase0d_sfx(
     dialogue_probe: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """Stage core-owned multi-event artifacts against live final bindings."""
+    import director_resolver
+
+    director_id = str(state.get("director_style") or "teacher-punch")
+    resolved_director = director_resolver.resolve_director_profile(director_id)
+    experience = resolved_director.get("experience")
+    sfx_experience = experience.get("sfx") if isinstance(experience, dict) else None
+    if not isinstance(sfx_experience, dict):
+        sfx_experience = {}
+    catalog_profile = sfx_experience.get("catalog_profile") or "v1"
+    if catalog_profile == "v2" and sfx_experience.get("mode") == "disabled":
+        raise ValueError(
+            f"catalog_profile v2 is rejected when experience.sfx.mode is disabled ({director_id})"
+        )
+
+    hints_path = project_dir / "working/sfx_hints.json"
+    sfx_hints: dict[str, Any] | None = None
+    if hints_path.is_file():
+        try:
+            sfx_hints = json.loads(hints_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"sfx_hints file is invalid: {hints_path}") from exc
+        if not isinstance(sfx_hints, dict):
+            raise ValueError(f"sfx_hints file is invalid: {hints_path}")
+        hint_errors = contract_registry.validate_artifact("sfx_hints", sfx_hints)
+        if hint_errors:
+            raise ValueError(f"sfx_hints file is invalid: {hints_path}: {hint_errors[0]}")
+
     timeline_revision = editor_base_state_revision(state)
     cut_hash = sfx_delivery.effective_cut_map_sha256(project_dir, state)
-    staged = sfx_delivery.stage_multi_event_delivery(
-        Path(stage), visual_evidence, timeline_revision, cut_hash,
-        dialogue_probe=dialogue_probe,
-    )
+    if catalog_profile == "v2":
+        staged = sfx_delivery.stage_multi_event_delivery(
+            Path(stage), visual_evidence, timeline_revision, cut_hash,
+            dialogue_probe=dialogue_probe,
+            catalog_profile="v2",
+            sfx_hints=sfx_hints,
+            source_state_revision=editor_state_revision(state),
+        )
+    else:
+        if sfx_hints is not None:
+            hint_count = len(sfx_hints.get("hints") or [])
+            print(
+                f"sfx_hints ignored under catalog_profile=v1 ({hint_count})",
+                file=sys.stderr,
+            )
+        staged = sfx_delivery.stage_multi_event_delivery(
+            Path(stage), visual_evidence, timeline_revision, cut_hash,
+            dialogue_probe=dialogue_probe,
+        )
     if not isinstance(staged, tuple) or len(staged) != 3:
         raise ValueError("core SFX staging returned invalid artifact bindings")
     plan_path, catalog_path, stem = (Path(value) for value in staged)
@@ -3371,7 +3413,7 @@ def qa_unpublished_output(
         sfx_delivery_report = report.get("sfx_delivery")
         if (
             not isinstance(sfx_delivery_report, dict)
-            or sfx_delivery_report.get("source") != "independent_sfx_evidence"
+            or sfx_delivery_report.get("source") not in sfx_delivery.INDEPENDENT_SFX_EVIDENCE_SOURCES
             or sfx_delivery_report.get("status") != "pass"
         ):
             report_path.unlink(missing_ok=True)

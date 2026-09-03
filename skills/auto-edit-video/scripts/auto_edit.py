@@ -5269,6 +5269,24 @@ def cmd_cut(args: argparse.Namespace) -> int:
             print(canonical_director_json({"error_code": "registry_invalid", "details": [str(exc)]}))
         return 2
 
+    if args.sfx_hints:
+        import contract_registry
+
+        hints_source = Path(args.sfx_hints).expanduser().resolve()
+        if not hints_source.is_file():
+            return die(f"no such sfx hints file: {hints_source}")
+        try:
+            hints_payload = read_json(hints_source)
+        except ValueError as exc:
+            return die(f"invalid sfx hints file: {hints_source}: {exc}")
+        hint_errors = contract_registry.validate_artifact("sfx_hints", hints_payload)
+        if hint_errors:
+            return die(f"invalid sfx hints file: {hints_source}: {hint_errors[0]}")
+        hints_dest = project_dir / "working/sfx_hints.json"
+        if hints_dest.is_file():
+            print(f"overwriting existing sfx hints: {hints_dest}")
+        write_json(hints_dest, hints_payload)
+
     # Where the clip length and the platform are decided, for both routes in.
     # They were decided on one of them: a folder went to ingest-folder, which
     # takes neither, so --seconds and --platform did nothing at all there and
@@ -5583,6 +5601,20 @@ def cmd_cut(args: argparse.Namespace) -> int:
         made.append(item)
         if direct_final:
             delivery_snapshots.append(delivery_snapshot)
+
+    if not direct_final:
+        sfx_experience = (resolved.get("experience") or {}).get("sfx")
+        if isinstance(sfx_experience, dict) and sfx_experience.get("catalog_profile") == "v2":
+            try:
+                import sfx_suggest
+
+                sfx_suggest.run(
+                    project_dir,
+                    Path(__file__).resolve().parent.parent / "references/sfx_keywords.json",
+                    project_dir / "working/sfx_suggestions.json",
+                )
+            except Exception as exc:
+                print(f"sfx_suggest advisory scan failed: {exc}", file=sys.stderr)
 
     payload = {
         "ok": bool(made) and not final_delivery_failure,
@@ -6467,6 +6499,10 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument(
         "--burned-in", choices=("auto", "yes", "no"), default="auto",
         help="does the footage already carry subtitles?",
+    )
+    cut.add_argument(
+        "--sfx-hints", default=None,
+        help="path to a sfx_hints.json contract file, copied into working/",
     )
     cut.set_defaults(func=cmd_cut)
 

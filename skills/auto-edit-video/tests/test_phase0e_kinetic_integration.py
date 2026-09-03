@@ -563,7 +563,7 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
         plan = json.loads(
             (self.project / artifacts["audio_event_plan"]["path"]).read_text("utf-8")
         )
-        self.assertEqual(plan["schema_version"], 2)
+        self.assertEqual(plan["schema_version"], 3)
         events = plan["events"]
         self.assertGreaterEqual(len(events), 2)
         trigger_ids = [event["trigger_id"] for event in events]
