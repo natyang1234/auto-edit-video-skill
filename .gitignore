@@ -18,3 +18,6 @@ skills/open-edit
 .claude/
 .codex/
 .gemini/
+
+# SFX 授權素材庫（Phase 3a，2026-09-03）：正規化 WAV 是交付物，允許入庫
+!skills/auto-edit-video/assets/sfx/**/*.wav
