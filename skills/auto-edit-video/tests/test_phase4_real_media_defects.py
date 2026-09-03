@@ -64,7 +64,8 @@ class FrozenSceneAcrossRemovedPauseTests(unittest.TestCase):
             renderer.ffmpeg_path(), "-y",
             "-f", "lavfi", "-i", "testsrc2=s=360x640:r=30:d=2.4",
             "-f", "lavfi", "-i", "sine=f=160:r=48000:d=2.4",
-            "-filter:a", "volume=0.025",
+            # 0.025 used to sit only ~1-3 LU above qa_video's audible-ratio gate (test-fixture fragility, not a product defect); 0.07 keeps >=5 LU margin for both catalog_profile v1 and v2 (measured in P6_report.md) -- do not lower this back toward 0.025.
+            "-filter:a", "volume=0.07",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
             str(self.source),
         ], text=True, capture_output=True, timeout=60)

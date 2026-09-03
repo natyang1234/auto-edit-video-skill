@@ -180,7 +180,7 @@
                 "additionalProperties": false
               },
               "reason": {
-                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit", "category_rate_limit", "hint_out_of_range"]
+                "enum": ["adjacent_onset", "overlap_limit", "clip_density_limit", "category_rate_limit", "hint_out_of_range", "lag_evidence_reserve"]
               }
             },
             "additionalProperties": false

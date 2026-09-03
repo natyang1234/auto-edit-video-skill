@@ -583,6 +583,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 failures.append(f"{asset_id}: approval evidence path must not be a symlink: {approval_evidence_path}")
             elif not approval_evidence_path.is_file():
                 failures.append(f"{asset_id}: approval evidence missing: {approval_evidence_path}")
+            elif not approval_evidence_path.resolve().is_relative_to(sfx_root.resolve()):
+                failures.append(f"{asset_id}: approval evidence path escapes library root: {approval_evidence_path}")
             else:
                 actual_approval_evidence = sha256_of_file(approval_evidence_path)
                 if actual_approval_evidence != approval.get("evidence_sha256"):
@@ -597,6 +599,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 failures.append(f"{asset_id}: source evidence path must not be a symlink: {source_evidence_path}")
             elif not source_evidence_path.is_file():
                 failures.append(f"{asset_id}: source evidence missing: {source_evidence_path}")
+            elif not source_evidence_path.resolve().is_relative_to(sfx_root.resolve()):
+                failures.append(f"{asset_id}: source evidence path escapes library root: {source_evidence_path}")
             else:
                 actual_source_evidence = sha256_of_file(source_evidence_path)
                 if actual_source_evidence != approval.get("source_evidence_sha256"):

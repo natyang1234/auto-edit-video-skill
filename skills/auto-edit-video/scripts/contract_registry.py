@@ -31,6 +31,11 @@ from sfx_mapping import (
     V2_PROCEDURAL_ASSET_IDS,
     category_rate_limit_window_samples,
 )
+from sfx_delivery import (
+    _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES,
+    _PIPELINE_LAG_RESERVE_SAMPLES,
+    _dialogue_untouched_span_samples,
+)
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = SKILL_DIR / "contracts" / "schemas"
@@ -1325,13 +1330,15 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
         errors.append(f"$.catalog_revision_sha256: schema v{version} must not contain this field")
 
     sfx_hints_sha256 = artifact.get("sfx_hints_sha256")
-    if sfx_hints_sha256 is not None:
-        if (
+    if version == 3:
+        if sfx_hints_sha256 is not None and (
             not isinstance(sfx_hints_sha256, str)
             or len(sfx_hints_sha256) != 64
             or any(char not in "0123456789abcdef" for char in sfx_hints_sha256)
         ):
             errors.append("$.sfx_hints_sha256: must be 64 lowercase hex characters")
+    elif sfx_hints_sha256 is not None:
+        errors.append(f"$.sfx_hints_sha256: schema v{version} must not contain this field")
 
     role_priority = {
         "title_enter": 0,
@@ -1451,6 +1458,8 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
             if all(type(value) is int for value in (fade_in, fade_out)) and fade_in + fade_out > duration:
                 errors.append(f"{path}.fades: fades exceed event duration")
         evidence = event.get("evidence")
+        if version in (1, 2) and isinstance(evidence, dict) and "hint" in evidence:
+            errors.append(f"{path}.evidence.hint: schema v{version} does not support hint evidence")
         trigger = evidence.get("trigger") if isinstance(evidence, dict) else None
         if not isinstance(trigger, dict):
             errors.append(f"{path}.evidence.trigger: schema v{version} requires complete renderer trigger evidence")
@@ -1832,7 +1841,7 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
                 if active > 2:
                     expected_reason = "overlap_limit"
                     break
-        if expected_reason is None and "catalog_revision_sha256" in artifact:
+        if expected_reason is None and version == 3:
             candidate_category = ROLE_TO_CATEGORY.get(candidate.get("role")) or candidate.get("category")
             if candidate_category is not None and type(candidate_expected) is int and any(
                 (ROLE_TO_CATEGORY.get(item.get("role")) or item.get("category")) == candidate_category
@@ -1844,6 +1853,17 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
                 expected_reason = "category_rate_limit"
         if expected_reason is None and len(simulated_kept) >= density.get("density_cap", 0):
             expected_reason = "clip_density_limit"
+        if (
+            expected_reason is None
+            and version == 3
+            and type(total_samples) is int
+        ):
+            trial_events = simulated_kept + [candidate]
+            reserve_span = _dialogue_untouched_span_samples(
+                trial_events, _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES, total_samples
+            )
+            if reserve_span is not None and reserve_span < _PIPELINE_LAG_RESERVE_SAMPLES:
+                expected_reason = "lag_evidence_reserve"
         if candidate_id in set(kept_ids):
             if expected_reason is not None:
                 errors.append(f"$.density: kept candidate {candidate_id!r} should be dropped for {expected_reason}")

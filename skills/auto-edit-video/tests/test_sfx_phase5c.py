@@ -1,4 +1,4 @@
-"""Phase 5c: v2 Studio-edit rejection guard and adaptive pipeline-lag stride.
+"""Phase 5c: v2 Studio-edit rejection guard and fixed-stride pipeline-lag evidence.
 
 Covers two Codex-review fixes layered on the v1/v2 SFX delivery pipeline:
 
@@ -7,16 +7,19 @@ Covers two Codex-review fixes layered on the v1/v2 SFX delivery pipeline:
   ``audio_event_edits`` -- instead of silently building an incomplete
   starter-asset path map that can only remix v1's seven fixed assets.
   Studio edits remain fully supported under ``catalog_profile: "v1"``.
-* ``_estimate_dialogue_pipeline_lag`` now samples its safe (non-SFX-cue)
-  dialogue window with an adaptive stride, so a long real SFX asset that
-  eats most of a short final clip's untouched span no longer starves the
-  minimum-evidence floor of independent measurements it would have met at
-  the default stride against a short procedural asset.
+* ``_estimate_dialogue_pipeline_lag`` samples its safe (non-SFX-cue)
+  dialogue window at a fixed stride, using 512 independent fixed-stride
+  measurements as its evidence floor. A long real SFX asset that eats
+  most of a short final clip's untouched span correctly starves this
+  floor -- ``_dialogue_pipeline_lag_unavailable_reason`` reports why, and
+  production-side density policy keeps a matching reserve so a kept plan
+  never lands in this starved state.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -183,8 +186,29 @@ def _seeded_noise(total: int, seed: int, amplitude: float) -> list[tuple[float, 
     return samples
 
 
-class PipelineLagAdaptiveStrideTests(unittest.TestCase):
-    """Long real cues must not starve pipeline-lag evidence sampling."""
+def _seeded_voice(
+    total: int, seed: int, amplitude: float, *, fundamental_hz: float = 150.0,
+    sample_rate: int = 48000,
+) -> list[tuple[float, float]]:
+    """A quasi-periodic voice-like signal: a fundamental plus two harmonics
+    and a light seeded-noise floor, instead of pure white noise."""
+    samples: list[tuple[float, float]] = []
+    for index in range(total):
+        seed = (1664525 * seed + 1013904223) & 0xFFFFFFFF
+        noise = ((((seed >> 8) / 16777215.0) * 2.0) - 1.0)
+        t = index / sample_rate
+        voice = (
+            math.sin(2.0 * math.pi * fundamental_hz * t)
+            + 0.5 * math.sin(2.0 * math.pi * 2.0 * fundamental_hz * t)
+            + 0.25 * math.sin(2.0 * math.pi * 3.0 * fundamental_hz * t)
+        ) / 1.75
+        value = amplitude * (0.9 * voice + 0.1 * noise)
+        samples.append((value, value))
+    return samples
+
+
+class PipelineLagFixedStrideTests(unittest.TestCase):
+    """Fixed-stride evidence sampling must not be gamed by a short safe window."""
 
     def test_subtract_intervals_merges_and_clips(self) -> None:
         self.assertEqual(
@@ -195,13 +219,13 @@ class PipelineLagAdaptiveStrideTests(unittest.TestCase):
         self.assertEqual(sfx_delivery._subtract_intervals(0, 100, [(-10, 200)]), [])
         self.assertEqual(sfx_delivery._subtract_intervals(50, 50, [(0, 100)]), [])
 
-    def test_pipeline_lag_adaptive_stride_recovers_short_safe_window(self) -> None:
+    def test_pipeline_lag_short_safe_window_returns_none_with_reason(self) -> None:
         max_lag_samples = 512
         event_start_sample = 1024
         duration_samples = 2000
         total = 5160  # leaves exactly 600 safe samples after the 2x-lag exclusion
 
-        dialogue_samples = _seeded_noise(total, 0xC0FFEE, 10 ** (-20.0 / 20.0))
+        dialogue_samples = _seeded_voice(total, 0xC0FFEE, 10 ** (-20.0 / 20.0))
         stem_samples = [(0.0, 0.0)] * total
         cue_seed = 0xBADC0FFE
         cue_amplitude = 10 ** (-26.0 / 20.0)
@@ -221,10 +245,15 @@ class PipelineLagAdaptiveStrideTests(unittest.TestCase):
         lag_match = sfx_delivery._estimate_dialogue_pipeline_lag(
             output_samples, dialogue_samples, [event], max_lag_samples=max_lag_samples,
         )
-        self.assertIsNotNone(lag_match)
-        correlation, found_lag, _dialogue_gain = lag_match
-        self.assertEqual(found_lag, 0)
-        self.assertGreaterEqual(correlation, sfx_delivery.CANDIDATE_CORRELATION_THRESHOLD)
+        self.assertIsNone(lag_match)
+
+        reason = sfx_delivery._dialogue_pipeline_lag_unavailable_reason(
+            output_samples, dialogue_samples, [event], max_lag_samples=max_lag_samples,
+        )
+        self.assertEqual(
+            reason,
+            "insufficient untouched dialogue span for pipeline lag: 12.5 ms < 714.7 ms",
+        )
 
     def test_pipeline_lag_still_requires_minimum_evidence_floor(self) -> None:
         max_lag_samples = 512

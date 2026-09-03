@@ -41,6 +41,15 @@ CANDIDATE_CORRELATION_THRESHOLD = 0.30
 _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES = 512
 _PIPELINE_LAG_DIALOGUE_STRIDE = 67
 _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES = 512
+# The evidence floor is 512 independent samples at the fixed stride above,
+# i.e. this many untouched dialogue samples with no SFX cue nearby.
+_PIPELINE_LAG_MIN_SAFE_SAMPLES = _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES * _PIPELINE_LAG_DIALOGUE_STRIDE
+# Density policy keeps this much extra margin in reserve on top of the
+# verifier's own floor, covering the max-lag trim at both ends of the safe
+# window so a plan that clears the reserve check also clears the verifier.
+_PIPELINE_LAG_RESERVE_SAMPLES = (
+    _PIPELINE_LAG_MIN_SAFE_SAMPLES + 2 * _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES
+)
 # Candidate sample-count tolerance against the staged final-domain stem is
 # DIRECTIONAL, because the codec artefact it absorbs only has one sign.
 #
@@ -404,19 +413,17 @@ def _subtract_intervals(
     return safe
 
 
-def _estimate_dialogue_pipeline_lag(
-    output_samples: list[tuple[float, float]],
-    dialogue_samples: list[tuple[float, float]],
+def _dialogue_lag_exclusion_windows(
     events: list[dict[str, Any]],
-    *,
-    max_lag_samples: int = _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES,
-) -> tuple[float, int, float] | None:
-    """Bind one candidate lag and gain outside every cue window."""
-    if type(max_lag_samples) is not int or max_lag_samples < 0:
-        return None
-    common_length = min(len(output_samples), len(dialogue_samples))
-    if common_length <= 2 * max_lag_samples:
-        return None
+    max_lag_samples: int,
+    common_length: int,
+) -> list[tuple[int, int]] | None:
+    """Build the pipeline-lag exclusion window for each SFX event.
+
+    Shared by the verifier's evidence sampler and the density policy's
+    lag-evidence reserve so the two sides can never disagree about which
+    dialogue samples an SFX cue puts out of bounds for lag correlation.
+    """
     exclusions: list[tuple[int, int]] = []
     for event in events:
         if not isinstance(event, dict):
@@ -432,25 +439,50 @@ def _estimate_dialogue_pipeline_lag(
             max(0, start - 2 * max_lag_samples),
             min(common_length, start + duration + 2 * max_lag_samples),
         ))
+    return exclusions
+
+
+def _dialogue_untouched_span_samples(
+    events: list[dict[str, Any]],
+    max_lag_samples: int,
+    common_length: int,
+) -> int | None:
+    """Total dialogue samples outside every event's pipeline-lag exclusion."""
+    if common_length <= 2 * max_lag_samples:
+        return 0
+    exclusions = _dialogue_lag_exclusion_windows(events, max_lag_samples, common_length)
+    if exclusions is None:
+        return None
     safe_ranges = _subtract_intervals(
         max_lag_samples, common_length - max_lag_samples, exclusions
     )
-    safe_sample_count = sum(upper - lower for lower, upper in safe_ranges)
-    if safe_sample_count < _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES:
+    return sum(upper - lower for lower, upper in safe_ranges)
+
+
+def _estimate_dialogue_pipeline_lag(
+    output_samples: list[tuple[float, float]],
+    dialogue_samples: list[tuple[float, float]],
+    events: list[dict[str, Any]],
+    *,
+    max_lag_samples: int = _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES,
+) -> tuple[float, int, float] | None:
+    """Bind one candidate lag and gain outside every cue window."""
+    if type(max_lag_samples) is not int or max_lag_samples < 0:
         return None
-    # A real SFX asset can run long enough that its exclusion neighborhood
-    # eats most of a short final clip.  Keep the default stride when the
-    # untouched span can afford it, and only pack samples closer together
-    # when it cannot, so the minimum-evidence floor stays the same number of
-    # independent measurements rather than being waived.
-    stride = max(
-        1,
-        min(_PIPELINE_LAG_DIALOGUE_STRIDE, safe_sample_count // _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES),
-    )
+    common_length = min(len(output_samples), len(dialogue_samples))
+    if common_length <= 2 * max_lag_samples:
+        return None
+    exclusions = _dialogue_lag_exclusion_windows(events, max_lag_samples, common_length)
+    if exclusions is None:
+        return None
     dialogue_indices = [
         index
-        for lower, upper in safe_ranges
-        for index in range(lower, upper, stride)
+        for index in range(
+            max_lag_samples,
+            common_length - max_lag_samples,
+            _PIPELINE_LAG_DIALOGUE_STRIDE,
+        )
+        if not any(lower <= index < upper for lower, upper in exclusions)
     ]
     if len(dialogue_indices) < _PIPELINE_LAG_MIN_DIALOGUE_SAMPLES:
         return None
@@ -502,6 +534,28 @@ def _estimate_dialogue_pipeline_lag(
     if not math.isfinite(dialogue_gain) or dialogue_gain <= 0.0:
         return None
     return best[0], best[1], dialogue_gain
+
+
+def _dialogue_pipeline_lag_unavailable_reason(
+    output_samples: list[tuple[float, float]],
+    dialogue_samples: list[tuple[float, float]],
+    events: list[dict[str, Any]],
+    *,
+    max_lag_samples: int = _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES,
+) -> str | None:
+    """Explain why ``_estimate_dialogue_pipeline_lag`` found no evidence span."""
+    if type(max_lag_samples) is not int or max_lag_samples < 0:
+        return None
+    common_length = min(len(output_samples), len(dialogue_samples))
+    safe_sample_count = _dialogue_untouched_span_samples(events, max_lag_samples, common_length)
+    if safe_sample_count is None or safe_sample_count >= _PIPELINE_LAG_MIN_SAFE_SAMPLES:
+        return None
+    safe_ms = safe_sample_count / SAMPLE_RATE * 1000.0
+    need_ms = _PIPELINE_LAG_MIN_SAFE_SAMPLES / SAMPLE_RATE * 1000.0
+    return (
+        "insufficient untouched dialogue span for pipeline lag: "
+        f"{safe_ms:.1f} ms < {need_ms:.1f} ms"
+    )
 
 
 def _signed_projection_gain(
@@ -1320,6 +1374,68 @@ def select_asset(
     return asset_id
 
 
+def _select_reserve_aware_asset(
+    category: str,
+    catalog: dict[str, Any],
+    *,
+    event_index: int,
+    prefer: str,
+    trigger_onset_sample: int,
+    total_samples: int,
+) -> str:
+    """``select_asset``, but passed over in favor of a same-category
+    alternative when the naturally preferred asset's own duration alone
+    would already starve the fixed-stride pipeline-lag evidence reserve
+    ``_apply_density_policy_v2`` requires.
+
+    This is a best-effort pre-filter against one isolated event -- it
+    cannot see what else the plan will end up keeping, so it is not a
+    substitute for the reserve rule in ``_apply_density_policy_v2``, which
+    remains the sole authority and still drops a candidate outright when no
+    available asset in its category actually fits alongside the rest of
+    the kept events.
+    """
+    asset_id = select_asset(category, catalog, event_index=event_index, prefer=prefer)
+
+    def fits_reserve(asset: dict[str, Any]) -> bool:
+        duration = asset.get("duration_samples")
+        anchor = asset.get("transient_anchor_sample")
+        if type(duration) is not int or type(anchor) is not int or not 0 <= anchor < duration:
+            return False
+        event_start = max(0, trigger_onset_sample - anchor)
+        if event_start + duration > total_samples:
+            return False
+        span = _dialogue_untouched_span_samples(
+            [{"event_start_sample": event_start, "duration_samples": duration}],
+            _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES,
+            total_samples,
+        )
+        return span is not None and span >= _PIPELINE_LAG_RESERVE_SAMPLES
+
+    by_asset_id = {
+        asset["asset_id"]: asset
+        for asset in catalog.get("assets", [])
+        if isinstance(asset, dict) and isinstance(asset.get("asset_id"), str)
+    }
+    chosen = by_asset_id.get(asset_id)
+    if chosen is not None and fits_reserve(chosen):
+        return asset_id
+
+    alternatives = [
+        asset for asset in catalog.get("assets", [])
+        if isinstance(asset, dict) and asset.get("category") == category
+    ]
+    alternatives.sort(key=lambda asset: asset.get("asset_id") or "")
+    if prefer == "external":
+        alternatives.sort(key=lambda asset: asset.get("pack") != "external-licensed")
+    for alternative in alternatives:
+        if alternative.get("asset_id") == asset_id:
+            continue
+        if fits_reserve(alternative):
+            return alternative["asset_id"]
+    return asset_id
+
+
 def canonical_trigger(visual_evidence: dict[str, Any]) -> dict[str, Any]:
     """Pick exactly one delivered faithful title trigger from renderer evidence."""
     if not isinstance(visual_evidence, dict) or not isinstance(visual_evidence.get("items"), list):
@@ -1977,6 +2093,18 @@ def _apply_density_policy_v2(
             reason = "category_rate_limit"
         elif len(kept) >= density_cap:
             reason = "clip_density_limit"
+        else:
+            candidate_start = candidate["event_start_sample"]
+            candidate_duration = candidate["duration_samples"]
+            trial_events = kept + [{
+                "event_start_sample": candidate_start,
+                "duration_samples": candidate_duration,
+            }]
+            reserve_span = _dialogue_untouched_span_samples(
+                trial_events, _CANDIDATE_MAX_PIPELINE_LAG_SAMPLES, total_samples
+            )
+            if reserve_span is not None and reserve_span < _PIPELINE_LAG_RESERVE_SAMPLES:
+                reason = "lag_evidence_reserve"
 
         if reason is None:
             kept.append(candidate)
@@ -2538,7 +2666,10 @@ def _stage_multi_event_delivery_v2(
     selected_proposals = []
     for index, proposal in enumerate(proposals):
         category = ROLE_TO_CATEGORY[proposal["role"]]
-        asset_id = select_asset(category, catalog, event_index=index, prefer="external")
+        asset_id = _select_reserve_aware_asset(
+            category, catalog, event_index=index, prefer="external",
+            trigger_onset_sample=proposal["trigger_onset_sample"], total_samples=total_samples,
+        )
         selected_proposals.append({**proposal, "asset_id": asset_id})
 
     hint_list: list[Any] = []
@@ -2556,7 +2687,10 @@ def _stage_multi_event_delivery_v2(
     for index, hint in enumerate(hint_list):
         onset = hint["onset_sample"]
         category = hint["category"]
-        asset_id = select_asset(category, catalog, event_index=index, prefer="external")
+        asset_id = _select_reserve_aware_asset(
+            category, catalog, event_index=index, prefer="external",
+            trigger_onset_sample=onset, total_samples=total_samples,
+        )
         hint_proposals.append({
             "trigger_id": f"sfx-hint-{index:04d}",
             "trigger_onset_sample": onset,
@@ -3799,9 +3933,15 @@ def _verify_multi_event_delivery(
                 pipeline_lag = lag_match[1]
                 dialogue_gain = lag_match[2]
             else:
-                failures.append(
-                    "candidate output: dialogue-controlled pipeline lag unavailable"
+                message = "candidate output: dialogue-controlled pipeline lag unavailable"
+                unavailable_reason = _dialogue_pipeline_lag_unavailable_reason(
+                    candidate_audio.samples,
+                    dialogue_control.samples,
+                    plan_events,
                 )
+                if unavailable_reason is not None:
+                    message = f"{message} ({unavailable_reason})"
+                failures.append(message)
         for event in plan_events:
             if not isinstance(event, dict):
                 continue
@@ -4169,9 +4309,15 @@ def _verify_multi_event_delivery_v2(
                 pipeline_lag = lag_match[1]
                 dialogue_gain = lag_match[2]
             else:
-                failures.append(
-                    "candidate output: dialogue-controlled pipeline lag unavailable"
+                message = "candidate output: dialogue-controlled pipeline lag unavailable"
+                unavailable_reason = _dialogue_pipeline_lag_unavailable_reason(
+                    candidate_audio.samples,
+                    dialogue_control.samples,
+                    events_list,
                 )
+                if unavailable_reason is not None:
+                    message = f"{message} ({unavailable_reason})"
+                failures.append(message)
         for event in events_list:
             if not isinstance(event, dict):
                 continue
