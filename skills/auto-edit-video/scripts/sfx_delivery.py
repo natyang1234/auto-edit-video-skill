@@ -96,6 +96,10 @@ from sfx_mapping import (
     V2_PROCEDURAL_ASSET_CATEGORIES,
     category_rate_limit_window_samples,
 )
+import sfx_import  # noqa: E402
+
+SFX_LIBRARY_ENV = "AUTO_EDIT_SFX_LIBRARY"
+
 _DENSITY_ROLE_ASSETS = {
     "title_enter": "soft-ui-tick-v1",
     "transition": "short-whoosh-v1",
@@ -1011,6 +1015,149 @@ def _generate_v2_procedural_assets(directory: Path) -> tuple[dict[str, dict[str,
     return assets, decoded
 
 
+def _default_sfx_library_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "assets" / "sfx" / "LIBRARY.json"
+
+
+def load_sfx_library(library_path: str | Path | None = None) -> dict[str, Any]:
+    """Load, fully re-verify, and index the external-licensed SFX library.
+
+    Resolution order for ``library_path``: explicit argument, then the
+    ``AUTO_EDIT_SFX_LIBRARY`` environment variable, then the skill's own
+    ``assets/sfx/LIBRARY.json``. Every record's evidence chain is recomputed
+    from disk; any symlink, path escape, hash mismatch, or non-approved
+    record anywhere in the library fails the entire load closed rather than
+    skipping the bad record.
+    """
+    if library_path is not None:
+        resolved = Path(library_path)
+    else:
+        env_override = os.environ.get(SFX_LIBRARY_ENV)
+        resolved = Path(env_override) if env_override else _default_sfx_library_path()
+    if resolved.is_symlink():
+        raise SfxDeliveryError(f"sfx library path must not be a symlink: {resolved}")
+    if not resolved.is_file():
+        raise SfxDeliveryError(f"sfx library not found: {resolved}")
+    sfx_root = resolved.resolve().parent
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            library = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SfxDeliveryError(f"sfx library is not readable JSON: {exc}") from exc
+    if not isinstance(library, dict) or not isinstance(library.get("records"), list):
+        raise SfxDeliveryError("sfx library must be an object with a records array")
+
+    by_asset_id: dict[str, dict[str, Any]] = {}
+    for record in library["records"]:
+        if not isinstance(record, dict):
+            raise SfxDeliveryError("sfx library record must be an object")
+        asset_id = record.get("asset_id")
+        if not isinstance(asset_id, str) or not asset_id:
+            raise SfxDeliveryError("sfx library record is missing asset_id")
+        if asset_id in by_asset_id:
+            raise SfxDeliveryError(f"sfx library has duplicate asset_id: {asset_id}")
+        if record.get("review_state") != "approved_licensed":
+            raise SfxDeliveryError(f"{asset_id}: sfx library record is not approved_licensed")
+
+        expected_hash = record.get("record_sha256")
+        actual_hash = sfx_import.record_hash(record)
+        if actual_hash != expected_hash:
+            raise SfxDeliveryError(f"{asset_id}: sfx library record_sha256 mismatch")
+
+        relative_path = record.get("relative_path")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise SfxDeliveryError(f"{asset_id}: sfx library record is missing relative_path")
+        wav_path = sfx_root / relative_path
+        if wav_path.is_symlink():
+            raise SfxDeliveryError(f"{asset_id}: sfx wav path must not be a symlink: {wav_path}")
+        try:
+            resolved_wav = wav_path.resolve(strict=True)
+        except OSError as exc:
+            raise SfxDeliveryError(f"{asset_id}: sfx wav file missing: {wav_path}") from exc
+        if not resolved_wav.is_relative_to(sfx_root.resolve()):
+            raise SfxDeliveryError(f"{asset_id}: sfx wav path escapes library root: {wav_path}")
+        actual_delivery = sfx_import.sha256_of_file(resolved_wav)
+        if actual_delivery != record.get("delivery_sha256"):
+            raise SfxDeliveryError(f"{asset_id}: sfx library delivery_sha256 mismatch")
+        raw, _ = sfx_import.read_wav_pcm24_stereo(resolved_wav)
+        actual_pcm = sfx_import.sha256_of_bytes(raw)
+        if actual_pcm != record.get("decoded_pcm_sha256"):
+            raise SfxDeliveryError(f"{asset_id}: sfx library decoded_pcm_sha256 mismatch")
+
+        license_block = record.get("license")
+        if not isinstance(license_block, dict):
+            raise SfxDeliveryError(f"{asset_id}: sfx library record is missing license")
+        evidence_file = license_block.get("evidence_file")
+        if not isinstance(evidence_file, str) or not evidence_file:
+            raise SfxDeliveryError(f"{asset_id}: sfx library record is missing license.evidence_file")
+        evidence_path = sfx_root / evidence_file
+        if evidence_path.is_symlink():
+            raise SfxDeliveryError(f"{asset_id}: license evidence path must not be a symlink: {evidence_path}")
+        try:
+            resolved_evidence = evidence_path.resolve(strict=True)
+        except OSError as exc:
+            raise SfxDeliveryError(f"{asset_id}: license evidence missing: {evidence_path}") from exc
+        if not resolved_evidence.is_relative_to(sfx_root.resolve()):
+            raise SfxDeliveryError(f"{asset_id}: license evidence path escapes library root: {evidence_path}")
+        actual_evidence = sfx_import.sha256_of_file(resolved_evidence)
+        if actual_evidence != license_block.get("evidence_sha256"):
+            raise SfxDeliveryError(f"{asset_id}: license evidence_sha256 mismatch")
+
+        by_asset_id[asset_id] = record
+
+    return {
+        "library_path": resolved,
+        "sfx_root": sfx_root,
+        "records": library["records"],
+        "by_asset_id": by_asset_id,
+    }
+
+
+def _external_catalog_asset(record: dict[str, Any]) -> dict[str, Any]:
+    """Project one fully-verified library record into a sfx_catalog v2 asset."""
+    wav = record["wav"]
+    source = record["source"]
+    license_block = record["license"]
+    return {
+        "asset_id": record["asset_id"],
+        "pack": "external-licensed",
+        "role": "content_hint",
+        "category": record["category"],
+        "license": {
+            "name": license_block["name"],
+            "source_url": license_block["source_url"],
+            "commercial_ok": license_block["commercial_ok"],
+            "attribution_required": license_block["attribution_required"],
+        },
+        "library_record_sha256": record["record_sha256"],
+        "source_sha256": record["source_sha256"],
+        "duration_samples": wav["duration_samples"],
+        "transient_anchor_sample": wav["transient_anchor_sample"],
+        "noise_floor_dbfs": wav["noise_floor_dbfs"],
+        "rms_dbfs": wav["rms_dbfs"],
+        "peak_dbfs": wav["peak_dbfs"],
+        "wav_sha256": record["delivery_sha256"],
+        "decoded_pcm_sha256": record["decoded_pcm_sha256"],
+        "provenance": (
+            f"external licensed asset via {source.get('provider', 'unknown')}; "
+            f"source page {source.get('page_url', '')}; author {source.get('author', '')}"
+        ),
+        "review_state": "approved_licensed",
+    }
+
+
+def _copy_staged_external_asset(source_path: Path, dest_path: Path, expected_sha256: str) -> None:
+    if source_path.is_symlink():
+        raise SfxDeliveryError(f"external sfx source must not be a symlink: {source_path}")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_path, dest_path)
+    if dest_path.is_symlink():
+        raise SfxDeliveryError(f"staged external sfx wav must not be a symlink: {dest_path}")
+    actual = sha256_file(dest_path)
+    if actual != expected_sha256:
+        raise SfxDeliveryError(f"staged external sfx wav does not match library evidence: {dest_path.name}")
+
+
 def write_one_cue_stem(
     path: Path,
     *,
@@ -1283,7 +1430,12 @@ def _density_catalog_by_asset_id_v1(catalog: dict[str, Any]) -> dict[str, dict[s
 
 
 def _density_catalog_by_asset_id_v2(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validate and index the Phase 2 procedural catalog without changing it."""
+    """Validate and index the Phase 2+ catalog without changing it.
+
+    Procedural assets must equal the deterministic rebuild, exactly as
+    before. External-licensed assets are independently re-verified against
+    the fully re-hashed sfx library evidence chain rather than rejected.
+    """
     if not isinstance(catalog, dict):
         raise SfxDeliveryError("density policy catalog must be an object")
     catalog_errors = _contract_errors("sfx_catalog", catalog)
@@ -1294,16 +1446,20 @@ def _density_catalog_by_asset_id_v2(catalog: dict[str, Any]) -> dict[str, dict[s
         raise SfxDeliveryError("density policy requires the Phase 2 procedural catalog")
 
     by_asset_id: dict[str, dict[str, Any]] = {}
+    external_assets: list[dict[str, Any]] = []
     for asset in assets:
         if not isinstance(asset, dict):
             raise SfxDeliveryError("density policy catalog asset must be an object")
-        if asset.get("pack") == "external-licensed":
-            raise SfxDeliveryError("external assets not yet supported in verifier")
         asset_id = asset.get("asset_id")
         if not isinstance(asset_id, str) or asset_id in by_asset_id:
             raise SfxDeliveryError("density policy catalog has duplicate asset id")
         by_asset_id[asset_id] = asset
-    if set(by_asset_id) != set(V2_PROCEDURAL_ASSET_IDS):
+        if asset.get("pack") == "external-licensed":
+            external_assets.append(asset)
+
+    external_ids = {asset["asset_id"] for asset in external_assets}
+    procedural_ids = set(by_asset_id) - external_ids
+    if procedural_ids != set(V2_PROCEDURAL_ASSET_IDS):
         raise SfxDeliveryError("density policy catalog is not the complete Phase 2 procedural pack")
     try:
         with tempfile.TemporaryDirectory(prefix="sfx-density-catalog-v2-") as directory:
@@ -1315,6 +1471,18 @@ def _density_catalog_by_asset_id_v2(catalog: dict[str, Any]) -> dict[str, dict[s
             raise SfxDeliveryError(
                 f"density policy catalog asset is not the deterministic procedural asset: {asset_id}"
             )
+
+    if external_assets:
+        library = load_sfx_library()
+        for asset in external_assets:
+            asset_id = asset["asset_id"]
+            record = library["by_asset_id"].get(asset_id)
+            if record is None:
+                raise SfxDeliveryError(f"density policy external asset not found in sfx library: {asset_id}")
+            if asset != _external_catalog_asset(record):
+                raise SfxDeliveryError(
+                    f"density policy external asset does not match sfx library evidence chain: {asset_id}"
+                )
     return by_asset_id
 
 
@@ -1584,9 +1752,7 @@ def _apply_density_policy_v2(
     catalog_by_asset_id = _density_catalog_by_asset_id_v2(catalog)
     seen_trigger_ids: set[str] = set()
     resolved = [
-        _resolve_density_proposal(
-            proposal, catalog_by_asset_id, total_samples, seen_trigger_ids
-        )
+        _resolve_density_proposal(proposal, catalog_by_asset_id, total_samples, seen_trigger_ids)
         for proposal in proposals
     ]
     candidates = sorted(
@@ -2098,6 +2264,8 @@ def _stage_multi_event_delivery_v2(
     timeline_revision: str,
     cut_map_sha256: str,
     dialogue_probe: Path | None = None,
+    *,
+    include_external: bool = True,
 ) -> tuple[Path, Path, Path]:
     """Stage a schema-v3 deterministic multi-event plan from the v2 SFX catalog."""
     stage = Path(stage_dir)
@@ -2113,12 +2281,26 @@ def _stage_multi_event_delivery_v2(
     motion_hash = canonical_motion_plan_hash(evidence_snapshot)
 
     generated_assets, _ = _generate_v2_procedural_assets(stage)
+    external_assets: dict[str, dict[str, Any]] = {}
+    if include_external:
+        library = load_sfx_library()
+        for record in library["records"]:
+            asset_id = record["asset_id"]
+            entry = _external_catalog_asset(record)
+            source_path = library["sfx_root"] / record["relative_path"]
+            dest_path = stage / f"{asset_id}.wav"
+            _copy_staged_external_asset(source_path, dest_path, record["delivery_sha256"])
+            external_assets[asset_id] = entry
+
     catalog = {
         "schema_version": 2,
         "sample_rate": SAMPLE_RATE,
         "channels": CHANNELS,
         "sample_width_bytes": SAMPLE_WIDTH,
-        "assets": [generated_assets[asset_id] for asset_id in V2_PROCEDURAL_ASSET_IDS],
+        "assets": (
+            [generated_assets[asset_id] for asset_id in V2_PROCEDURAL_ASSET_IDS]
+            + [external_assets[asset_id] for asset_id in sorted(external_assets)]
+        ),
     }
     catalog_errors = _contract_errors("sfx_catalog", catalog)
     if catalog_errors:
@@ -2173,6 +2355,7 @@ def _stage_multi_event_delivery_v2(
         asset_id: stage / V2_PROCEDURAL_ASSET_FILENAMES[asset_id]
         for asset_id in V2_PROCEDURAL_ASSET_IDS
     }
+    asset_paths.update({asset_id: stage / f"{asset_id}.wav" for asset_id in external_assets})
     if dialogue_probe is not None:
         ducks = dialogue_priority_ducks(
             events, asset_paths, decode_s24le_wav(Path(dialogue_probe))
@@ -2222,6 +2405,7 @@ def stage_multi_event_delivery(
     dialogue_probe: Path | None = None,
     *,
     catalog_profile: str = "v1",
+    include_external: bool = True,
 ) -> tuple[Path, Path, Path]:
     if catalog_profile == "v1":
         return _stage_multi_event_delivery_v1(
@@ -2229,7 +2413,8 @@ def stage_multi_event_delivery(
         )
     if catalog_profile == "v2":
         return _stage_multi_event_delivery_v2(
-            stage_dir, visual_evidence, timeline_revision, cut_map_sha256, dialogue_probe
+            stage_dir, visual_evidence, timeline_revision, cut_map_sha256, dialogue_probe,
+            include_external=include_external,
         )
     raise SfxDeliveryError(f"unknown SFX catalog profile: {catalog_profile!r}")
 
@@ -3519,6 +3704,32 @@ def _verify_multi_event_delivery_v2(
         except SfxDeliveryError as exc:
             failures.append(str(exc))
 
+    if isinstance(catalog, dict) and not failures:
+        stage_dir = Path(plan_path).parent
+        for asset in catalog.get("assets", []):
+            if not isinstance(asset, dict) or asset.get("pack") != "external-licensed":
+                continue
+            asset_id = asset.get("asset_id")
+            staged_wav = stage_dir / f"{asset_id}.wav"
+            if staged_wav.is_symlink():
+                failures.append(f"staged external sfx wav must not be a symlink: {asset_id}")
+                continue
+            try:
+                staged_bytes = staged_wav.read_bytes()
+            except OSError as exc:
+                failures.append(f"staged external sfx wav is unreadable: {asset_id} ({exc})")
+                continue
+            if sha256_bytes(staged_bytes) != asset.get("wav_sha256"):
+                failures.append(f"staged external sfx wav does not match catalog wav_sha256: {asset_id}")
+                continue
+            try:
+                staged_decoded = decode_s24le_wav_bytes(staged_bytes, source=str(staged_wav))
+            except SfxDeliveryError as exc:
+                failures.append(f"staged external sfx wav: {asset_id}: {exc}")
+                continue
+            if sha256_bytes(staged_decoded.pcm) != asset.get("decoded_pcm_sha256"):
+                failures.append(f"staged external sfx wav decoded PCM does not match catalog: {asset_id}")
+
     if isinstance(catalog, dict):
         catalog_revision_sha256 = _canonical_hash(catalog)
         observed_hashes["catalog_revision_sha256"] = catalog_revision_sha256
@@ -3564,6 +3775,13 @@ def _verify_multi_event_delivery_v2(
                     asset_id: Path(directory) / V2_PROCEDURAL_ASSET_FILENAMES[asset_id]
                     for asset_id in V2_PROCEDURAL_ASSET_IDS
                 }
+                asset_paths.update(
+                    {
+                        asset_id: stage_dir / f"{asset_id}.wav"
+                        for asset_id, asset in catalog_by_asset_id.items()
+                        if asset.get("pack") == "external-licensed"
+                    }
+                )
                 rebuilt_path = Path(directory) / "rebuilt_sfx_stem.wav"
                 rebuilt = _write_multi_event_stem(
                     rebuilt_path,

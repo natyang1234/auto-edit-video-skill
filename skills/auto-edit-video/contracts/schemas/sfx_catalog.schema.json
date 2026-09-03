@@ -108,7 +108,7 @@
           "duration_samples": {
             "type": "integer",
             "minimum": 1920,
-            "maximum": 72000
+            "maximum": 96000
           },
           "transient_anchor_sample": {
             "type": "integer",

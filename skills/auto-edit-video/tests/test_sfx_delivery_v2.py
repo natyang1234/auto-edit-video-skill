@@ -129,7 +129,7 @@ class StageMultiEventDeliveryV2Tests(unittest.TestCase):
         revision, cut_hash = "a" * 64, "b" * 64
         with tempfile.TemporaryDirectory() as directory:
             plan_path, catalog_path, stem_path = sfx_delivery.stage_multi_event_delivery(
-                Path(directory), evidence, revision, cut_hash, catalog_profile="v2"
+                Path(directory), evidence, revision, cut_hash, catalog_profile="v2", include_external=False
             )
             import json
 
@@ -183,41 +183,41 @@ class StageMultiEventDeliveryV2Tests(unittest.TestCase):
 
 
 class DensityCatalogExternalAssetFailClosedTests(unittest.TestCase):
-    def test_external_asset_in_v2_catalog_fails_closed_with_exact_message(self) -> None:
-        catalog = {
-            "schema_version": 2,
-            "sample_rate": 48000,
-            "channels": 2,
-            "sample_width_bytes": 3,
-            "assets": [
-                {
-                    "asset_id": "some-external-v1",
-                    "pack": "external-licensed",
-                    "role": "content_hint",
-                    "category": "cash_coin",
-                    "duration_samples": 4800,
-                    "transient_anchor_sample": 0,
-                    "noise_floor_dbfs": -90.0,
-                    "rms_dbfs": -18.0,
-                    "peak_dbfs": -3.0,
-                    "wav_sha256": "a" * 64,
-                    "decoded_pcm_sha256": "b" * 64,
-                    "provenance": "external test fixture",
-                    "review_state": "approved_licensed",
-                    "license": {
-                        "name": "test-license",
-                        "source_url": "https://example.invalid/license",
-                        "commercial_ok": True,
-                        "attribution_required": False,
-                    },
-                    "library_record_sha256": "c" * 64,
-                    "source_sha256": "d" * 64,
-                }
-            ],
-        }
+    def test_external_asset_not_in_sfx_library_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, catalog_path, _ = sfx_delivery.stage_multi_event_delivery(
+                Path(directory), _multi_event_visual_evidence(), "a" * 64, "b" * 64,
+                catalog_profile="v2", include_external=False,
+            )
+            import json
+
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["assets"].append({
+            "asset_id": "unknown-external-v1",
+            "pack": "external-licensed",
+            "role": "content_hint",
+            "category": "cash_coin",
+            "duration_samples": 4800,
+            "transient_anchor_sample": 0,
+            "noise_floor_dbfs": -90.0,
+            "rms_dbfs": -18.0,
+            "peak_dbfs": -3.0,
+            "wav_sha256": "a" * 64,
+            "decoded_pcm_sha256": "b" * 64,
+            "provenance": "external test fixture",
+            "review_state": "approved_licensed",
+            "license": {
+                "name": "test-license",
+                "source_url": "https://example.invalid/license",
+                "commercial_ok": True,
+                "attribution_required": False,
+            },
+            "library_record_sha256": "c" * 64,
+            "source_sha256": "d" * 64,
+        })
         with self.assertRaises(sfx_delivery.SfxDeliveryError) as ctx:
             sfx_delivery._density_catalog_by_asset_id_v2(catalog)
-        self.assertEqual(str(ctx.exception), "external assets not yet supported in verifier")
+        self.assertIn("unknown-external-v1", str(ctx.exception))
 
 
 class SelectAssetTests(unittest.TestCase):
