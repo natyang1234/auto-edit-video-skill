@@ -63,6 +63,11 @@ def make_full_record(sfx_root: Path, asset_id: str = "unit-test-tone-v1") -> dic
     evidence_path = licenses_dir / "test-license.md"
     evidence_path.write_text("test license evidence\n", encoding="utf-8")
 
+    evidence_dir = sfx_root / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    source_evidence_path = evidence_dir / f"{asset_id}.md"
+    source_evidence_path.write_text("test source acquisition evidence\n", encoding="utf-8")
+
     raw, _ = si.read_wav_pcm24_stereo(wav_path)
     metrics = si.compute_metrics(si.frames_from_raw(raw, len(frames)))
     metrics.pop("_peak_linear", None)
@@ -81,7 +86,20 @@ def make_full_record(sfx_root: Path, asset_id: str = "unit-test-tone-v1") -> dic
         "source_sha256": "0" * 64,
         "delivery_sha256": si.sha256_of_file(wav_path),
         "decoded_pcm_sha256": si.sha256_of_bytes(raw),
-        "normalizer": {"tool": "ffmpeg", "version": "ffmpeg version test", "params": ["dummy"]},
+        "normalizer": {
+            "tool": "ffmpeg",
+            "version": "ffmpeg version test",
+            "params": {
+                "sample_rate": 48000,
+                "channels": 2,
+                "bit_depth": 24,
+                "silence_threshold_dbfs": si.SILENCE_THRESHOLD_DBFS,
+                "head_pad_samples": si.HEAD_PAD_SAMPLES,
+                "tail_pad_samples": si.TAIL_PAD_SAMPLES,
+                "target_peak_dbfs": si.TARGET_PEAK_DBFS,
+                "ffmpeg_version": "ffmpeg version test",
+            },
+        },
         "wav": {
             "sample_rate": 48000,
             "channels": 2,
@@ -102,8 +120,13 @@ def make_full_record(sfx_root: Path, asset_id: str = "unit-test-tone-v1") -> dic
         },
         "approval": {
             "approver": "claude-code-on-behalf-of-nat",
+            "authority": "nat (delegated 2026-09-03)",
             "approved_at": "2026-09-03T00:00:00Z",
             "basis": "license snapshot + source page",
+            "evidence_file": "licenses/test-license.md",
+            "evidence_sha256": si.sha256_of_file(evidence_path),
+            "source_evidence_file": f"evidence/{asset_id}.md",
+            "source_evidence_sha256": si.sha256_of_file(source_evidence_path),
         },
         "review_state": "approved_licensed",
         "relative_path": f"{category}/{asset_id}.wav",
@@ -287,13 +310,22 @@ class EndToEndImportTests(unittest.TestCase):
             "--author", "unit-test-author",
             "--license", "pixabay-content-license",
             "--license-evidence", str(self._license_evidence(tmp)),
+            "--source-evidence", str(self._source_evidence(tmp, asset_id)),
             "--library", str(library),
+            "--approver", "unit-test-approver",
+            "--approved-by-authority", "unit-test-authority (delegated 2026-09-03)",
         ])
         return rc, library
 
     def _license_evidence(self, tmp: Path) -> Path:
-        evidence = tmp / "license.md"
+        evidence = tmp / "assets" / "sfx" / "licenses" / "test-license.md"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
         evidence.write_text("test license\n", encoding="utf-8")
+        return evidence
+
+    def _source_evidence(self, tmp: Path, asset_id: str) -> Path:
+        evidence = tmp / f"{asset_id}-source-evidence.md"
+        evidence.write_text("test source acquisition evidence\n", encoding="utf-8")
         return evidence
 
     def test_import_succeeds_and_verifies(self) -> None:
@@ -349,7 +381,10 @@ class EndToEndImportTests(unittest.TestCase):
                 "--author", "unit-test-author",
                 "--license", "pixabay-content-license",
                 "--license-evidence", str(self._license_evidence(tmp_path)),
+                "--source-evidence", str(self._source_evidence(tmp_path, "too-short-v1")),
                 "--library", str(library),
+                "--approver", "unit-test-approver",
+                "--approved-by-authority", "unit-test-authority (delegated 2026-09-03)",
             ])
             self.assertNotEqual(rc, 0)
             self.assertFalse(library.exists())

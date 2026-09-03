@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 from sfx_mapping import (
     ROLE_TO_CATEGORY,
+    SFX_CATEGORIES,
     V2_PROCEDURAL_ASSET_CATEGORIES,
     V2_PROCEDURAL_ASSET_GENERATORS,
     V2_PROCEDURAL_ASSET_IDS,
@@ -1313,13 +1314,15 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
         errors.append("$: schema v2 requires mix_mode and density evidence")
 
     catalog_revision_sha256 = artifact.get("catalog_revision_sha256")
-    if catalog_revision_sha256 is not None:
+    if version == 3:
         if (
             not isinstance(catalog_revision_sha256, str)
             or len(catalog_revision_sha256) != 64
             or any(char not in "0123456789abcdef" for char in catalog_revision_sha256)
         ):
-            errors.append("$.catalog_revision_sha256: must be 64 lowercase hex characters")
+            errors.append("$.catalog_revision_sha256: schema v3 requires 64 lowercase hex characters")
+    elif catalog_revision_sha256 is not None:
+        errors.append(f"$.catalog_revision_sha256: schema v{version} must not contain this field")
 
     sfx_hints_sha256 = artifact.get("sfx_hints_sha256")
     if sfx_hints_sha256 is not None:
@@ -1436,11 +1439,8 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
                 errors.append(f"{path}: expected transient is outside 3840-sample trigger tolerance")
         duration = event.get("duration_samples")
         stem_count = artifact.get("sfx_stem_sample_count")
-        is_out_of_range_hint_drop = event.get("role") == "content_hint" and event.get("reason") == "hint_out_of_range"
         if all(type(value) is int for value in (start, duration, stem_count)):
-            if start < 0 or duration <= 0:
-                errors.append(f"{path}: event is outside sfx stem bounds")
-            elif start + duration > stem_count and not is_out_of_range_hint_drop:
+            if start < 0 or duration <= 0 or start + duration > stem_count:
                 errors.append(f"{path}: event is outside sfx stem bounds")
         if is_v2 and all(type(value) is int for value in (anchor, duration)) and not 0 <= anchor < duration:
             errors.append(f"{path}.asset_transient_anchor_sample: must be below duration_samples")
@@ -1453,6 +1453,7 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
         evidence = event.get("evidence")
         trigger = evidence.get("trigger") if isinstance(evidence, dict) else None
         if not isinstance(trigger, dict):
+            errors.append(f"{path}.evidence.trigger: schema v{version} requires complete renderer trigger evidence")
             return None, None
         if trigger.get("id") != trigger_id:
             errors.append(f"{path}.evidence.trigger.id: does not match trigger_id")
@@ -1532,7 +1533,9 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
             errors.append(f"{path}: role/asset does not match normalized renderer evidence")
         return trigger, (start, start + duration, trigger_id) if type(start) is int and type(duration) is int else None
 
-    def validate_hint_event(event, path: str) -> tuple[int, int, str] | None:
+    def validate_hint_event(
+        event, path: str, *, dropped_reason: str | None = None
+    ) -> tuple[int, int, str] | None:
         """Schema v3 content_hint events: no renderer trigger, evidence is a hint."""
         if not isinstance(event, dict):
             return None
@@ -1551,9 +1554,17 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
                 errors.append(f"{path}: expected transient is outside 3840-sample trigger tolerance")
         duration = event.get("duration_samples")
         stem_count = artifact.get("sfx_stem_sample_count")
+        claims_out_of_range = dropped_reason == "hint_out_of_range"
         if all(type(value) is int for value in (start, duration, stem_count)):
-            if start < 0 or duration <= 0 or start + duration > stem_count:
+            out_of_range = start + duration > stem_count
+            if start < 0 or duration <= 0:
                 errors.append(f"{path}: event is outside sfx stem bounds")
+            elif out_of_range and not claims_out_of_range:
+                errors.append(f"{path}: event is outside sfx stem bounds")
+            elif claims_out_of_range and not out_of_range:
+                errors.append(f"{path}.reason: hint_out_of_range requires the event to exceed sfx stem bounds")
+        elif claims_out_of_range:
+            errors.append(f"{path}.reason: hint_out_of_range requires resolvable stem bounds")
         if all(type(value) is int for value in (anchor, duration)) and not 0 <= anchor < duration:
             errors.append(f"{path}.asset_transient_anchor_sample: must be below duration_samples")
         fades = event.get("fades")
@@ -1579,12 +1590,27 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
         evidence = event.get("evidence")
         hint = evidence.get("hint") if isinstance(evidence, dict) else None
         if not isinstance(hint, dict):
+            errors.append(f"{path}.evidence.hint: complete hint evidence is required")
             return None
         if hint.get("onset_sample") != trigger_onset:
             errors.append(f"{path}.evidence.hint.onset_sample: does not match trigger_onset_sample")
         category = event.get("category")
-        if category != hint.get("category"):
+        if category not in SFX_CATEGORIES:
+            errors.append(f"{path}.category: must be a recognized SFX category")
+        elif category != hint.get("category"):
             errors.append(f"{path}.category: must match evidence.hint.category")
+        asset_id = event.get("asset_id")
+        if not isinstance(asset_id, str) or not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+", asset_id):
+            errors.append(f"{path}.asset_id: does not match expected asset id pattern")
+        elif catalog is not None:
+            catalog_asset = next(
+                (a for a in catalog.get("assets", []) if isinstance(a, dict) and a.get("asset_id") == asset_id),
+                None,
+            )
+            if catalog_asset is None:
+                errors.append(f"{path}.asset_id: not found in catalog")
+            elif category is not None and catalog_asset.get("category") != category:
+                errors.append(f"{path}.asset_id: catalog asset category does not match event category")
         return (start, start + duration, trigger_id) if type(start) is int and type(duration) is int else None
 
     seen_ids: set[str] = set()
@@ -1738,7 +1764,21 @@ def semantic_audio_event_plan(artifact, catalog=None) -> list[str]:
         if item.get("trigger_id") in dropped_by_id:
             errors.append("$.density.dropped: duplicate trigger id")
         dropped_by_id[item.get("trigger_id")] = item
-        _, _ = validate_event({**item, "id": f"dropped-{item.get('trigger_id')}", "gain_db": -12, "fades": {"in_samples": 0, "out_samples": 0}, "duck_group": "dialogue_priority", "review_state": "approved_generated", "reason": reason}, f"$.density.dropped[{dropped.index(item)}]", is_v2=True)
+        drop_path = f"$.density.dropped[{dropped.index(item)}]"
+        drop_evidence = item.get("evidence")
+        fabricated_drop = {
+            **item,
+            "id": f"dropped-{item.get('trigger_id')}",
+            "gain_db": -12,
+            "fades": {"in_samples": 0, "out_samples": 0},
+            "duck_group": "dialogue_priority",
+            "review_state": "approved_generated",
+            "reason": reason,
+        }
+        if version == 3 and isinstance(drop_evidence, dict) and "hint" in drop_evidence:
+            validate_hint_event(fabricated_drop, drop_path, dropped_reason=reason)
+        else:
+            validate_event(fabricated_drop, drop_path, is_v2=True)
     if density.get("dropped_reasons") != reason_counts:
         errors.append("$.density.dropped_reasons: does not match dropped evidence")
     if set(kept_ids) & set(dropped_ids):

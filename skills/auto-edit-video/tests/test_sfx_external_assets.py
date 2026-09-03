@@ -63,6 +63,11 @@ def _make_record(
     evidence_path = licenses_dir / f"{asset_id}-license.md"
     evidence_path.write_text(f"test license evidence for {asset_id}\n", encoding="utf-8")
 
+    evidence_dir = sfx_root / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    source_evidence_path = evidence_dir / f"{asset_id}.md"
+    source_evidence_path.write_text(f"test source acquisition evidence for {asset_id}\n", encoding="utf-8")
+
     raw, _ = sfx_import.read_wav_pcm24_stereo(wav_path)
     metrics = sfx_import.compute_metrics(sfx_import.frames_from_raw(raw, nframes))
     metrics.pop("_peak_linear", None)
@@ -81,7 +86,20 @@ def _make_record(
         "source_sha256": "0" * 64,
         "delivery_sha256": sfx_import.sha256_of_file(wav_path),
         "decoded_pcm_sha256": sfx_import.sha256_of_bytes(raw),
-        "normalizer": {"tool": "ffmpeg", "version": "ffmpeg version test", "params": ["dummy"]},
+        "normalizer": {
+            "tool": "ffmpeg",
+            "version": "ffmpeg version test",
+            "params": {
+                "sample_rate": 48000,
+                "channels": 2,
+                "bit_depth": 24,
+                "silence_threshold_dbfs": sfx_import.SILENCE_THRESHOLD_DBFS,
+                "head_pad_samples": sfx_import.HEAD_PAD_SAMPLES,
+                "tail_pad_samples": sfx_import.TAIL_PAD_SAMPLES,
+                "target_peak_dbfs": sfx_import.TARGET_PEAK_DBFS,
+                "ffmpeg_version": "ffmpeg version test",
+            },
+        },
         "wav": {
             "sample_rate": 48000,
             "channels": 2,
@@ -102,8 +120,13 @@ def _make_record(
         },
         "approval": {
             "approver": "claude-code-on-behalf-of-nat",
+            "authority": "nat (delegated 2026-09-03)",
             "approved_at": "2026-09-03T00:00:00Z",
             "basis": "license snapshot + source page",
+            "evidence_file": f"licenses/{asset_id}-license.md",
+            "evidence_sha256": sfx_import.sha256_of_file(evidence_path),
+            "source_evidence_file": f"evidence/{asset_id}.md",
+            "source_evidence_sha256": sfx_import.sha256_of_file(source_evidence_path),
         },
         "review_state": "approved_licensed",
         "relative_path": f"{category}/{asset_id}.wav",

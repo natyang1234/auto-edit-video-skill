@@ -3,9 +3,11 @@
 External, externally-licensed SFX imported by `scripts/sfx_import.py`. Each
 delivered WAV in `<category>/<asset_id>.wav` has a matching record in
 `LIBRARY.json` with source provenance, three hashes (source mp3,
-delivered wav, decoded PCM), normalizer params, audio metrics, license
-evidence, and approval metadata. Original source mp3 files are not stored in
-this repo; only their sha256 is retained in each record's `source_sha256`.
+delivered wav, decoded PCM), normalizer params (logical settings only — no
+file paths), audio metrics, license evidence, and an approval block backed
+by two independently verifiable evidence files. Original source mp3 files
+are not stored in this repo; only their sha256 is retained in each record's
+`source_sha256`.
 
 ## Add a new asset
 
@@ -19,12 +21,32 @@ python3 scripts/sfx_import.py import \
   --author <name> \
   --license pixabay-content-license \
   --license-evidence assets/sfx/licenses/pixabay-content-license-2026-09-03.md \
-  --library assets/sfx/LIBRARY.json
+  --source-evidence <path-to-per-asset-acquisition-evidence.md> \
+  --library assets/sfx/LIBRARY.json \
+  --approver <who ran this import> \
+  --approved-by-authority <who externally authorized this batch, e.g. "nat (delegated 2026-09-03)">
 ```
 
 `asset-id` must match `^[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$`. Duplicate
 `asset-id` values are rejected. Normalization is deterministic: importing the
 same source twice produces byte-identical WAV output.
+
+`--approver` and `--approved-by-authority` have no default and must be
+non-blank — approval can no longer be silently self-claimed. `--license-evidence`
+must already live inside the `assets/sfx/` tree (the license-summary-page
+snapshot backing the license claim). `--source-evidence` is a per-asset
+acquisition-evidence file (source page URL, author, title/slug, file URL,
+acquisition time and method, `source_sha256`, and the page's license
+declaration text as it read at acquisition time); the CLI copies it into the
+canonical location `assets/sfx/evidence/<asset_id>.md` and hashes that copy.
+The resulting `approval` block records `evidence_file`/`evidence_sha256`
+(the license snapshot) and `source_evidence_file`/`source_evidence_sha256`
+(the per-asset acquisition evidence) alongside `approver`, `authority`,
+`approved_at`, and `basis` — every one of these six fields is required and
+checked by both `verify` and `sfx_delivery.load_sfx_library()`. The import
+also refuses to write a record containing `/private/`, `/tmp/`, or `/Users/`
+anywhere in it, so no local/scratch filesystem path can leak into
+`LIBRARY.json`.
 
 ## Verify
 
@@ -35,7 +57,11 @@ python3 scripts/sfx_import.py verify --library assets/sfx/LIBRARY.json
 Recomputes `delivery_sha256`, `decoded_pcm_sha256`, license
 `evidence_sha256`, and `record_sha256` for every record and fails (non-zero
 exit) on any mismatch, including tampering with a delivered WAV or a hand
-edited `LIBRARY.json`.
+edited `LIBRARY.json`. Also checks that every `approval` field is present
+and non-empty, that `approval.approved_at` is ISO 8601, and that both the
+license-snapshot evidence and the per-asset source-acquisition evidence
+resolve (no symlink, no path escape) to files whose sha256 matches the
+recorded hash.
 
 ## License
 

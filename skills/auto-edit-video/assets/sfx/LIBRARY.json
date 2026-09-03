@@ -3,9 +3,14 @@
   "records": [
     {
       "approval": {
-        "approved_at": "2026-09-03T12:32:18Z",
+        "approved_at": "2026-09-03T20:13:39Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/cash-register-kaching-v1.md",
+        "source_evidence_sha256": "4dc11566b6ff39264e396555de560f27cea40d157577087342f167a8fed78913"
       },
       "asset_id": "cash-register-kaching-v1",
       "category": "cash_coin",
@@ -20,16 +25,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/cash-register-kaching-376867.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-oj134m8b/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-oj134m8b/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=3345:end_sample=51930,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-oj134m8b/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-oj134m8b/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-2.447135dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/cash_coin/cash-register-kaching-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "fe23a11606a3e6e0a2d041ba55aaeff3cc2eebe7cc6dc1fd3d64792e5bd61064",
+      "record_sha256": "dcb93b89c0250dcb421197c51fa88adaeb37b2e32074b82f20fe0e9e36448e42",
       "relative_path": "cash_coin/cash-register-kaching-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -53,9 +63,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:33:31Z",
+        "approved_at": "2026-09-03T20:13:39Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/clean-minimal-pop-v1.md",
+        "source_evidence_sha256": "28fad0fe83435a473530a27274bec09b3d1822c39beca2e6a832b63512a29534"
       },
       "asset_id": "clean-minimal-pop-v1",
       "category": "click_pop",
@@ -70,16 +85,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/clean-minimal-pop-467466.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-r9krreu4/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-r9krreu4/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=6992:end_sample=78336,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-r9krreu4/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-r9krreu4/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-3.000000dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/click_pop/clean-minimal-pop-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "f4683488e73a93c71e2ceecf384e5b027335ab6b0b21931b4095309fb21d7f94",
+      "record_sha256": "2dd0829509ed0b50e825287b030a812cf0685f8f5c5a2054baf36f251f422404",
       "relative_path": "click_pop/clean-minimal-pop-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -103,9 +123,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:34:24Z",
+        "approved_at": "2026-09-03T20:13:40Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/combat-impact-v1.md",
+        "source_evidence_sha256": "0db27f2e40a15efe158f190f5c136aec3ecda07689446eb565ae042e4d9737e5"
       },
       "asset_id": "combat-impact-v1",
       "category": "impact_hit",
@@ -120,16 +145,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/combat-impact-352458.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-puw7kdzs/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-puw7kdzs/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=2253:end_sample=36644,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-puw7kdzs/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-puw7kdzs/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=0.182738dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/impact_hit/combat-impact-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "e820642eaeac1b11cb9f00b6a8cacfb4638b89b397ef96e04ab09fe234508552",
+      "record_sha256": "53ea2faf79c8af7c180f6c50d5f4df4ea00d2d9842f70b06ea3dd8ff0e290fb5",
       "relative_path": "impact_hit/combat-impact-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -153,9 +183,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:35:35Z",
+        "approved_at": "2026-09-03T20:13:41Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/digital-glitch-noise-hd-v1.md",
+        "source_evidence_sha256": "7f4ad5ab0d039207b53bbfea0118c546bf816031be0a952653bbf93378e5cdcd"
       },
       "asset_id": "digital-glitch-noise-hd-v1",
       "category": "error_glitch",
@@ -170,16 +205,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/digital-glitch-noise-hd-379465.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-23vvk3v6/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-23vvk3v6/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=1157:end_sample=52308,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-23vvk3v6/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-23vvk3v6/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-2.231046dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/error_glitch/digital-glitch-noise-hd-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "7b7f1e1092fe77a51fe6021a6c435c3d8e966e8f505d0364faad333d9e818d31",
+      "record_sha256": "56216378f2341d00a9e771209343546062eb3db88c85f7d59cb5cc73cd49fcae",
       "relative_path": "error_glitch/digital-glitch-noise-hd-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -203,9 +243,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:35:29Z",
+        "approved_at": "2026-09-03T20:13:41Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/ding-sfx-v1.md",
+        "source_evidence_sha256": "8ae0521eab94a457cf0fa546faf2dfea47a4738e0190bb964e98546e5c6ac04f"
       },
       "asset_id": "ding-sfx-v1",
       "category": "success_ding",
@@ -220,16 +265,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/ding-sfx-472366.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-311ut23a/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-311ut23a/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=41:end_sample=81792,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-311ut23a/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-311ut23a/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=2.588913dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/success_ding/ding-sfx-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "e3b6d5a66d6de592406718753c3d080b85e9185d37aba3378a1be000217b849b",
+      "record_sha256": "729c318accec0c93566425662323b7771bd0fa49517907f7adac0d817591c416",
       "relative_path": "success_ding/ding-sfx-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -253,9 +303,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:35:35Z",
+        "approved_at": "2026-09-03T20:13:41Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/error-sound-v1.md",
+        "source_evidence_sha256": "a7175698e26ce5816bcccecb376097f9dced896103b6403ca4e42d56ef5c6f11"
       },
       "asset_id": "error-sound-v1",
       "category": "error_glitch",
@@ -270,16 +325,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/error-sound-390301.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-_41z4ccg/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-_41z4ccg/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=2152:end_sample=76487,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-_41z4ccg/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-_41z4ccg/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=1.232469dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/error_glitch/error-sound-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "d0a9ef0c7711081d08265273e1b5e9435cb3f16bf3533d35278b324dbde6e9df",
+      "record_sha256": "971e0b26f45c05f069db0c7b5e71d9a41d646e87b211bebc9545002230893895",
       "relative_path": "error_glitch/error-sound-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -303,9 +363,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:33:10Z",
+        "approved_at": "2026-09-03T20:13:39Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/pop-v1.md",
+        "source_evidence_sha256": "5c832241a5e4e61f5d23d4a77a533f695d0cdc102b126770ad5ff1ad595ce358"
       },
       "asset_id": "pop-v1",
       "category": "click_pop",
@@ -320,16 +385,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/pop-423717.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-kz3ia4ar/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-kz3ia4ar/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=6550:end_sample=14953,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-kz3ia4ar/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-kz3ia4ar/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-3.000000dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/click_pop/pop-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "5a3291ba15779342b37f7e3a7bacf4e040e16b9d776f8fa9bd9d236333a1f545",
+      "record_sha256": "518824a3038a19216f8496e7456953a35866133b2141da746f8b47d3cf4a7d84",
       "relative_path": "click_pop/pop-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -353,9 +423,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:34:14Z",
+        "approved_at": "2026-09-03T20:13:40Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/punch-impact-hit-v1.md",
+        "source_evidence_sha256": "b86fe8be0a6022a5013f9ca4bfc6104498a39da31f3718d85e3ac6e0f10c88e0"
       },
       "asset_id": "punch-impact-hit-v1",
       "category": "impact_hit",
@@ -370,16 +445,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/punch-impact-hit-567196.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-6zxhz_xk/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-6zxhz_xk/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=2113:end_sample=53825,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-6zxhz_xk/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-6zxhz_xk/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-2.999999dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/impact_hit/punch-impact-hit-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "402d012d83139a131e0f3b0862b5d1ae7b918b2823a3c8a85104579ae79ee6b6",
+      "record_sha256": "ba7b951603dbe09b0b549633d1c8cb2928f9d2916a6575b02efdfff88ed8f856",
       "relative_path": "impact_hit/punch-impact-hit-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -403,9 +483,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:33:08Z",
+        "approved_at": "2026-09-03T20:13:39Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/register-cha-ching-v1.md",
+        "source_evidence_sha256": "5a8ce177242f990a3f262c0c0d8896e20cc457d7f60c26e8d126070fb681ffe2"
       },
       "asset_id": "register-cha-ching-v1",
       "category": "cash_coin",
@@ -420,16 +505,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/register-cha-ching-376896.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-nfnvhub_/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-nfnvhub_/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=2986:end_sample=50226,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-nfnvhub_/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-nfnvhub_/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-0.283901dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/cash_coin/register-cha-ching-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "e796b94e249e53c98274a6a51bf4434bf71dfe4201eeec6a1c5ceb9f095fa628",
+      "record_sha256": "ac7e87503d1298399b45ffd3bd6f29e79fad9a183fcaafbb6501d59b3a7783f8",
       "relative_path": "cash_coin/register-cha-ching-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -453,9 +543,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:34:33Z",
+        "approved_at": "2026-09-03T20:13:40Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/ui-success-chime-v1.md",
+        "source_evidence_sha256": "9f351d8d3b0ff525f68f5f7039375148d62bfabe6a7580ba910073830466eeb6"
       },
       "asset_id": "ui-success-chime-v1",
       "category": "success_ding",
@@ -470,16 +565,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/ui-success-chime-513565.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-djipfs3h/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-djipfs3h/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=962:end_sample=33264,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-djipfs3h/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-djipfs3h/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=8.788307dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/success_ding/ui-success-chime-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "6b616c12dca2d959e80e56b13904a8e998e3a82a0381520b5dfaad12f973d62b",
+      "record_sha256": "5dedb53785239589020f87521e2cd2e41680f9a8a8c4d3ff9e94e1614b9cd58d",
       "relative_path": "success_ding/ui-success-chime-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -503,9 +603,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:33:59Z",
+        "approved_at": "2026-09-03T20:13:40Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/whoosh-effect-v1.md",
+        "source_evidence_sha256": "c7040bda0e7816e21e3889fbf394ea8cb6e50aaf922c9cddbee9aba815552be7"
       },
       "asset_id": "whoosh-effect-v1",
       "category": "whoosh",
@@ -520,16 +625,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/whoosh-effect-405447.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-e0fxpvqr/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-e0fxpvqr/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=865:end_sample=49536,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-e0fxpvqr/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-e0fxpvqr/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-3.000000dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/whoosh/whoosh-effect-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "f8c7792b7079148f8c4a3f0d4b75a5b1819325b6f7a6b32d1dee3e178f008b48",
+      "record_sha256": "5094f5e8c46d71c201868e4163f4ab4db00db7e463c22a2e659de26025c8da5e",
       "relative_path": "whoosh/whoosh-effect-v1.wav",
       "review_state": "approved_licensed",
       "source": {
@@ -553,9 +663,14 @@
     },
     {
       "approval": {
-        "approved_at": "2026-09-03T12:33:45Z",
+        "approved_at": "2026-09-03T20:13:40Z",
         "approver": "claude-code-on-behalf-of-nat",
-        "basis": "license snapshot + source page"
+        "authority": "nat (delegated 2026-09-03)",
+        "basis": "license snapshot + source page",
+        "evidence_file": "licenses/pixabay-content-license-2026-09-03.md",
+        "evidence_sha256": "02458d67dca9eb1656b89230f85129f818dbac83de8ed74276ed74989213ef2b",
+        "source_evidence_file": "evidence/whoosh-motion-v1.md",
+        "source_evidence_sha256": "47a4f7a58d2d6b525d29c6eca6e51c3a05ad5bc9bb4d2691e2b6f19833c8c8d6"
       },
       "asset_id": "whoosh-motion-v1",
       "category": "whoosh",
@@ -570,16 +685,21 @@
         "source_url": "https://pixabay.com/service/license-summary/"
       },
       "normalizer": {
-        "params": [
-          "-i /private/tmp/claude-501/-Users-nai/fceea750-afcd-45a0-aa45-bf30d3330055/scratchpad/sfx_raw/whoosh-motion-405445.mp3 -fflags +bitexact -flags:a +bitexact -map_metadata -1 -ar 48000 -ac 2 -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-n186akv0/stage1_resample.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-n186akv0/stage1_resample.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af atrim=start_sample=865:end_sample=49536,asetpts=PTS-STARTPTS -c:a pcm_s24le -f wav /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-n186akv0/stage2_trimmed.wav",
-          "-i /var/folders/hd/p_y54vk551x2rmjkq0zyqd240000gn/T/sfx-import-n186akv0/stage2_trimmed.wav -fflags +bitexact -flags:a +bitexact -map_metadata -1 -af volume=-3.000000dB -c:a pcm_s24le -f wav /Users/nai/auto-edit-video-skill/skills/auto-edit-video/assets/sfx/whoosh/whoosh-motion-v1.wav"
-        ],
+        "params": {
+          "bit_depth": 24,
+          "channels": 2,
+          "ffmpeg_version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+          "head_pad_samples": 240,
+          "sample_rate": 48000,
+          "silence_threshold_dbfs": -60.0,
+          "tail_pad_samples": 960,
+          "target_peak_dbfs": -3.0
+        },
         "tool": "ffmpeg",
         "version": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers"
       },
       "pack": "external-licensed",
-      "record_sha256": "1738002270c712990b6139eb46763b55c43986c3af1e35cfe6d89e439e0c9f49",
+      "record_sha256": "9b0ead36f666244c1de1ca88e4a387255862f6c5ddabb8861e29d6ad96202205",
       "relative_path": "whoosh/whoosh-motion-v1.wav",
       "review_state": "approved_licensed",
       "source": {

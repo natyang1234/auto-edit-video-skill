@@ -430,9 +430,12 @@ categories: `cash_coin` (money/results beats), `click_pop` (UI reveals, list
 steps), `whoosh` (scene/section transitions), `impact_hit` (emphasis on a key
 point), `success_ding` (completion/success beats), and `error_glitch`
 (mistakes/warnings). The 7 fixed trigger roles (`title_enter`, `row_reveal`,
-`count_tick`, `typing`, `transition`, `grid_fill`, `complete`) each always
-resolve to one pinned procedural asset via `scripts/sfx_mapping.ROLE_TO_CATEGORY`;
-this mapping is unchanged across catalog profiles.
+`count_tick`, `typing`, `transition`, `grid_fill`, `complete`) always resolve
+to a fixed category via `scripts/sfx_mapping.ROLE_TO_CATEGORY`; this
+role-to-category mapping is unchanged across catalog profiles, but which
+asset fills that category depends on the profile: `v1` fixes each role to
+its one pinned procedural asset, while `v2` selects the asset from the
+frozen catalog per role, preferring external assets.
 
 Two catalog profiles control what non-trigger content-hint events can select
 from:

@@ -30,7 +30,7 @@ competing final timeline.
 | Synthetic motion insert | optional HyperFrames workflow | Render as an asset or selected primary composition |
 | Default Chinese voice | optional Rumi safe catalog | Use only when discovered and explicitly approved |
 | Other TTS/BGM | Edge or optional `hyperframes-media` | No implicit downloads or vendored provider code |
-| SFX cue selection | bundled `sfx_mapping.py`/`sfx_delivery.py`; `catalog_profile` v1 or v2 | Trigger-role events always resolve to their pinned procedural asset in both profiles |
+| SFX cue selection | bundled `sfx_mapping.py`/`sfx_delivery.py`; `catalog_profile` v1 or v2 | Trigger-role events always resolve to a fixed category; `v1` fixes the asset, `v2` selects the asset from the frozen catalog per role, preferring external assets |
 | Final QA | bundled `qa_video.py` | Studio binds report/contact/output hashes; human inspection still required |
 
 ### SFX catalog profile
@@ -42,9 +42,11 @@ competing final timeline.
   realistic timbres, when the director profile is `kinetic-explainer` (its
   default), or when `working/sfx_hints.json`/`sfx_suggest.py` name categories
   better served by the wider external-asset pool.
-- Both profiles resolve the 7 fixed trigger roles to the same pinned
-  procedural asset; `catalog_profile` only changes what non-trigger
-  content-hint events can select from.
+- Both profiles resolve the 7 fixed trigger roles to the same fixed
+  category; `v1` fixes each role to its one pinned procedural asset, `v2`
+  selects the asset from the frozen catalog per role (preferring external
+  assets), and `catalog_profile` also changes what non-trigger content-hint
+  events can select from.
 
 When destructive cutting is required, perform it before overlay/card rendering.
 The page-editor renderer intentionally rejects a final render when approved

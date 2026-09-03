@@ -48,6 +48,9 @@ ASSET_ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$")
 SCHEMA_VERSION = 1
 LIBRARY_ID = "auto-edit-sfx-library"
 
+FORBIDDEN_PATH_FRAGMENTS = ("/private/", "/tmp/", "/Users/")
+APPROVAL_REQUIRED_FIELDS = ("approver", "authority", "approved_at", "basis", "evidence_file", "evidence_sha256")
+
 KNOWN_LICENSES = {
     "pixabay-content-license": {
         "name": "Pixabay Content License",
@@ -242,7 +245,7 @@ def check_peak_rms_range(metrics: dict[str, Any]) -> None:
         )
 
 
-def normalize_source(source: Path, out_wav: Path) -> tuple[list[str], dict[str, Any]]:
+def normalize_source(source: Path, out_wav: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the deterministic ffmpeg normalization chain, return (params, metrics)."""
     with tempfile.TemporaryDirectory(prefix="sfx-import-") as tmpdir:
         tmp = Path(tmpdir)
@@ -301,11 +304,16 @@ def normalize_source(source: Path, out_wav: Path) -> tuple[list[str], dict[str, 
     metrics.pop("_peak_linear", None)
     check_peak_rms_range(metrics)
 
-    params = [
-        " ".join(stage1_args),
-        " ".join(stage2_args),
-        " ".join(stage3_args),
-    ]
+    params = {
+        "sample_rate": SAMPLE_RATE,
+        "channels": CHANNELS,
+        "bit_depth": SAMPLE_WIDTH_BYTES * 8,
+        "silence_threshold_dbfs": SILENCE_THRESHOLD_DBFS,
+        "head_pad_samples": HEAD_PAD_SAMPLES,
+        "tail_pad_samples": TAIL_PAD_SAMPLES,
+        "target_peak_dbfs": TARGET_PEAK_DBFS,
+        "ffmpeg_version": ffmpeg_version_line(),
+    }
     decoded_pcm_sha256 = sha256_of_bytes(raw_final)
     return params, {**metrics, "decoded_pcm_sha256": decoded_pcm_sha256}
 
@@ -354,6 +362,25 @@ def iso8601_now() -> str:
     )
 
 
+def is_iso8601(value: Any) -> bool:
+    import datetime
+
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def check_no_forbidden_path_fragments(record: dict[str, Any]) -> None:
+    text = json.dumps(record)
+    for fragment in FORBIDDEN_PATH_FRAGMENTS:
+        if fragment in text:
+            raise SfxImportError(f"record must not contain absolute path fragment {fragment!r}")
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     if args.category not in SFX_CATEGORIES:
         print(f"error: unknown category {args.category!r}; must be one of {SFX_CATEGORIES}", file=sys.stderr)
@@ -363,6 +390,12 @@ def cmd_import(args: argparse.Namespace) -> int:
         return 1
     if args.license not in KNOWN_LICENSES:
         print(f"error: unknown license {args.license!r}; must be one of {list(KNOWN_LICENSES)}", file=sys.stderr)
+        return 1
+    if not args.approver.strip():
+        print("error: --approver must not be blank", file=sys.stderr)
+        return 1
+    if not args.approved_by_authority.strip():
+        print("error: --approved-by-authority must not be blank", file=sys.stderr)
         return 1
 
     source = Path(args.source).resolve()
@@ -375,6 +408,11 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"error: license evidence not found: {license_evidence}", file=sys.stderr)
         return 1
 
+    source_evidence = Path(args.source_evidence).resolve()
+    if not source_evidence.is_file():
+        print(f"error: source evidence not found: {source_evidence}", file=sys.stderr)
+        return 1
+
     library_path = Path(args.library).resolve()
     library = load_library(library_path)
     existing_ids = {r["asset_id"] for r in library["records"]}
@@ -383,6 +421,20 @@ def cmd_import(args: argparse.Namespace) -> int:
         return 1
 
     sfx_root = library_path.parent
+
+    try:
+        evidence_file = str(license_evidence.relative_to(sfx_root))
+    except ValueError:
+        print(f"error: --license-evidence must live inside {sfx_root}", file=sys.stderr)
+        return 1
+
+    canonical_source_evidence = sfx_root / "evidence" / f"{args.asset_id}.md"
+    canonical_source_evidence.parent.mkdir(parents=True, exist_ok=True)
+    if source_evidence != canonical_source_evidence:
+        canonical_source_evidence.write_bytes(source_evidence.read_bytes())
+    source_evidence_file = str(canonical_source_evidence.relative_to(sfx_root))
+    source_evidence_sha256 = sha256_of_file(canonical_source_evidence)
+
     out_wav = sfx_root / args.category / f"{args.asset_id}.wav"
     out_wav.parent.mkdir(parents=True, exist_ok=True)
 
@@ -399,11 +451,6 @@ def cmd_import(args: argparse.Namespace) -> int:
     decoded_pcm_sha256 = norm.pop("decoded_pcm_sha256")
     evidence_sha256 = sha256_of_file(license_evidence)
     license_meta = KNOWN_LICENSES[args.license]
-
-    try:
-        evidence_file = str(license_evidence.relative_to(sfx_root))
-    except ValueError:
-        evidence_file = str(license_evidence)
 
     record: dict[str, Any] = {
         "asset_id": args.asset_id,
@@ -444,12 +491,24 @@ def cmd_import(args: argparse.Namespace) -> int:
         },
         "approval": {
             "approver": args.approver,
+            "authority": args.approved_by_authority,
             "approved_at": iso8601_now(),
             "basis": "license snapshot + source page",
+            "evidence_file": evidence_file,
+            "evidence_sha256": evidence_sha256,
+            "source_evidence_file": source_evidence_file,
+            "source_evidence_sha256": source_evidence_sha256,
         },
         "review_state": "approved_licensed",
         "relative_path": f"{args.category}/{args.asset_id}.wav",
     }
+    try:
+        check_no_forbidden_path_fragments(record)
+    except SfxImportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        if out_wav.exists():
+            out_wav.unlink()
+        return 1
     record["record_sha256"] = record_hash(record)
 
     library["records"].append(record)
@@ -507,6 +566,42 @@ def cmd_verify(args: argparse.Namespace) -> int:
                     f"(expected {record['license']['evidence_sha256']}, got {actual_evidence})"
                 )
 
+        approval = record.get("approval")
+        if not isinstance(approval, dict):
+            failures.append(f"{asset_id}: approval block missing")
+            continue
+        for field in APPROVAL_REQUIRED_FIELDS:
+            if not isinstance(approval.get(field), str) or not approval.get(field):
+                failures.append(f"{asset_id}: approval.{field} must be a non-empty string")
+        if isinstance(approval.get("approved_at"), str) and not is_iso8601(approval["approved_at"]):
+            failures.append(f"{asset_id}: approval.approved_at is not ISO 8601: {approval['approved_at']!r}")
+
+        approval_evidence_file = approval.get("evidence_file")
+        if isinstance(approval_evidence_file, str) and approval_evidence_file:
+            approval_evidence_path = sfx_root / approval_evidence_file
+            if approval_evidence_path.is_symlink():
+                failures.append(f"{asset_id}: approval evidence path must not be a symlink: {approval_evidence_path}")
+            elif not approval_evidence_path.is_file():
+                failures.append(f"{asset_id}: approval evidence missing: {approval_evidence_path}")
+            else:
+                actual_approval_evidence = sha256_of_file(approval_evidence_path)
+                if actual_approval_evidence != approval.get("evidence_sha256"):
+                    failures.append(f"{asset_id}: approval.evidence_sha256 mismatch")
+
+        source_evidence_file = approval.get("source_evidence_file")
+        if not isinstance(source_evidence_file, str) or not source_evidence_file:
+            failures.append(f"{asset_id}: approval.source_evidence_file must be a non-empty string")
+        else:
+            source_evidence_path = sfx_root / source_evidence_file
+            if source_evidence_path.is_symlink():
+                failures.append(f"{asset_id}: source evidence path must not be a symlink: {source_evidence_path}")
+            elif not source_evidence_path.is_file():
+                failures.append(f"{asset_id}: source evidence missing: {source_evidence_path}")
+            else:
+                actual_source_evidence = sha256_of_file(source_evidence_path)
+                if actual_source_evidence != approval.get("source_evidence_sha256"):
+                    failures.append(f"{asset_id}: approval.source_evidence_sha256 mismatch")
+
     if failures:
         print(f"verify FAILED: {len(failures)} problem(s)")
         for f in failures:
@@ -549,8 +644,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--author", required=True)
     p_import.add_argument("--license", required=True)
     p_import.add_argument("--license-evidence", required=True, dest="license_evidence")
+    p_import.add_argument("--source-evidence", required=True, dest="source_evidence")
     p_import.add_argument("--library", default="assets/sfx/LIBRARY.json")
-    p_import.add_argument("--approver", default="claude-code-on-behalf-of-nat")
+    p_import.add_argument("--approver", required=True)
+    p_import.add_argument("--approved-by-authority", required=True, dest="approved_by_authority")
     p_import.set_defaults(func=cmd_import)
 
     p_verify = sub.add_parser("verify", help="recompute all hashes and check for tampering")

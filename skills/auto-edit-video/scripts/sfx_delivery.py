@@ -1108,6 +1108,43 @@ def load_sfx_library(library_path: str | Path | None = None) -> dict[str, Any]:
         if actual_evidence != license_block.get("evidence_sha256"):
             raise SfxDeliveryError(f"{asset_id}: license evidence_sha256 mismatch")
 
+        approval = record.get("approval")
+        if not isinstance(approval, dict):
+            raise SfxDeliveryError(f"{asset_id}: sfx library record is missing approval")
+        for field in sfx_import.APPROVAL_REQUIRED_FIELDS:
+            value = approval.get(field)
+            if not isinstance(value, str) or not value:
+                raise SfxDeliveryError(f"{asset_id}: approval.{field} must be a non-empty string")
+        if not sfx_import.is_iso8601(approval["approved_at"]):
+            raise SfxDeliveryError(f"{asset_id}: approval.approved_at is not ISO 8601")
+
+        approval_evidence_path = sfx_root / approval["evidence_file"]
+        if approval_evidence_path.is_symlink():
+            raise SfxDeliveryError(f"{asset_id}: approval evidence path must not be a symlink: {approval_evidence_path}")
+        try:
+            resolved_approval_evidence = approval_evidence_path.resolve(strict=True)
+        except OSError as exc:
+            raise SfxDeliveryError(f"{asset_id}: approval evidence missing: {approval_evidence_path}") from exc
+        if not resolved_approval_evidence.is_relative_to(sfx_root.resolve()):
+            raise SfxDeliveryError(f"{asset_id}: approval evidence path escapes library root: {approval_evidence_path}")
+        if sfx_import.sha256_of_file(resolved_approval_evidence) != approval.get("evidence_sha256"):
+            raise SfxDeliveryError(f"{asset_id}: approval.evidence_sha256 mismatch")
+
+        source_evidence_file = approval.get("source_evidence_file")
+        if not isinstance(source_evidence_file, str) or not source_evidence_file:
+            raise SfxDeliveryError(f"{asset_id}: approval.source_evidence_file must be a non-empty string")
+        source_evidence_path = sfx_root / source_evidence_file
+        if source_evidence_path.is_symlink():
+            raise SfxDeliveryError(f"{asset_id}: source evidence path must not be a symlink: {source_evidence_path}")
+        try:
+            resolved_source_evidence = source_evidence_path.resolve(strict=True)
+        except OSError as exc:
+            raise SfxDeliveryError(f"{asset_id}: source evidence missing: {source_evidence_path}") from exc
+        if not resolved_source_evidence.is_relative_to(sfx_root.resolve()):
+            raise SfxDeliveryError(f"{asset_id}: source evidence path escapes library root: {source_evidence_path}")
+        if sfx_import.sha256_of_file(resolved_source_evidence) != approval.get("source_evidence_sha256"):
+            raise SfxDeliveryError(f"{asset_id}: approval.source_evidence_sha256 mismatch")
+
         by_asset_id[asset_id] = record
 
     return {
@@ -3954,7 +3991,7 @@ def _verify_multi_event_delivery_v2(
         catalog_revision_sha256 = _canonical_hash(catalog)
         observed_hashes["catalog_revision_sha256"] = catalog_revision_sha256
         declared_catalog_revision = plan.get("catalog_revision_sha256") if isinstance(plan, dict) else None
-        if declared_catalog_revision is not None and declared_catalog_revision != catalog_revision_sha256:
+        if declared_catalog_revision != catalog_revision_sha256:
             failures.append("audio_event_plan.catalog_revision_sha256 does not match the staged catalog")
 
     events = plan.get("events") if isinstance(plan, dict) else None

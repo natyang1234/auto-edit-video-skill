@@ -9,16 +9,16 @@
   "alignment_tolerance_samples": 3840,
   "sfx_stem_sha256": "427c8d9ad5c3505ce088babf54ef41e1695e5da911bd49f53cfc39b6a3e58e36",
   "sfx_stem_decoded_pcm_sha256": "c1f8ebd3500c0592ea3b50b4fa2196081ff8a32de445de83a181405b9fb3039d",
-  "sfx_stem_sample_count": 240000,
+  "sfx_stem_sample_count": 500000,
   "mix_mode": "deterministic_s24_saturating_sum_v1",
   "density": {
-    "total_samples": 240000,
+    "total_samples": 500000,
     "sample_rate": 48000,
     "adjacent_onset_samples": 5760,
     "adjacent_onset_authority": "expected_transient_sample",
     "max_overlap": 2,
     "max_cues_per_minute": 40,
-    "density_cap": 3,
+    "density_cap": 6,
     "priority_order": [
       "title_enter",
       "transition",
@@ -42,6 +42,7 @@
     "dropped_reasons": {},
     "dropped": []
   },
+  "catalog_revision_sha256": "76037913e17c2fca9f1db1629795b6aae30d4550059a6ccfcaba3eee912fab7d",
   "events": [
     {
       "id": "sfx-event-0001",
@@ -81,12 +82,12 @@
     {
       "id": "sfx-event-0002",
       "trigger_id": "row-1",
-      "trigger_onset_sample": 72000,
-      "event_start_sample": 71760,
+      "trigger_onset_sample": 252000,
+      "event_start_sample": 251760,
       "duration_samples": 6240,
       "asset_id": "short-pop-v1",
       "asset_transient_anchor_sample": 240,
-      "expected_transient_sample": 72000,
+      "expected_transient_sample": 252000,
       "role": "row_reveal",
       "gain_db": -12,
       "fades": {
@@ -97,7 +98,7 @@
       "evidence": {
         "trigger": {
           "id": "row-1",
-          "onset_sample": 72000,
+          "onset_sample": 252000,
           "kind": "dynamic_list",
           "component_id": "dynamic-list",
           "motion": {
@@ -116,12 +117,12 @@
     {
       "id": "sfx-event-0003",
       "trigger_id": "coin-1",
-      "trigger_onset_sample": 132000,
-      "event_start_sample": 131760,
+      "trigger_onset_sample": 492000,
+      "event_start_sample": 491760,
       "duration_samples": 6240,
       "asset_id": "coin-blip-v1",
       "asset_transient_anchor_sample": 240,
-      "expected_transient_sample": 132000,
+      "expected_transient_sample": 492000,
       "role": "row_reveal",
       "category": "cash_coin",
       "gain_db": -12,
@@ -132,7 +133,7 @@
       "duck_group": "dialogue_priority",
       "evidence": {
         "hint": {
-          "onset_sample": 132000,
+          "onset_sample": 492000,
           "category": "cash_coin",
           "reason": "detected a coin/cash-register cue in the raw footage audio",
           "source_state_revision": "d16fdd85e4926ac50b435aaa8be41f8f28bc4cc274cb6ceee3b3d0c2dfda71c1"
