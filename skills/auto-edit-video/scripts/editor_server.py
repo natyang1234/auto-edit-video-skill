@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import caption_engine
+import fx_overlay
 import asset_registry
 import contract_registry
 import delivery_envelope
@@ -75,6 +76,57 @@ from director_resolver import (
 SKILL_DIR = Path(__file__).resolve().parents[1]
 EDITOR_DIR = SKILL_DIR / "editor"
 STATE_REL = Path("working/editor_state.json")
+
+FX_MENU_BRIDGE = """
+(function(){
+  const csrf=__CSRF__;
+  const row=document.querySelector('#copy')?.parentElement; if(!row) return;
+  // Way back to the editor (this page may have replaced the editor tab).
+  const bar=document.createElement('div');
+  bar.style.cssText='position:sticky;top:0;z-index:50;display:flex;gap:10px;align-items:center;padding:8px 14px;background:#17130f;color:#fbf7ef;font-size:14px';
+  const back=document.createElement('a'); back.href='/'; back.textContent='← 回編輯器預覽影片'; back.style.cssText='color:#fbf7ef;font-weight:700;text-decoration:none';
+  back.addEventListener('click',ev=>{ if(window.opener&&!window.opener.closed){ev.preventDefault();try{window.opener.focus();window.close()}catch(e){location.href='/'}} });
+  const hint=document.createElement('span'); hint.textContent='點下方組合或卡片 → 「套用到 Studio」，特效會排進時間軸；真正畫面要在編輯器按「輸出預覽」。'; hint.style.opacity='.8';
+  bar.append(back,hint); document.body.prepend(bar);
+  const btn=document.createElement('button'); btn.className='btn'; btn.textContent='套用到 Studio';
+  btn.title='把目前選的效果依字幕段落排進這個專案，並鎖定主題的風格包';
+  const rep=document.createElement('label'); rep.style.cssText='font-size:12px;display:inline-flex;gap:4px;align-items:center;margin-left:6px';
+  const cb=document.createElement('input'); cb.type='checkbox'; rep.append(cb,'先清掉舊特效');
+  row.append(btn,rep);
+  btn.addEventListener('click',async()=>{
+    const codes=EFF.effects.filter(e=>sel.has(e.code)).map(e=>e.code);
+    if(!codes.length){toast('先選效果');return}
+    btn.disabled=true;
+    try{
+      const r=await fetch('/api/fx/apply',{method:'POST',headers:{'Content-Type':'application/json','X-Auto-Edit-CSRF':csrf},
+        body:JSON.stringify({codes,theme:theme.no,main,alt,replace:cb.checked,font_ids:(typeof window.menuFontSelection==='function'?window.menuFontSelection():{})})});
+      const j=await r.json();
+      if(!j.ok){toast('失敗：'+(j.error||(j.errors||[]).join('；')));return}
+      toast('已加入 '+j.added+' 個特效'+(j.style_pack?'，風格包 '+j.style_pack:'')+(j.fonts&&Object.keys(j.fonts).length?'，字型 '+Object.values(j.fonts).join('／'):'')+(j.warnings&&j.warnings.length?'；'+j.warnings.join('；'):'')+'，回編輯器…');
+      let handed=false;
+      try{ if(window.opener&&!window.opener.closed){ window.opener.postMessage({type:'fx-applied',added:j.added},location.origin); handed=true; } }catch(e){}
+      setTimeout(()=>{ if(handed){ try{window.opener.focus();window.close()}catch(e){location.href='/'} } else { location.href='/'; } },1400);
+    }catch(e){toast('連不上 Studio：'+e.message)}finally{btn.disabled=false}
+  });
+})();
+"""
+
+
+def fx_menu_parts() -> dict[str, str] | None:
+    """menu/index.html split into page / css / js (thumb paths rebased to /fx-thumbs/)."""
+    menu_file = fx_overlay.skill_dir() / "menu" / "index.html"
+    if not menu_file.is_file():
+        return None
+    html = menu_file.read_text(encoding="utf-8")
+    style = re.search(r"<style>(.*?)</style>", html, re.S)
+    script = re.search(r"<script>(.*?)</script>", html, re.S)
+    if not style or not script:
+        return None
+    js = script.group(1).replace("`thumbs/", "`/fx-thumbs/thumbs/").replace("e.has_thumb?e.thumb:", 'e.has_thumb?"/fx-thumbs/"+e.thumb:')
+    page = html.replace(style.group(0), '<link rel="stylesheet" href="/fx-menu.css">', 1)
+    page = page.replace(script.group(0), '<script src="/fx-menu.js"></script><script src="/fx-menu-bridge.js"></script>', 1)
+    return {"html": page, "css": style.group(1), "js": js}
+
 LATEST_DELIVERY_QA_REL = Path("working/latest_final_qa.json")
 ALLOWED_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov"}
 ALLOWED_ASSET_MIME_TYPES = {
@@ -217,6 +269,56 @@ STYLE_PACK_PRESENTATION = {
 }
 
 
+def _theme_pack_presentation() -> dict[str, dict[str, str]]:
+    import theme_packs
+
+    try:
+        entries = theme_packs.load_manifest()
+    except RuntimeError:
+        return {}
+    return {
+        entry["id"]: {"label": entry["label"], "description": entry["description"]}
+        for entry in entries
+    }
+
+
+STYLE_PACK_PRESENTATION.update(_theme_pack_presentation())
+
+
+def project_style_pack_override(manifest: dict[str, Any] | None) -> str | None:
+    """A style pack pinned at init (``--style-pack``), validated fail-closed."""
+    value = manifest.get("style_pack") if isinstance(manifest, dict) else None
+    if value in (None, ""):
+        return None
+    import structured_card_compositor
+
+    if not isinstance(value, str) or value not in structured_card_compositor.style_pack_ids():
+        raise ValueError(f"unknown style pack in project.json: {value!r}")
+    return value
+
+
+def default_style_pack_for(manifest: dict[str, Any] | None, director_id: str) -> str:
+    return project_style_pack_override(manifest) or DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
+        director_id, "dark-data-presenter"
+    )
+
+
+def theme_caption_style(
+    manifest: dict[str, Any] | None, caption_style: dict[str, Any]
+) -> dict[str, Any]:
+    """A pinned pack's ``caption_emphasis`` replaces the director's keyword colour."""
+    pack_id = project_style_pack_override(manifest)
+    if pack_id is None:
+        return caption_style
+    import structured_card_compositor
+
+    palette = structured_card_compositor.load_style_pack(pack_id)["tokens"]["palette"]
+    emphasis = palette.get("caption_emphasis")
+    if not emphasis:
+        return caption_style
+    return {**caption_style, "emphasis_color": str(emphasis)}
+
+
 def public_style_pack_catalog() -> list[dict[str, Any]]:
     """Validated style packs exposed to the local editor picker."""
     import structured_card_compositor
@@ -306,6 +408,11 @@ def _editor_render_revision_payload(
         # Which QA gates apply is part of what was approved: relaxing them
         # must invalidate an approval given under stricter ones.
         "qa_policy": state.get("qa_policy"),
+        # fx layers name fonts by catalog id; the glyphs behind those ids (catalog + font files) are
+        # part of what was approved, so a font swap on disk invalidates the approval (2026-10-22).
+        "fx_fonts_digest": fx_overlay.fonts_digest_for(state) if any(
+            isinstance(o, dict) and o.get("type") == "fx" and o.get("font_ids") for o in raw_revision_overlays
+        ) else None,
     }
     if include_audio_event_edits and "audio_event_edits" in state:
         payload["audio_event_edits"] = state.get("audio_event_edits")
@@ -2542,7 +2649,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
     if director_id not in DIRECTOR_PRESETS:
         director_id = "teacher-punch"
     director = DIRECTOR_PRESETS[director_id]
-    caption_style = dict(director["caption"])
+    caption_style = theme_caption_style(manifest, dict(director["caption"]))
     emphasis_plan = read_json(project_dir / "working/emphasis_plan.json", {"items": []}) or {
         "items": []
     }
@@ -2662,9 +2769,7 @@ def default_editor_state(project_dir: Path, manifest: dict[str, Any]) -> dict[st
         "visual_quality_mode": "designed",
         "graphic_package_style": "craft-stack",
         "style_pack": {
-            "project_default": DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
-                director_id, "dark-data-presenter"
-            ),
+            "project_default": default_style_pack_for(manifest, director_id),
             "per_highlight": {},
         },
         "video_template": default_video_template_state(),
@@ -2726,7 +2831,7 @@ def apply_director_to_state(
     transcript-grounded caption text and timing.
     """
     director = DIRECTOR_PRESETS[director_id]
-    caption_style = dict(director["caption"])
+    caption_style = theme_caption_style(manifest, dict(director["caption"]))
     transcript = read_json(project_dir / "working/transcript_words.json", {}) or {}
     highlight_plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
     retained: list[dict[str, Any]] = []
@@ -2774,9 +2879,7 @@ def apply_director_to_state(
     if not isinstance(style_pack, dict):
         style_pack = {"project_default": "dark-data-presenter", "per_highlight": {}}
         state["style_pack"] = style_pack
-    style_pack["project_default"] = DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
-        director_id, "dark-data-presenter"
-    )
+    style_pack["project_default"] = default_style_pack_for(manifest, director_id)
     review = state.get("review")
     if isinstance(review, dict):
         overlay_ids = {str(item.get("id")) for item in state["overlays"]}
@@ -3278,7 +3381,7 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
         errors.append("overlays cannot exceed 1000 items")
     seen: set[str] = set()
     overlay_highlight_refs: list[tuple[str, str]] = []
-    allowed_types = {"caption", "emphasis", "title", "card", "image", "gif", "video", "animation"}
+    allowed_types = {"caption", "emphasis", "title", "card", "image", "gif", "video", "animation", "fx"}
     for index, overlay in enumerate(overlays):
         if not isinstance(overlay, dict):
             errors.append(f"overlay {index} must be an object")
@@ -3289,6 +3392,8 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
         seen.add(overlay_id)
         if overlay.get("type") not in allowed_types:
             errors.append(f"overlay {overlay_id or index} has an unsupported type")
+        elif overlay.get("type") == "fx":
+            errors.extend(fx_overlay.validate(overlay, state))
         try:
             start = float(overlay.get("start"))
             end = float(overlay.get("end"))
@@ -3654,7 +3759,8 @@ class EditorHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; "
-            "style-src 'self'; script-src 'self'; connect-src 'self'; "
+            + ("style-src 'self' 'unsafe-inline'; " if getattr(self, "_csp_style_inline", False) else "style-src 'self'; ")
+            + "script-src 'self'; connect-src 'self'; "
             "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         super().end_headers()
@@ -4731,6 +4837,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     project / "working/narrative_edit_plan.json", None
                 ),
                 "video_templates": public_template_catalog(),
+                "fx_catalog": fx_overlay.catalog(),
                 "template_capabilities": {
                     "cutout": {
                         key: value
@@ -4979,6 +5086,45 @@ class EditorHandler(BaseHTTPRequestHandler):
                 return
             self.serve_file(artifact)
             return
+        if path in {"/fx-menu", "/fx-menu.css", "/fx-menu.js", "/fx-menu-bridge.js"}:
+            # The 風格菜單 page served from the skill so it can order straight
+            # into this project ("套用到 Studio"). The page is one file with
+            # inline style/script; the CSP here is script-src 'self', so its
+            # pieces are served as separate same-origin resources, thumbnails
+            # resolve through /fx-thumbs/, and the bridge posts to /api/fx/apply.
+            parts = fx_menu_parts()
+            if parts is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if path == "/fx-menu":
+                body, ctype = parts["html"], "text/html; charset=utf-8"
+                self._csp_style_inline = True  # the page keeps a few static style="" attributes
+            elif path == "/fx-menu.css":
+                body, ctype = parts["css"], "text/css; charset=utf-8"
+            elif path == "/fx-menu.js":
+                body, ctype = parts["js"], "application/javascript; charset=utf-8"
+            else:
+                body, ctype = FX_MENU_BRIDGE.replace("__CSRF__", json.dumps(self.server.csrf_token)), "application/javascript; charset=utf-8"
+            data = body.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path.startswith("/fx-thumbs/"):
+            # Effect-menu thumbnails (風格菜單) straight from the edit-style-profiles skill, read-only.
+            rel = urllib.parse.unquote(path[len("/fx-thumbs/"):])
+            if not re.fullmatch(r"thumbs(/[A-Za-z0-9_-]{1,32})?/[0-9]{1,3}\.jpg", rel):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            menu = (fx_overlay.skill_dir() / "menu").resolve()
+            thumb = (menu / rel).resolve()
+            if menu not in thumb.parents:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.serve_file(thumb)
+            return
         static_name = "index.html" if path in {"/", "/index.html"} else path.removeprefix("/")
         if "/" in static_name or static_name.startswith("."):
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -5025,6 +5171,56 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         self.server.schedule_caption_render()
         self.send_json(response)
+
+    def handle_fx_apply(self) -> None:
+        """Order from the 風格菜單: add its effect codes as fx layers (and pin the theme pack)."""
+        try:
+            body = self.read_json_body()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            codes = [str(c) for c in (body.get("codes") or []) if re.fullmatch(r"[A-Z]\d{1,3}", str(c))][:40]
+            theme = str(body.get("theme") or "")
+            if theme and not re.fullmatch(r"[A-Za-z0-9]{1,16}", theme):
+                raise ValueError("theme is invalid")
+            main = str(body.get("main") or "")
+            alt = str(body.get("alt") or "")
+            font_ids = body.get("font_ids")
+            if font_ids is not None:
+                if not isinstance(font_ids, dict):
+                    raise ValueError("font_ids must be an object")
+                font_ids = {str(k): str(v) for k, v in font_ids.items() if v}
+                font_errors = fx_overlay.validate_font_ids(font_ids)
+                if font_errors:
+                    raise ValueError("；".join(font_errors))
+            if not codes:
+                raise ValueError("沒有效果代碼")
+            project = self.server.project_dir
+            manifest = read_json(project / "project.json", {}) or {}
+            state = read_json(project / STATE_REL)
+            if state is None:
+                state = default_editor_state(project, manifest)
+            duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+            overlays, pack, warnings = fx_overlay.plan_from_menu(state, duration, codes, theme, main, alt, font_ids or None)
+            if body.get("replace"):
+                state["overlays"] = [o for o in state.get("overlays", []) if o.get("type") != "fx"]
+            state.setdefault("overlays", []).extend(overlays)
+            packs = {item.get("id") for item in public_style_pack_catalog()}
+            if pack and pack in packs:
+                sp = state.get("style_pack") if isinstance(state.get("style_pack"), dict) else {}
+                sp = dict(sp or {}); sp["project_default"] = pack; sp.setdefault("per_highlight", {})
+                state["style_pack"] = sp
+            elif pack:
+                warnings.append(f"沒有風格包 {pack}，顏色維持目前設定")
+            errors, response = self.persist_editor_state(state)
+            if errors:
+                self.send_json({"ok": False, "errors": errors}, status=422)
+                return
+        except (ValueError, TypeError) as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        self.send_json({"ok": True, "added": len(overlays), "codes": [o["code"] for o in overlays],
+                        "style_pack": pack, "fonts": fx_overlay.families_for(font_ids), "warnings": warnings,
+                        "revision": response.get("revision")})
 
     def persist_editor_state(
         self,
@@ -5291,6 +5487,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/captions/apply-style":
             self.handle_caption_apply_style()
+            return
+        if path == "/api/fx/apply":
+            self.handle_fx_apply()
             return
         if path == "/api/structured-layers":
             self.handle_structured_layers()

@@ -227,6 +227,8 @@
           <button class="button button-secondary full-width replan-button" id="replan-highlights" type="button">依目前導演與重點重新選段</button>
 
           <div class="quick-tools" role="group" aria-label="加入時間軸內容">
+            <button class="quick-tool" data-add-type="fx" type="button"><i aria-hidden="true">✺</i><span>加入特效</span></button>
+            <a class="quick-tool" id="open-fx-menu" href="/fx-menu" target="fx-menu" rel="opener"><i aria-hidden="true">☰</i><span>風格菜單點菜</span></a>
             <button class="quick-tool" data-add-type="animation" type="button"><i aria-hidden="true">✦</i><span>加入動畫</span></button>
             <button class="quick-tool" data-add-type="title" type="button"><i aria-hidden="true">T</i><span>加入字卡</span></button>
             <button class="quick-tool" data-add-type="emphasis" type="button"><i aria-hidden="true">Aa</i><span>加入特效字</span></button>
@@ -265,6 +267,22 @@
               <span>顯示文字</span>
               <textarea id="overlay-text" rows="3" maxlength="1000"></textarea>
             </label>
+
+            <section class="fx-panel" id="fx-panel" aria-labelledby="fx-panel-title" hidden>
+              <div class="effect-editor-heading">
+                <div>
+                  <span class="field-label" id="fx-panel-title">風格菜單特效</span>
+                  <small id="fx-panel-note">點縮圖換效果；顏色跟著「視覺風格包」的主題走，輸出時才真正算圖。</small>
+                </div>
+              </div>
+              <div class="fx-toolbar">
+                <div class="fx-cats" id="fx-cats" role="tablist" aria-label="效果類別"></div>
+                <input id="fx-search" type="search" placeholder="搜代碼／名稱" aria-label="搜尋效果">
+              </div>
+              <div class="fx-grid" id="fx-grid" role="radiogroup" aria-label="效果"></div>
+              <p class="fx-spec" id="fx-spec"></p>
+              <div class="fx-vars" id="fx-vars"></div>
+            </section>
 
             <section class="effect-editor" id="effect-editor" aria-labelledby="effect-editor-title">
               <div class="effect-editor-heading">
@@ -309,9 +327,12 @@
 
             <label class="field field-full">
               <span>字體</span>
-              <select id="font-family">
-                <option value="">載入已驗證專案字型…</option>
-              </select>
+              <span class="font-pick-row">
+                <select id="font-family">
+                  <option value="">載入已驗證專案字型…</option>
+                </select>
+                <button type="button" id="font-pick-open" class="fx-font-pick" title="用預覽挑字型；Google Fonts 有的字型可一鍵匯入成專案字型">挑選（含預覽）</button>
+              </span>
             </label>
 
             <label class="field range-field">

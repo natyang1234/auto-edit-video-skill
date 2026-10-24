@@ -672,17 +672,31 @@ class _HTTPBody:
         response: http.client.HTTPResponse,
         connection: _PinnedHTTPSConnection,
         request: TransportRequest,
+        sock: socket.socket | ssl.SSLSocket | None = None,
     ) -> None:
         self._response = response
         self._connection = connection
         self._request = request
+        # ``Connection: close`` makes http.client drop ``connection.sock`` inside
+        # getresponse() (response.will_close) while the response keeps its own
+        # file object, so the live socket is captured by the caller before that
+        # and the body is read through the response, not the connection
+        # (2026-10-22: every GitHub API answer tripped the old sock-is-None check).
+        self._sock = sock
 
     def __iter__(self) -> Iterable[bytes]:
         while True:
             remaining = _remaining(self._request.deadline, self._request.clock)
-            if self._connection.sock is None:
+            if self._response.isclosed() and not getattr(self._response, "length", None):
+                return
+            sock = self._sock if self._sock is not None else self._connection.sock
+            if sock is None and self._response.isclosed():
                 raise TransportError("HTTPS connection closed before body completed")
-            self._connection.sock.settimeout(min(self._request.read_timeout, remaining))
+            if sock is not None:
+                try:
+                    sock.settimeout(min(self._request.read_timeout, remaining))
+                except OSError:
+                    pass
             try:
                 chunk = self._response.read(DEFAULT_CHUNK_SIZE)
             except (TimeoutError, socket.timeout) as exc:
@@ -774,9 +788,10 @@ class PinnedHTTPSTransport:
                 connection.sock.settimeout(
                     min(request.read_timeout, _remaining(request.deadline, request.clock))
                 )
+                live_sock = connection.sock
                 raw_response = connection.getresponse()
                 peer_ip = connection.peer_ip
-                body = _HTTPBody(raw_response, connection, request)
+                body = _HTTPBody(raw_response, connection, request, live_sock)
 
                 active_connection = connection
 

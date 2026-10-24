@@ -9,6 +9,7 @@ It performs no filesystem or network I/O until a public method is called.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -51,6 +52,8 @@ from open_svg_providers import (
     wikimedia_svg_search_url,
 )
 from open_font_providers import (
+    FONT_MIMES,
+    parse_github_fonts_tree,
     FONT_MIME,
     FontAssetCandidate,
     fontsource_discovery_url,
@@ -166,6 +169,14 @@ _PROVIDERS: tuple[dict[str, Any], ...] = (
         "cost_class": "free",
         "network_disclosure": "會將 exact package id 傳送至 Fontsource API，並要求指定 strict semver。",
     },
+    {
+        "id": "github-fonts",
+        "label": "GitHub 字型倉庫（允許清單）",
+        "kind": "font",
+        "consent_required": True,
+        "cost_class": "free",
+        "network_disclosure": "只對 contracts/github_fonts.json 允許清單裡的字型，向 api.github.com 讀取釘住 commit 的 git tree，並從 raw.githubusercontent.com 下載該字型檔與授權檔；兩者都以清單釘住的 Git blob SHA 驗證。不接受任何自訂 repo 或路徑。",
+    },
 )
 _PROVIDER_BY_ID = {item["id"]: item for item in _PROVIDERS}
 _SEARCH_HOSTS = {
@@ -174,6 +185,7 @@ _SEARCH_HOSTS = {
     "wikimedia-svg": frozenset({"commons.wikimedia.org"}),
     "google-fonts": frozenset({"api.github.com"}),
     "fontsource": frozenset({"api.fontsource.org"}),
+    "github-fonts": frozenset({"api.github.com"}),
 }
 _IMPORT_HOSTS = {
     "openverse": frozenset({"api.openverse.org"}),
@@ -184,6 +196,7 @@ _IMPORT_HOSTS = {
     "wikimedia-svg": frozenset({"upload.wikimedia.org"}),
     "google-fonts": frozenset({"raw.githubusercontent.com"}),
     "fontsource": frozenset({"cdn.jsdelivr.net"}),
+    "github-fonts": frozenset({"raw.githubusercontent.com"}),
 }
 _MIME_EXTENSION = {
     "image/jpeg": ".jpg",
@@ -955,6 +968,13 @@ class AssetProviderService:
                 family = normalize_google_family_id(family)
                 normalized = f"{root}/{family}"
                 return normalized, (root, family), google_fonts_contents_url(root, family)
+            if provider_id == "github-fonts":
+                import github_fonts
+
+                item = github_fonts.entry(query) if re.fullmatch(r"[a-z0-9][a-z0-9-]{1,40}", query) else None
+                if item is None:
+                    raise ProviderDataError("GitHub font query must be an allowlisted font id")
+                return item["id"], (item["id"],), github_fonts.discovery_url(item)
             if provider_id == "fontsource":
                 match = re.fullmatch(
                     r"([a-z0-9]+(?:-[a-z0-9]+)*)@((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))",
@@ -980,6 +1000,8 @@ class AssetProviderService:
             parsed = _strict_json_bytes(payload)
             if provider_id == "google-fonts":
                 return parse_google_fonts_contents(parsed, identity[0], identity[1])
+            if provider_id == "github-fonts":
+                return parse_github_fonts_tree(parsed, identity[0])
             return parse_fontsource(parsed, identity[0], identity[1])
         except (OSError, ValueError, ProviderDataError) as exc:
             raise _error("font provider returned invalid data", 422, "provider_data_invalid") from exc
@@ -1226,7 +1248,7 @@ class AssetProviderService:
                 or (
                     candidate.mime_type not in _MIME_EXTENSION
                     and candidate.mime_type != SVG_MIME
-                    and candidate.mime_type != FONT_MIME
+                    and candidate.mime_type not in FONT_MIMES
                 )
             ):
                 raise _error("import token was not found", 404, "import_token_not_found")
@@ -1463,15 +1485,72 @@ class AssetProviderService:
 
         def validate_license(path: Path) -> None:
             nonlocal normalized_license, normalized_license_sha
+            raw_license = path.read_bytes()
+            trusted_header = False
+            if provider_id == "github-fonts":
+                import github_fonts
+
+                allow = github_fonts.entry_by_font_blob(candidate.candidate_id.partition(":")[0])
+                if allow is None or github_fonts.git_blob_sha1(raw_license) != allow["license_blob_sha1"]:
+                    raise ValueError("GitHub licence file does not match the allowlisted blob")
+                trusted_header = True
             normalized_license, normalized_license_sha = asset_registry.validate_font_license_text(
-                path.read_bytes(), candidate.license_spdx
+                raw_license, candidate.license_spdx, trusted_header=trusted_header
             )
+
+        def unwrap_release_zip(path: Path, allow: dict[str, Any]) -> bytes:
+            """Release-zip source: pinned zip SHA-256 → exactly one plain member → pinned size and
+            SHA-256 → the member bytes replace the staged file so everything downstream sees a
+            normal font file. Streaming read with a hard output cap; nothing is extracted to disk
+            by zipfile and no name lookup is used (duplicate names cannot pick a different entry)."""
+            import zipfile
+
+            src = allow["source"]
+            raw_zip = path.read_bytes()
+            if len(raw_zip) != src["zip_size"] or hashlib.sha256(raw_zip).hexdigest() != src["zip_sha256"]:
+                raise ValueError("release zip does not match the pinned size/SHA-256")
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw_zip)) as archive:
+                    infos = archive.infolist()
+                    if len(infos) != 1:
+                        raise ValueError("release zip must contain exactly one member")
+                    info = infos[0]
+                    if (
+                        info.filename != src["member"]
+                        or info.is_dir()
+                        or info.flag_bits & 0x1  # encrypted
+                        or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                        or info.file_size != src["member_size"]
+                    ):
+                        raise ValueError("release zip member does not match the allowlist")
+                    out = bytearray()
+                    with archive.open(info) as member:
+                        while True:
+                            chunk = member.read(1 << 20)
+                            if not chunk:
+                                break
+                            out.extend(chunk)
+                            if len(out) > src["member_size"]:
+                                raise ValueError("release zip member exceeds its pinned size")
+            except zipfile.BadZipFile as exc:
+                raise ValueError("release zip is malformed") from exc
+            member_bytes = bytes(out)
+            if len(member_bytes) != src["member_size"] or hashlib.sha256(member_bytes).hexdigest() != src["member_sha256"]:
+                raise ValueError("release zip member does not match the pinned SHA-256")
+            path.write_bytes(member_bytes)
+            return member_bytes
 
         def validate_font(path: Path) -> None:
             nonlocal validated_result
             if self._font_validator is None or self._font_capability_identity is None:
                 raise ValueError("font validator unavailable")
             raw = path.read_bytes()
+            if provider_id == "github-fonts":
+                import github_fonts
+
+                allow = github_fonts.entry_by_font_blob(candidate.candidate_id.partition(":")[0])
+                if allow is not None and github_fonts.is_release(allow):
+                    raw = unwrap_release_zip(path, allow)
             result = self._font_validator(
                 raw,
                 required_text,
@@ -1509,12 +1588,19 @@ class AssetProviderService:
             )
             if not license_stage.is_file() or license_stage.is_symlink() or not normalized_license:
                 raise _error("font license download did not produce text", 502, "provider_failure")
+            font_hosts, font_max = _IMPORT_HOSTS[provider_id], FONT_MAX_BYTES
+            if provider_id == "github-fonts":
+                import github_fonts
+
+                allow = github_fonts.entry_by_font_blob(candidate.candidate_id.partition(":")[0])
+                if allow is not None and github_fonts.is_release(allow):
+                    font_hosts, font_max = github_fonts.RELEASE_DOWNLOAD_HOSTS, allow["source"]["zip_size"]
             self._download(
                 candidate.download_url,
                 font_stage,
                 root,
-                allowed_hosts=_IMPORT_HOSTS[provider_id],
-                max_bytes=FONT_MAX_BYTES,
+                allowed_hosts=font_hosts,
+                max_bytes=font_max,
                 validator=validate_font,
             )
             if not font_stage.is_file() or font_stage.is_symlink() or validated_result is None:
@@ -1525,7 +1611,7 @@ class AssetProviderService:
             license_sha = hashlib.sha256(license_raw).hexdigest()
             if font_sha != validated_result.sha256:
                 raise _error("font validator hash does not match download", 422, "policy_rejected")
-            if provider_id == "google-fonts":
+            if provider_id in ("google-fonts", "github-fonts"):
                 expected_blob_sha, separator, _name = candidate.candidate_id.partition(":")
                 actual_blob_sha = hashlib.sha1(
                     f"blob {len(font_raw)}\0".encode("ascii") + font_raw,
@@ -1533,10 +1619,16 @@ class AssetProviderService:
                 ).hexdigest()
                 if separator != ":" or actual_blob_sha != expected_blob_sha:
                     raise _error(
-                        "Google Fonts blob does not match repository listing",
+                        "font blob does not match repository listing",
                         422,
                         "policy_rejected",
                     )
+            if provider_id == "github-fonts":
+                import github_fonts
+
+                allow = github_fonts.entry_by_font_blob(candidate.candidate_id.partition(":")[0])
+                if allow is None or github_fonts.git_blob_sha1(license_raw) != allow["license_blob_sha1"]:
+                    raise _error("GitHub licence blob does not match the allowlist", 422, "policy_rejected")
             font_rel = Path("assets/fonts") / f"{font_sha}.{validated_result.container}"
             license_rel = Path("licenses") / f"{license_sha}.txt"
             candidate_hash = hashlib.sha256(candidate.candidate_id.encode("utf-8")).hexdigest()[:16]
@@ -1588,6 +1680,27 @@ class AssetProviderService:
                 / (hashlib.sha256(asset_id.encode("utf-8")).hexdigest() + ".json")
             )
             receipt_preexisted = receipt_path.exists() or receipt_path.is_symlink()
+            # A receipt minted under an older validator policy is set aside by the registry
+            # (never deleted) so the font can be re-validated; only that case may "replace".
+            receipt_superseded = receipt_preexisted and asset_registry.font_receipt_is_stale(root, item)
+            set_aside_before = (
+                set(receipt_path.parent.glob(f"{receipt_path.stem}.superseded-*.json"))
+                if receipt_superseded else set()
+            )
+
+            def restore_set_aside() -> None:
+                """Undo a supersede when a later step fails: put the old receipt back."""
+                if not receipt_superseded:
+                    return
+                new_copies = set(receipt_path.parent.glob(f"{receipt_path.stem}.superseded-*.json")) - set_aside_before
+                if len(new_copies) == 1:
+                    try:
+                        if receipt_path.is_file() and not receipt_path.is_symlink():
+                            receipt_path.unlink()
+                        os.replace(new_copies.pop(), receipt_path)
+                    except OSError:
+                        pass
+
             try:
                 receipt = asset_registry.save_font_provider_receipt(
                     root,
@@ -1611,8 +1724,9 @@ class AssetProviderService:
                     and not receipt_path.is_symlink()
                 ):
                     created_paths.append(receipt_path)
+                restore_set_aside()
                 raise
-            if receipt_preexisted:
+            if receipt_preexisted and not receipt_superseded:
                 raise asset_registry.AssetRegistryError(
                     "font receipt publication replaced preexisting evidence"
                 )

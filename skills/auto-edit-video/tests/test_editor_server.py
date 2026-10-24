@@ -3192,9 +3192,12 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
         payload = json.loads(body.decode("utf-8"))
+        import theme_packs
+
         self.assertEqual(
             {pack["id"] for pack in payload["style_packs"]},
-            {"dark-data-presenter", "kinetic-social", "editorial-paper"},
+            {"dark-data-presenter", "kinetic-social", "editorial-paper"}
+            | {entry["id"] for entry in theme_packs.load_manifest()},
         )
         self.assertEqual(
             payload["director_presets"]["high-energy"]["motion_intensity"],

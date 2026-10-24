@@ -170,10 +170,13 @@ class ArtifactParsingTests(unittest.TestCase):
 
 
 class StylePackRegistryTests(unittest.TestCase):
-    def test_registry_exposes_exactly_three_valid_packs(self) -> None:
+    def test_registry_exposes_base_packs_then_manifest_theme_packs(self) -> None:
+        import theme_packs
+
+        theme_ids = tuple(entry["id"] for entry in theme_packs.load_manifest())
         self.assertEqual(
             scc.style_pack_ids(),
-            ("dark-data-presenter", "kinetic-social", "editorial-paper"),
+            ("dark-data-presenter", "kinetic-social", "editorial-paper") + theme_ids,
         )
         for pack_id in scc.style_pack_ids():
             pack = scc.load_style_pack(pack_id)

@@ -129,7 +129,8 @@ function cacheElements() {
     "voice-speed", "save-voice", "voice-status",
     "audio-event-form", "audio-event-id", "audio-event-role", "audio-event-asset", "audio-event-start-sample",
     "audio-event-gain-db", "audio-event-start-seconds", "audio-event-policy", "audio-event-error",
-    "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output"
+    "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output",
+    "fx-panel", "fx-panel-note", "fx-cats", "fx-search", "fx-grid", "fx-spec", "fx-vars"
   ].forEach((id) => { elements[id] = byId(id); });
 }
 
@@ -1368,7 +1369,7 @@ async function replanHighlights() {
 }
 
 function layerLabel(overlay) {
-  const typeLabels = { caption: "字幕", emphasis: "特效字", title: "標題卡", card: "字卡", image: "圖片", gif: "GIF", video: "插入影片", animation: "動畫字卡" };
+  const typeLabels = { caption: "字幕", emphasis: "特效字", title: "標題卡", card: "字卡", image: "圖片", gif: "GIF", video: "插入影片", animation: "動畫字卡", fx: "特效" };
   return typeLabels[overlay.type] || overlay.type;
 }
 
@@ -1568,6 +1569,16 @@ function renderPreviewOverlays(force = false) {
         elements["stage-frame"].clientWidth / Math.max(1, state.canvas.width);
       node.style.width = `${captionRaster.width * rasterScale}px`;
       node.classList.add("is-caption-raster");
+    } else if (overlay.type === "fx") {
+      // The real pixels come from HyperFrames at render time; the stage shows the
+      // menu thumbnail (in the pack's theme when one exists) and the code.
+      node = document.createElement("div");
+      const effect = fxEffectByCode(overlay.code);
+      const thumb = fxThumbUrl(effect);
+      if (thumb) { const img = document.createElement("img"); img.src = thumb; img.alt = effect?.name || overlay.code; node.append(img); }
+      const tag = document.createElement("span");
+      tag.textContent = `${overlay.code || "FX"} ${effect?.name || ""}${effect?.matte ? " ⓜ" : ""}`;
+      node.append(tag);
     } else if (assetType) {
       node = overlay.type === "video" ? document.createElement("video") : document.createElement("img");
       node.src = sourcePathToUrl(overlay.source);
@@ -1860,6 +1871,212 @@ function enableOverlayDrag(node, overlay) {
   });
 }
 
+// ---- 風格菜單特效（fx overlay）：目錄來自 /api/project 的 fx_catalog ----
+let activeFxCategory = "";
+let lastFxCode = "";
+
+function fxCatalog() { return projectPayload?.fx_catalog || { effects: [], categories: {}, schemes: {} }; }
+function fxEffects() { return fxCatalog().effects || []; }
+function fxEffectByCode(code) { return fxEffects().find((effect) => effect.code === code) || null; }
+function fxThemeNo() {
+  const packId = String(state?.style_pack?.project_default || "");
+  const match = packId.match(/^theme-([A-Za-z0-9]+)-(paper|navy)$/);
+  return match ? match[1] : "kwons";
+}
+function fxThumbUrl(effect) {
+  if (!effect) return "";
+  const byTheme = effect.thumbs_by_theme || {};
+  const rel = byTheme[fxThemeNo()] || effect.thumb || "";
+  return rel ? `${fxCatalog().thumb_base || "/fx-thumbs/"}${rel}` : "";
+}
+function applyFxCode(overlay, code) {
+  const effect = fxEffectByCode(code);
+  if (!effect) return;
+  overlay.code = code;
+  overlay.text = effect.name;
+  overlay.values = {};
+  effect.vars.filter((item) => item.kind === "text").forEach((item) => { overlay.values[item.id] = item.default; });
+  const placement = effect.vars.find((item) => item.kind === "placement");
+  overlay.placement = placement ? placement.default : "";
+  overlay.scheme = overlay.scheme || "";
+  if (effect.media_max && overlay.end - overlay.start > effect.media_max) overlay.end = overlay.start + effect.media_max;
+  lastFxCode = code;
+}
+function renderFxPanel(overlay) {
+  const catalog = fxCatalog();
+  if (!catalog.available) {
+    elements["fx-panel-note"].textContent = `效果庫不可用：${catalog.reason || "找不到 edit-style-profiles"}`;
+    elements["fx-grid"].replaceChildren();
+    return;
+  }
+  const cats = catalog.categories || {};
+  const tabs = [["", "全部"], ...Object.entries(cats)];
+  elements["fx-cats"].replaceChildren(...tabs.map(([key, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "tab");
+    button.className = key === activeFxCategory ? "is-selected" : "";
+    button.textContent = key ? `${key} ${label}` : label;
+    button.addEventListener("click", () => { activeFxCategory = key; renderFxPanel(overlay); });
+    return button;
+  }));
+  const query = (elements["fx-search"].value || "").trim().toLowerCase();
+  const list = fxEffects().filter((effect) => (!activeFxCategory || effect.category === activeFxCategory)
+    && (!query || effect.code.toLowerCase().includes(query) || effect.name.toLowerCase().includes(query)));
+  elements["fx-grid"].replaceChildren(...list.map((effect) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `fx-card${effect.code === overlay.code ? " is-selected" : ""}`;
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(effect.code === overlay.code));
+    button.disabled = effect.available === false;
+    button.title = `#${effect.num} ${effect.name}\n${effect.spec || ""}`;
+    const thumb = fxThumbUrl(effect);
+    if (thumb) { const img = document.createElement("img"); img.loading = "lazy"; img.src = thumb; img.alt = effect.name; button.append(img); }
+    const code = document.createElement("span"); code.className = "fx-code"; code.textContent = effect.code; button.append(code);
+    if (effect.matte) { const m = document.createElement("span"); m.className = "fx-m"; m.textContent = "ⓜ"; button.append(m); }
+    const name = document.createElement("span"); name.className = "fx-name"; name.textContent = effect.name; button.append(name);
+    button.addEventListener("click", () => {
+      if (effect.code === overlay.code) return;
+      pushHistory();
+      applyFxCode(overlay, effect.code);
+      markDirty("換效果，儲存中…");
+      renderInspector(); renderLayerList(); renderTimeline(); renderPreviewOverlays(true);
+    });
+    return button;
+  }));
+  const effect = fxEffectByCode(overlay.code);
+  elements["fx-spec"].textContent = effect
+    ? `#${effect.num} ${effect.name}｜${effect.spec || ""}${effect.matte ? "｜ⓜ 需要人物去背：輸出時自動用 matte_video.py 處理這一段。" : ""}${effect.needs_video ? "｜此效果會拿這一段原片做變形（最長 " + (effect.media_max || 4) + " 秒）。" : ""}`
+    : "";
+  const vars = effect ? effect.vars : [];
+  const rows = [];
+  vars.filter((item) => item.kind === "text").forEach((item) => {
+    const label = document.createElement("label");
+    const span = document.createElement("span"); span.textContent = item.label || item.id; label.append(span);
+    const input = document.createElement("input");
+    input.type = "text"; input.maxLength = 200;
+    input.value = overlay.values?.[item.id] ?? item.default ?? "";
+    input.addEventListener("input", () => {
+      overlay.values = overlay.values || {};
+      overlay.values[item.id] = input.value;
+      markDirty("修改特效文字，儲存中…");
+      renderLayerList();
+    });
+    label.append(input);
+    rows.push(label);
+  });
+  const placement = vars.find((item) => item.kind === "placement");
+  if (placement) {
+    const label = document.createElement("label");
+    const span = document.createElement("span"); span.textContent = "擺位（避開臉）"; label.append(span);
+    const select = document.createElement("select");
+    [["top", "上"], ["bottom", "下"], ["left", "左"], ["right", "右"]].forEach(([value, text]) => {
+      const option = document.createElement("option"); option.value = value; option.textContent = text; select.append(option);
+    });
+    select.value = overlay.placement || placement.default || "top";
+    select.addEventListener("change", () => { overlay.placement = select.value; markDirty("修改擺位，儲存中…"); });
+    label.append(select);
+    rows.push(label);
+  }
+  const schemeLabel = document.createElement("label");
+  const schemeSpan = document.createElement("span"); schemeSpan.textContent = `字卡色組（主題 ${fxThemeNo()}）`; schemeLabel.append(schemeSpan);
+  const schemeSelect = document.createElement("select");
+  [["", "跟隨風格包"], ...Object.entries(catalog.schemes || {})].forEach(([value, text]) => {
+    const option = document.createElement("option"); option.value = value; option.textContent = text; schemeSelect.append(option);
+  });
+  schemeSelect.value = overlay.scheme || "";
+  schemeSelect.addEventListener("change", () => { overlay.scheme = schemeSelect.value; markDirty("修改色組，儲存中…"); });
+  schemeLabel.append(schemeSelect);
+  rows.push(schemeLabel);
+  // 字型（2026-10-22）：目錄 id → 伺服器對照成 family；選項以該字型本身顯示預覽。
+  if (Array.isArray(catalog.fonts) && catalog.fonts.length) {
+    [["display", "標題字型（此效果）"], ["body", "內文字型（此效果）"]].forEach(([role, text]) => {
+      const label = document.createElement("label");
+      const span = document.createElement("span"); span.textContent = text; label.append(span);
+      label.append(fxFontPicker(overlay, role));
+      rows.push(label);
+    });
+  }
+  elements["fx-vars"].replaceChildren(...rows);
+}
+
+const FX_FONT_FALLBACK = { display: '"Songti TC","Noto Serif TC",serif', body: '"PingFang TC","Noto Sans TC",sans-serif', mono: "Menlo,monospace", hand: '"Hannotate TC","Songti TC",serif' };
+let fxFontPop = null;
+function closeFxFontPop() { if (fxFontPop) { fxFontPop.remove(); fxFontPop = null; } }
+document.addEventListener("click", (ev) => { if (fxFontPop && !fxFontPop.contains(ev.target)) closeFxFontPop(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeFxFontPop(); });
+function fxFontPicker(overlay, role) {
+  const fonts = (fxCatalog().fonts || []).filter((f) => f.verified !== false);
+  const byId = Object.fromEntries(fonts.map((f) => [f.id, f]));
+  const stack = (id) => (byId[id] ? `"${byId[id].family}", ${FX_FONT_FALLBACK[role]}` : FX_FONT_FALLBACK[role]);
+  const button = document.createElement("button");
+  button.type = "button"; button.className = "fx-font-pick";
+  button.title = "點開選字型（每個選項用自己的字型顯示）";
+  const paint = () => {
+    const id = overlay.font_ids?.[role] || "";
+    button.textContent = id ? (byId[id]?.label || id) : "跟隨風格包";
+    button.style.fontFamily = stack(id);
+    button.classList.toggle("is-empty", !id);
+  };
+  paint();
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    openFxFontPop(button, role, overlay.font_ids?.[role] || "", (id) => {
+      overlay.font_ids = overlay.font_ids || {};
+      if (id) overlay.font_ids[role] = id; else delete overlay.font_ids[role];
+      if (!Object.keys(overlay.font_ids).length) delete overlay.font_ids;
+      paint();
+      markDirty("修改特效字型，儲存中…");
+    });
+  });
+  return button;
+}
+function openFxFontPop(anchor, role, current, pick) {
+  closeFxFontPop();
+  const fonts = (fxCatalog().fonts || []).filter((f) => f.verified !== false);
+  const langs = { all: "全部", tc: "繁中", en: "英文", jp: "日文", sys: "系統內建" };
+  const rect = anchor.getBoundingClientRect();
+  const pop = document.createElement("div"); pop.className = "fx-font-pop"; fxFontPop = pop;
+  pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 450))}px`;
+  pop.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - 80)}px`;
+  pop.addEventListener("click", (ev) => ev.stopPropagation());
+  let lang = "all"; let q = "";
+  const input = document.createElement("input"); input.type = "search"; input.placeholder = "搜字型名、用途…"; input.className = "fx-font-q";
+  const tabs = document.createElement("div"); tabs.className = "fx-font-tabs";
+  const list = document.createElement("div"); list.className = "fx-font-list";
+  const row = (id, sampleText, family, label, note, selected) => {
+    const b = document.createElement("button"); b.type = "button"; b.className = `fx-font-row${selected ? " is-selected" : ""}`;
+    const sm = document.createElement("span"); sm.className = "fx-font-sample"; sm.textContent = sampleText;
+    sm.style.fontFamily = family ? `"${family}", ${FX_FONT_FALLBACK[role]}` : FX_FONT_FALLBACK[role];
+    const nm = document.createElement("span"); nm.className = "fx-font-name"; nm.textContent = label;
+    if (note) { const small = document.createElement("small"); small.textContent = note; nm.append(small); }
+    b.append(sm, nm);
+    b.addEventListener("click", () => { pick(id); closeFxFontPop(); });
+    return b;
+  };
+  const render = () => {
+    tabs.replaceChildren(...Object.entries(langs).map(([key, text]) => {
+      const t = document.createElement("button"); t.type = "button"; t.className = key === lang ? "is-selected" : ""; t.textContent = text;
+      t.addEventListener("click", () => { lang = key; render(); });
+      return t;
+    }));
+    const term = q.trim().toLowerCase();
+    const hit = (f) => (lang === "all" || f.lang === lang) && (!term || [f.label, f.family, f.note, f.cat, f.id].join(" ").toLowerCase().includes(term));
+    const sorted = fonts.filter(hit).sort((a, b) => (b.role === role) - (a.role === role));
+    const rows = [row("", "跟隨風格包", "", "（不指定）", "", !current)];
+    let sep = false;
+    sorted.forEach((f) => {
+      if (!sep && f.role !== role) { const d = document.createElement("div"); d.className = "fx-font-sep"; d.textContent = "其他角色的字型（也可以用）"; rows.push(d); sep = true; }
+      rows.push(row(f.id, f.sample || "Aa", f.family, f.label, `${f.note || ""}${f.family !== f.label ? `　${f.family}` : ""}`, current === f.id));
+    });
+    if (!sorted.length) { const d = document.createElement("div"); d.className = "fx-font-sep"; d.textContent = "沒有符合的字型"; rows.push(d); }
+    list.replaceChildren(...rows);
+  };
+  input.addEventListener("input", () => { q = input.value; render(); });
+  pop.append(input, tabs, list); document.body.append(pop); render(); input.focus();
+}
+
 function renderInspector() {
   const audioEvent = currentAudioEvent();
   if (audioEvent) {
@@ -1875,14 +2092,17 @@ function renderInspector() {
     elements["layer-form"].hidden = true;
     return;
   }
-  const assetType = ["image", "gif", "video"].includes(overlay.type);
+  const fxType = overlay.type === "fx";
+  const assetType = ["image", "gif", "video"].includes(overlay.type) || fxType;
   const designCard = Boolean(overlay.design_role);
   const style = overlay.style || (overlay.style = deepCopy(state.caption_defaults));
   const position = designCard ? editableLayout(overlay) : style;
   elements["inspector-empty"].hidden = true;
   elements["layer-form"].hidden = false;
-  elements["selected-type"].textContent = overlay.type.toUpperCase();
-  elements["selected-name"].textContent = layerLabel(overlay);
+  elements["selected-type"].textContent = fxType ? `FX · ${overlay.code || ""}` : overlay.type.toUpperCase();
+  elements["selected-name"].textContent = fxType ? `特效 ${fxEffectByCode(overlay.code)?.name || overlay.code || ""}` : layerLabel(overlay);
+  elements["fx-panel"].hidden = !fxType;
+  if (fxType) renderFxPanel(overlay);
   elements["text-field"].hidden = assetType;
   elements["effect-editor"].hidden = !["caption", "emphasis"].includes(overlay.type) || designCard;
   elements["overlay-text"].value = overlay.text || "";
@@ -1893,7 +2113,7 @@ function renderInspector() {
   elements["font-size"].value = style.font_size || 58;
   elements["font-size-output"].value = style.font_size || 58;
   elements["font-size"].closest("label").hidden = assetType || designCard;
-  elements["asset-width-row"].hidden = !assetType;
+  elements["asset-width-row"].hidden = !assetType || fxType;
   elements["asset-width"].value = style.width || 32;
   elements["asset-width-output"].value = `${style.width || 32}%`;
   elements["font-color"].value = style.color || "#f7f2e8";
@@ -1912,6 +2132,8 @@ function renderInspector() {
   elements["position-y-output"].value = `${position.y ?? (designCard ? 50 : 76)}%`;
   elements["overlay-animation"].value = style.animation || "none";
   elements["overlay-animation"].closest("label").hidden = assetType || designCard;
+  elements["position-x"].closest(".field-pair, .field, label").hidden = fxType;
+  elements["position-y"].closest(".field-pair, .field, label").hidden = fxType;
   elements["overlay-visible"].checked = overlay.visible !== false;
   if (!elements["effect-editor"].hidden) renderEffectSpanList(overlay);
   renderLayoutWarning();
@@ -1954,12 +2176,20 @@ function addOverlay(type, source = null) {
   if (type === "title" || type === "animation") Object.assign(style, { box: true, y: 42, max_width: 82 });
   const id = `${type}-${Date.now().toString(36)}`;
   const defaults = { caption: "新增字幕", emphasis: "關鍵重點", title: "影片標題", animation: "補充說明" };
-  state.overlays.push({
+  const overlay = {
     id, type, start, end: Math.max(end, start + 0.2), text: defaults[type] || "", emphasis: [],
-    visible: true, locked: false, z_index: ["image", "gif", "video"].includes(type) ? 10 : 30,
+    visible: true, locked: false, z_index: ["image", "gif", "video"].includes(type) ? 10 : type === "fx" ? 25 : 30,
     style, source, provenance: source ? "user-uploaded-through-local-editor" : "manual editor layer",
     highlight_id: activeHighlight()?.id || null,
-  });
+  };
+  if (type === "fx") {
+    const first = fxEffects().find((effect) => effect.available !== false);
+    if (!first) { showToast("找不到效果庫（edit-style-profiles）", "error"); return; }
+    overlay.style = { x: 50, y: 50, width: 100, animation: "none", opacity: 1 };
+    applyFxCode(overlay, lastFxCode && fxEffects().some((effect) => effect.code === lastFxCode) ? lastFxCode : first.code);
+    overlay.provenance = "edit-style-profiles effect chosen in the local editor";
+  }
+  state.overlays.push(overlay);
   selectOverlay(id, true);
   markDirty("新增圖層，儲存中…");
 }
@@ -1979,6 +2209,16 @@ function deleteSelectedOverlay() {
 function updateOverlayFromForm() {
   const overlay = currentOverlay();
   if (!overlay) return;
+  if (overlay.type === "fx") {
+    // An effect block is full-frame and keeps its own text; the form only owns timing and visibility.
+    overlay.start = Number(elements["overlay-start"].value);
+    overlay.end = Math.max(overlay.start + 0.2, Number(elements["overlay-end"].value));
+    overlay.visible = elements["overlay-visible"].checked;
+    overlay.style = { x: 50, y: 50, width: 100, animation: "none", opacity: 1 };
+    markDirty("圖層變更，儲存中…");
+    renderLayoutWarning();
+    return;
+  }
   const style = overlay.style || (overlay.style = {});
   const designCard = Boolean(overlay.design_role);
   const position = editableLayout(overlay);
@@ -2078,7 +2318,7 @@ function renderTimeline() {
   }
   const groups = [
     { name: "影片", kind: "source" },
-    { name: "動畫", types: ["image", "gif", "video", "animation"] },
+    { name: "動畫", types: ["image", "gif", "video", "animation", "fx"] },
     { name: "字卡", types: ["emphasis", "title", "card"] },
     { name: "字幕", types: ["caption"] },
     { name: "音訊", kind: "audio" },
@@ -3144,6 +3384,13 @@ function bindEvents() {
     }
   });
   document.querySelectorAll("[data-add-type]").forEach((button) => button.addEventListener("click", () => addOverlay(button.dataset.addType)));
+  elements["fx-search"].addEventListener("input", () => { const overlay = currentOverlay(); if (overlay?.type === "fx") renderFxPanel(overlay); });
+  // The 風格菜單 tab (/fx-menu) adds fx layers server-side; pick them up without a manual reload.
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin || event.data?.type !== "fx-applied") return;
+    showToast(`風格菜單已加入 ${event.data.added} 個特效，重新載入…`);
+    setTimeout(() => location.reload(), 600);
+  });
   elements["asset-upload-button"].addEventListener("click", () => elements["asset-input"].click());
   elements["asset-input"].addEventListener("change", () => uploadAsset(elements["asset-input"].files[0]));
   elements["delete-layer"].addEventListener("click", deleteSelectedOverlay);
@@ -3449,6 +3696,116 @@ async function loadProjectFont(assetId) {
     loadingProjectFontIds.delete(assetId);
   }
 }
+
+// ---- 字幕字型挑選器（2026-10-22）：已驗證專案字型用實際字型檔預覽；目錄裡 Google Fonts 有的字型可一鍵匯入 ----
+let captionFontPop = null;
+let captionFontImportBusy = false;
+function closeCaptionFontPop() { if (captionFontPop) { captionFontPop.remove(); captionFontPop = null; } }
+document.addEventListener("click", (ev) => { if (captionFontPop && !captionFontPop.contains(ev.target)) closeCaptionFontPop(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeCaptionFontPop(); });
+function captionFontSelectAsset(assetId) {
+  const select = elements["font-family"];
+  if (!select) return;
+  if (![...select.options].some((o) => o.value === assetId)) populateFontSelect({ font_asset_id: assetId });
+  select.value = assetId;
+  updateOverlayFromForm();
+  loadProjectFont(assetId);
+}
+async function captionFontImportFromGoogle(entry, statusEl) {
+  if (captionFontImportBusy) return;
+  captionFontImportBusy = true;
+  const say = (t) => { if (statusEl) statusEl.textContent = t; };
+  try {
+    say("記錄來源同意…");
+    const consent = await request("/api/providers/consent", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider_id: entry.google ? "google-fonts" : "github-fonts", consented: true, confirmed_by: "editor" }) });
+    if (consent && consent.ok === false) throw new Error(consent.error || "來源同意記錄失敗");
+    const providerId = entry.google ? "google-fonts" : "github-fonts";
+    const query = entry.google ? entry.google : entry.id;
+    say(providerId === "google-fonts" ? "向 Google Fonts 倉庫查詢…" : "向作者 GitHub 倉庫（允許清單）查詢…");
+    const found = await request("/api/assets/search", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider_id: providerId, query, page: 1 }) });
+    if (found && found.ok === false) throw new Error(found.error || "查詢失敗");
+    const results = Array.isArray(found?.items) ? found.items : (Array.isArray(found?.results) ? found.results : []);
+    if (!results.length) throw new Error("倉庫裡沒有這個字型");
+    // Prefer the upright face: "Family[wght].ttf" / "Family-Regular.ttf" over any "-Italic" file.
+    const nameOf = (r) => String(r.candidate_id || r.download_url || "").split(":").pop();
+    const upright = results.filter((r) => !/italic/i.test(nameOf(r)));
+    const pick = upright.find((r) => /\[|-Regular\.ttf$/.test(nameOf(r))) || upright[0] || results[0];
+    say("下載、驗證、寫收據…");
+    const imported = await request("/api/assets/import-provider", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ import_token: pick.import_token }) });
+    if (imported && imported.ok === false) throw new Error(imported.error || "匯入失敗");
+    const assetId = imported?.asset_id || imported?.asset?.asset_id || imported?.item?.asset_id || "";
+    await renderFontPanel();
+    const match = projectFonts.find((f) => (assetId && f.asset_id === assetId) || String(f.family || "").toLowerCase() === String(entry.family).toLowerCase());
+    if (match) captionFontSelectAsset(match.asset_id);
+    showToast(`已匯入並套用字型：${entry.label}`, "success");
+    closeCaptionFontPop();
+  } catch (error) {
+    const hint = /security policy/.test(String(error.message))
+      ? "（驗證器拒收：最常見是字型沒有字幕用到的字，例如英文字型配中文字幕；或字型太複雜超出安全上限）"
+      : "";
+    say(`失敗：${error.message}${hint}`);
+    showToast(`字型匯入失敗：${error.message}${hint}`, "error");
+  } finally {
+    captionFontImportBusy = false;
+  }
+}
+function openCaptionFontPop(anchor) {
+  closeCaptionFontPop();
+  const style = currentOverlay()?.style || state?.caption_defaults || {};
+  const currentId = String(style.font_asset_id || "");
+  const catalogFonts = (fxCatalog().fonts || []);
+  const importedFamilies = new Set(projectFonts.map((f) => String(f.family || "").toLowerCase()));
+  const rect = anchor.getBoundingClientRect();
+  const pop = document.createElement("div"); pop.className = "fx-font-pop"; captionFontPop = pop;
+  pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 450))}px`;
+  pop.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - 80)}px`;
+  pop.addEventListener("click", (ev) => ev.stopPropagation());
+  let q = "";
+  const input = document.createElement("input"); input.type = "search"; input.placeholder = "搜字型名、用途…"; input.className = "fx-font-q";
+  const list = document.createElement("div"); list.className = "fx-font-list";
+  const status = document.createElement("div"); status.className = "fx-font-sep";
+  const sep = (text) => { const d = document.createElement("div"); d.className = "fx-font-sep"; d.textContent = text; return d; };
+  const row = ({ sampleText, family, label, note, selected, action, actionLabel }) => {
+    const b = document.createElement("button"); b.type = "button"; b.className = `fx-font-row${selected ? " is-selected" : ""}`;
+    const sm = document.createElement("span"); sm.className = "fx-font-sample"; sm.textContent = sampleText;
+    sm.style.fontFamily = family;
+    const nm = document.createElement("span"); nm.className = "fx-font-name"; nm.textContent = label;
+    const small = document.createElement("small"); small.textContent = `${note || ""}${actionLabel ? `　→ ${actionLabel}` : ""}`; nm.append(small);
+    b.append(sm, nm);
+    b.addEventListener("click", action);
+    return b;
+  };
+  const render = () => {
+    const term = q.trim().toLowerCase();
+    const rows = [];
+    rows.push(sep("已驗證專案字型（用實際字型檔預覽）"));
+    const own = projectFonts.filter((f) => !term || [f.family, f.style, f.asset_id].join(" ").toLowerCase().includes(term));
+    own.forEach((f) => {
+      loadProjectFont(f.asset_id);
+      rows.push(row({ sampleText: "字幕 Caption Aa 0123", family: `"ProjectFont-${f.asset_id}"`, label: String(f.family || f.asset_id),
+        note: `${f.style || ""}${f.weight ? ` · ${f.weight}` : ""}${f.license_spdx ? ` · ${f.license_spdx}` : ""}`, selected: currentId === f.asset_id,
+        action: () => { captionFontSelectAsset(f.asset_id); closeCaptionFontPop(); } }));
+    });
+    if (!own.length) rows.push(sep("（尚無專案字型）"));
+    rows.push(row({ sampleText: "Legacy 系統字型", family: '"PingFang TC","Noto Sans TC",sans-serif', label: "Legacy（未驗證）", note: "不能當專案字型；final 會標記",
+      selected: !currentId, action: () => { elements["font-family"].value = "__legacy__"; updateOverlayFromForm(); closeCaptionFontPop(); } }));
+    rows.push(sep("可一鍵匯入（Google Fonts／作者 GitHub 允許清單，匯入後走驗證與收據）"));
+    const importable = catalogFonts.filter((f) => (f.google || f.github) && !importedFamilies.has(String(f.family).toLowerCase())
+      && (!term || [f.label, f.family, f.note, f.cat, f.id].join(" ").toLowerCase().includes(term)));
+    importable.forEach((f) => rows.push(row({ sampleText: f.sample || "Aa", family: `"${f.family}", ${FX_FONT_FALLBACK[f.role === "body" ? "body" : "display"]}`,
+      label: f.label, note: `${f.note || ""}${f.family !== f.label ? `　${f.family}` : ""}`, selected: false, actionLabel: "匯入並套用",
+      action: () => captionFontImportFromGoogle(f, status) })));
+    if (!importable.length) rows.push(sep("（沒有符合的可匯入字型）"));
+    rows.push(status);
+    list.replaceChildren(...rows);
+  };
+  input.addEventListener("input", () => { q = input.value; render(); });
+  pop.append(input, list); document.body.append(pop); render(); input.focus();
+}
+byIdSafe("font-pick-open")?.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); openCaptionFontPop(ev.currentTarget); });
 
 byIdSafe("apply-caption-scope")?.addEventListener("click", applyCaptionScopeStyle);
 renderFontPanel();

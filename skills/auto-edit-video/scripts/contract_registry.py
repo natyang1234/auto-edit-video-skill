@@ -370,7 +370,7 @@ def _canonical_provider_license_evidence(value, spdx) -> bool:
 
 
 def _canonical_font_license_evidence(provider_id, value, spdx) -> bool:
-    if provider_id not in {"google-fonts", "fontsource"} or spdx not in {
+    if provider_id not in {"google-fonts", "fontsource", "github-fonts"} or spdx not in {
         "OFL-1.1", "Apache-2.0", "Ubuntu-font-1.0",
     }:
         return False
@@ -379,6 +379,17 @@ def _canonical_font_license_evidence(provider_id, value, spdx) -> bool:
     parsed = urlsplit(value)
     if parsed.query or parsed.fragment or parsed.port is not None:
         return False
+    if provider_id == "github-fonts":
+        # exact raw URL of an allowlisted (commit-pinned) licence file, nothing else
+        try:
+            import github_fonts
+        except ImportError:
+            return False
+        return any(
+            value == github_fonts.raw_url(item, item["license_path"]) and item["license_spdx"] == spdx
+            for item in (github_fonts.entry(font_id) for font_id in github_fonts.ids())
+            if item is not None
+        )
     if provider_id == "google-fonts":
         commit = "2796410152d4f9524b68ed46e69c1b60f8e0f7c3"
         match = re.fullmatch(

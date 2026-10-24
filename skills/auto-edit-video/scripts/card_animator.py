@@ -164,6 +164,11 @@ def build_card_html(
     ink = _token(pack, "palette", "ink", "#E6EDF3")
     accent = _token(pack, "palette", "accent", "#E5484D")
     panel = _token(pack, "palette", "panel", "#161B22")
+    muted = _token(pack, "palette", "muted", "#9AA4AF")
+    title_spec = compositor.title_font_spec(pack)
+    title_family = (
+        f"font-family:{title_spec['css']};" if title_spec else ""
+    )
     surface = compositor.surface_style(pack, render_scale)
     panel_alpha = f"{round(float(surface['panel_alpha']) * 255):02X}"
     # Type sizes and geometry come from the static compositor's public ramp;
@@ -179,13 +184,13 @@ html,body{{margin:0;background:transparent}}
 .card{{position:absolute;inset:0;background:{panel}{panel_alpha};border-radius:{surface['radius']:g}px;
   border:{surface['border_width']:g}px solid {surface['border']};
   padding:{px(28)};box-sizing:border-box;color:{ink};overflow:hidden}}
-.title{{font-size:{px(compositor.TITLE_PT)};font-weight:700;text-align:center;white-space:pre-wrap}}
+.title{{font-size:{px(compositor.TITLE_PT)};font-weight:700;text-align:center;white-space:pre-wrap;{title_family}}}
 .u{{display:inline-block;white-space:pre}}
 .list{{font-size:{px(compositor.LIST_BODY_PT)};line-height:{px(compositor.LIST_ROW_PT)}}}
 .index{{color:{accent}}}
-.value{{font-size:{px(compositor.STAT_VALUE_PT)};font-weight:700;color:{accent}}}
+.value{{font-size:{px(compositor.STAT_VALUE_PT)};font-weight:700;color:{accent};{title_family}}}
 .label{{font-size:{px(compositor.STAT_LABEL_PT)};margin-top:{px(6)}}}
-.track{{height:{px(6)};background:#9AA4AF55;margin-top:{px(10)}}}
+.track{{height:{px(6)};background:{muted}55;margin-top:{px(10)}}}
 .bar{{height:100%;background:{accent};transform-origin:left center}}
 </style></head><body>
 <div id="stage" data-composition-id="card-animation" data-start="0"
