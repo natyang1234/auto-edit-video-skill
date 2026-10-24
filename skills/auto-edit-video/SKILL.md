@@ -1,19 +1,6 @@
 ---
 name: auto-edit-video
-description: >-
-  Automatically edit a local video file supplied by the user. In the default
-  agent-first mode, read the video, create the internal project and local
-  transcript, apply conservative reviewed cuts, export a new MP4, run QA, and
-  return the result without requiring a UI or user-supplied Whisper files. Use
-  when the user gives a video path and asks to auto edit, clean up speech,
-  remove silence/fillers/stutters/repetitions/false starts, or make a short
-  highlight. Support platform-aware short, medium, long, automatic, full, and
-  custom-second targets without hard-coding 30 seconds. When the user asks for
-  an interface, launch the loopback Studio for local import, editing intent,
-  five deterministic director profiles, up to ten reviewed highlights,
-  captions/layers, preview, QA-bound single or batch final approval, and
-  download. Never uploads
-  externally by default and never uses CapCut.
+description: "Edit a local video file end to end: transcript, conservative cuts (silence, fillers, stutters, repeats), export MP4, QA. Use when the user gives a video path and asks to auto edit, clean up speech, or make a short highlight. Local Studio UI only if asked. No external upload, no CapCut."
 ---
 
 # Auto Edit Video
@@ -115,6 +102,13 @@ MP4 to review real mask edges. Never substitute a cloud background-removal API.
 If the local rembg environment or model is absent, leave those templates
 disabled and report the missing capability.
 
+Colour themes (`theme-<no>-paper|navy` style packs; `scripts/theme_packs.py list|build`)
+and the `fx` effect-layer overlay (HyperFrames blocks from `edit-style-profiles`,
+rendered by `scripts/fx_overlay.py`; Studio "加入特效" and `/fx-menu`;
+`AUTO_EDIT_DISABLE_FX=1` disables it) are documented in
+[references/THEMES_AND_FX.md](references/THEMES_AND_FX.md). Read it before pinning a
+theme pack or adding effect layers.
+
 Keep the approval order:
 `destructive_edit` → `highlight_selection` → `timeline` → `final`. Every request
 uses the server-provided current revision. A final render freezes state/source/
@@ -177,6 +171,10 @@ python3 "$SKILL/scripts/auto_edit.py" editor \
   --project-dir /absolute/path/project \
   --port 8765 --open
 ```
+
+`editor`／`studio` 啟動時會自檢直譯器：字幕引擎（CoreText via pyobjc）與驗證器釘住的 fonttools 4.62.1
+目前只裝在 `/opt/homebrew/bin/python3.14`，而 `python3` 指到 3.15；沒有引擎時會自動改用 3.14 重新啟動
+（訊息寫 stderr，`AUTO_EDIT_INTERPRETER_CHECKED=1` 防止迴圈）。要跳過自檢就直接用 python3.14 啟動。
 
 Omit every `--voice-*` flag to keep the original voice. Voiceover is opt-in.
 The `editor` command is optional and is not part of the current agent-first
@@ -331,6 +329,11 @@ where the user wants premium occlusion/VFX captions; follow its identity gate.
 
 ### 6. Match visuals to meaning
 
+Storyboard gate (nat, 2026-10-21): before adding effects or designed cards, draft
+`storyboard.md` with `edit-style-profiles/tools/storyboard.py init` (effect codes,
+one theme, card colour schemes, hook options A/B/C), get nat's pick, and pass
+`storyboard.py check` first. Skip only for cut-only output with no effects.
+
 Write `working/visual_plan.json` with a timed entry for each proposed asset,
 title card, data card, illustration, animation, or B-roll insert. Every entry
 must include transcript evidence, purpose, source/provenance, timing, and a
@@ -393,6 +396,8 @@ for the shared HyperFrames engine. Exact commands and the Rumi credential rules 
 credentials or clone identifiers into this skill.
 
 ### 7.1 Built-in SFX layer
+
+> **本機分工（2026-10-24 nat 核可）**：成片音效預設走 `suggest-sfx`（852 筆素材庫、cue 表給 nat 審、`mix_sfx.py --check` 量 RMS）。本節內建層只在 `kinetic-explainer` 導演模式需要字卡自動卡點時開；**同一支片只用一套**，開了內建層就不再跑 suggest-sfx 混音，反之在 director_mode 設 `experience.sfx.mode: "disabled"` **並把 `catalog_profile` 改成 `"v1"`**（kinetic-explainer 預設 v2，`v2＋disabled` 會被 `contract_registry.py` 拒絕）。
 
 Read [references/SFX.md](references/SFX.md) before enabling or editing sound effects.
 It covers the six semantic SFX categories, the 7 fixed trigger roles, the `v1`/`v2`
