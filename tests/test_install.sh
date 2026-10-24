@@ -34,7 +34,7 @@ fi
 test -f "$TEMP_HOME/.codex/skills/auto-edit-video/SKILL.md"
 "$ROOT/install.sh" --agent codex --home "$TEMP_HOME" --check >/dev/null
 
-if find "$TEMP_HOME/.codex/skills" -maxdepth 1 -type d -name 'auto-edit-video.backup-*' | rg -q .; then
+if find "$TEMP_HOME/.codex/skills" -maxdepth 1 -type d -name 'auto-edit-video.backup-*' | grep -q .; then
   printf 'installer polluted the active skill tree with a backup directory\n' >&2
   exit 1
 fi
@@ -49,7 +49,7 @@ test -f "$BACKUP/SKILL.md"
 # the quarantined directory directly, and prove the old bytes came back.
 mv "$TEMP_HOME/.codex/skills/auto-edit-video" "$TEMP_HOME/.codex/skills/auto-edit-video.failed-test"
 mv "$BACKUP" "$TEMP_HOME/.codex/skills/auto-edit-video"
-rg -q 'restore-drill-marker' "$TEMP_HOME/.codex/skills/auto-edit-video/SKILL.md"
+grep -q 'restore-drill-marker' "$TEMP_HOME/.codex/skills/auto-edit-video/SKILL.md"
 mv "$TEMP_HOME/.codex/skills/auto-edit-video" "$BACKUP"
 mv "$TEMP_HOME/.codex/skills/auto-edit-video.failed-test" "$TEMP_HOME/.codex/skills/auto-edit-video"
 "$ROOT/install.sh" --agent codex --home "$TEMP_HOME" --check >/dev/null
