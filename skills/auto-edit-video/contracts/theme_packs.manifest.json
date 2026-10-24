@@ -1,0 +1,305 @@
+{
+  "schema": "theme-pack-manifest/1",
+  "packs": [
+    {
+      "id": "theme-kwons-paper",
+      "file": "style_pack__theme_kwons_paper.json",
+      "label": "主題 kwons 米白深藍（預設）｜紙底",
+      "description": "palette-catalog「米白深藍（預設）」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-kwons-navy",
+      "file": "style_pack__theme_kwons_navy.json",
+      "label": "主題 kwons 米白深藍（預設）｜深底",
+      "description": "palette-catalog「米白深藍（預設）」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-075-paper",
+      "file": "style_pack__theme_075_paper.json",
+      "label": "主題 075 馬戲團條紋｜紙底",
+      "description": "palette-catalog「馬戲團條紋」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-075-navy",
+      "file": "style_pack__theme_075_navy.json",
+      "label": "主題 075 馬戲團條紋｜深底",
+      "description": "palette-catalog「馬戲團條紋」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-034-paper",
+      "file": "style_pack__theme_034_paper.json",
+      "label": "主題 034 月光海軍藍｜紙底",
+      "description": "palette-catalog「月光海軍藍」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-034-navy",
+      "file": "style_pack__theme_034_navy.json",
+      "label": "主題 034 月光海軍藍｜深底",
+      "description": "palette-catalog「月光海軍藍」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-029-paper",
+      "file": "style_pack__theme_029_paper.json",
+      "label": "主題 029 北歐湖泊｜紙底",
+      "description": "palette-catalog「北歐湖泊」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-029-navy",
+      "file": "style_pack__theme_029_navy.json",
+      "label": "主題 029 北歐湖泊｜深底",
+      "description": "palette-catalog「北歐湖泊」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-027-paper",
+      "file": "style_pack__theme_027_paper.json",
+      "label": "主題 027 晴空藍｜紙底",
+      "description": "palette-catalog「晴空藍」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-027-navy",
+      "file": "style_pack__theme_027_navy.json",
+      "label": "主題 027 晴空藍｜深底",
+      "description": "palette-catalog「晴空藍」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-021-paper",
+      "file": "style_pack__theme_021_paper.json",
+      "label": "主題 021 和紙與抹茶｜紙底",
+      "description": "palette-catalog「和紙與抹茶」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-021-navy",
+      "file": "style_pack__theme_021_navy.json",
+      "label": "主題 021 和紙與抹茶｜深底",
+      "description": "palette-catalog「和紙與抹茶」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-014-paper",
+      "file": "style_pack__theme_014_paper.json",
+      "label": "主題 014 霧感尤加利｜紙底",
+      "description": "palette-catalog「霧感尤加利」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-014-navy",
+      "file": "style_pack__theme_014_navy.json",
+      "label": "主題 014 霧感尤加利｜深底",
+      "description": "palette-catalog「霧感尤加利」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-023-paper",
+      "file": "style_pack__theme_023_paper.json",
+      "label": "主題 023 豆乳咖啡｜紙底",
+      "description": "palette-catalog「豆乳咖啡」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-023-navy",
+      "file": "style_pack__theme_023_navy.json",
+      "label": "主題 023 豆乳咖啡｜深底",
+      "description": "palette-catalog「豆乳咖啡」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-060-paper",
+      "file": "style_pack__theme_060_paper.json",
+      "label": "主題 060 香橙奶霜｜紙底",
+      "description": "palette-catalog「香橙奶霜」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-060-navy",
+      "file": "style_pack__theme_060_navy.json",
+      "label": "主題 060 香橙奶霜｜深底",
+      "description": "palette-catalog「香橙奶霜」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-072-paper",
+      "file": "style_pack__theme_072_paper.json",
+      "label": "主題 072 紅寶石櫻桃｜紙底",
+      "description": "palette-catalog「紅寶石櫻桃」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-072-navy",
+      "file": "style_pack__theme_072_navy.json",
+      "label": "主題 072 紅寶石櫻桃｜深底",
+      "description": "palette-catalog「紅寶石櫻桃」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-001-paper",
+      "file": "style_pack__theme_001_paper.json",
+      "label": "主題 001 櫻花牛奶｜紙底",
+      "description": "palette-catalog「櫻花牛奶」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-001-navy",
+      "file": "style_pack__theme_001_navy.json",
+      "label": "主題 001 櫻花牛奶｜深底",
+      "description": "palette-catalog「櫻花牛奶」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-064-paper",
+      "file": "style_pack__theme_064_paper.json",
+      "label": "主題 064 霓虹之夜｜紙底",
+      "description": "palette-catalog「霓虹之夜」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-064-navy",
+      "file": "style_pack__theme_064_navy.json",
+      "label": "主題 064 霓虹之夜｜深底",
+      "description": "palette-catalog「霓虹之夜」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-076-paper",
+      "file": "style_pack__theme_076_paper.json",
+      "label": "主題 076 酒紅奶油｜紙底",
+      "description": "palette-catalog「酒紅奶油」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-076-navy",
+      "file": "style_pack__theme_076_navy.json",
+      "label": "主題 076 酒紅奶油｜深底",
+      "description": "palette-catalog「酒紅奶油」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-077-paper",
+      "file": "style_pack__theme_077_paper.json",
+      "label": "主題 077 墨黑鈷藍｜紙底",
+      "description": "palette-catalog「墨黑鈷藍」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-077-navy",
+      "file": "style_pack__theme_077_navy.json",
+      "label": "主題 077 墨黑鈷藍｜深底",
+      "description": "palette-catalog「墨黑鈷藍」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-078-paper",
+      "file": "style_pack__theme_078_paper.json",
+      "label": "主題 078 森林杏桃｜紙底",
+      "description": "palette-catalog「森林杏桃」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-078-navy",
+      "file": "style_pack__theme_078_navy.json",
+      "label": "主題 078 森林杏桃｜深底",
+      "description": "palette-catalog「森林杏桃」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-079-paper",
+      "file": "style_pack__theme_079_paper.json",
+      "label": "主題 079 可可粉霧｜紙底",
+      "description": "palette-catalog「可可粉霧」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-079-navy",
+      "file": "style_pack__theme_079_navy.json",
+      "label": "主題 079 可可粉霧｜深底",
+      "description": "palette-catalog「可可粉霧」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-080-paper",
+      "file": "style_pack__theme_080_paper.json",
+      "label": "主題 080 靛藍銀灰｜紙底",
+      "description": "palette-catalog「靛藍銀灰」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-080-navy",
+      "file": "style_pack__theme_080_navy.json",
+      "label": "主題 080 靛藍銀灰｜深底",
+      "description": "palette-catalog「靛藍銀灰」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-081-paper",
+      "file": "style_pack__theme_081_paper.json",
+      "label": "主題 081 橄欖芥末｜紙底",
+      "description": "palette-catalog「橄欖芥末」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-081-navy",
+      "file": "style_pack__theme_081_navy.json",
+      "label": "主題 081 橄欖芥末｜深底",
+      "description": "palette-catalog「橄欖芥末」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-082-paper",
+      "file": "style_pack__theme_082_paper.json",
+      "label": "主題 082 炭黑萊姆｜紙底",
+      "description": "palette-catalog「炭黑萊姆」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-082-navy",
+      "file": "style_pack__theme_082_navy.json",
+      "label": "主題 082 炭黑萊姆｜深底",
+      "description": "palette-catalog「炭黑萊姆」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-083-paper",
+      "file": "style_pack__theme_083_paper.json",
+      "label": "主題 083 電光藍橙｜紙底",
+      "description": "palette-catalog「電光藍橙」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-083-navy",
+      "file": "style_pack__theme_083_navy.json",
+      "label": "主題 083 電光藍橙｜深底",
+      "description": "palette-catalog「電光藍橙」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-084-paper",
+      "file": "style_pack__theme_084_paper.json",
+      "label": "主題 084 番茄奶油｜紙底",
+      "description": "palette-catalog「番茄奶油」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-084-navy",
+      "file": "style_pack__theme_084_navy.json",
+      "label": "主題 084 番茄奶油｜深底",
+      "description": "palette-catalog「番茄奶油」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-085-paper",
+      "file": "style_pack__theme_085_paper.json",
+      "label": "主題 085 薰衣草酸黃｜紙底",
+      "description": "palette-catalog「薰衣草酸黃」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-085-navy",
+      "file": "style_pack__theme_085_navy.json",
+      "label": "主題 085 薰衣草酸黃｜深底",
+      "description": "palette-catalog「薰衣草酸黃」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-086-paper",
+      "file": "style_pack__theme_086_paper.json",
+      "label": "主題 086 深海珊瑚｜紙底",
+      "description": "palette-catalog「深海珊瑚」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-086-navy",
+      "file": "style_pack__theme_086_navy.json",
+      "label": "主題 086 深海珊瑚｜深底",
+      "description": "palette-catalog「深海珊瑚」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-087-paper",
+      "file": "style_pack__theme_087_paper.json",
+      "label": "主題 087 黑白莓紅｜紙底",
+      "description": "palette-catalog「黑白莓紅」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-087-navy",
+      "file": "style_pack__theme_087_navy.json",
+      "label": "主題 087 黑白莓紅｜深底",
+      "description": "palette-catalog「黑白莓紅」配色；宋體標題、深色卡片與亮色字。"
+    },
+    {
+      "id": "theme-088-paper",
+      "file": "style_pack__theme_088_paper.json",
+      "label": "主題 088 墨綠奶油｜紙底",
+      "description": "palette-catalog「墨綠奶油」配色；宋體標題、米白紙卡與墨色字。"
+    },
+    {
+      "id": "theme-088-navy",
+      "file": "style_pack__theme_088_navy.json",
+      "label": "主題 088 墨綠奶油｜深底",
+      "description": "palette-catalog「墨綠奶油」配色；宋體標題、深色卡片與亮色字。"
+    }
+  ]
+}
