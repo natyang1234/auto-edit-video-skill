@@ -29,6 +29,10 @@ from visual_motion_probe import measure_declared_motion  # noqa: E402
     shutil.which("ffmpeg") and shutil.which("ffprobe"),
     "needs local ffmpeg",
 )
+@unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: renders through the CoreText caption engine / structured card compositor (pyobjc), which Linux CI does not have",
+)
 class Phase2SceneIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="phase2-scenes-")

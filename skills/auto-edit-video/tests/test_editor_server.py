@@ -54,6 +54,17 @@ from editor_server import (  # noqa: E402
 SYNTHETIC_QA_POLICY = dataclasses.asdict(qa_video.QaPolicy())
 
 
+# Platform gates: these tests run on macOS and are skipped only on Linux CI.
+requires_macos_coretext = unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: renders through the CoreText caption engine / structured card compositor (pyobjc), which Linux CI does not have",
+)
+requires_macos_rembg = unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: needs the local rembg runtime installed on nat's Mac; not provisioned on Linux CI",
+)
+
+
 def synthetic_visual_authority() -> dict[str, object]:
     """A canonical frozen-visual-authority block as the renderer reports it."""
     material = {
@@ -1568,6 +1579,7 @@ class EditorServerTests(unittest.TestCase):
             self.assertEqual(registry.read_bytes(), migrated_before_get)
             self.assertEqual(registry.stat().st_mtime_ns, mtime_before_get)
 
+    @requires_macos_rembg
     def test_state_save_asset_scope_upload_and_final_gate(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         self.assertEqual(status, 200)
@@ -3938,6 +3950,7 @@ class EditorServerTests(unittest.TestCase):
         self.assertIn("evidence re-anchor", app_js)
         self.assertIn("規格待重核", app_js)
 
+    @requires_macos_coretext
     def test_caption_snap_endpoint_and_boundary_validation(self) -> None:
         payload = {"text": "我愛👩‍👩‍👧‍👦你", "start_char": 3, "end_char": 5}
         status, snapped = self.json_request("POST", "/api/captions/snap", payload)
@@ -3990,6 +4003,7 @@ class EditorServerTests(unittest.TestCase):
         status, saved = self.json_request("PUT", "/api/editor-state", state)
         self.assertEqual(status, 200, saved)
 
+    @requires_macos_coretext
     def test_legacy_span_migration_snaps_or_removes(self) -> None:
         status, _headers, body = self.request("GET", "/api/project")
         state = json.loads(body.decode("utf-8"))["state"]
@@ -4767,6 +4781,7 @@ class EditorRendererTests(unittest.TestCase):
         self.assertFalse(final.exists())
         self.assertIn("QA failed", result.stderr + result.stdout)
 
+    @requires_macos_coretext
     def test_required_caption_missing_fails_before_direct_staging_and_preserves_output(self) -> None:
         transcript_source = {
             "schema_version": 1,

@@ -13,6 +13,14 @@ import structured_card_compositor as scc  # noqa: E402
 import theme_packs  # noqa: E402
 
 
+# Sibling-skill gate: palette-catalog (fx_theme.py) is a separate local skill, not part of this repo.
+PALETTE_FX_THEME = theme_packs.PALETTE_CATALOG / "fx_theme.py"
+requires_palette_catalog = unittest.skipUnless(
+    PALETTE_FX_THEME.is_file(),
+    "needs the sibling palette-catalog skill (palette-catalog/fx_theme.py); not installed on CI",
+)
+
+
 class ThemePackTests(unittest.TestCase):
     def test_manifest_packs_validate_and_match_ids(self) -> None:
         entries = theme_packs.load_manifest()
@@ -26,6 +34,7 @@ class ThemePackTests(unittest.TestCase):
                         "surface_ink", "caption_emphasis", "muted"):
                 self.assertRegex(palette[key], r"^#[0-9A-F]{6}$", key)
 
+    @requires_palette_catalog
     def test_generated_pack_is_reproducible(self) -> None:
         regenerated = theme_packs.pack_for("075", "navy")
         on_disk = scc.load_style_pack("theme-075-navy")
@@ -59,6 +68,7 @@ class ThemePackTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     theme_packs.load_manifest(path)
 
+    @requires_palette_catalog
     def test_muted_text_stays_readable(self) -> None:
         sys.path.insert(0, str(theme_packs.PALETTE_CATALOG))
         import fx_theme

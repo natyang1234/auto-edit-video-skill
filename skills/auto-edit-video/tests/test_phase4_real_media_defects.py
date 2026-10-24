@@ -40,6 +40,10 @@ from test_phase3_preservation_mutations import _DeliveryRoundtripCase  # noqa: E
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs local ffmpeg")
+@unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: renders through the CoreText caption engine / structured card compositor (pyobjc), which Linux CI does not have",
+)
 class FrozenSceneAcrossRemovedPauseTests(unittest.TestCase):
     """A scene that spans a removed pause is still one scene.
 

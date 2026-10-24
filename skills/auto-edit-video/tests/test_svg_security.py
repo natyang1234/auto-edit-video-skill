@@ -38,6 +38,13 @@ from svg_security import (  # noqa: E402
 CORPUS = SKILL_DIR / "contracts" / "fixtures" / "svg_threat_corpus.json"
 
 
+# Platform gates: these tests run on macOS and are skipped only on Linux CI.
+requires_macos_sandbox_exec = unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: hashes the real /usr/bin/sandbox-exec used by the production SVG rasterizer sandbox; Linux has no sandbox-exec",
+)
+
+
 def _chunk(kind: bytes, payload: bytes) -> bytes:
     crc = binascii.crc32(kind)
     crc = binascii.crc32(payload, crc) & 0xFFFFFFFF
@@ -277,6 +284,7 @@ class RasterizerTests(unittest.TestCase):
         self.assertFalse(checked.available)
         self.assertEqual(checked.code, "RASTERIZER_TEST_BACKEND")
 
+    @requires_macos_sandbox_exec
     def test_machine_manifest_loader_is_strict_and_permission_gated(self) -> None:
         path = self.root / "manifest.json"
         manifest = self.manifest(
@@ -310,6 +318,7 @@ class RasterizerTests(unittest.TestCase):
         link.symlink_to(path)
         self.assertEqual(load_resvg_manifest(link)[1], "RASTERIZER_MANIFEST_UNSAFE")
 
+    @requires_macos_sandbox_exec
     def test_manifest_schema_version_requires_exact_plain_integer_one(self) -> None:
         path = self.root / "manifest.json"
         manifest = self.manifest(
@@ -342,6 +351,7 @@ class RasterizerTests(unittest.TestCase):
                 "RASTERIZER_MANIFEST_INVALID",
             )
 
+    @requires_macos_sandbox_exec
     def test_reviewed_profile_cannot_be_replaced_by_self_signed_profile(self) -> None:
         path = self.root / "manifest.json"
         manifest = self.manifest()
@@ -364,6 +374,7 @@ class RasterizerTests(unittest.TestCase):
         self.reviewed_profile.write_bytes(BUNDLED_SANDBOX_PROFILE_BYTES + b"\n; drift")
         self.assertEqual(load_resvg_manifest(path)[1], "RASTERIZER_MANIFEST_UNSAFE")
 
+    @requires_macos_sandbox_exec
     def test_manifest_is_independent_of_runtime_bundle_copy_path(self) -> None:
         path = self.root / "manifest.json"
         manifest = self.manifest(
@@ -391,6 +402,7 @@ class RasterizerTests(unittest.TestCase):
         self.assertNotIn("(allow network", profile)
         self.assertNotIn("mach-", profile)
 
+    @requires_macos_sandbox_exec
     def test_production_runner_contract_has_no_shell_and_no_memory_cap_claim(self) -> None:
         manifest = self.manifest(
             executable_path=str(self.executable.resolve()),

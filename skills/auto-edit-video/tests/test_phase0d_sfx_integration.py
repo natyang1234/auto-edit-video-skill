@@ -26,6 +26,10 @@ from editor_server import gate_revision  # noqa: E402
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs local ffmpeg")
+@unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: renders through the CoreText caption engine / structured card compositor (pyobjc), which Linux CI does not have",
+)
 class Phase0dSfxIntegrationTests(unittest.TestCase):
     """Exercise the public final route against actual rendered media bytes."""
 
