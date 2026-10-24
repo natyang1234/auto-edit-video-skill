@@ -1,6 +1,6 @@
 ---
 name: auto-edit-video
-description: "Edit a local video file end to end: transcript, conservative cuts (silence, fillers, stutters, repeats), export MP4, QA. Use when the user gives a video path and asks to auto edit, clean up speech, or make a short highlight. Local Studio UI only if asked. No external upload, no CapCut."
+description: "Edit a local video file end to end: transcript, conservative cuts (silence, fillers, stutters, repeats), export MP4, QA. Use when the user gives a video path and asks to auto edit, clean up speech, or make a short highlight. Local Studio UI only if asked. No external upload; CapCut only as the semi-auto `export-capcut` draft (nat polishes in CapCut)."
 ---
 
 # Auto Edit Video
@@ -234,7 +234,7 @@ Defaults are deliberately conservative:
 - original audio retained;
 - clean rail subtitles with sparse keyword emphasis;
 - content-matched cards, assets, and animations enabled;
-- CapCut disabled.
+- CapCut: not used by default; semi-auto draft only when nat asks (`export-capcut`, see Hard rules).
 
 ### 3. Transcribe and propose cuts
 
@@ -458,7 +458,11 @@ Read [references/ROUTING.md](references/ROUTING.md) before selecting a renderer.
 - Treat all AI outputs as editable proposals.
 - Use only owned/licensed media, fonts, music, and voices; store provenance.
 - Do not fabricate B-roll evidence, quotes, product screens, or numerical cards.
-- Never invoke CapCut, write CapCut drafts, or call CapCut helpers that mutate data.
+- CapCut semi-auto mode only (nat 2026-08-23): the one allowed CapCut write is
+  `python3 "$SKILL/scripts/auto_edit.py" export-capcut PROJECT [--name N] [--srt S] [--no-captions] [--force]`,
+  which builds a Mac CapCut 9.x draft from the cut timeline and captions for nat to polish by hand.
+  Never drive the CapCut UI, never write a draft while CapCut is open (auto-save overwrites it),
+  and export to a test draft root unless nat asks for the real draft library.
 - Keep voice generation opt-in and disclose whether text leaves the machine.
 - Report project path, manifest, selected route, voice provider/ID, preview URL,
   final MP4, QA report, contact sheet, and unresolved risks.
