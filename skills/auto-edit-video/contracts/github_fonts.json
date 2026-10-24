@@ -1,0 +1,119 @@
+{
+  "fonts": {
+    "chenyuluoyan": {
+      "commit": "6e36815b0bec9f4f948298698d00b27a5f0b65c1",
+      "container": "ttf",
+      "family": "ChenYuluoyan 2.0",
+      "font_blob_sha1": "647b14819d9a734eec5800bcbbff0f5cad2d42cf",
+      "font_path": "ChenYuluoyan-2.0-Thin.ttf",
+      "label": "辰宇落雁體 2.0",
+      "license_blob_sha1": "23a40dbecdc3ce1c191d9efc9f2bef5dd8843346",
+      "license_path": "license.txt",
+      "license_spdx": "OFL-1.1",
+      "owner": "Chenyu-otf",
+      "repo": "chenyuluoyan_thin"
+    },
+    "chiron-go-round": {
+      "commit": "9d73676cbea393bf511fec766ab6f56249ba9ea4",
+      "container": "otf",
+      "family": "Chiron GoRound TC",
+      "font_blob_sha1": "aa97ddd6dd36d95131cbd2bf1eecf03f3d57e33e",
+      "font_path": "STATIC_OTF/ChironGoRoundTC-800EB.otf",
+      "label": "昭源環方",
+      "license_blob_sha1": "b81a61cf39af5c1d4649316bc9b873ffa7355ca1",
+      "license_path": "LICENSE.md",
+      "license_spdx": "OFL-1.1",
+      "owner": "chiron-fonts",
+      "repo": "chiron-go-round-tc"
+    },
+    "cubic-11": {
+      "commit": "4c566f7d6cc5c05ee360fe9cff56b5da1fcafd4d",
+      "container": "ttf",
+      "family": "Cubic 11",
+      "font_blob_sha1": "48b3411ce6f6f54db45b6125d108b574ebdc973e",
+      "font_path": "fonts/ttf/Cubic_11.ttf",
+      "label": "俐方體 11 號",
+      "license_blob_sha1": "4e863313ebd22ae0b44ea5f9538142b6b10e8f29",
+      "license_path": "OFL.txt",
+      "license_spdx": "OFL-1.1",
+      "owner": "ACh-K",
+      "repo": "Cubic-11"
+    },
+    "iansui": {
+      "commit": "9d9a8e68bf1e138dd91e562eeff28d95bca33196",
+      "container": "ttf",
+      "family": "Iansui",
+      "font_blob_sha1": "3dcc17971252ea3c23f1eac4e6277e762f4566d0",
+      "font_path": "fonts/ttf/Iansui-Regular.ttf",
+      "label": "芫荽",
+      "license_blob_sha1": "a0ac83f276c6f47cba5c09fd96bd599bc175e399",
+      "license_path": "OFL.txt",
+      "license_spdx": "OFL-1.1",
+      "owner": "ButTaiwan",
+      "repo": "iansui"
+    },
+    "jf-open-huninn": {
+      "commit": "f240f9071a78298f379bc087cae2010df11cf477",
+      "container": "ttf",
+      "family": "jf-openhuninn-2.1",
+      "font_blob_sha1": "49ce714ce7fcb394e89ab74de62d80f22ea41771",
+      "font_path": "font/jf-openhuninn-2.1.ttf",
+      "label": "jf open 粉圓",
+      "license_blob_sha1": "7058b6acd1dd73013e2301a5a32fe51fd732f4fb",
+      "license_path": "LICENSE",
+      "license_spdx": "OFL-1.1",
+      "owner": "justfont",
+      "repo": "open-huninn-font"
+    },
+    "mantou-sans": {
+      "commit": "826e7a941f3b722033bad786db364287dee55780",
+      "container": "ttf",
+      "family": "Mantou Sans",
+      "font_blob_sha1": "31378b66447d79261e697ff2cd430cb63a8a87e2",
+      "font_path": "Font/MantouSans-Regular.ttf",
+      "label": "饅頭黑體",
+      "license_blob_sha1": "4a0338361843f9c995b6331c820ca80d879a3c5e",
+      "license_path": "OFL.txt",
+      "license_spdx": "OFL-1.1",
+      "owner": "mant0u0",
+      "repo": "MantouSans"
+    },
+    "wd-xl-lubrifont": {
+      "commit": "4db65d808c17cf74ff8f07a2c39b664746e9d6a2",
+      "container": "otf",
+      "family": "WD-XL Lubrifont TC",
+      "font_blob_sha1": "d6b02dd60a38edcbdc7d0e51af26b22e28e9289d",
+      "font_path": "fonts/OTF/WD-XLLubrifontTC-Regular.otf",
+      "label": "WD-XL 滑油字 TC",
+      "license_blob_sha1": "24054ce906eec4a0b48c0b82ed1eb41fbc064062",
+      "license_path": "OFL.txt",
+      "license_spdx": "OFL-1.1",
+      "owner": "NightFurySL2001",
+      "repo": "WD-XL-font"
+    },
+    "zhuque-fangsong": {
+      "commit": "803217b9663d1c6e1402e91acc94e4f572713d73",
+      "container": "ttf",
+      "family": "Zhuque Fangsong (technical preview)",
+      "font_blob_sha1": "3f69b67fc67f1fd6b640b00c101db8a39c547502",
+      "font_path": "ZhuqueFangsong-Regular.ttf",
+      "label": "朱雀仿宋",
+      "license_blob_sha1": "1091c8f8b724daaa25b0c941ae3115217744c6c6",
+      "license_path": "LICENSE.txt",
+      "license_spdx": "OFL-1.1",
+      "owner": "TrionesType",
+      "repo": "zhuque",
+      "source": {
+        "kind": "release-zip",
+        "member": "ZhuqueFangsong-Regular.ttf",
+        "member_sha256": "558c62730844fe54ba220146ed62f859d4e2880188d92d985f8921c6e3743bc4",
+        "member_size": 8824084,
+        "url": "https://github.com/TrionesType/zhuque/releases/download/v0.212/ZhuqueFangsong-v0.212.zip",
+        "zip_sha256": "bb8b661a7643d2296a72d9d10530a00949419c4e527fb61783f73c2ba1a8c062",
+        "zip_size": 5743932
+      }
+    }
+  },
+  "note": "Code-reviewed allowlist for the github-fonts caption provider. Every entry pins an immutable commit plus the Git blob SHA-1 of the font file and of its licence file; the service refuses any id, path or repository not listed here. Edit only through a reviewed change: scripts/github_fonts.py pins this file's SHA-256.",
+  "schema": "github-fonts-allowlist/1"
+}
