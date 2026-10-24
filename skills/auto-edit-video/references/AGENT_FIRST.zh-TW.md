@@ -119,7 +119,7 @@ Agent 只有在下列條件成立時才能回報完成：
 - 不傳送到 LINE、Email、雲端硬碟或社群平台。
 - 不把影片、音訊或逐字稿上傳到臨時公開服務。
 - 不自動使用雲端 TTS、聲音複製、外部 B-roll 或未授權素材。
-- 不使用 CapCut，也不修改 CapCut 草稿。
+- CapCut 只走半自動（nat 2026-08-23）：要 CapCut 草稿時用 `export-capcut` 產草稿給 nat 手動微調；不操作 CapCut 介面、CapCut 開著時不寫草稿。
 
 ## 9. 執行環境
 

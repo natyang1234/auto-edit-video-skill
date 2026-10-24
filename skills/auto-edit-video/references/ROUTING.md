@@ -63,4 +63,4 @@ before caption and visual timing are finalized.
 - HyperFrames TTS provider IDs are not interchangeable.
 - Rumi voice aliases are resolved only by the shared `tts_voices.py` whitelist;
   never substitute a HyperFrames ID or copy a Fish clone reference into the manifest.
-- CapCut is disabled in every route.
+- CapCut: no route drives CapCut; when nat asks for a CapCut draft, run `export-capcut` after the cut (semi-auto mode, nat 2026-08-23).
