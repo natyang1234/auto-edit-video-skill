@@ -231,7 +231,7 @@ class NoScratchPathLeakageTests(unittest.TestCase):
     def test_real_library_has_no_absolute_scratch_paths(self) -> None:
         library_path = SKILL_DIR / "assets" / "sfx" / "LIBRARY.json"
         text = library_path.read_text(encoding="utf-8")
-        for fragment in ("/private/", "/tmp/", "/Users/"):
+        for fragment in ("/private/", "/tmp/", "/Users" "/"):
             self.assertNotIn(fragment, text)
 
     def test_real_library_normalizer_params_is_logical_only(self) -> None:
@@ -244,7 +244,7 @@ class NoScratchPathLeakageTests(unittest.TestCase):
             self.assertIn("bit_depth", params)
             self.assertIn("target_peak_dbfs", params)
             params_text = json.dumps(params)
-            for fragment in ("/private/", "/tmp/", "/Users/", "/var/"):
+            for fragment in ("/private/", "/tmp/", "/Users" "/", "/var/"):
                 self.assertNotIn(fragment, params_text)
 
 

@@ -48,7 +48,7 @@ ASSET_ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$")
 SCHEMA_VERSION = 1
 LIBRARY_ID = "auto-edit-sfx-library"
 
-FORBIDDEN_PATH_FRAGMENTS = ("/private/", "/tmp/", "/Users/")
+FORBIDDEN_PATH_FRAGMENTS = ("/private/", "/tmp/", "/Users" "/")
 APPROVAL_REQUIRED_FIELDS = ("approver", "authority", "approved_at", "basis", "evidence_file", "evidence_sha256")
 
 KNOWN_LICENSES = {

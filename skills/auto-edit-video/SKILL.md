@@ -34,7 +34,7 @@ browser preview.
 Example user request:
 
 ```text
-Use $auto-edit-video to automatically edit /path/to/input.mp4 and return the MP4.
+/auto-edit-video automatically edit /path/to/input.mp4 and return the MP4.
 ```
 
 Do not launch the page editor in this mode unless the user explicitly asks for
@@ -337,11 +337,9 @@ must include transcript evidence, purpose, source/provenance, timing, and a
 fallback. Never choose a merely similar-looking asset when it contradicts the
 spoken content.
 
-The local Studio searches Openverse/Wikimedia still-image metadata after the project's explicit network-disclosure consent. Explicit import of allowlisted `CC0-1.0`/`CC-BY-4.0` stores a private copy, source/creator/license/hash, regenerates `ATTRIBUTION.md`, and binds it to the final rights gate; evidence is not legal advice.
-
-Font search is metadata-only: Google Fonts uses the pinned-commit grammar `(ofl|apache|ufl)/family`, Fontsource exact `id@x.y.z` semver. Explicit import strictly validates and stores private TTF/OTF, license, and SPDX evidence. Exact `font_asset_id` coverage of rendered glyphs is required: missing/tampered/uncovered fonts block preview/final; `AUTO_EDIT_FONT` is an explicitly unverified legacy fallback only without a project font ID.
-
-SVG search shows Heroicons/Lucide/Tabler/Wikimedia metadata; raw SVG never enters DOM or timeline, only strictly sanitized bounded rasterized PNG. Production never trusts `PATH`: after installing `resvg`, explicitly run `python3 scripts/configure_resvg.py --resvg <canonical-absolute-path>` from the skill directory to create the owner-only manifest and reviewed deny-network sandbox profile. Missing, drifted, or unsafe configuration labels SVG import unavailable and fails closed. Tests use fake transport/rasterizer, never live provider search. Arbitrary URLs, GIF, and B-roll provider retrieval remain unsupported; licensed local uploads work.
+Studio provider search (Openverse/Wikimedia stills, fonts, SVG icons) is metadata-only until
+an explicit, consented import. Read [references/ASSET_PROVIDERS.md](references/ASSET_PROVIDERS.md)
+for the license allowlists, font-coverage gate, and `resvg` SVG sandbox setup.
 
 Create transcript-grounded text cards in the bundled editor. When installed,
 route richer designed cards to `talking-head-recut`, finished narration footage
@@ -389,124 +387,18 @@ Pin both provider and voice ID. Gender is a selection constraint, not a voice ID
 For providers without native word timings, transcribe the generated narration
 and use those timings for captions.
 
-For Edge voiceover:
-
-```bash
-python3 "$SKILL/scripts/auto_edit.py" synthesize-edge \
-  --manifest PROJECT/project.json \
-  --script PROJECT/voice/narration.txt \
-  --allow-cloud
-```
-
-For the shared Rumi voice system:
-
-```bash
-python3 "$SKILL/scripts/auto_edit.py" synthesize-rumi \
-  --manifest PROJECT/project.json \
-  --script PROJECT/voice/narration.txt \
-  --allow-cloud
-```
-
-Do not copy voice credentials or clone identifiers into this skill. Locate the
-optional Rumi system through `RUMI_VOICE_SYSTEM`; the known OpenClaw workspace
-path is only a compatibility fallback. If no safe catalog is present, do not
-offer Rumi and use an explicitly approved available provider instead.
-
-For the shared HyperFrames engine, first build its request:
-
-```bash
-python3 "$SKILL/scripts/auto_edit.py" audio-request \
-  --manifest PROJECT/project.json \
-  --script PROJECT/voice/narration.txt
-```
-
-Then call the exact discovered engine documented by `hyperframes-media`; do not
-download or vendor it implicitly.
+Run `synthesize-edge`, `synthesize-rumi` (both require `--allow-cloud`), or `audio-request`
+for the shared HyperFrames engine. Exact commands and the Rumi credential rules are in
+[references/VOICEOVER_COMMANDS.md](references/VOICEOVER_COMMANDS.md). Never copy voice
+credentials or clone identifiers into this skill.
 
 ### 7.1 Built-in SFX layer
 
-The skill ships a deterministic sound-effect layer with six semantic
-categories: `cash_coin` (money/results beats), `click_pop` (UI reveals, list
-steps), `whoosh` (scene/section transitions), `impact_hit` (emphasis on a key
-point), `success_ding` (completion/success beats), and `error_glitch`
-(mistakes/warnings). The 7 fixed trigger roles (`title_enter`, `row_reveal`,
-`count_tick`, `typing`, `transition`, `grid_fill`, `complete`) always resolve
-to a fixed category via `scripts/sfx_mapping.ROLE_TO_CATEGORY`; this
-role-to-category mapping is unchanged across catalog profiles, but which
-asset fills that category depends on the profile: `v1` fixes each role to
-its one pinned procedural asset, while `v2` selects the asset from the
-frozen catalog per role, preferring external assets.
-
-Two catalog profiles control what non-trigger content-hint events can select
-from:
-
-- `v1` (`phase1-local-procedural`): the original 7 procedurally generated WAVs
-  only. Fully deterministic, no external assets.
-- `v2` (the default profile for the `kinetic-explainer` director profile): the
-  same 7 plus 2 additional procedural assets (`coin-blip-v1`,
-  `glitch-buzz-v1`), plus 12 Pixabay-licensed WAVs in `assets/sfx/<category>/`
-  tracked with source provenance, a hash chain, and approval metadata in
-  `assets/sfx/LIBRARY.json`. `scripts/sfx_delivery.load_sfx_library()`
-  re-verifies every record's evidence chain on every load and never trusts the
-  JSON file at face value.
-
-Select the profile through director_mode `experience.sfx.catalog_profile`
-(`"v1"` or `"v2"`). `catalog_profile: "v2"` is rejected when
-`experience.sfx.mode` is `"disabled"`.
-
-For explicit event placement, write `working/sfx_hints.json` (contract
-`sfx_hints`, schema v1):
-
-```json
-{
-  "schema_version": 1,
-  "hints": [
-    {"onset_sample": 480000, "category": "success_ding", "reason": "closing beat"}
-  ]
-}
-```
-
-`onset_sample` is measured on the post-cut, final timeline at 48kHz, and hints
-must be strictly increasing by onset. Pass the file to the cut CLI and it is
-copied into the project's `working/` directory:
-
-```bash
-python3 "$SKILL/scripts/auto_edit.py" cut \
-  --manifest PROJECT/project.json \
-  --sfx-hints PROJECT/sfx_hints.json
-```
-
-`scripts/sfx_suggest.py` is an advisory helper: it scans the final captions
-against [references/sfx_keywords.json](references/sfx_keywords.json) and
-writes `working/sfx_suggestions.json`. It only proposes candidate
-category/onset pairs; it never edits `sfx_hints.json` or the delivered
-timeline, so a suggestion requires an explicit copy into `sfx_hints.json` (or
-manual placement) to take effect.
-
-Manage the external asset library with `scripts/sfx_import.py`:
-
-- `import` — normalize a licensed source file, place it under
-  `assets/sfx/<category>/`, and append a hashed, approved record to
-  `LIBRARY.json`.
-- `verify` — recompute every record's hashes and fail with a non-zero exit on
-  any tampering or drift, including a hand-edited `LIBRARY.json`.
-- `list` — print the current library contents.
-
-All current external assets use the Pixabay Content License (commercial use
-allowed, no attribution required, no standalone redistribution of the raw
-asset); see [assets/sfx/README.md](assets/sfx/README.md) for the full
-evidence chain.
-
-Density limits apply regardless of profile: a 120ms minimum gap between cues,
-at most 2 overlapping cues, and at most 40 cues per minute. Catalog v2
-additionally caps `whoosh` to at most 1 cue per 10 seconds and every other
-category to at most 1 cue per 5 seconds.
-
-Studio audio-event edits (`audio_event_edits`, moving or re-gaining a cue in
-the Studio timing editor) are only supported under `catalog_profile: "v1"`.
-A project with `catalog_profile: "v2"` (the `kinetic-explainer` default)
-rejects rendering with existing `audio_event_edits`; clear the edits or move
-the project to a v1-catalog director before rendering.
+Read [references/SFX.md](references/SFX.md) before enabling or editing sound effects.
+It covers the six semantic SFX categories, the 7 fixed trigger roles, the `v1`/`v2`
+catalog profiles (`experience.sfx.catalog_profile`), `working/sfx_hints.json`
+placement (`cut --sfx-hints`), `sfx_suggest.py`, `sfx_import.py` library management,
+density limits, and the rule that Studio `audio_event_edits` work only under `v1`.
 
 ### 8. Render and verify
 

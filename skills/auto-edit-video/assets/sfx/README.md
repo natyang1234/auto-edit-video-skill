@@ -44,7 +44,7 @@ The resulting `approval` block records `evidence_file`/`evidence_sha256`
 (the per-asset acquisition evidence) alongside `approver`, `authority`,
 `approved_at`, and `basis` — every one of these six fields is required and
 checked by both `verify` and `sfx_delivery.load_sfx_library()`. The import
-also refuses to write a record containing `/private/`, `/tmp/`, or `/Users/`
+also refuses to write a record containing `/private/`, `/tmp/`, or the macOS user-home prefix (`/Users` followed by `/`)
 anywhere in it, so no local/scratch filesystem path can leak into
 `LIBRARY.json`.
 

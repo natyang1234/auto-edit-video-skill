@@ -200,7 +200,7 @@
     "word_count": 31,
     "segment_count": 4,
     "caption_count": 4,
-    "source_json": "/Users/nai/auto-edit-projects/20260814t085038z-2025-11-25-1149-img-7766-ce64b1b0-ffd4/working/whisper-local/8580dfdc83c545c1a6c97d5cfc4ca2e3/original.json",
+    "source_json": "<projects-root>/20260814t085038z-2025-11-25-1149-img-7766-ce64b1b0-ffd4/working/whisper-local/8580dfdc83c545c1a6c97d5cfc4ca2e3/original.json",
     "source_revision": "67beb8189c807292704b5132d3ab630b67ac7a782ff8b0f29455e6461c2b1f51",
     "source_generation": 0,
     "decoded_pcm_sha256": "d486c82909570be4ac232b9d98046180d8b47954a3b5de16ec08b5e199a75f61",
