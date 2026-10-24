@@ -7,6 +7,9 @@ from io import BytesIO
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 
+# Seconds since 1904-01-01 (the sfnt epoch); any constant works, it only has to be fixed.
+FIXED_HEAD_TIMESTAMP = 3_850_000_000
+
 
 def build_ttf(
     *,
@@ -58,6 +61,10 @@ def build_ttf(
     )
     builder.setupPost()
     builder.setupMaxp()
+    # Pin head.created/modified and stop TTFont.save() from stamping the current time;
+    # otherwise two builds that straddle a wall-clock second produce different bytes.
+    builder.updateHead(created=FIXED_HEAD_TIMESTAMP, modified=FIXED_HEAD_TIMESTAMP)
+    builder.font.recalcTimestamp = False
     output = BytesIO()
     builder.save(output)
     return output.getvalue()
