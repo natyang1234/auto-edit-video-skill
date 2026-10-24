@@ -437,6 +437,9 @@ class StructuredCardTests(unittest.TestCase):
             "type": "title",
             "payload": {"title": "同一份內容", "kicker": "PACK"},
         }
+        pack_ids = scc.style_pack_ids()
+        # 3 個基本包＋theme_packs 產生的主題包（10/21 起）；數量以登錄表為準，不寫死。
+        self.assertGreaterEqual(len(pack_ids), 3)
         digests = {
             pack_id: scc.render_card(
                 self.project,
@@ -445,10 +448,10 @@ class StructuredCardTests(unittest.TestCase):
                 self.state["canvas"],
                 1.0,
             )[1]
-            for pack_id in scc.style_pack_ids()
+            for pack_id in pack_ids
         }
-        self.assertEqual(len(digests), 3)
-        self.assertEqual(len(set(digests.values())), 3)
+        self.assertEqual(len(digests), len(pack_ids))
+        self.assertEqual(len(set(digests.values())), len(pack_ids))
 
     def test_label_overflow_fails_closed(self) -> None:
         layers = make_layers()
