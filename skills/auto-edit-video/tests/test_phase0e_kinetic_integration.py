@@ -72,6 +72,10 @@ class _OllamaHandler(http.server.BaseHTTPRequestHandler):
     shutil.which("ffmpeg") and shutil.which("ffprobe"),
     "needs local ffmpeg",
 )
+@unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: renders through the CoreText caption engine / structured card compositor (pyobjc), which Linux CI does not have",
+)
 class Phase0eKineticIntegrationTests(unittest.TestCase):
     """Keep acquisition deterministic, but execute the real delivery route."""
 

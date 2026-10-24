@@ -15,6 +15,13 @@ sys.path.insert(0, str(SKILL_DIR / "scripts"))
 import generated_images as gi  # noqa: E402
 
 
+# Platform gates: these tests run on macOS and are skipped only on Linux CI.
+requires_macos_openclaw_bridge = unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: exercises the local OpenClaw chatgpt-image-bridge install under ~/.openclaw; absent on Linux CI",
+)
+
+
 class FakeResult:
     def __init__(self, returncode: int = 0, stderr: str = "") -> None:
         self.returncode = returncode
@@ -111,6 +118,7 @@ class GeneratedImageTests(unittest.TestCase):
         self.assertIn("bridge exploded", result["reason"])
         self.assertFalse((self.project / gi.LEDGER_REL).exists())
 
+    @requires_macos_openclaw_bridge
     def test_an_unreachable_browser_is_reported_not_raised(self) -> None:
         result = gi.generate_image(
             self.project, "beat-1", "a cat", cdp="http://127.0.0.1:9", runner=self.runner()

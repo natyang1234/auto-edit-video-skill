@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,6 +131,10 @@ def _always_overlong_translation(self) -> None:
     _reply(self, translate)
 
 
+@unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: renders through the CoreText caption engine / structured card compositor (pyobjc), which Linux CI does not have",
+)
 class Phase3BilingualPublicCutRedTests(phase0e.unittest.TestCase):
     """Reuse one Phase 0e fixture without inheriting its complete test suite."""
 

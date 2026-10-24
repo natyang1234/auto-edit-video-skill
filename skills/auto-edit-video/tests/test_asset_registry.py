@@ -48,6 +48,13 @@ JPEG_2X1 = base64.b64decode(
 )
 
 
+# Platform gates: these tests run on macOS and are skipped only on Linux CI.
+requires_macos_imageio = unittest.skipUnless(
+    sys.platform == "darwin",
+    "macOS only: secure still-image decoding uses Quartz ImageIO (pyobjc), which Linux CI does not have",
+)
+
+
 def strict_png(width: int = 24, height: int = 24) -> bytes:
     def chunk(kind: bytes, payload: bytes) -> bytes:
         checksum = binascii.crc32(kind)
@@ -470,6 +477,7 @@ class AssetRegistryTests(unittest.TestCase):
             asset_registry.current_item(self.project, "assets/other.png", item["sha256"])
         )
 
+    @requires_macos_imageio
     def test_resolve_approved_image_snapshot_returns_approved_png(self) -> None:
         payload = strict_png()
         item = self.item()
@@ -493,6 +501,7 @@ class AssetRegistryTests(unittest.TestCase):
         self.assertEqual(resolved["bytes"], payload)
         self.assertEqual(resolved["format"], "png")
 
+    @requires_macos_imageio
     def test_resolve_approved_image_snapshot_returns_approved_jpeg(self) -> None:
         item = self.item(path="assets/photo.jpeg")
         item["sha256"] = hashlib.sha256(JPEG_2X1).hexdigest()
@@ -643,6 +652,7 @@ class AssetRegistryTests(unittest.TestCase):
                 },
             )
 
+    @requires_macos_imageio
     def test_resolve_approved_image_snapshot_reads_one_fd_across_atomic_replace(self) -> None:
         payload = strict_png()
         replacement = strict_png(width=25)
