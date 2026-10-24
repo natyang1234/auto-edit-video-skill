@@ -23,7 +23,7 @@ CC-BY-NC／ND 系列、未知授權、來源不可考、以及來源條款禁 AI
    license evidence 是固定 provider ID→SPDX→official GitHub repo→pinned ref→LICENSE path；並有
    server 匯入流程產生、與 registry item/hash 一致的 consistency evidence；單獨新增或修改
    `assets/provenance.json` 不足以自動核可。
-7. Google Fonts／Fontsource 字型只接受 project-private `assets/fonts/<sha256>.ttf|.otf`，
+7. Google Fonts／Fontsource／GitHub 允許清單（`contracts/github_fonts.json`，釘 commit 與字型／授權檔 Git blob SHA，程式碼釘住清單 SHA-256；字型只在 Release zip 時另釘 zip 與成員的大小＋SHA-256）字型只接受 project-private `assets/fonts/<sha256>.ttf|.otf`，
    並須有 server 產生的 strict v3 receipt，同時綁定 pinned commit／strict semver candidate、
    font bytes、實際下載且通過 SPDX text fingerprint 的 `licenses/<sha256>.txt`、validator identity
    與 import-time glyph coverage。Final resolve 必須重算所有實體 hash、重驗 license text 與當前

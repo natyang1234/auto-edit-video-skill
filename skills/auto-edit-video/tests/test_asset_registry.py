@@ -903,6 +903,56 @@ class AssetRegistryTests(unittest.TestCase):
             asset_registry.resolve_project_font(self.project, item["asset_id"])
         self.assertEqual(asset_registry.list_project_fonts(self.project), [])
 
+    def test_font_receipt_from_previous_policy_version_is_rejected(self) -> None:
+        # 2026-10-22: policy/2 raised the outline budget; a receipt minted under policy/1 must
+        # not resolve — the font has to be re-validated under the current limits.
+        item, _receipt = self.publish_font_receipt()
+        receipt_path = (
+            self.project / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        data = json.loads(receipt_path.read_text("utf-8"))
+        data["validator"]["receipt"]["policy_version"] = "font-security-policy/1"
+        receipt_path.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            asset_registry.resolve_project_font(self.project, item["asset_id"])
+        self.assertEqual(asset_registry.list_project_fonts(self.project), [])
+
+    def test_font_receipt_under_stale_policy_can_be_superseded_but_valid_one_cannot(self) -> None:
+        item, _receipt = self.publish_font_receipt()
+        receipt_path = (
+            self.project / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        # Still valid → immutable.
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            self.publish_font_receipt()
+        data = json.loads(receipt_path.read_text("utf-8"))
+        data["validator"]["receipt"]["policy_version"] = "font-security-policy/1"
+        receipt_path.write_text(json.dumps(data), encoding="utf-8")
+        # Stale → set aside and replaced; the font resolves again afterwards.
+        item2, _ = self.publish_font_receipt()
+        self.assertEqual(item2["asset_id"], item["asset_id"])
+        superseded = list(receipt_path.parent.glob(f"{receipt_path.stem}.superseded-*.json"))
+        self.assertEqual(len(superseded), 1)
+        asset_registry.resolve_project_font(self.project, item["asset_id"])
+
+    def test_tampered_policy_field_on_otherwise_valid_receipt_is_not_treated_as_stale_when_bytes_differ(self) -> None:
+        # Faking an old policy on a receipt whose font bytes no longer match the registry item must
+        # not unlock a supersede: it is a collision, not a policy bump.
+        item, _receipt = self.publish_font_receipt()
+        receipt_path = (
+            self.project / asset_registry.PROVIDER_RECEIPTS_REL
+            / (hashlib.sha256(item["asset_id"].encode()).hexdigest() + ".json")
+        )
+        data = json.loads(receipt_path.read_text("utf-8"))
+        data["validator"]["receipt"]["policy_version"] = "font-security-policy/1"
+        data["font"]["sha256"] = "0" * 64
+        receipt_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertFalse(asset_registry.font_receipt_is_stale(self.project, item))
+        with self.assertRaises(asset_registry.AssetRegistryError):
+            self.publish_font_receipt()
+
     def test_font_v3_rejects_receipt_path_binary_license_and_symlink_tamper(self) -> None:
         item, receipt = self.publish_font_receipt()
         receipt_path = (

@@ -330,11 +330,12 @@ class AssetProviderServiceTests(unittest.TestCase):
             [
                 "openverse", "wikimedia", "heroicons", "lucide", "tabler",
                 "wikimedia-svg", "google-fonts", "fontsource",
+                "github-fonts",
             ],
         )
         self.assertEqual(
             [item["kind"] for item in status["providers"]],
-            ["image", "image", "svg", "svg", "svg", "svg", "font", "font"],
+            ["image", "image", "svg", "svg", "svg", "svg", "font", "font", "font"],
         )
         self.assertTrue(all(item["available"] for item in status["providers"][:2]))
         self.assertTrue(all(item["availability_code"] == "available" for item in status["providers"][:2]))

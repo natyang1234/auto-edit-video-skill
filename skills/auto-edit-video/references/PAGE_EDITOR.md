@@ -31,7 +31,9 @@ plans, source QA, and `working/editor_state.json`.
   `ATTRIBUTION.md`, and final-rights-gate checks.
 - Per-project explicit network-disclosure consent for Studio provider search.
   Font search shows metadata only: Google Fonts uses pinned-commit
-  `(ofl|apache|ufl)/family` queries and Fontsource uses exact `id@x.y.z` semver.
+  `(ofl|apache|ufl)/family` queries, Fontsource uses exact `id@x.y.z` semver, and
+  `github-fonts` takes only an allowlisted font id (`contracts/github_fonts.json`:
+  commit-pinned author repositories, both font and licence verified by Git blob SHA).
   Explicit import strictly validates and stores project-private TTF/OTF plus its
   license and SPDX evidence. The exact `font_asset_id` must cover actual
   rendered glyphs; missing, tampered, or uncovered fonts block preview/final.

@@ -3254,3 +3254,48 @@ body {
     animation: none;
   }
 }
+
+
+/* ---- 風格菜單特效（fx overlay） ---- */
+.fx-panel { display: grid; gap: 10px; padding: 10px 0 4px; border-top: 1px solid var(--line, #d9d2c5); }
+.fx-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.fx-cats { display: flex; gap: 4px; flex-wrap: wrap; }
+.fx-cats button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line, #d9d2c5); background: transparent; cursor: pointer; }
+.fx-cats button.is-selected { background: var(--ink, #17130f); color: var(--paper-0, #fbf7ef); border-color: var(--ink, #17130f); }
+#fx-search { flex: 1 1 120px; min-width: 100px; font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid var(--line, #d9d2c5); border-radius: 6px; }
+.fx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); grid-auto-rows: 132px; gap: 6px; max-height: 300px; overflow: auto; padding: 2px; }
+.fx-card { position: relative; display: block; width: 100%; height: 132px; min-height: 0; padding: 0; margin: 0; border: 2px solid transparent; border-radius: 8px; background: var(--paper-2, #efe8db); cursor: pointer; overflow: hidden; box-sizing: border-box; }
+.fx-card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.fx-card .fx-code { position: absolute; left: 4px; top: 4px; font: 700 11px/1 ui-monospace, Menlo, monospace; padding: 2px 4px; border-radius: 4px; background: rgba(23, 19, 15, .8); color: #fbf7ef; }
+.fx-card .fx-m { position: absolute; right: 4px; top: 4px; font-size: 10px; padding: 1px 4px; border-radius: 4px; background: var(--vermilion, #bf3f1f); color: #fff; }
+.fx-card .fx-name { position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; line-height: 1.2; padding: 3px 4px; background: rgba(23, 19, 15, .72); color: #fbf7ef; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fx-card.is-selected { border-color: var(--vermilion, #bf3f1f); }
+.fx-card:disabled { opacity: .4; cursor: not-allowed; }
+.fx-spec { margin: 0; font-size: 12px; line-height: 1.5; color: var(--ink-2, #5a5248); }
+.fx-vars { display: grid; gap: 6px; }
+.fx-vars label { display: grid; gap: 2px; font-size: 12px; }
+.fx-vars input, .fx-vars select { font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line, #d9d2c5); border-radius: 6px; }
+.preview-overlay.type-fx { width: 100%; height: 100%; max-width: none; left: 50%; top: 50%; transform: translate(-50%, -50%); display: grid; place-items: end start; pointer-events: none; }
+.preview-overlay.type-fx img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .55; }
+.preview-overlay.type-fx span { position: relative; margin: 0 0 8% 6%; font: 700 .9rem/1.2 ui-monospace, Menlo, monospace; padding: 4px 8px; border-radius: 6px; background: rgba(23, 19, 15, .8); color: #fbf7ef; text-shadow: none; }
+.timeline-clip.type-fx { background: var(--vermilion, #bf3f1f); }
+
+a.quick-tool { text-decoration: none; color: inherit; }
+
+/* fx 圖層字型挑選器（2026-10-22） */
+.fx-font-pick { font-size: 13px; padding: 4px 9px; border-radius: 6px; border: 1px solid var(--line, #d9d2c5); background: var(--paper, #fbf7ef); color: inherit; cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.fx-font-pick.is-empty { opacity: .7; }
+.fx-font-pop { position: fixed; z-index: 400; width: 440px; max-height: 70vh; background: var(--paper, #fbf7ef); color: var(--ink, #17130f); border: 1px solid var(--line, #d9d2c5); border-radius: 12px; box-shadow: 0 14px 34px rgba(0,0,0,.3); display: flex; flex-direction: column; padding: 8px; box-sizing: border-box; }
+.fx-font-pop .fx-font-q { font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line, #d9d2c5); margin-bottom: 6px; }
+.fx-font-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.fx-font-tabs button { font: inherit; font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line, #d9d2c5); background: transparent; color: inherit; cursor: pointer; }
+.fx-font-tabs button.is-selected { background: var(--ink, #17130f); color: var(--paper, #fbf7ef); }
+.fx-font-list { overflow: auto; display: grid; gap: 2px; }
+.fx-font-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; text-align: left; border: 0; background: transparent; padding: 6px 8px; border-radius: 8px; cursor: pointer; font: inherit; color: inherit; }
+.fx-font-row:hover { background: var(--paper-2, #efe8db); }
+.fx-font-row.is-selected { outline: 2px solid var(--vermilion, #bf3f1f); }
+.fx-font-row .fx-font-sample { font-size: 22px; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fx-font-row .fx-font-name { font-size: 12px; text-align: right; opacity: .85; max-width: 160px; }
+.fx-font-row .fx-font-name small { display: block; opacity: .65; font-size: 11px; }
+.fx-font-sep { font-size: 11px; opacity: .6; padding: 6px 8px 2px; }
+.font-pick-row { display: flex; gap: 6px; align-items: center; } .font-pick-row select { flex: 1; min-width: 0; }

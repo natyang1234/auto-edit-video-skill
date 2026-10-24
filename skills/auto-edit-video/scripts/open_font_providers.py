@@ -34,6 +34,8 @@ FONTSOURCE_LANDING_ENDPOINT = "https://fontsource.org/fonts"
 
 FONT_MIME = "font/ttf"
 FONT_TTF_MIME = FONT_MIME
+FONT_OTF_MIME = "font/otf"
+FONT_MIMES = frozenset({FONT_TTF_MIME, FONT_OTF_MIME})  # closed set: TTF or CFF-OTF (2026-10-22)
 
 _GOOGLE_ROOT_LICENSES = {
     "ofl": ("OFL-1.1", "OFL.txt"),
@@ -310,8 +312,8 @@ class FontAssetCandidate:
             raise ProviderDataError("font candidate weight is invalid")
         if self.license_spdx not in FONT_LICENSE_URLS:
             raise ProviderDataError("font candidate license is not allowed")
-        if self.mime_type != FONT_MIME:
-            raise ProviderDataError("font candidate MIME must be font/ttf")
+        if self.mime_type not in FONT_MIMES:
+            raise ProviderDataError("font candidate MIME must be font/ttf or font/otf")
         if not isinstance(self.attribution_required, bool):
             raise ProviderDataError("font candidate attribution flag is invalid")
         for field in ("download_url", "landing_url", "license_url", "license_download_url"):
@@ -463,6 +465,60 @@ def parse_google_fonts_contents(
 parse_google_fonts_listing = parse_google_fonts_contents
 parse_google_fonts_repo_listing = parse_google_fonts_contents
 parse_google_fonts = parse_google_fonts_contents
+
+
+def parse_github_fonts_tree(payload: Any, font_id: str) -> list[FontAssetCandidate]:
+    """Parse the GitHub *contents* object of one allowlisted font file (``github-fonts``).
+
+    The allowlist pins commit and blob SHAs; the object must agree exactly (path, blob SHA,
+    bounded size) or this fails closed. The licence blob is verified from the downloaded bytes
+    at import and resolve time. Exactly one candidate (the pinned file) is ever produced."""
+    import github_fonts
+
+    item = github_fonts.entry(font_id)
+    if item is None:
+        raise ProviderDataError("GitHub font id is not allowlisted")
+    if not isinstance(payload, dict):
+        raise ProviderDataError("GitHub payload must be an object")
+    if github_fonts.is_release(item):
+        # Release object for the pinned tag: the pinned asset must still exist with the pinned
+        # name, exact size and download URL (the bytes themselves are pinned by SHA-256 at import).
+        src = item["source"]
+        assets = payload.get("assets")
+        if payload.get("tag_name") != github_fonts.release_tag(item) or not isinstance(assets, list) or len(assets) > 200:
+            raise ProviderDataError("GitHub release payload does not match the pinned tag")
+        wanted = src["url"].rsplit("/", 1)[-1]
+        matches = [a for a in assets if isinstance(a, dict) and a.get("name") == wanted]
+        if len(matches) != 1 or matches[0].get("size") != src["zip_size"] or matches[0].get("browser_download_url") != src["url"]:
+            raise ProviderDataError("GitHub release asset does not match the allowlist")
+    elif (
+        payload.get("type") != "file"
+        or payload.get("path") != item["font_path"]
+        or not _valid_sha(payload.get("sha"))
+        or payload.get("sha") != item["font_blob_sha1"]
+        or not _valid_size(payload.get("size"), GOOGLE_FONT_MAX_BYTES)
+    ):
+        raise ProviderDataError("GitHub font object does not match the allowlist")
+    name = item["font_path"].rsplit("/", 1)[-1]
+    return [
+        FontAssetCandidate(
+            provider_id="github-fonts",
+            candidate_id=f"{item['font_blob_sha1']}:{name}",
+            family=item["family"],
+            style="",
+            weight=None,
+            subset="",
+            unicode_range="",
+            version=item["commit"],
+            license_spdx=item["license_spdx"],
+            download_url=github_fonts.font_download_url(item),
+            landing_url=github_fonts.font_landing_url(item),
+            license_url=github_fonts.landing_url(item, item["license_path"]),
+            license_download_url=github_fonts.raw_url(item, item["license_path"]),
+            mime_type=FONT_OTF_MIME if item["container"] == "otf" else FONT_TTF_MIME,
+            attribution_required=True,
+        )
+    ]
 
 
 def _canonical_fontsource_license(value: Any) -> str | None:
@@ -797,6 +853,9 @@ __all__ = [
     "FONT_LICENSE_URLS",
     "FONT_MIME",
     "FONT_TTF_MIME",
+    "FONT_OTF_MIME",
+    "FONT_MIMES",
+    "parse_github_fonts_tree",
     "FONTSOURCE_API_ENDPOINT",
     "FONTSOURCE_CDN_ENDPOINT",
     "FONTSOURCE_LANDING_ENDPOINT",

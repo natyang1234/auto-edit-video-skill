@@ -21,7 +21,7 @@ from fontTools.ttLib import TTFont
 
 
 FONT_VALIDATOR_VERSION = "font-security/1"
-POLICY_VERSION = "font-security-policy/1"
+POLICY_VERSION = "font-security-policy/3"  # /2: outline points 2M→12M; /3: CFF charstring total 8→20 MiB (2026-10-22)
 RECEIPT_VERSION = "font-validation-receipt/1"
 PINNED_FONTTOOLS_VERSION = "4.62.1"
 ALLOWED_FONT_LICENSES = frozenset({"OFL-1.1", "Apache-2.0", "Ubuntu-font-1.0"})
@@ -42,14 +42,23 @@ MAX_AXES = 16
 MAX_INSTANCES = 64
 MAX_REQUIRED_TEXT_CHARACTERS = 100_000
 MAX_POINTS_PER_GLYPH = 10_000
-MAX_TOTAL_OUTLINE_POINTS = 2_000_000
+# 2026-10-22 (nat 核可): raised from 2_000_000 so CJK families pass. A Traditional Chinese
+# font carries 20k–50k glyphs (Noto Sans TC ≈2.7M points, 台北黑體 ≈4.8M, 內海 ≈9.1M); the
+# bound still caps worst-case validator/renderer work, every other limit is unchanged, and
+# sources stay pinned (immutable Google Fonts commit over HTTPS, SHA-256 re-verified on use).
+MAX_TOTAL_OUTLINE_POINTS = 12_000_000
 MAX_CONTOURS_PER_GLYPH = 512
 MAX_COMPONENTS_PER_GLYPH = 64
 MAX_COMPOSITE_DEPTH = 16
 MAX_INSTRUCTION_BYTES = 64 * 1024
 MAX_CFF_CHARSTRING_BYTES = 64 * 1024
-MAX_CFF_TOTAL_CHARSTRING_BYTES = 8 * 1024 * 1024
-MAX_CFF_SUBROUTINES = 4096
+MAX_CFF_TOTAL_CHARSTRING_BYTES = 20 * 1024 * 1024  # 2026-10-22 (nat 核可): 8→20 MiB so 50k-glyph CJK CFF fonts (昭源環方 ≈18 MB) pass; expansion is bounded by the Type 2 walker, this only caps storage
+MAX_CFF_SUBROUTINES = 65_536  # CFF INDEX maximum; CJK CID fonts carry 13k–30k per FD (2026-10-22, was 4096)
+# 2026-10-22 (Codex review of the 12M raise): expansion bounds, not just storage bounds.
+MAX_CFF_SUBR_DEPTH = 10            # CFF spec nesting limit; cycles are rejected outright
+MAX_CFF_EXPANDED_OPS = 100_000     # operators one glyph may execute once every subr call is followed
+MAX_CFF_FONT_EXPANDED_OPS = 30_000_000  # … and across the whole font (bounds the analyser itself)
+MAX_COMPOSITE_EXPANDED_POINTS = 200_000  # points one composite glyph may reference after expansion
 MAX_GLYPH_NAME_CHARACTERS = 128
 
 _LIMITS = {
@@ -77,6 +86,10 @@ _LIMITS = {
     "cff_charstring_bytes": MAX_CFF_CHARSTRING_BYTES,
     "cff_total_charstring_bytes": MAX_CFF_TOTAL_CHARSTRING_BYTES,
     "cff_subroutines": MAX_CFF_SUBROUTINES,
+    "cff_subr_depth": MAX_CFF_SUBR_DEPTH,
+    "cff_expanded_ops": MAX_CFF_EXPANDED_OPS,
+    "cff_font_expanded_ops": MAX_CFF_FONT_EXPANDED_OPS,
+    "composite_expanded_points": MAX_COMPOSITE_EXPANDED_POINTS,
     "glyph_name_characters": MAX_GLYPH_NAME_CHARACTERS,
 }
 
@@ -546,6 +559,24 @@ def _validate_outlines(font: TTFont, container: str, glyph_order: list[str]) -> 
             graph[glyph_name] = ()
 
         memo: dict[str, int] = {}
+        simple_points: dict[str, int] = {}
+        for glyph_name in glyph_order:
+            if not graph[glyph_name]:
+                simple_points[glyph_name] = len(getattr(glyf[glyph_name], "coordinates", ()))
+        expanded_memo: dict[str, int] = {}
+
+        def expanded(glyph_name: str) -> int:
+            """Points the renderer touches for this glyph once components are expanded (memoised,
+            so a composite that references the same child many times is charged many times)."""
+            cached = expanded_memo.get(glyph_name)
+            if cached is not None:
+                return cached
+            children = graph[glyph_name]
+            result = simple_points.get(glyph_name, 0) if not children else sum(expanded(c) for c in children)
+            if children and result > MAX_COMPOSITE_EXPANDED_POINTS:
+                _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+            expanded_memo[glyph_name] = result
+            return result
 
         def depth(glyph_name: str, path: frozenset[str]) -> int:
             cached = memo.get(glyph_name)
@@ -563,19 +594,28 @@ def _validate_outlines(font: TTFont, container: str, glyph_order: list[str]) -> 
             memo[glyph_name] = result
             return result
 
+        total_expanded = 0
         for glyph_name in glyph_order:
-            depth(glyph_name, frozenset())
+            depth(glyph_name, frozenset())  # rejects cycles before expansion is charged
+        for glyph_name in glyph_order:
+            total_expanded += expanded(glyph_name)
+            if total_expanded > MAX_TOTAL_OUTLINE_POINTS:
+                _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
         return
 
     class CountingPen:
-        def __init__(self, glyph_names: set[str]) -> None:
+        def __init__(self, glyph_names: set[str], running: list[int] | None = None) -> None:
             self.glyph_names = glyph_names
             self.points = 0
             self.components = 0
+            self.component_names: list[str] = []  # seac base/accent references (endchar with 4 args)
+            self.running = running  # [total so far] shared across glyphs → abort mid-draw, not after
 
         def _points(self, values: tuple[tuple[float, float], ...]) -> None:
             self.points += len(values)
             if self.points > MAX_POINTS_PER_GLYPH:
+                _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+            if self.running is not None and self.running[0] + self.points > MAX_TOTAL_OUTLINE_POINTS:
                 _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
             for point in values:
                 if (
@@ -614,6 +654,7 @@ def _validate_outlines(font: TTFont, container: str, glyph_order: list[str]) -> 
             transformation: tuple[float, float, float, float, float, float],
         ) -> None:
             self.components += 1
+            self.component_names.append(glyph_name)
             if (
                 self.components > MAX_COMPONENTS_PER_GLYPH
                 or glyph_name not in self.glyph_names
@@ -635,20 +676,40 @@ def _validate_outlines(font: TTFont, container: str, glyph_order: list[str]) -> 
     if len(charstrings) != len(glyph_order):
         _reject("FONT_CFF_INVALID")
     global_subrs = getattr(top_dict, "GlobalSubrs", ())
-    local_subrs = getattr(getattr(top_dict, "Private", None), "Subrs", ())
-    if len(global_subrs) > MAX_CFF_SUBROUTINES or len(local_subrs) > MAX_CFF_SUBROUTINES:
+    # CID-keyed CFF (every CJK OpenType font) keeps local subrs per FDArray entry and maps
+    # glyphs to them through FDSelect; a name-keyed font has one Private dict (2026-10-22).
+    fd_array = getattr(top_dict, "FDArray", None)
+    if fd_array is not None:
+        local_tables = [getattr(getattr(fd, "Private", None), "Subrs", ()) or () for fd in fd_array]
+        fd_select = getattr(top_dict, "FDSelect", None)
+        if fd_select is None or len(fd_select) != len(glyph_order):
+            _reject("FONT_CFF_INVALID")
+        fd_of = [int(fd_select[i]) for i in range(len(glyph_order))]
+        if any(not 0 <= fd < len(local_tables) for fd in fd_of):
+            _reject("FONT_CFF_INVALID")
+    else:
+        local_tables = [getattr(getattr(top_dict, "Private", None), "Subrs", ()) or ()]
+        fd_of = [0] * len(glyph_order)
+    if len(global_subrs) > MAX_CFF_SUBROUTINES or any(len(t) > MAX_CFF_SUBROUTINES for t in local_tables):
         _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
     total_bytes = 0
-    for subroutine in (*global_subrs, *local_subrs):
+    # Snapshot raw bytecode now: fontTools drops ``.bytecode`` once a charstring/subr has been
+    # decompiled by a draw, and the walker must see the same bytes the interpreter will run.
+    global_codes = [getattr(sr, "bytecode", None) for sr in global_subrs]
+    local_codes = [[getattr(sr, "bytecode", None) for sr in table] for table in local_tables]
+    for subroutine in (*global_subrs, *(sr for table in local_tables for sr in table)):
         bytecode = getattr(subroutine, "bytecode", None)
         if not isinstance(bytecode, bytes) or len(bytecode) > MAX_CFF_CHARSTRING_BYTES:
             _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
         total_bytes += len(bytecode)
         if total_bytes > MAX_CFF_TOTAL_CHARSTRING_BYTES:
             _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
-    total_points = 0
+    budget = [0]  # operators executed by the bounded walker across the whole font
+    running = [0]
+    cff_points: dict[str, int] = {}
+    cff_graph: dict[str, tuple[str, ...]] = {}
     glyph_names = set(glyph_order)
-    for glyph_name in glyph_order:
+    for glyph_index, glyph_name in enumerate(glyph_order):
         charstring = charstrings[glyph_name]
         bytecode = getattr(charstring, "bytecode", None)
         if not isinstance(bytecode, bytes) or len(bytecode) > MAX_CFF_CHARSTRING_BYTES:
@@ -656,11 +717,200 @@ def _validate_outlines(font: TTFont, container: str, glyph_order: list[str]) -> 
         total_bytes += len(bytecode)
         if total_bytes > MAX_CFF_TOTAL_CHARSTRING_BYTES:
             _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
-        pen = CountingPen(glyph_names)
+        # Bounded walk first: follow every subr call with the real stem context, depth ≤ spec,
+        # no cycles, ≤ MAX_CFF_EXPANDED_OPS per glyph and ≤ MAX_CFF_FONT_EXPANDED_OPS per font —
+        # only then is fontTools' interpreter allowed to run, and it aborts the moment the point
+        # budget is hit.
+        _cff_walk(bytecode, global_codes, local_codes[fd_of[glyph_index]], budget)
+        pen = CountingPen(glyph_names, running)
         charstring.draw(pen)
-        total_points += pen.points
-        if total_points > MAX_TOTAL_OUTLINE_POINTS:
+        running[0] += pen.points
+        if running[0] > MAX_TOTAL_OUTLINE_POINTS:
             _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+        cff_points[glyph_name] = pen.points
+        cff_graph[glyph_name] = tuple(pen.component_names)
+    # seac (endchar with 4 operands) references two other glyphs as components; the renderer
+    # expands them, so they are charged, depth-limited and cycle-checked exactly like TrueType
+    # composites (Codex review 2026-10-22, round 4).
+    _charge_component_expansion(glyph_order, cff_points, cff_graph)
+
+
+def _charge_component_expansion(glyph_order: list[str], points: dict[str, int], graph: dict[str, tuple[str, ...]]) -> int:
+    """Expanded outline points across a glyph set whose glyphs may reference other glyphs.
+    A reference is billed every point of the referenced glyph (memoised), nesting is capped at
+    MAX_COMPOSITE_DEPTH, cycles are rejected, one referencing glyph may expand to at most
+    MAX_COMPOSITE_EXPANDED_POINTS and the whole set to MAX_TOTAL_OUTLINE_POINTS."""
+    depth_memo: dict[str, int] = {}
+    expanded_memo: dict[str, int] = {}
+
+    def depth(name: str, path: frozenset[str]) -> int:
+        cached = depth_memo.get(name)
+        if cached is not None:
+            return cached
+        if name in path:
+            _reject("FONT_GLYPH_INVALID")
+        children = graph.get(name, ())
+        if any(child not in graph for child in children):
+            _reject("FONT_GLYPH_INVALID")
+        result = 0 if not children else 1 + max(depth(child, path | {name}) for child in children)
+        if result > MAX_COMPOSITE_DEPTH:
+            _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+        depth_memo[name] = result
+        return result
+
+    def expanded(name: str) -> int:
+        cached = expanded_memo.get(name)
+        if cached is not None:
+            return cached
+        children = graph.get(name, ())
+        result = points.get(name, 0) + sum(expanded(child) for child in children)
+        if children and result > MAX_COMPOSITE_EXPANDED_POINTS:
+            _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+        expanded_memo[name] = result
+        return result
+
+    total = 0
+    for name in glyph_order:
+        depth(name, frozenset())
+    for name in glyph_order:
+        total += expanded(name)
+        if total > MAX_TOTAL_OUTLINE_POINTS:
+            _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+    return total
+
+
+_T2_OPS = {
+    1: "hstem", 3: "vstem", 4: "vmoveto", 5: "rlineto", 6: "hlineto", 7: "vlineto", 8: "rrcurveto",
+    10: "callsubr", 11: "return", 14: "endchar", 18: "hstemhm", 19: "hintmask", 20: "cntrmask",
+    21: "rmoveto", 22: "hmoveto", 23: "vstemhm", 24: "rcurveline", 25: "rlinecurve", 26: "vvcurveto",
+    27: "hhcurveto", 29: "callgsubr", 30: "vhcurveto", 31: "hvcurveto",
+}
+
+
+_T2_ESC_FLEX = {34: 7, 35: 13, 36: 9, 37: 11}  # hflex, flex, hflex1, flex1 → fixed operand count
+
+
+class _T2State:
+    __slots__ = ("stack", "stems", "ops", "mask_bytes")
+
+    def __init__(self) -> None:
+        self.stack: list[float] = []
+        self.stems = 0
+        self.ops = 0
+        self.mask_bytes: int | None = None  # fixed at the first hintmask/cntrmask, like fontTools
+
+
+def _cff_walk(bytecode: bytes, global_subrs: list[Any], local_subrs: list[Any], budget: list[int]) -> int:
+    """Walk one Type 2 charstring, following subroutine calls with the glyph's own stem context
+    (hintmask length depends on it), without drawing anything. ``global_subrs``/``local_subrs``
+    are lists of raw bytecode. Rejects recursive subrs, nesting
+    deeper than MAX_CFF_SUBR_DEPTH, unknown operators, and any glyph whose expanded operator
+    count exceeds MAX_CFF_EXPANDED_OPS; the per-font budget bounds the walker itself."""
+    from fontTools.misc.psCharStrings import calcSubrBias
+
+    gbias = calcSubrBias(global_subrs) if len(global_subrs) else 0
+    lbias = calcSubrBias(local_subrs) if len(local_subrs) else 0
+    state = _T2State()
+
+    def run(code: bytes, depth: int, path: tuple[Any, ...]) -> None:
+        """Scan one bytecode to its end (return/endchar do not stop the scan, see below)."""
+        i = 0
+        n = len(code)
+        while i < n:
+            b0 = code[i]
+            if b0 >= 32 or b0 == 28:
+                if b0 == 28:
+                    if i + 2 >= n:
+                        _reject("FONT_CFF_INVALID")
+                    value = int.from_bytes(code[i + 1:i + 3], "big", signed=True); i += 3
+                elif b0 <= 246:
+                    value = b0 - 139; i += 1
+                elif b0 <= 250:
+                    if i + 1 >= n:
+                        _reject("FONT_CFF_INVALID")
+                    value = (b0 - 247) * 256 + code[i + 1] + 108; i += 2
+                elif b0 <= 254:
+                    if i + 1 >= n:
+                        _reject("FONT_CFF_INVALID")
+                    value = -(b0 - 251) * 256 - code[i + 1] - 108; i += 2
+                else:
+                    if i + 4 >= n:
+                        _reject("FONT_CFF_INVALID")
+                    value = int.from_bytes(code[i + 1:i + 5], "big", signed=True) / 65536.0; i += 5
+                state.stack.append(value)
+                if len(state.stack) > 513:  # Type 2 argument stack limit (CFF2 raised it; CFF2 is rejected)
+                    _reject("FONT_CFF_INVALID")
+                continue
+            state.ops += 1
+            budget[0] += 1
+            if state.ops > MAX_CFF_EXPANDED_OPS or budget[0] > MAX_CFF_FONT_EXPANDED_OPS:
+                _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+            if b0 == 12:
+                if i + 1 >= n:
+                    _reject("FONT_CFF_INVALID")
+                # Only the flex family is modelled (it consumes every argument). Arithmetic /
+                # storage escapes could compute a subr index the walker cannot see, so they are
+                # rejected outright rather than approximated (Codex review 2026-10-22).
+                expected = _T2_ESC_FLEX.get(code[i + 1])
+                if expected is None or len(state.stack) != expected:
+                    _reject("FONT_CFF_INVALID")  # flex takes a fixed operand count (Codex round 5 minor)
+                state.stack.clear(); i += 2
+                continue
+            op = _T2_OPS.get(b0)
+            if op is None:
+                _reject("FONT_CFF_INVALID")
+            i += 1
+            if op in ("callsubr", "callgsubr"):
+                if not state.stack:
+                    _reject("FONT_CFF_INVALID")
+                index = int(state.stack.pop()) + (lbias if op == "callsubr" else gbias)
+                table = local_subrs if op == "callsubr" else global_subrs
+                if not 0 <= index < len(table):
+                    _reject("FONT_CFF_INVALID")
+                key = (op, index)
+                if key in path:
+                    _reject("FONT_CFF_INVALID")  # recursive subroutine
+                if depth + 1 > MAX_CFF_SUBR_DEPTH:
+                    _reject("FONT_GLYPH_COMPLEXITY_LIMIT")
+                sub = table[index]  # raw bytecode snapshots
+                if not isinstance(sub, bytes):
+                    _reject("FONT_CFF_INVALID")
+                run(sub, depth + 1, path + (key,))
+                continue
+            if op == "return":
+                # fontTools 4.62.1: op_return is a no-op that keeps the operand stack (subrs
+                # routinely leave numbers for the caller) and the scan continues to the end of
+                # the bytecode, so a call hidden behind return still executes — the walker
+                # mirrors both (Codex review 2026-10-22, round 3).
+                continue
+            if op == "endchar":
+                state.stack.clear()  # outline extractor pops everything; scanning continues
+                continue
+            if op in ("hstem", "vstem", "hstemhm", "vstemhm"):
+                state.stems += len(state.stack) // 2  # counted even after a mask, as fontTools does
+                state.stack.clear()
+                continue
+            if op in ("hintmask", "cntrmask"):
+                # Type 2 / fontTools: operands before a mask count as an implicit vstem; the mask
+                # width is frozen the first time it is non-zero (a zero-width first mask leaves it
+                # uninitialised, exactly like fontTools), and later masks keep that width so
+                # operands pushed before them can never stretch a mask over a following operator.
+                state.stems += len(state.stack) // 2
+                state.stack.clear()
+                if state.mask_bytes is None:
+                    width = (state.stems + 7) // 8
+                    if width:
+                        state.mask_bytes = width
+                else:
+                    width = state.mask_bytes
+                i += width
+                if i > n:
+                    _reject("FONT_CFF_INVALID")
+                continue
+            state.stack.clear()
+
+    run(bytecode, 0, ())
+    return state.ops
 
 
 def _coverage_trace(

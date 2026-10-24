@@ -1815,6 +1815,49 @@ def build_render_command(
             continue
         raw_start = float(source_overlay.get("start", 0.0))
         raw_end = float(source_overlay.get("end", 0.0))
+        if source_overlay.get("type") == "fx":
+            # A 風格菜單 effect block: rendered now to a transparent .mov over
+            # exactly this source window (compose.py clip), then drawn as a
+            # full-frame video layer like an animated card. A failed render
+            # skips the effect and reports it; it never blocks the delivery.
+            import fx_overlay
+
+            # The clip is one animation over one source window. If a cut
+            # removes part of that window the pieces would replay or show
+            # removed footage, so the effect is re-fitted to the longest
+            # surviving piece (and says so) instead of being split.
+            pieces = sorted(
+                ((max(raw_start, seg_start), min(raw_end, seg_end))
+                 for seg_start, seg_end in segments
+                 if min(raw_end, seg_end) - max(raw_start, seg_start) > 0.05),
+                key=lambda piece: piece[1] - piece[0], reverse=True,
+            )
+            if not pieces:
+                continue  # entirely inside removed material, like any overlay
+            if abs(pieces[0][0] - raw_start) > 1e-6 or abs(pieces[0][1] - raw_end) > 1e-6:
+                print(json.dumps({"fx_refit": {
+                    "layer": source_overlay.get("id"), "code": source_overlay.get("code"),
+                    "from": [raw_start, raw_end], "to": list(pieces[0]),
+                }}, ensure_ascii=False), file=sys.stderr)
+                raw_start, raw_end = pieces[0]
+                source_overlay = dict(source_overlay, start=raw_start, end=raw_end)
+            rendered = fx_overlay.render_for_timeline(
+                project_dir,
+                source_overlay,
+                project_dir / str(manifest.get("source", {}).get("staged_path", "")),
+                str(style_pack_for_clip(state, clip).get("id") or ""),
+                quality,
+                canvas=(width, height),
+            )
+            if rendered is None:
+                if quality == "final":
+                    raise ValueError(
+                        f"effect {source_overlay.get('code')} ({source_overlay.get('id')}) "
+                        "failed to render; fix it or remove the layer before a final render "
+                        "(see fx_fallback on stderr)"
+                    )
+                continue
+            source_overlay = fx_overlay.as_video_overlay(source_overlay, rendered)
         # Overlay times are stored on the source axis; project them onto the
         # post-cut axis. Crossing a removed region yields one window per
         # surviving intersection; fully removed overlays disappear.

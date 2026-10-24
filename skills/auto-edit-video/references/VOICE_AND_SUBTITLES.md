@@ -59,7 +59,7 @@ Chinese. The auditable result is stored in
 
 | Selection | Behavior |
 |---|---|
-| `rumi` | Optional installed Rumi safe catalog; Fish Audio for named Chinese voices and Edge for neural fallbacks |
+| `rumi` | Optional installed Rumi safe catalog; Fish Audio for named Chinese voices, Gemini TTS for `gemini-<Name>` voices (opt-in, never default; style via `tts_voices.py --style`, default Taiwan accent; speed passed as `--rate` and applied via ffmpeg atempo inside `tts_voices.py`; pitch unsupported), and Edge for neural fallbacks |
 | `edge` | Online Microsoft Edge TTS; deterministic locale/gender presets; no key |
 | `auto` | HyperFrames engine chooses HeyGen → ElevenLabs → Kokoro |
 | `heygen` | Cloud; voice ID must be a Starfish voice UUID |
@@ -118,7 +118,7 @@ always stores the resolved voice ID, never only `male` or `female`.
 
 ## Privacy and consent
 
-- Rumi/Fish, Edge, HeyGen, and ElevenLabs send narration text to an external service.
+- Rumi/Fish, Gemini, Edge, HeyGen, and ElevenLabs send narration text to an external service.
 - Rumi synthesis requires `--allow-cloud`; the command never prints credentials
   and dry-run output redacts narration text.
 - Edge synthesis requires `--allow-cloud`.

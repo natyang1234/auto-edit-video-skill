@@ -1230,7 +1230,7 @@ def rumi_catalog_entries() -> list[dict[str, Any]]:
         locale_match = re.match(r"^([a-z]{2}-[A-Z]{2})-", voice_id)
         entries.append(
             {
-                "provider": "rumi" if backend == "fish" else "edge",
+                "provider": "rumi" if backend in {"fish", "gemini"} else "edge",
                 "voice_system": "rumi",
                 "backend": backend,
                 "language": locale_match.group(1) if locale_match else language,
@@ -2109,6 +2109,15 @@ def cmd_apply_narrative_plan(args: argparse.Namespace) -> int:
 def cmd_init(args: argparse.Namespace) -> int:
     source = Path(args.input).expanduser().resolve()
     project_dir = Path(args.project_dir).expanduser().resolve()
+    style_pack = getattr(args, "style_pack", None)
+    if style_pack:
+        import structured_card_compositor
+
+        if style_pack not in structured_card_compositor.style_pack_ids():
+            return die(
+                f"unknown style pack: {style_pack} "
+                f"(choose from: {', '.join(structured_card_compositor.style_pack_ids())})"
+            )
     try:
         voice = make_voice_config(args)
         manifest = initialize_project(
@@ -2137,10 +2146,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         return die(str(exc))
+    if getattr(args, "style_pack", None):
+        manifest["style_pack"] = args.style_pack
+        write_json(project_dir / "project.json", manifest)
     emit(
         {
             "ok": True,
             "manifest": str(project_dir / "project.json"),
+            "style_pack": manifest.get("style_pack"),
             "project_dir": str(project_dir),
             "voiceover": voice,
             "output_target": manifest["output_target"],
@@ -3294,9 +3307,10 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
     manifest = read_json(project_dir / "project.json")
     try:
         from editor_server import (
-            DEFAULT_STYLE_PACK_BY_DIRECTOR,
             DIRECTOR_PRESETS,
+            default_style_pack_for,
             editor_state_revision,
+            theme_caption_style,
         )
     except ImportError as exc:
         raise ValueError(f"cannot load editor highlight bridge: {exc}") from exc
@@ -3349,14 +3363,12 @@ def sync_highlight_plan_to_editor(project_dir: Path, plan: dict[str, Any]) -> in
     configuration = plan.get("configuration") if isinstance(plan.get("configuration"), dict) else {}
     director_id = str(configuration.get("director_profile", "teacher-punch"))
     if director_id in DIRECTOR_PRESETS:
-        caption_style = dict(DIRECTOR_PRESETS[director_id]["caption"])
+        caption_style = theme_caption_style(manifest, dict(DIRECTOR_PRESETS[director_id]["caption"]))
         state["director_style"] = director_id
         previous_pack = state.get("style_pack") or {}
         previous_overrides = previous_pack.get("per_highlight") or {}
         state["style_pack"] = {
-            "project_default": DEFAULT_STYLE_PACK_BY_DIRECTOR.get(
-                director_id, "dark-data-presenter"
-            ),
+            "project_default": default_style_pack_for(manifest, director_id),
             "per_highlight": {
                 highlight_id: pack_id
                 for highlight_id, pack_id in previous_overrides.items()
@@ -5231,6 +5243,20 @@ def cmd_cut(args: argparse.Namespace) -> int:
     project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir \
         else out_dir / ".project"
     manifest_path = project_dir / "project.json"
+    requested_pack = getattr(args, "style_pack", None)
+    if requested_pack:
+        import structured_card_compositor
+
+        if requested_pack not in structured_card_compositor.style_pack_ids():
+            return die(f"unknown style pack: {requested_pack}")
+        if manifest_path.is_file():
+            pinned = read_json(manifest_path).get("style_pack")
+            if pinned != requested_pack:
+                return die(
+                    f"project already exists with style pack {pinned or '(director default)'}; "
+                    "use a new --project-dir to change it"
+                )
+    created_from_folder = False
 
     if not manifest_path.is_file() and folder is not None:
         # A folder brings its own pictures and B-roll, and says which file is
@@ -5247,6 +5273,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
             cmd_ingest_folder, _args_for("ingest-folder", *ingest_argv)
         ):
             return 2
+        created_from_folder = True
     elif not manifest_path.is_file():
         _step("preparing the project")
         init_argv = [
@@ -5254,9 +5281,16 @@ def cmd_cut(args: argparse.Namespace) -> int:
             "--source-language", args.language, "--platform", args.platform,
             "--source-has-burned-in", args.burned_in,
         ]
+        if getattr(args, "style_pack", None):
+            init_argv += ["--style-pack", args.style_pack]
         code = run_cut_stage(cmd_init, _args_for("init", *init_argv))
         if code:
             return code
+
+    if requested_pack and created_from_folder:
+        folder_manifest = read_json(manifest_path)
+        folder_manifest["style_pack"] = requested_pack
+        write_json(manifest_path, folder_manifest)
 
     try:
         persist_director_selection(
@@ -5819,7 +5853,10 @@ def cmd_synthesize_rumi(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        result = subprocess.run(cmd, text=True, capture_output=True, timeout=180)
+        # Gemini 長稿逐段合成＋429 重試，需較長時限
+        result = subprocess.run(
+            cmd, text=True, capture_output=True, timeout=900 if backend == "gemini" else 180
+        )
     except subprocess.TimeoutExpired:
         return die("Rumi voice synthesis timed out")
     if result.returncode != 0 or not synth_target.is_file():
@@ -6295,6 +6332,10 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--emphasis", choices=("off", "sparse", "balanced", "dense"), default="balanced")
     init.add_argument("--visual-density", choices=("sparse", "balanced", "dense"), default="balanced")
     init.add_argument("--no-cards", action="store_true")
+    init.add_argument(
+        "--style-pack",
+        help="Pin a card/caption style pack (e.g. theme-075-paper); see scripts/theme_packs.py list",
+    )
     init.add_argument("--no-assets", action="store_true")
     init.add_argument("--no-animations", action="store_true")
     init.add_argument("--voice-language", choices=VOICE_LANGUAGES)
@@ -6493,6 +6534,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cut.add_argument("--no-cards", action="store_true", help="no cards at all")
     cut.add_argument(
+        "--style-pack", default=None,
+        help="card/caption style pack for a new project (e.g. theme-075-paper)",
+    )
+    cut.add_argument(
         "--no-editorial", action="store_true",
         help="pick moments by score instead of asking a model",
     )
@@ -6645,7 +6690,76 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+PREFERRED_INTERPRETERS = ("/opt/homebrew/bin/python3.14", "/opt/homebrew/opt/python@3.14/bin/python3.14")
+REEXEC_FLAG = "AUTO_EDIT_INTERPRETER_CHECKED"
+
+
+def _interpreter_has_caption_engine() -> bool:
+    """True when this interpreter can run the macOS caption compositor and the pinned validator."""
+    try:
+        import caption_compositor  # noqa: PLC0415
+
+        if not caption_compositor.compositor_available():
+            return False
+        from fontTools import __version__ as fonttools_version  # noqa: PLC0415
+        from font_security import PINNED_FONTTOOLS_VERSION  # noqa: PLC0415
+
+        return fonttools_version == PINNED_FONTTOOLS_VERSION
+    except Exception:  # noqa: BLE001 - any import failure means "not this interpreter"
+        return False
+
+
+def _probe_interpreter(python: str) -> bool:
+    """Ask another interpreter, in a subprocess, whether it has the caption engine."""
+    code = (
+        "import sys; sys.path.insert(0, %r); import auto_edit; "
+        "sys.exit(0 if auto_edit._interpreter_has_caption_engine() else 1)" % str(SKILL_DIR / "scripts")
+    )
+    try:
+        return subprocess.run([python, "-c", code], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def maybe_reexec_for_caption_engine(argv: list[str]) -> None:
+    """``editor``/``studio`` need CoreText (pyobjc) and fonttools 4.62.1; on this Mac those live in
+    python3.14 while plain ``python3`` resolves to 3.15. If the current interpreter lacks the engine
+    and a preferred one has it, re-run the exact same command there (once; the env flag prevents
+    loops). Messages go to stderr so JSON-emitting subcommands stay machine-readable (2026-10-22)."""
+    if len(argv) < 2 or argv[1] not in {"editor", "studio"}:
+        return
+    if _interpreter_has_caption_engine():
+        return
+    if os.environ.get(REEXEC_FLAG):
+        print(
+            "[auto-edit] 警告：已經換過直譯器但字幕引擎仍不可用（CoreText／fonttools 4.62.1 缺）；字幕字型功能會不可用",
+            file=sys.stderr,
+        )
+        return
+    current = os.path.realpath(sys.executable)
+    for candidate in PREFERRED_INTERPRETERS:
+        if not os.path.exists(candidate) or os.path.realpath(candidate) == current:
+            continue
+        if _probe_interpreter(candidate):
+            print(
+                f"[auto-edit] {sys.version.split()[0]} 沒有字幕引擎（CoreText／fonttools 4.62.1），改用 {candidate} 重新啟動",
+                file=sys.stderr,
+            )
+            env = dict(os.environ, **{REEXEC_FLAG: "1"})
+            try:
+                os.execve(candidate, [candidate, os.path.abspath(argv[0]), *argv[1:]], env)
+            except OSError as exc:  # could not start it: try the next one
+                print(f"[auto-edit] 無法用 {candidate} 重新啟動：{exc}", file=sys.stderr)
+                continue
+            return  # execve never returns; a mocked one must not fall through to another candidate
+    print(
+        "[auto-edit] 警告：這個 Python 沒有字幕引擎，也找不到有引擎的 python3.14；字幕字型功能會不可用",
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
+    maybe_reexec_for_caption_engine(sys.argv)
     args = build_parser().parse_args()
     return int(args.func(args))
 

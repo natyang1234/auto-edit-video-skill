@@ -93,9 +93,10 @@ _BUILTIN_PROVIDER_PREFIXES = {
     "wikimedia-svg": "assets/generated/svg/",
     "google-fonts": "assets/fonts/",
     "fontsource": "assets/fonts/",
+    "github-fonts": "assets/fonts/",
 }
 _SVG_PROVIDER_IDS = frozenset({"heroicons", "lucide", "tabler", "wikimedia-svg"})
-_FONT_PROVIDER_IDS = frozenset({"google-fonts", "fontsource"})
+_FONT_PROVIDER_IDS = frozenset({"google-fonts", "fontsource", "github-fonts"})
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _EVIDENCE_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _SVG_RECEIPT_KEYS = frozenset(
@@ -898,6 +899,14 @@ def _font_license_evidence_matches(provider_id: Any, value: Any, spdx: Any) -> b
             return False
     except ValueError:
         return False
+    if provider_id == "github-fonts":
+        import github_fonts
+
+        return any(
+            value == github_fonts.raw_url(item, item["license_path"]) and item["license_spdx"] == spdx
+            for item in (github_fonts.entry(font_id) for font_id in github_fonts.ids())
+            if item is not None
+        )
     if provider_id == "google-fonts":
         match = re.fullmatch(
             rf"/google/fonts/{GOOGLE_FONTS_REF}/(ofl|apache|ufl)/([a-z0-9]{{1,80}})/(OFL\.txt|LICENSE\.txt|UFL\.txt)",
@@ -1038,6 +1047,55 @@ def save_svg_provider_receipt(
     return receipt
 
 
+def font_receipt_is_stale(project_dir: Path, item: dict) -> bool:
+    """True when this asset's own well-formed v3 receipt was minted under a different validator
+    policy/limits than the current one (so it can never resolve again and may be set aside).
+    The strict loader rejects such receipts, so the file is read minimally; anything malformed,
+    foreign, or still current is NOT stale (treated as a collision by the caller)."""
+    path = _provider_receipt_path(Path(project_dir), item["asset_id"])
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(existing, dict) or not isinstance(existing.get("validator"), dict):
+        return False
+    recorded = existing["validator"].get("receipt")
+    if not (
+        existing.get("schema_version") == 3
+        and existing.get("asset_id") == item.get("asset_id")
+        and existing.get("provider_id") == item.get("provider_id")
+        and isinstance(recorded, dict)
+        and (
+            recorded.get("policy_version") != FONT_POLICY_VERSION
+            or recorded.get("limits_sha256") != FONT_LIMITS_SHA256
+        )
+    ):
+        return False
+    # The old receipt must still be *this font's* genuine evidence in every respect the
+    # validator identity does not cover: same bytes on disk, same license artifact, same
+    # registry item. A receipt that fails those is tampered/foreign → collision, not stale.
+    try:
+        font_info = existing.get("font") if isinstance(existing.get("font"), dict) else {}
+        lic_info = existing.get("license") if isinstance(existing.get("license"), dict) else {}
+        font_path = _safe_existing_project_file(Path(project_dir), str(font_info.get("path") or ""), "font artifact")
+        lic_path = _safe_existing_project_file(Path(project_dir), str(lic_info.get("path") or ""), "font license artifact")
+        if font_info.get("sha256") != item.get("sha256"):
+            return False
+        if hashlib.sha256(font_path.read_bytes()).hexdigest() != font_info.get("sha256"):
+            return False
+        if hashlib.sha256(lic_path.read_bytes()).hexdigest() != lic_info.get("sha256"):
+            return False
+        artifact = load_registry(Path(project_dir))
+        current_items = [i for i in artifact["items"] if i.get("asset_id") == item.get("asset_id")]
+        if len(current_items) != 1 or existing.get("registry_item_sha256") != contract_registry.canonical_hash(current_items[0]):
+            return False
+    except (OSError, AssetRegistryError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def save_font_provider_receipt(
     project_dir: Path,
     item: dict,
@@ -1133,8 +1191,22 @@ def save_font_provider_receipt(
     if _font_receipt_shape_errors(receipt):
         raise AssetRegistryError("font provider consistency evidence is invalid")
     path = _provider_receipt_path(Path(project_dir), item["asset_id"])
-    if path.exists() or path.is_symlink():
+    if path.is_symlink():
         raise AssetRegistryError("provider consistency evidence already exists")
+    if path.exists():
+        # A receipt that still resolves is immutable. One that no longer does (validator policy
+        # bumped, limits changed) would otherwise block the font from ever being re-validated, so
+        # it is set aside — never deleted — and the fresh receipt takes its place (2026-10-22).
+        stale = font_receipt_is_stale(Path(project_dir), item)
+        if not stale:
+            raise AssetRegistryError("provider consistency evidence already exists")
+        import time as _time
+
+        stamp = _time.strftime("%Y%m%dT%H%M%SZ", _time.gmtime())
+        superseded = path.with_name(f"{path.stem}.superseded-{stamp}.json")
+        if superseded.exists() or superseded.is_symlink():
+            raise AssetRegistryError("provider consistency evidence already exists")
+        os.replace(path, superseded)
     _secure_prepare_relative_parent(
         Path(project_dir), path.relative_to(Path(project_dir)).as_posix(),
         "font provider consistency evidence",
@@ -1386,8 +1458,12 @@ def _canonical_license_lines(text: str) -> tuple[str, tuple[str, ...]]:
     return canonical, canonical_lines
 
 
-def validate_font_license_text(raw: bytes, spdx: str) -> tuple[str, str]:
-    """Validate hostile license bytes and return canonical text/hash."""
+def validate_font_license_text(raw: bytes, spdx: str, *, trusted_header: bool = False) -> tuple[str, str]:
+    """Validate hostile license bytes and return canonical text/hash.
+
+    ``trusted_header`` skips only the copyright-header line whitelist; the body must still be the
+    complete SPDX template. Callers may set it solely when the licence bytes hash to a Git blob
+    pinned in a code-reviewed allowlist (github-fonts), never from data in the download itself."""
     import unicodedata
 
     if not isinstance(raw, bytes) or not 0 < len(raw) <= 512 * 1024:
@@ -1396,6 +1472,8 @@ def validate_font_license_text(raw: bytes, spdx: str) -> tuple[str, str]:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise AssetRegistryError("font license text must be UTF-8") from exc
+    if text.startswith("\ufeff"):  # a UTF-8 BOM is encoding noise, not content (2026-10-22)
+        text = text[1:]
     if "\x00" in text or any(
         unicodedata.category(char) in {"Cf", "Cs"}
         or (unicodedata.category(char) == "Cc" and char not in {"\n", "\r", "\t"})
@@ -1423,12 +1501,30 @@ def validate_font_license_text(raw: bytes, spdx: str) -> tuple[str, str]:
     except (OSError, UnicodeError) as exc:
         raise AssetRegistryError("font license template is unavailable") from exc
     if normalized_lines != template_lines:
+        prefix_lines: tuple[str, ...] | None = None
         if (
-            len(normalized_lines) <= len(template_lines)
-            or normalized_lines[-len(template_lines) :] != template_lines
+            len(normalized_lines) > len(template_lines)
+            and normalized_lines[-len(template_lines) :] == template_lines
         ):
-            raise AssetRegistryError("font license text does not match declared SPDX")
-        prefix_lines = normalized_lines[: -len(template_lines)]
+            prefix_lines = normalized_lines[: -len(template_lines)]
+        else:
+            # Same words, different line wrapping: the SIL/Apache texts are
+            # distributed with several wrappings (Google Fonts, SIL, authors'
+            # repos).  Compare the wrapped body whitespace-insensitively and
+            # keep the lines before it as the copyright header (2026-10-22;
+            # every Google Fonts OFL.txt failed the exact-line match before).
+            template_words = " ".join(" ".join(template_lines).split())
+            for cut in range(0, min(len(normalized_lines), 40) + 1):
+                body_words = " ".join(" ".join(normalized_lines[cut:]).split())
+                if body_words == template_words:
+                    prefix_lines = normalized_lines[:cut]
+                    break
+                if len(body_words) < len(template_words):
+                    break
+            if prefix_lines is None:
+                raise AssetRegistryError("font license text does not match declared SPDX")
+            if not prefix_lines:
+                return normalized, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         prefix = "\n".join(prefix_lines)
         prefix_bytes = prefix.encode("utf-8")
         if not prefix_lines or len(prefix_bytes) > 8192 or len(prefix_lines) > 32:
@@ -1439,10 +1535,15 @@ def validate_font_license_text(raw: bytes, spdx: str) -> tuple[str, str]:
             "https://openfontlicense.org",
             "https://scripts.sil.org/OFL",
         }
+        boilerplate_re = re.compile(
+            r"(?:This license is copied below, and is also available with a FAQ at:(?: https?://(?:scripts\.sil\.org/OFL|openfontlicense\.org))?"
+            r"|https?://(?:scripts\.sil\.org/OFL|openfontlicense\.org)|-{10,}"
+            r"|This Font Software is licensed under the SIL Open Font License,|Version 1\.1\.)"
+        )
         for line in prefix_lines:
-            if not line:
+            if not line or trusted_header:
                 continue
-            if line in exact_boilerplate:
+            if line in exact_boilerplate or boilerplate_re.fullmatch(line):
                 continue
             if re.fullmatch(r"Copyright(?: \(c\))? [^\x00-\x1f\x7f]{1,500}", line):
                 continue
@@ -1610,6 +1711,28 @@ def _font_identity_urls(receipt: dict[str, Any]) -> tuple[str, str, str] | None:
                 f"{GOOGLE_FONTS_RAW_ENDPOINT}/{GOOGLE_FONTS_REF}/{root}/{family}/{name}",
                 f"{GOOGLE_FONTS_RAW_ENDPOINT}/{GOOGLE_FONTS_REF}/{root}/{family}/{license_name}",
                 query_hash,
+            )
+        if provider_id == "github-fonts":
+            import github_fonts
+
+            sha, separator, name = candidate_id.partition(":")
+            item = github_fonts.entry_by_font_blob(sha) if separator == ":" else None
+            if item is None or name != item["font_path"].rsplit("/", 1)[-1]:
+                return None
+            if candidate != {
+                "family": item["family"],
+                "style": "",
+                "weight": None,
+                "subset": "",
+                "unicode_range": "",
+                "version": item["commit"],
+                "source_url": github_fonts.font_landing_url(item),
+            }:
+                return None
+            return (
+                github_fonts.font_download_url(item),
+                github_fonts.raw_url(item, item["license_path"]),
+                hashlib.sha256(item["id"].encode()).hexdigest(),
             )
         if provider_id == "fontsource":
             parts = candidate_id.split(":")
@@ -1896,7 +2019,7 @@ def _font_receipt_consistency_errors(
         f"font-{item.get('provider_id')}-{candidate_hash}-{receipt['font']['sha256'][:16]}"
     )
     if item.get("asset_id") != expected_asset_id or re.fullmatch(
-        r"font-(?:google-fonts|fontsource)-[0-9a-f]{16}-[0-9a-f]{16}",
+        r"font-(?:google-fonts|fontsource|github-fonts)-[0-9a-f]{16}-[0-9a-f]{16}",
         str(item.get("asset_id")),
     ) is None:
         return ["font asset_id does not match canonical identity"], None
@@ -1926,9 +2049,22 @@ def _font_receipt_consistency_errors(
         ).hexdigest()
         if separator != ":" or actual_blob_sha != expected_blob_sha:
             return ["Google Fonts binary does not match pinned repository blob"], None
+    trusted_header = False
+    if item.get("provider_id") == "github-fonts":
+        import github_fonts
+
+        expected_blob_sha, separator, _name = receipt["candidate_id"].partition(":")
+        allow = github_fonts.entry_by_font_blob(expected_blob_sha) if separator == ":" else None
+        if allow is None or github_fonts.git_blob_sha1(raw) != expected_blob_sha:
+            return ["GitHub font binary does not match pinned repository blob"], None
+        if github_fonts.git_blob_sha1(license_raw) != allow["license_blob_sha1"]:
+            return ["GitHub licence file does not match pinned repository blob"], None
+        if github_fonts.is_release(allow) and hashlib.sha256(raw).hexdigest() != allow["source"]["member_sha256"]:
+            return ["GitHub release member does not match pinned SHA-256"], None
+        trusted_header = True
     try:
         _normalized, normalized_hash = validate_font_license_text(
-            license_raw, receipt["license"]["spdx"]
+            license_raw, receipt["license"]["spdx"], trusted_header=trusted_header
         )
     except AssetRegistryError:
         return ["font license artifact is invalid"], None
@@ -1969,7 +2105,7 @@ def resolve_project_font(
 ) -> dict[str, Any]:
     """Resolve one physically current v3 font; caller text can only expand coverage."""
     if not isinstance(asset_id, str) or re.fullmatch(
-        r"font-(?:google-fonts|fontsource)-[0-9a-f]{16}-[0-9a-f]{16}", asset_id
+        r"font-(?:google-fonts|fontsource|github-fonts)-[0-9a-f]{16}-[0-9a-f]{16}", asset_id
     ) is None:
         raise AssetRegistryError("font asset_id is invalid")
     artifact = load_registry(Path(project_dir))

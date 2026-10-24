@@ -1,6 +1,6 @@
 # Font security policy
 
-Policy version: `font-security-policy/1`
+Policy version: `font-security-policy/3` (2026-10-22: total outline points 2,000,000 → 12,000,000; CFF charstring total 8 MiB → 20 MiB so Traditional Chinese families, which carry 20k–50k glyphs, can pass; all other limits unchanged)
 Validator version: `font-security/1`
 Receipt version: `font-validation-receipt/1`
 
@@ -25,9 +25,24 @@ all-zero inter-table gap is rejected as `FONT_TABLE_GAP`.
 - name records: 256; encoded name string: 4 KiB; name table: 256 KiB;
 - variation axes: 16; named instances: 64;
 - one TrueType glyph: 10,000 points, 512 contours, 64 components, composite
-  depth 16; all simple glyph points: 2,000,000;
+  depth 16; all simple glyph points: 12,000,000 (charged after composite expansion: a composite is
+  billed every point of every component it references, memoised; one composite may reference at
+  most 200,000 expanded points);
 - one instruction program or CFF charstring: 64 KiB; all CFF charstrings:
-  8 MiB; local/global CFF subroutines: 4,096 each;
+  20 MiB; local/global CFF subroutines: 65,536 each (the CFF INDEX maximum; CID-keyed fonts are checked per
+  FDArray entry); before fontTools interprets a charstring, a bounded walker follows every subr
+  call with the glyph's stem context: nesting ≤ 10, no recursion, ≤ 100,000 operators per glyph
+  and ≤ 30,000,000 per font; the hintmask width is frozen at the first mask (operands before a
+  later mask, or stem operators after it, are rejected), only the flex escapes are modelled and
+  every other escape operator is rejected, and a subr index must be a literal operand; seac
+  (endchar with four operands) references are charged, depth-limited and cycle-checked exactly
+  like TrueType composites;
+  a `github-fonts` allowlist entry may name a GitHub Release zip instead of a tree file: the zip
+  is pinned by exact size and SHA-256, must hold exactly one plain (stored/deflate, unencrypted)
+  member whose size and SHA-256 are pinned too, and only that member — read in a streaming,
+  size-capped way, never extracted by name — enters validation; release assets are mutable,
+  so those hashes are what makes the source immutable; a receipt minted under an earlier policy/limits identity is set aside (never deleted) when the
+  same font is re-imported, so re-validation is possible after a policy bump;
 - NFC required text: 100,000 Unicode scalars.
 
 The validator requires pinned fontTools `4.62.1`, constructs `TTFont` with `lazy=False`, then forces table
