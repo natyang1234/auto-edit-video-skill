@@ -4602,7 +4602,7 @@ class EditorRendererTests(unittest.TestCase):
     def run_renderer(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             [
-                "python3",
+                sys.executable,
                 str(SCRIPTS_DIR / "render_editor_timeline.py"),
                 "--project-dir",
                 str(self.project),
