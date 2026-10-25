@@ -13,6 +13,11 @@ from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
+# Seconds since 1904-01-01 (the sfnt epoch). Fonts built here pin head.created/modified and
+# disable TTFont.save()'s timestamp refresh so builds straddling a wall-clock second stay
+# byte-identical (same fix as font_test_fixture.py).
+FIXED_HEAD_TIMESTAMP = 3_850_000_000
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
@@ -97,6 +102,8 @@ def build_ttf(
     )
     builder.setupPost()
     builder.setupMaxp()
+    builder.updateHead(created=FIXED_HEAD_TIMESTAMP, modified=FIXED_HEAD_TIMESTAMP)
+    builder.font.recalcTimestamp = False
     output = BytesIO()
     builder.save(output)
     return output.getvalue()
@@ -145,6 +152,8 @@ def build_otf() -> bytes:
         fsType=0,
     )
     builder.setupPost()
+    builder.updateHead(created=FIXED_HEAD_TIMESTAMP, modified=FIXED_HEAD_TIMESTAMP)
+    builder.font.recalcTimestamp = False
     output = BytesIO()
     builder.save(output)
     return output.getvalue()
@@ -159,6 +168,7 @@ def with_uvs(raw: bytes, selector: int, base: int, glyph_name: str | None = None
     subtable.cmap = {}
     subtable.uvsDict = {selector: [(base, glyph_name)]}
     font["cmap"].tables.append(subtable)
+    font.recalcTimestamp = False  # keep the input's pinned head timestamps
     output = BytesIO()
     font.save(output)
     font.close()
