@@ -404,6 +404,7 @@ It covers the six semantic SFX categories, the 7 fixed trigger roles, the `v1`/`
 catalog profiles (`experience.sfx.catalog_profile`), `working/sfx_hints.json`
 placement (`cut --sfx-hints`), `sfx_suggest.py`, `sfx_import.py` library management,
 density limits, and the rule that Studio `audio_event_edits` work only under `v1`.
+License evidence for the bundled `v2` assets: [assets/sfx/README.md](assets/sfx/README.md).
 
 ### 8. Render and verify
 
