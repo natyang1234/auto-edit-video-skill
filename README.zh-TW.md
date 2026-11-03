@@ -83,7 +83,7 @@ SVG 搜尋會顯示 Heroicons、Lucide、Tabler 與 Wikimedia 的中繼資料。
 | Agent／執行環境 | 安裝位置 | 支援方式 |
 |---|---|---|
 | OpenAI Codex | `$CODEX_HOME/skills` 或 `~/.codex/skills` | 原生 Agent Skill |
-| Claude Code | `~/.claude/skills` | 原生自訂 Skill |
+| Claude Code | `~/.claude/skills`（personal 位置） | 原生 Skill |
 | Grok Build | `~/.grok/skills` | 原生 Skill，也相容 Claude／Agent Skills |
 | OpenClaw | `~/.openclaw/skills` | 原生 managed/local Skill |
 | Hermes Agent | `$HERMES_HOME/skills` 或 `~/.hermes/skills` | 原生檔案型 Skill |
@@ -122,7 +122,7 @@ cd auto-edit-video-skill
 ./install.sh --agent shared
 ```
 
-安裝器預設不覆蓋既有版本。`--force` 會先建立時間戳備份再替換；`--dry-run` 只顯示目的地。安裝後請開新 Agent session 或重新啟動 CLI，讓技能清單刷新。
+安裝器預設不覆蓋既有版本。`--force` 會先建立時間戳備份再替換；`--dry-run` 只顯示目的地。Claude Code 會在目前 session 內自動偵測新加入 `~/.claude/skills` 的 skill，不必重啟；若該目錄在 session 開始時尚不存在，執行一次 `/reload-skills`。其他 Agent 請開新 session 或重新啟動 CLI，讓技能清單刷新。
 
 Codex 也可直接使用內建安裝器：
 
@@ -209,7 +209,7 @@ Skill 會搜尋同層與各 Agent 的使用者技能目錄。自訂額外根目�
 export AUTO_EDIT_SKILLS_ROOTS="/opt/agent-skills:$HOME/my-skills"
 ```
 
-可個別指定 `VIDEO_AUTOPILOT_SKILL_DIR`、`CUT_NARRATION_SKILL_DIR`、`NARRATION_VIDEO_SKILL_DIR`、`EMBEDDED_CAPTIONS_SKILL_DIR`、`TALKING_HEAD_RECUT_SKILL_DIR`、`HYPERFRAMES_MEDIA_SKILL_DIR` 與 `RUMI_VOICE_SYSTEM`。
+可個別指定 `VIDEO_AUTOPILOT_SKILL_DIR`、`CUT_NARRATION_SKILL_DIR`、`NARRATION_VIDEO_SKILL_DIR`、`EMBEDDED_CAPTIONS_SKILL_DIR`、`TALKING_HEAD_RECUT_SKILL_DIR`、`HYPERFRAMES_MEDIA_SKILL_DIR`、`EDIT_STYLE_PROFILES_SKILL_DIR` 與 `RUMI_VOICE_SYSTEM`。
 
 ## 安全界線
 

@@ -169,7 +169,7 @@ The skill never invokes CapCut. It does not include API keys, private voices, me
 | Agent/runtime | Install target | Status |
 |---|---|---|
 | OpenAI Codex | `$CODEX_HOME/skills` or `~/.codex/skills` | Native Agent Skill |
-| Claude Code | `~/.claude/skills` | Native custom Skill |
+| Claude Code | `~/.claude/skills` (personal skill location) | Native Skill |
 | Grok Build | `~/.grok/skills` | Native Skill; also reads Claude/Agent Skills roots |
 | OpenClaw | `~/.openclaw/skills` | Native managed/local Skill |
 | Hermes Agent | `$HERMES_HOME/skills` or `~/.hermes/skills` | Native filesystem Skill |
@@ -218,7 +218,7 @@ Codex users can also ask the built-in skill installer to install the skill direc
 $skill-installer install https://github.com/natyang1234/auto-edit-video-skill/tree/main/skills/auto-edit-video
 ```
 
-Start a new agent session after installation so its skill catalog refreshes.
+Claude Code picks up a skill added under `~/.claude/skills` within the current session, without a restart; if that directory did not exist when the session started, run `/reload-skills` once. Other agents: start a new session (or restart the CLI) so the skill catalog refreshes.
 
 ## Verify
 
@@ -304,7 +304,7 @@ The skill searches sibling and user-level roots for compatible optional skills. 
 export AUTO_EDIT_SKILLS_ROOTS="/opt/agent-skills:$HOME/my-skills"
 ```
 
-Specific overrides include `VIDEO_AUTOPILOT_SKILL_DIR`, `CUT_NARRATION_SKILL_DIR`, `NARRATION_VIDEO_SKILL_DIR`, `EMBEDDED_CAPTIONS_SKILL_DIR`, `TALKING_HEAD_RECUT_SKILL_DIR`, `HYPERFRAMES_MEDIA_SKILL_DIR`, and `RUMI_VOICE_SYSTEM`.
+Specific overrides include `VIDEO_AUTOPILOT_SKILL_DIR`, `CUT_NARRATION_SKILL_DIR`, `NARRATION_VIDEO_SKILL_DIR`, `EMBEDDED_CAPTIONS_SKILL_DIR`, `TALKING_HEAD_RECUT_SKILL_DIR`, `HYPERFRAMES_MEDIA_SKILL_DIR`, `EDIT_STYLE_PROFILES_SKILL_DIR`, and `RUMI_VOICE_SYSTEM`.
 
 ## Security model
 

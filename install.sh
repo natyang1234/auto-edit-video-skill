@@ -238,4 +238,4 @@ done
 if [[ -f "$BACKUP_BATCH/MANIFEST.tsv" ]]; then
   printf 'Recovery manifest: %s\n' "$BACKUP_BATCH/MANIFEST.tsv"
 fi
-printf '%s\n' 'Start a new agent session (or restart the CLI) so the skill catalog refreshes.'
+printf '%s\n' 'Claude Code picks up the new skill in the current session (run /reload-skills once if ~/.claude/skills did not exist before). Other agents: start a new session (or restart the CLI) so the skill catalog refreshes.'
