@@ -11,6 +11,7 @@ import subprocess
 import time
 import hashlib
 import copy
+import errno
 from unittest.mock import patch
 from pathlib import Path
 
@@ -2013,6 +2014,166 @@ class StylePresetApiTests(unittest.TestCase):
         status, current = self.request("GET", "/api/style-presets")
         self.assertEqual(status, 200, current)
         self.assertEqual(current["revision"], created["revision"])
+
+    def test_store_operational_errno_is_503_across_http_boundaries(self) -> None:
+        state_path = self.harness.project / "working/editor_state.json"
+        manifest_path = self.harness.project / "project.json"
+        journal_path = self.harness.project / "working/caption-preset-transaction.json"
+        store_path = self.harness.server.style_preset_store.path
+
+        def authority_snapshot() -> dict[Path, bytes | None]:
+            return {
+                path: path.read_bytes() if path.exists() else None
+                for path in (store_path, state_path, manifest_path, journal_path)
+            }
+
+        def open_store_fds() -> list[str]:
+            found: list[str] = []
+            for name in os.listdir("/dev/fd"):
+                try:
+                    target = os.readlink(f"/dev/fd/{name}")
+                except OSError:
+                    continue
+                if str(self.store_dir) in target:
+                    found.append(target)
+            return sorted(found)
+
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        real_mkdir = style_presets.os.mkdir
+        for failure_errno in (errno.EACCES, errno.ENOSPC, errno.EIO, errno.EROFS):
+            with self.subTest(boundary="mkdir", errno=failure_errno):
+                before = authority_snapshot()
+
+                def fail_store_mkdir(path, *args, **kwargs):
+                    if path == self.store_dir.name:
+                        raise OSError(failure_errno, "injected store mkdir failure")
+                    return real_mkdir(path, *args, **kwargs)
+
+                with patch.object(style_presets.os, "mkdir", side_effect=fail_store_mkdir):
+                    status, rejected = self.request("POST", "/api/style-presets", {
+                        "expected_library_revision": empty["revision"],
+                        "name": f"mkdir-{failure_errno}",
+                        "kind": "caption",
+                        "settings": {"style": {"color": "#123456"}},
+                    })
+                self.assertEqual(status, 503, rejected)
+                self.assertEqual(rejected["reason"], "store_io_error")
+                self.assertEqual(authority_snapshot(), before)
+                self.assertEqual(open_store_fds(), [])
+
+        _state, project_revision = self.install_caption()
+        created = self.create_caption_preset(empty["revision"])
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": project_revision,
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+        real_open = style_presets.os.open
+
+        for endpoint, request, component_errno in (
+            ("collection", ("GET", "/api/style-presets", None), errno.EACCES),
+            ("caption-plan", ("POST", "/api/style-presets/caption-plan", base), errno.EIO),
+        ):
+            with self.subTest(boundary=endpoint, errno=component_errno):
+                before = authority_snapshot()
+
+                def fail_store_component(path, flags, *args, **kwargs):
+                    if path == self.store_dir.name:
+                        raise OSError(component_errno, "injected store component failure")
+                    return real_open(path, flags, *args, **kwargs)
+
+                with patch.object(style_presets.os, "open", side_effect=fail_store_component):
+                    status, rejected = self.request(*request)
+                self.assertEqual(status, 503, rejected)
+                self.assertEqual(rejected["reason"], "store_io_error")
+                self.assertEqual(authority_snapshot(), before)
+                self.assertEqual(open_store_fds(), [])
+
+        for boundary, errnos in (
+            ("caption-apply-lock", (errno.EACCES, errno.ENOSPC, errno.EIO, errno.EROFS)),
+            ("mutation-lock", (errno.EACCES, errno.ENOSPC, errno.EIO, errno.EROFS)),
+        ):
+            for failure_errno in errnos:
+                with self.subTest(boundary=boundary, errno=failure_errno):
+                    before = authority_snapshot()
+
+                    def fail_lock_open(path, flags, *args, **kwargs):
+                        if path == ".presets.lock":
+                            raise OSError(failure_errno, "injected preset lock failure")
+                        return real_open(path, flags, *args, **kwargs)
+
+                    with patch.object(style_presets.os, "open", side_effect=fail_lock_open):
+                        if boundary == "caption-apply-lock":
+                            status, rejected = self.request(
+                                "POST",
+                                "/api/style-presets/caption-apply",
+                                {**base, "plan_digest": plan["plan_digest"]},
+                            )
+                        else:
+                            status, rejected = self.request("POST", "/api/style-presets", {
+                                "expected_library_revision": created["revision"],
+                                "name": f"lock-{failure_errno}",
+                                "kind": "caption",
+                                "settings": {"style": {"color": "#654321"}},
+                            })
+                    self.assertEqual(status, 503, rejected)
+                    self.assertEqual(rejected["reason"], "store_io_error")
+                    self.assertEqual(authority_snapshot(), before)
+                    self.assertEqual(open_store_fds(), [])
+
+        lock_path = self.harness.server.style_preset_store.lock_path
+        lock_path.unlink()
+        lock_path.mkdir()
+        try:
+            for boundary in ("caption-apply-special-lock", "mutation-special-lock"):
+                with self.subTest(boundary=boundary):
+                    before = authority_snapshot()
+                    if boundary == "caption-apply-special-lock":
+                        status, rejected = self.request(
+                            "POST",
+                            "/api/style-presets/caption-apply",
+                            {**base, "plan_digest": plan["plan_digest"]},
+                        )
+                    else:
+                        status, rejected = self.request("POST", "/api/style-presets", {
+                            "expected_library_revision": created["revision"],
+                            "name": "special-lock",
+                            "kind": "caption",
+                            "settings": {"style": {"color": "#654321"}},
+                        })
+                    self.assertEqual(status, 409, rejected)
+                    self.assertEqual(rejected["reason"], "store_unsafe")
+                    self.assertEqual(authority_snapshot(), before)
+                    self.assertEqual(open_store_fds(), [])
+        finally:
+            lock_path.rmdir()
+
+    def test_store_fifo_is_rejected_without_waiting_for_writer(self) -> None:
+        self.store_dir.mkdir(parents=True)
+        store_path = self.harness.server.style_preset_store.path
+        os.mkfifo(store_path, mode=0o600)
+        started = time.monotonic()
+        status, rejected = self.request("GET", "/api/style-presets")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(status, 409, rejected)
+        self.assertEqual(rejected["reason"], "store_corrupt")
+        self.assertTrue(store_path.exists())
+        self.assertTrue(stat.S_ISFIFO(store_path.stat().st_mode))
+
+        store_path.unlink()
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        status, current = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, current)
+        self.assertEqual(current["revision"], created["revision"])
+        self.assertEqual(len(current["presets"]), 1)
 
     def test_preview_failure_after_replace_reports_publication_truthfully(self) -> None:
         from tests.test_editor_server import EditorServerTests
