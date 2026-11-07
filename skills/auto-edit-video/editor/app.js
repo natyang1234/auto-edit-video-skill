@@ -2675,7 +2675,7 @@ function fxPreviewStatusForJob(job) {
 function fxPreviewTimingSuffix(job, label = "已用") {
   if (typeof job?.elapsed_s !== "number" || !Number.isFinite(job.elapsed_s)) return "";
   let suffix = ` · ${label} ${Math.round(job.elapsed_s)} 秒`;
-  if (job.state === "running") {
+  if (job.state === "running" && job.phase !== "cancelling" && !job.error) {
     const eta = job.eta_remaining_s;
     suffix += typeof eta === "number" && Number.isFinite(eta)
       ? ` · 預估還需 ${Math.ceil(eta)} 秒（依近期同設定估算）`

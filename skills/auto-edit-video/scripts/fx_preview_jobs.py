@@ -1577,36 +1577,38 @@ class FxPreviewJobManager:
             env["FX_PREVIEW_RESULT_DIR_FD"] = str(runtime_fd)
             env["FX_PREVIEW_SCRATCH_LEASE_FD"] = str(lease_fd)
             env["FX_PREVIEW_MAINTENANCE_FD"] = str(maintenance_fd)
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(self.renderer_script),
-                    "--request",
-                    str(request_path),
-                    "--result",
-                    str(result_path),
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-                env=env,
-                pass_fds=(request_fd, runtime_fd, lease_fd, maintenance_fd),
-            )
-            os.close(request_fd)
-            request_fd = -1
             with self._lock:
                 current = self._jobs.get(job_id)
                 if current is None or current.get("cancel_requested"):
-                    if self._terminate_process(process):
-                        self._finish_cancelled(job_id)
-                    else:
-                        self._mark_termination_unverified(job_id)
+                    # cancel() published the request while no worker process
+                    # existed; holding this lock prevents any later launch.
+                    self._finish_cancelled(job_id, process_absence_verified=True)
                     return
+                # Popen and job registration are one cancellation critical
+                # section.  cancel() can therefore never mistake an already
+                # created but not-yet-registered process for "no process".
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(self.renderer_script),
+                        "--request",
+                        str(request_path),
+                        "--result",
+                        str(result_path),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                    env=env,
+                    pass_fds=(request_fd, runtime_fd, lease_fd, maintenance_fd),
+                )
                 current["process"] = process
                 self._set_timing_phase(current, "preparing")
                 current["message"] = _PHASE_MESSAGES["preparing"]
+            os.close(request_fd)
+            request_fd = -1
             progress = threading.Thread(
                 target=self._consume_progress,
                 args=(job_id, process.stderr),
@@ -1622,7 +1624,7 @@ class FxPreviewJobManager:
                     terminated = self._terminate_process(process)
                     with self._lock:
                         if terminated:
-                            self._finish_cancelled(job_id)
+                            self._finish_cancelled(job_id, process_absence_verified=True)
                         else:
                             self._mark_termination_unverified(job_id)
                     return
@@ -1683,8 +1685,7 @@ class FxPreviewJobManager:
                 return
             with self._lock:
                 current = self._jobs.get(job_id)
-                if current is None or current.get("cancel_requested"):
-                    self._finish_cancelled(job_id)
+                if self._worker_cancel_pending(current):
                     return
                 self._set_timing_phase(current, "validating")
                 current["message"] = _PHASE_MESSAGES["validating"]
@@ -1730,8 +1731,7 @@ class FxPreviewJobManager:
                 return
             with self._lock:
                 current = self._jobs.get(job_id)
-                if current is None or current.get("cancel_requested"):
-                    self._finish_cancelled(job_id)
+                if self._worker_cancel_pending(current):
                     return
                 if _canonical_sha256(current_deps) != current["dependency_hash"]:
                     self._finish_failed(job_id, "preview_stale", "預覽期間來源或樣式已變更，請重新產生")
@@ -1791,14 +1791,13 @@ class FxPreviewJobManager:
             self._atomic_json_in("cache", cache_receipt.name, receipt)
             with self._lock:
                 current = self._jobs.get(job_id)
-                if current is None or current.get("cancel_requested"):
+                if self._worker_cancel_pending(current):
                     self._assert_storage_safe("working", "root", "cache")
                     for name in (cache_media.name, cache_receipt.name):
                         try:
                             os.unlink(name, dir_fd=self._storage_pins["cache"].fd)
                         except FileNotFoundError:
                             pass
-                    self._finish_cancelled(job_id)
                     return
                 self._set_timing_phase(current, "ready")
                 elapsed = max(0.0, time.monotonic() - current["timing_started"])
@@ -1904,7 +1903,12 @@ class FxPreviewJobManager:
                     continue
                 with self._lock:
                     job = self._jobs.get(job_id)
-                    if job is None or job.get("state") != "running":
+                    if (
+                        job is None
+                        or job.get("state") != "running"
+                        or job.get("cancel_requested")
+                        or job.get("error")
+                    ):
                         return
                     self._set_timing_phase(job, phase)
                     job["message"] = _PHASE_MESSAGES[phase]
@@ -1988,6 +1992,11 @@ class FxPreviewJobManager:
         )
 
     @staticmethod
+    def _worker_cancel_pending(job: dict[str, Any] | None) -> bool:
+        """Stop worker callbacks without preempting the cancel handler's verdict."""
+        return job is None or bool(job.get("cancel_requested"))
+
+    @staticmethod
     def _validate_mp4(path: Path, expected_duration: float) -> dict[str, Any]:
         if not _regular_nonsymlink(path) or path.suffix.lower() != ".mp4":
             raise ValueError("preview artifact is not a regular MP4")
@@ -2020,6 +2029,13 @@ class FxPreviewJobManager:
         job = self._jobs.get(job_id)
         if job is None or job.get("state") in TERMINAL_STATES:
             return
+        # Every caller holds _lock.  A cancel handler owns process-group
+        # verification outside this lock, so suppress the competing failure
+        # transition here but let that handler alone choose cancelled versus
+        # termination_unverified.  Never claim cancellation merely because the
+        # request flag raced with a worker error.
+        if job.get("cancel_requested"):
+            return
         self._set_timing_phase(job, "failed")
         job["timing_finished"] = time.monotonic()
         job.update(
@@ -2035,9 +2051,15 @@ class FxPreviewJobManager:
         if self._active_job_id == job_id:
             self._active_job_id = None
 
-    def _finish_cancelled(self, job_id: str) -> None:
+    def _finish_cancelled(
+        self, job_id: str, *, process_absence_verified: bool = False
+    ) -> None:
         job = self._jobs.get(job_id)
-        if job is None or job.get("state") == "cancelled":
+        if (
+            not process_absence_verified
+            or job is None
+            or job.get("state") in TERMINAL_STATES
+        ):
             return
         self._set_timing_phase(job, "cancelled")
         job["timing_finished"] = time.monotonic()
@@ -2080,10 +2102,21 @@ class FxPreviewJobManager:
             terminated = True
         with self._lock:
             if terminated:
-                self._finish_cancelled(job_id)
+                self._finish_cancelled(job_id, process_absence_verified=True)
             else:
                 self._mark_termination_unverified(job_id)
-            return self._public_job_locked(self._jobs[job_id])
+            public_job = self._public_job_locked(self._jobs[job_id])
+        if terminated:
+            # A termination_unverified worker may have outlived _run_job's
+            # finally block while inheriting its lease.  Once a later cancel
+            # proves the process group is gone, retry only this job's pinned,
+            # leased shadow cleanup.  A still-held lease fails closed; the
+            # worker's own finally remains the subsequent cleanup path.
+            try:
+                self._cleanup_renderer_scratch(job_id)
+            except (FxPreviewJobError, OSError):
+                pass
+        return public_job
 
     def public_job(self, job_id: str) -> dict[str, Any]:
         self.prune()
@@ -2136,6 +2169,11 @@ class FxPreviewJobManager:
             timings[phase] = timings.get(phase, 0.0) + max(0.0, now - job.get("timing_phase_started", now))
         samples = self._timing_samples.get(self._timing_group(job), [])
         estimate = sorted(samples)[len(samples) // 2] if len(samples) >= 3 else None
+        eta_visible = (
+            job.get("state") == "running"
+            and job.get("phase") != "cancelling"
+            and not job.get("error")
+        )
         public = {
             "id": job["id"],
             "state": job["state"],
@@ -2146,7 +2184,9 @@ class FxPreviewJobManager:
             "preview_options": deepcopy(job.get("preview_options") or {}),
             "elapsed_s": round(elapsed, 2),
             "phase_timings_s": {k: round(v, 2) for k, v in timings.items()},
-            "eta_remaining_s": round(estimate - elapsed, 2) if estimate is not None and elapsed < estimate and job.get("state") == "running" else None,
+            "eta_remaining_s": round(estimate - elapsed, 2)
+            if estimate is not None and elapsed < estimate and eta_visible
+            else None,
             "eta_sample_count": len(samples),
         }
         media = job.get("media")
