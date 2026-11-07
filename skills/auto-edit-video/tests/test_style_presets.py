@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -1673,6 +1674,345 @@ class StylePresetApiTests(unittest.TestCase):
         finally:
             case.tearDown()
             case.doCleanups()
+
+    def test_batch_auxiliary_restore_and_unlink_io_failures_are_unclean(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        for mode in ("restore", "unlink"):
+            with self.subTest(mode=mode):
+                case = EditorServerTests(methodName="runTest")
+                case.setUp()
+                try:
+                    state, _clip_ids = case.approve_batch_prerequisites()
+                    real_gate = editor_server.ensure_caption_preset_mutation_ready
+                    real_publish = editor_server.delivery_envelope.publish_direct_delivery
+                    real_exact = editor_server._atomic_write_exact
+                    real_unlink = Path.unlink
+                    calls = 0
+                    prior_path: Path | None = None
+
+                    def fail_second_member(project: Path) -> None:
+                        nonlocal calls
+                        calls += 1
+                        if calls == 3:
+                            editor_server.begin_caption_preset_transaction(project)
+                        real_gate(project)
+
+                    def seed_prior(*args: object, **kwargs: object):
+                        nonlocal prior_path
+                        publication = real_publish(*args, **kwargs)
+                        if (
+                            mode == "restore"
+                            and prior_path is None
+                            and isinstance(
+                                publication,
+                                editor_server.delivery_envelope.DeferredPublication,
+                            )
+                        ):
+                            prior_path = (
+                                case.project
+                                / "working/render_receipts"
+                                / f"{publication.render_id}.json"
+                            )
+                            prior_path.parent.mkdir(parents=True, exist_ok=True)
+                            prior_path.write_bytes(b"prior-receipt")
+                        return publication
+
+                    def fail_exact(path: Path, raw: bytes) -> None:
+                        if mode == "restore":
+                            raise OSError("injected auxiliary restore failure")
+                        real_exact(path, raw)
+
+                    def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                        if (
+                            mode == "unlink"
+                            and path.parent.name == "render_receipts"
+                            and path.name.startswith("render_")
+                        ):
+                            raise OSError("injected auxiliary unlink failure")
+                        real_unlink(path, *args, **kwargs)
+
+                    with (
+                        patch.object(
+                            editor_server.subprocess,
+                            "run",
+                            side_effect=case.fake_batch_subprocess(),
+                        ),
+                        patch.object(
+                            editor_server, "ffprobe_has_visual_stream", return_value=True
+                        ),
+                        patch.object(
+                            editor_server,
+                            "ensure_caption_preset_mutation_ready",
+                            side_effect=fail_second_member,
+                        ),
+                        patch.object(
+                            editor_server.delivery_envelope,
+                            "publish_direct_delivery",
+                            side_effect=seed_prior,
+                        ),
+                        patch.object(editor_server, "_atomic_write_exact", side_effect=fail_exact),
+                        patch.object(Path, "unlink", new=fail_unlink),
+                    ):
+                        status, accepted = case.json_request("POST", "/api/render-batch", {
+                            "quality": "final",
+                            "expected_revision": state["revision"],
+                        })
+                        self.assertEqual(status, 202, accepted)
+                        failed = case.wait_for_render_terminal()
+                    self.assertEqual(failed["state"], "failed_unclean", failed)
+                    self.assertFalse(failed["previous_latest_preserved"])
+                    self.assertTrue(failed["rollback_errors"])
+                    self.assertTrue(failed["leaked_paths"])
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_batch_post_commit_failure_keeps_member_auxiliary_records(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            state, _clip_ids = case.approve_batch_prerequisites()
+            real_atomic = editor_server.atomic_write_json
+
+            def fail_after_latest(path: Path, payload: object) -> None:
+                real_atomic(path, payload)
+                if path.name == "latest_final_qa.json":
+                    raise OSError("injected post-commit pointer failure")
+
+            with (
+                patch.object(
+                    editor_server.subprocess,
+                    "run",
+                    side_effect=case.fake_batch_subprocess(),
+                ),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(editor_server, "atomic_write_json", side_effect=fail_after_latest),
+            ):
+                status, accepted = case.json_request("POST", "/api/render-batch", {
+                    "quality": "final",
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertEqual(failed["state"], "failed", failed)
+            self.assertNotIn("leaked_paths", failed)
+            member_receipts = sorted(
+                (case.project / "working/render_receipts").glob("render_*.json")
+            )
+            member_qa = sorted(
+                (case.project / "working/delivery_qa").glob("render_*.json")
+            )
+            self.assertEqual((len(member_receipts), len(member_qa)), (2, 2))
+            for path in (*member_receipts, *member_qa):
+                self.assertTrue(path.read_bytes())
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_batch_cleanup_failure_keeps_original_root_cause_and_classification(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            state, _clip_ids = case.approve_batch_prerequisites()
+            real_atomic = editor_server.atomic_write_json
+            real_unlink = Path.unlink
+            failed_write = False
+
+            def fail_with_qa_root_cause(path: Path, payload: object) -> None:
+                nonlocal failed_write
+                real_atomic(path, payload)
+                if (
+                    not failed_write
+                    and path.parent.name == "delivery_qa"
+                    and path.name.startswith("render_")
+                ):
+                    failed_write = True
+                    raise RuntimeError("delivery QA failed: injected root cause")
+
+            def fail_receipt_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+                if (
+                    failed_write
+                    and path.parent.name == "render_receipts"
+                    and path.name.startswith("render_")
+                ):
+                    raise OSError("injected cleanup failure")
+                real_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(
+                    editor_server.subprocess,
+                    "run",
+                    side_effect=case.fake_batch_subprocess(),
+                ),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(
+                    editor_server, "atomic_write_json", side_effect=fail_with_qa_root_cause
+                ),
+                patch.object(Path, "unlink", new=fail_receipt_cleanup),
+            ):
+                status, accepted = case.json_request("POST", "/api/render-batch", {
+                    "quality": "final",
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertTrue(failed_write)
+            self.assertEqual(failed["state"], "failed_unclean", failed)
+            self.assertIn("delivery QA failed: injected root cause", failed["message"])
+            self.assertTrue(failed["rollback_errors"])
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_preset_store_io_errors_are_typed_and_preserve_document(self) -> None:
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        preset = created["preset"]
+        store_path = self.harness.server.style_preset_store.path
+
+        cases = (
+            ("GET", "/api/style-presets", None, style_presets.os, "read", OSError("read EIO")),
+            (
+                "POST",
+                "/api/style-presets",
+                {
+                    "expected_library_revision": created["revision"],
+                    "name": "disk-full-create",
+                    "kind": "caption",
+                    "settings": {"style": {"color": "#123456"}},
+                },
+                style_presets.os,
+                "write",
+                OSError("write ENOSPC"),
+            ),
+            (
+                "PUT",
+                f"/api/style-presets/{preset['id']}",
+                {
+                    "expected_library_revision": created["revision"],
+                    "name": "fsync-update",
+                    "kind": "caption",
+                    "settings": {"style": {"color": "#654321"}},
+                },
+                style_presets.os,
+                "fsync",
+                OSError("fsync EIO"),
+            ),
+            (
+                "DELETE",
+                f"/api/style-presets/{preset['id']}",
+                {"expected_library_revision": created["revision"]},
+                style_presets.os,
+                "replace",
+                PermissionError("replace EACCES"),
+            ),
+        )
+        for method, path, payload, owner, attribute, failure in cases:
+            with self.subTest(method=method, fault=attribute):
+                before = store_path.read_bytes()
+                with patch.object(owner, attribute, side_effect=failure):
+                    status, rejected = self.request(method, path, payload)
+                self.assertEqual(status, 503, rejected)
+                self.assertEqual(rejected["reason"], "store_io_error")
+                self.assertEqual(store_path.read_bytes(), before)
+                status, healthy = self.request("GET", "/api/style-presets")
+                self.assertEqual(status, 200, healthy)
+                self.assertEqual(healthy["revision"], created["revision"])
+
+    def test_preset_store_postreplace_fsync_error_requires_reload(self) -> None:
+        status, initial = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, initial)
+        real_fsync = style_presets.os.fsync
+        injected = False
+
+        def fail_directory_fsync(descriptor: int) -> None:
+            nonlocal injected
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                injected = True
+                raise OSError("injected post-replace directory fsync failure")
+            real_fsync(descriptor)
+
+        with patch.object(style_presets.os, "fsync", side_effect=fail_directory_fsync):
+            status, uncertain = self.request("POST", "/api/style-presets", {
+                "expected_library_revision": initial["revision"],
+                "name": "post-replace-visible",
+                "kind": "caption",
+                "settings": {"style": {"color": "#123456"}},
+            })
+        self.assertTrue(injected)
+        self.assertEqual(status, 503, uncertain)
+        self.assertEqual(uncertain["reason"], "store_io_error")
+        self.assertIn("重新載入清單確認", uncertain["error"])
+        self.assertNotIn("原檔未變更", uncertain["error"])
+
+        status, current = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, current)
+        self.assertNotEqual(current["revision"], initial["revision"])
+        self.assertEqual(
+            [preset["name"] for preset in current["presets"]],
+            ["post-replace-visible"],
+        )
+
+        stale_payload = {
+            "expected_library_revision": initial["revision"],
+            "name": "stale-cas",
+            "kind": "caption",
+            "settings": {"style": {"color": "#654321"}},
+        }
+        status, stale = self.request("POST", "/api/style-presets", stale_payload)
+        self.assertEqual(status, 409, stale)
+        self.assertEqual(stale["reason"], "library_revision_conflict")
+        stale_payload["expected_library_revision"] = current["revision"]
+        stale_payload["name"] = "current-cas"
+        status, created = self.request("POST", "/api/style-presets", stale_payload)
+        self.assertEqual(status, 201, created)
+        self.assertNotEqual(created["revision"], current["revision"])
+
+    def test_caption_apply_store_read_error_is_typed_and_writes_nothing(self) -> None:
+        _state, project_revision = self.install_caption()
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": project_revision,
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+        paths = (
+            self.harness.server.style_preset_store.path,
+            self.harness.project / "working/editor_state.json",
+            self.harness.project / "project.json",
+        )
+        before = {path: path.read_bytes() for path in paths}
+        journal = self.harness.project / "working/caption-preset-transaction.json"
+        self.assertFalse(journal.exists())
+
+        with patch.object(
+            style_presets.os,
+            "read",
+            side_effect=OSError("injected locked collection read EIO"),
+        ):
+            status, rejected = self.request("POST", "/api/style-presets/caption-apply", {
+                **base,
+                "plan_digest": plan["plan_digest"],
+            })
+        self.assertEqual(status, 503, rejected)
+        self.assertEqual(rejected["reason"], "store_io_error")
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertFalse(journal.exists())
+        status, current = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, current)
+        self.assertEqual(current["revision"], created["revision"])
 
     def test_preview_failure_after_replace_reports_publication_truthfully(self) -> None:
         from tests.test_editor_server import EditorServerTests

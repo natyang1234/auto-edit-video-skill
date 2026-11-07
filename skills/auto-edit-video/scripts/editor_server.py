@@ -431,10 +431,12 @@ class BatchAuxiliaryRollbackError(RuntimeError):
         *,
         leaked_paths: list[str],
         rollback_errors: list[str],
+        original_error: BaseException | None = None,
     ) -> None:
         super().__init__(message)
         self.leaked_paths = tuple(leaked_paths)
         self.rollback_errors = tuple(rollback_errors)
+        self.original_error = original_error
 
 
 def _editor_render_revision_payload(
@@ -7728,6 +7730,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             publication_lock_held = False
             return delivery, publication, auxiliary
         finally:
+            original_error = sys.exception()
             if publication_lock_held:
                 self.server.project_lock.release()
             cleanup_leaks: list[str] = []
@@ -7759,11 +7762,17 @@ class EditorHandler(BaseHTTPRequestHandler):
                 except (OSError, delivery_envelope.DeliveryEnvelopeError):
                     pass
             if cleanup_errors:
+                root_message = (
+                    str(original_error)
+                    if original_error is not None
+                    else "batch member publication failed"
+                )
                 raise BatchAuxiliaryRollbackError(
-                    "batch member rollback was incomplete",
+                    f"{root_message}; batch member rollback was incomplete",
                     leaked_paths=cleanup_leaks,
                     rollback_errors=cleanup_errors,
-                )
+                    original_error=original_error,
+                ) from original_error
 
     def render_batch_worker(
         self,
