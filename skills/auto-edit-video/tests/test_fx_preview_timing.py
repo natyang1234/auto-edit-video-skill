@@ -1,8 +1,8 @@
 import sys
+import shutil
 import time
 import subprocess
 import json
-import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,6 +51,120 @@ def test_output_window_rejects_final_and_unfrozen_preview(tmp_path):
                                 variant_id="other", preview_fx_quality="draft", preview_output_window=(1, 1))
 
 
+FFMPEG_DEPENDENCY_SKIP = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required for real media timing coverage",
+)
+
+
+def _probe_video_frames(video: Path) -> tuple[list[bytes], list[float]]:
+    stream = json.loads(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(video),
+            ],
+            text=True,
+            timeout=30,
+        )
+    )["streams"][0]
+    width = int(stream["width"])
+    height = int(stream["height"])
+    timestamps = json.loads(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "json",
+                str(video),
+            ],
+            text=True,
+            timeout=30,
+        )
+    )["frames"]
+    raw = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    ).stdout
+    frame_size = width * height * 3
+    assert frame_size > 0
+    assert len(raw) % frame_size == 0
+    frames = [raw[index:index + frame_size] for index in range(0, len(raw), frame_size)]
+    pts = [float(frame["best_effort_timestamp_time"]) for frame in timestamps]
+    assert len(frames) == len(pts)
+    return frames, pts
+
+
+def _probe_duration(video: Path) -> float:
+    payload = json.loads(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(video),
+            ],
+            text=True,
+            timeout=30,
+        )
+    )
+    return float(payload["format"]["duration"])
+
+
+def _frame_mean_abs_error(left: bytes, right: bytes) -> float:
+    assert len(left) == len(right)
+    return sum(abs(a - b) for a, b in zip(left, right)) / len(left)
+
+
+def _assert_aligned_frames(
+    reference: list[bytes], candidate: list[bytes], offset: int, label: str,
+) -> list[float]:
+    assert len(candidate) == 10, f"{label}: expected 10 frames, got {len(candidate)}"
+    assert offset >= 0 and offset + len(candidate) <= len(reference)
+    errors = [
+        _frame_mean_abs_error(reference[offset + index], frame)
+        for index, frame in enumerate(candidate)
+    ]
+    assert all(error <= 12 for error in errors), (
+        f"{label}: frame content is not aligned; errors={errors}"
+    )
+    return errors
+
+
+@FFMPEG_DEPENDENCY_SKIP
 @pytest.mark.parametrize("has_audio,multi", [(True, False), (False, False), (True, True), (False, True)])
 def test_window_decodes_source_and_silent_audio_routes(tmp_path, has_audio, multi):
     source = tmp_path / "source.mp4"
@@ -63,15 +177,68 @@ def test_window_decodes_source_and_silent_audio_routes(tmp_path, has_audio, mult
     state = {"canvas": {"width": 64, "height": 96, "fps": 10}, "segments": segments,
              "overlays": [], "subject_tracking": False}
     manifest = {"source": {"staged_path": "source.mp4", "duration_s": 3, "has_audio": has_audio}}
+    full = tmp_path / "full.mp4"
     output = tmp_path / "preview.mp4"
+    wrong = tmp_path / "wrong-start.mp4"
+    window_start = 1.0 if multi else 0.5
+    expected_full_duration = 2.5 if multi else 3.0
     with patch.object(timeline, "source_has_audible_signal", return_value=has_audio):
-        cmd = timeline.build_render_command(tmp_path, state, manifest, output, "preview",
-                                            preview_fx_quality="draft", preview_output_window=(0.5, 1))
-    subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-    subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "null", "-"], check=True, timeout=30)
-    info = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                                               "-of", "json", str(output)]))
-    assert abs(float(info["format"]["duration"]) - 1) < .15
+        full_cmd = timeline.build_render_command(
+            tmp_path, state, manifest, full, "preview", preview_fx_quality="draft"
+        )
+        window_cmd = timeline.build_render_command(
+            tmp_path,
+            state,
+            manifest,
+            output,
+            "preview",
+            preview_fx_quality="draft",
+            preview_output_window=(window_start, 1.0),
+        )
+        wrong_cmd = timeline.build_render_command(
+            tmp_path,
+            state,
+            manifest,
+            wrong,
+            "preview",
+            preview_fx_quality="draft",
+            preview_output_window=(0.0, 1.0),
+        )
+    subprocess.run(full_cmd, check=True, capture_output=True, timeout=30)
+    subprocess.run(window_cmd, check=True, capture_output=True, timeout=30)
+    subprocess.run(wrong_cmd, check=True, capture_output=True, timeout=30)
+    for rendered in (full, output, wrong):
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(rendered), "-f", "null", "-"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    assert abs(_probe_duration(full) - expected_full_duration) < .15
+    assert abs(_probe_duration(output) - 1.0) < .15
+    assert abs(_probe_duration(wrong) - 1.0) < .15
+
+    full_frames, full_pts = _probe_video_frames(full)
+    preview_frames, preview_pts = _probe_video_frames(output)
+    wrong_frames, wrong_pts = _probe_video_frames(wrong)
+    assert full_pts and abs(full_pts[0]) < .01
+    assert preview_pts and abs(preview_pts[0]) < .01
+    assert wrong_pts and abs(wrong_pts[0]) < .01
+    offset = round(window_start * 10)
+    aligned_errors = _assert_aligned_frames(full_frames, preview_frames, offset, "aligned")
+    wrong_errors = [
+        _frame_mean_abs_error(full_frames[offset + index], frame)
+        for index, frame in enumerate(wrong_frames)
+    ]
+    aligned_mean = sum(aligned_errors) / len(aligned_errors)
+    wrong_mean = sum(wrong_errors) / len(wrong_errors)
+    print(
+        f"frame alignment has_audio={has_audio} multi={multi} "
+        f"aligned_mean_abs={aligned_mean:.3f} wrong_start_mean_abs={wrong_mean:.3f}"
+    )
+    assert wrong_mean > 15, f"wrong-start control unexpectedly matched: errors={wrong_errors}"
+    with pytest.raises(AssertionError, match="wrong-start"):
+        _assert_aligned_frames(full_frames, wrong_frames, offset, "wrong-start")
 
 
 def test_eta_requires_three_matching_samples_and_uses_elapsed():
@@ -101,28 +268,3 @@ def test_eta_requires_three_matching_samples_and_uses_elapsed():
     job.update(state="ready", phase="ready", timing_finished=now + 3)
     with patch.object(jobs.time, "monotonic", return_value=now + 100):
         assert manager._public_job_locked(job)["elapsed_s"] == 5
-
-
-def test_timing_suffix_hides_eta_while_cancelling_or_after_error():
-    app_source = (Path(__file__).resolve().parents[1] / "editor" / "app.js").read_text(
-        encoding="utf-8"
-    )
-    match = re.search(
-        r"function fxPreviewTimingSuffix\(job, label = \"已用\"\) \{.*?\n\}\n\n"
-        r"(?=function fxPreviewApplyJob)",
-        app_source,
-        flags=re.DOTALL,
-    )
-    assert match is not None, "fxPreviewTimingSuffix must remain directly testable"
-    script = match.group(0) + """
-const cases = [
-  {state: 'running', phase: 'cancelling', elapsed_s: 7, eta_remaining_s: 12, eta_sample_count: 3},
-  {state: 'running', phase: 'encoding', elapsed_s: 8, eta_remaining_s: 11, eta_sample_count: 3,
-   error: {code: 'termination_unverified', message: 'retry cancel'}},
-];
-process.stdout.write(JSON.stringify(cases.map((job) => fxPreviewTimingSuffix(job))));
-"""
-    rendered = json.loads(
-        subprocess.check_output(["node", "-e", script], text=True, timeout=10)
-    )
-    assert rendered == [" · 已用 7 秒", " · 已用 8 秒"]

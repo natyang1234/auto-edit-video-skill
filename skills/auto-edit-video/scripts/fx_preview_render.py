@@ -92,6 +92,25 @@ def _unlink_lease_if_same(directory_fd: int, name: str, descriptor: int) -> bool
         return False
 
 
+def _owned_shadows_absent(directory_fd: int, owner: str) -> bool:
+    """Prove every new-format shadow for one lease owner is absent."""
+    pattern = re.compile(
+        rf"^timeline-project-{re.escape(owner)}-[0-9a-f]{{16}}-[A-Za-z0-9_-]+$"
+    )
+    try:
+        for entry in os.scandir(directory_fd):
+            if pattern.fullmatch(entry.name) is None:
+                continue
+            try:
+                entry.stat(follow_symlinks=False)
+            except OSError:
+                return False
+            return False
+        return True
+    except OSError:
+        return False
+
+
 def _acquire_renderer_maintenance_shared(cache: Path) -> tuple[int, int]:
     """Hold the fixed shared guard before any renderer-cache read or write."""
     cache_fd = _open_directory_no_follow(cache)
@@ -563,11 +582,20 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
         lease_locked = True
         shadow = Path(tempfile.mkdtemp(prefix=f"timeline-project-{scratch_owner}-{key}-", dir=cache))
     except Exception:
-        if owns_lease_path and lease_locked and lease_fd >= 0:
-            _unlink_lease_if_same(cache_fd, lease_name, lease_fd)
-        if lease_fd >= 0:
-            os.close(lease_fd)
-        os.close(cache_fd)
+        try:
+            if (
+                owns_lease_path
+                and lease_locked
+                and lease_fd >= 0
+                and _owned_shadows_absent(cache_fd, scratch_owner)
+            ):
+                _unlink_lease_if_same(cache_fd, lease_name, lease_fd)
+        finally:
+            try:
+                if lease_fd >= 0:
+                    os.close(lease_fd)
+            finally:
+                os.close(cache_fd)
         raise
     assert shadow is not None
     path = shadow / "working" / "render_snapshots" / f"fx-preview-{key}.json"
@@ -662,12 +690,26 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     except Exception as exc:
         raise PreviewError("timeline_render_failed", "完整時間軸預覽無法渲染") from exc
     finally:
-        path.unlink(missing_ok=True)
-        shutil.rmtree(shadow, ignore_errors=True)
-        if owns_lease_path and lease_locked:
-            _unlink_lease_if_same(cache_fd, lease_name, lease_fd)
-        os.close(lease_fd)
-        os.close(cache_fd)
+        try:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                shutil.rmtree(shadow, ignore_errors=True)
+            except OSError:
+                pass
+            if (
+                owns_lease_path
+                and lease_locked
+                and _owned_shadows_absent(cache_fd, scratch_owner)
+            ):
+                _unlink_lease_if_same(cache_fd, lease_name, lease_fd)
+        finally:
+            try:
+                os.close(lease_fd)
+            finally:
+                os.close(cache_fd)
     time_map, out_at = [], 0.0
     for seg_start, seg_end in segments:
         left, right = max(sample_start, seg_start), min(sample_start + duration, seg_end)
