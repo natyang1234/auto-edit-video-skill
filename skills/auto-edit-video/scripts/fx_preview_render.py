@@ -608,20 +608,20 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     layout_reports: dict[str, Any] = {}
     target_material = dependencies.get("material")
     expected_broll = None
-    if isinstance(target_material, dict):
-        for candidate in state.get("overlays", []):
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("type") == "fx"
-                and candidate.get("code") == "B1"
-                and candidate.get("material") == target_material
-                and float(candidate.get("start", -1)) <= sample_start + 1e-6
-                and float(candidate.get("end", -1)) >= sample_start + duration - 1e-6
-            ):
-                expected_broll = candidate
-                break
     observed_broll = False
     try:
+        if isinstance(target_material, dict):
+            for candidate in state.get("overlays", []):
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("type") == "fx"
+                    and candidate.get("code") == "B1"
+                    and candidate.get("material") == target_material
+                    and float(candidate.get("start", -1)) <= sample_start + 1e-6
+                    and float(candidate.get("end", -1)) >= sample_start + duration - 1e-6
+                ):
+                    expected_broll = candidate
+                    break
         # Copy exactly the files frozen by the manager.  Historical renders,
         # unreferenced assets and unrelated symlinks never enter the shadow.
         for relative, expected_digest in dependency_files(dependencies).items():

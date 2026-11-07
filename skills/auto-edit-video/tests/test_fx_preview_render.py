@@ -434,6 +434,75 @@ class FxPreviewRequestTests(unittest.TestCase):
         self.assertFalse(any(cache.glob(f"timeline-project-{owner}-*")))
         self.assertFalse((cache / f".timeline-owner-{owner}.lock").exists())
 
+    def test_malformed_matching_broll_window_closes_fds_and_cleans_owned_scratch(self):
+        cache, output, dependencies, snapshot = self._simple_timeline_inputs()
+        material = {
+            "asset_id": "asset-fixture",
+            "path": "assets/fixture.png",
+            "sha256": "0" * 64,
+            "kind": "image",
+        }
+        dependencies["material"] = material
+        foreign = cache / "foreign.keep"
+        foreign.write_text("keep", encoding="utf-8")
+        original_open = os.open
+
+        cases = (
+            ("start_none", None, 3.0, TypeError, "1" * 32),
+            ("end_string", 1.0, "not-a-number", ValueError, "2" * 32),
+        )
+        for label, candidate_start, candidate_end, cause_type, owner in cases:
+            with self.subTest(case=label):
+                current = json.loads(json.dumps(snapshot))
+                current["state"]["overlays"] = [{
+                    "id": "malformed-b1",
+                    "type": "fx",
+                    "code": "B1",
+                    "start": candidate_start,
+                    "end": candidate_end,
+                    "material": material,
+                }]
+                lease_name = f".timeline-owner-{owner}.lock"
+                opened: dict[str, int] = {}
+                cache_identity = (cache.stat().st_dev, cache.stat().st_ino)
+
+                def observed_open(path, flags, mode=0o777, *, dir_fd=None):
+                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                    info = os.fstat(descriptor)
+                    if (info.st_dev, info.st_ino) == cache_identity:
+                        opened["cache"] = descriptor
+                    elif path == lease_name and dir_fd is not None:
+                        opened["lease"] = descriptor
+                    return descriptor
+
+                with (
+                    mock.patch.dict(os.environ, {"FX_PREVIEW_SCRATCH_LEASE_FD": ""}),
+                    mock.patch.object(worker.os, "open", side_effect=observed_open),
+                    mock.patch.object(timeline, "render_project") as render_mock,
+                ):
+                    with self.assertRaises(worker.PreviewError) as got:
+                        worker.timeline_preview(
+                            self.project,
+                            cache,
+                            output,
+                            current,
+                            1.0,
+                            2.0,
+                            dependencies,
+                            scratch_owner=owner,
+                        )
+
+                self.assertEqual(got.exception.code, "timeline_render_failed")
+                self.assertIsInstance(got.exception.__cause__, cause_type)
+                self.assertEqual(set(opened), {"cache", "lease"})
+                for descriptor in opened.values():
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+                render_mock.assert_not_called()
+                self.assertFalse(any(cache.glob(f"timeline-project-{owner}-*")))
+                self.assertFalse((cache / lease_name).exists())
+                self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
+
     def test_direct_timeline_rmtree_permission_error_keeps_lease_for_manager_retry(self):
         cache, output, dependencies, snapshot = self._simple_timeline_inputs()
         owner = "b" * 32
