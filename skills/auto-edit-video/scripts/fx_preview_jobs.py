@@ -54,6 +54,10 @@ TIMELINE_SCRATCH_RE = re.compile(
 )
 TIMELINE_LEASE_RE = re.compile(r"^\.timeline-owner-([0-9a-f]{32})\.lock$")
 RENDERER_MAINTENANCE_LOCK = ".renderer-maintenance.lock"
+RENDERER_TOUCH_RETRY_ATTEMPTS = 6
+RENDERER_TOUCH_RETRY_DELAY_S = 0.01
+RENDERER_TOUCH_RETRY_BUDGET_S = 0.05
+RUNTIME_ARTIFACT_SUFFIXES = ("request.json", "result.json", "part.mp4")
 
 _PHASE_MESSAGES = {
     "queued": "已排入本機預覽工作",
@@ -1836,16 +1840,15 @@ class FxPreviewJobManager:
                     pass
             try:
                 self._assert_storage_safe("working", "root", "runtime")
-                for name in (
-                    f"{job_id}.part.mp4",
-                    f"{job_id}.request.json",
-                    f"{job_id}.result.json",
-                ):
+                for suffix in ("part.mp4", "request.json", "result.json"):
                     try:
-                        os.unlink(name, dir_fd=self._storage_pins["runtime"].fd)
-                    except FileNotFoundError:
+                        os.unlink(
+                            f"{job_id}.{suffix}",
+                            dir_fd=self._storage_pins["runtime"].fd,
+                        )
+                    except OSError:
                         pass
-            except (FxPreviewJobError, OSError):
+            except FxPreviewJobError:
                 pass
             if lease_fd >= 0:
                 try:
@@ -2438,7 +2441,16 @@ class FxPreviewJobManager:
     def _touch_renderer_cache(self) -> None:
         """Record successful use so the 24-hour idle TTL is meaningful."""
         self._assert_storage_safe("working", "root", "renderer")
-        renderer_guard = self._acquire_renderer_maintenance_lock(exclusive=True)
+        deadline = time.monotonic() + RENDERER_TOUCH_RETRY_BUDGET_S
+        renderer_guard = None
+        for attempt in range(RENDERER_TOUCH_RETRY_ATTEMPTS):
+            renderer_guard = self._acquire_renderer_maintenance_lock(exclusive=True)
+            if renderer_guard is not None:
+                break
+            now = time.monotonic()
+            if attempt + 1 >= RENDERER_TOUCH_RETRY_ATTEMPTS or now >= deadline:
+                return
+            time.sleep(min(RENDERER_TOUCH_RETRY_DELAY_S, max(0.0, deadline - now)))
         if renderer_guard is None:
             return
         now_ns = time.time_ns()
@@ -2475,6 +2487,28 @@ class FxPreviewJobManager:
             self._walk_files_at(self._storage_pins["renderer"].fd, touch)
         finally:
             os.close(renderer_guard)
+
+    def _owned_runtime_entries_absent(self, owner: str) -> bool:
+        """Return true only when every exact owner runtime name is provably absent."""
+        if JOB_ID_RE.fullmatch(owner) is None:
+            raise FxPreviewJobError(
+                409, "preview_storage_changed", "FX 預覽暫存 ownership 無效"
+            )
+        self._assert_storage_safe("working", "root", "runtime")
+        runtime_fd = self._storage_pins["runtime"].fd
+        for suffix in RUNTIME_ARTIFACT_SUFFIXES:
+            try:
+                os.stat(
+                    f"{owner}.{suffix}",
+                    dir_fd=runtime_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            return False
+        return True
 
     def _cleanup_renderer_scratch(self, owner: str | None = None) -> None:
         """Remove only idle, leased shadow projects through the pinned cache."""
@@ -2517,7 +2551,12 @@ class FxPreviewJobManager:
                         for entry in os.scandir(renderer_fd)
                     )
                 if removed_all:
-                    self._unlink_scratch_lease_if_same(scratch_owner, lease_fd)
+                    try:
+                        runtime_absent = self._owned_runtime_entries_absent(scratch_owner)
+                    except (FxPreviewJobError, OSError):
+                        runtime_absent = False
+                    if runtime_absent:
+                        self._unlink_scratch_lease_if_same(scratch_owner, lease_fd)
             finally:
                 os.close(lease_fd)
 
@@ -2554,13 +2593,13 @@ class FxPreviewJobManager:
             if lease_fd is None:
                 continue
             try:
-                for suffix in ("request.json", "result.json", "part.mp4"):
+                for suffix in RUNTIME_ARTIFACT_SUFFIXES:
                     try:
                         os.unlink(
                             f"{scratch_owner}.{suffix}",
                             dir_fd=runtime_fd,
                         )
-                    except FileNotFoundError:
+                    except OSError:
                         pass
             finally:
                 os.close(lease_fd)
