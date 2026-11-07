@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import style_presets  # noqa: E402
 import editor_server  # noqa: E402
+import studio_server  # noqa: E402
 import asset_registry  # noqa: E402
 from font_security import validate_font_bytes  # noqa: E402
 from tests.font_test_fixture import build_ttf  # noqa: E402
@@ -886,6 +887,70 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertTrue(journal.is_file())
         self.assertEqual(journal.read_bytes(), b"{corrupt-journal")
 
+    def test_unhashable_phase_and_bool_schema_journals_fail_closed_without_disconnect(self) -> None:
+        project = self.harness.project.resolve()
+        journal = project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
+        base = {
+            "schema_version": 1,
+            "phase": "prepared",
+            "before": {
+                name: editor_server._caption_preset_snapshot(path)
+                for name, path in editor_server._caption_preset_target_paths(project).items()
+            },
+            "after_sha256": None,
+        }
+        cases = (
+            {**base, "phase": []},
+            {**base, "phase": {}},
+            {**base, "schema_version": True},
+            {
+                **base,
+                "phase": "committed",
+                "after_sha256": {"state": "0" * 64, "manifest": False},
+            },
+            {
+                **base,
+                "phase": "committed",
+                "before": {
+                    **base["before"],
+                    "state": {
+                        "exists": False,
+                        "sha256": "0" * 64,
+                        "data_base64": None,
+                    },
+                },
+                "after_sha256": {"state": "0" * 64, "manifest": "1" * 64},
+            },
+        )
+        for payload in cases:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            journal.write_bytes(raw)
+            with self.subTest(payload=payload):
+                status, blocked = self.request("PUT", "/api/editor-state", {})
+                self.assertEqual(status, 503, blocked)
+                self.assertEqual(blocked["reason"], "transaction_recovery_required")
+                self.assertTrue(blocked["restart_required"])
+                self.assertEqual(journal.read_bytes(), raw)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPTS / "editor_server.py"),
+                        "--project-dir",
+                        str(project),
+                        "--port",
+                        "0",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    env=dict(os.environ),
+                )
+                self.assertEqual(result.returncode, 3, result)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn(str(journal), result.stderr)
+                self.assertEqual(journal.read_bytes(), raw)
+        journal.unlink()
+
     def test_caption_apply_retains_journal_when_rollback_itself_fails(self) -> None:
         _state, project_revision = self.install_caption()
         manifest_path = self.harness.project / "project.json"
@@ -935,6 +1000,369 @@ class StylePresetApiTests(unittest.TestCase):
         # sufficient to finish the exact rollback.
         editor_server.recover_caption_preset_transaction(self.harness.project)
         self.assertFalse(journal.exists())
+
+    def test_prepared_journal_blocks_queued_and_later_project_mutations(self) -> None:
+        state, project_revision = self.install_caption()
+        manifest_path = self.harness.project / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["approvals"]["timeline"] = {
+            "approved": True,
+            "state_revision": "stale",
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": project_revision,
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+
+        rollback_started = threading.Event()
+        release_rollback = threading.Event()
+        put_started = threading.Event()
+        apply_result: list[tuple[int, dict]] = []
+        put_result: list[tuple[int, dict]] = []
+        real_atomic = editor_server.atomic_write_json
+        failed_manifest = False
+
+        def fail_manifest_once(path: Path, payload: object) -> None:
+            nonlocal failed_manifest
+            if Path(path).resolve() == manifest_path.resolve() and not failed_manifest:
+                failed_manifest = True
+                raise OSError("injected project manifest write failure")
+            real_atomic(Path(path), payload)
+
+        def fail_rollback(_path: Path, _raw: bytes) -> None:
+            rollback_started.set()
+            self.assertTrue(release_rollback.wait(timeout=3))
+            raise OSError("injected rollback failure")
+
+        put_state = copy.deepcopy(state)
+        target = next(
+            item for item in put_state["overlays"]
+            if item["id"] == "caption-preset-target"
+        )
+        target["style"]["color"] = "#FEDCBA"
+        put_state["x_expected_revision"] = project_revision
+
+        def apply_request() -> None:
+            apply_result.append(self.request("POST", "/api/style-presets/caption-apply", {
+                **base,
+                "plan_digest": plan["plan_digest"],
+            }))
+
+        def put_request() -> None:
+            put_started.set()
+            put_result.append(self.request("PUT", "/api/editor-state", put_state))
+
+        with (
+            patch.object(editor_server, "atomic_write_json", side_effect=fail_manifest_once),
+            patch.object(editor_server, "_atomic_write_exact", side_effect=fail_rollback),
+        ):
+            apply_thread = threading.Thread(target=apply_request)
+            apply_thread.start()
+            self.assertTrue(rollback_started.wait(timeout=3))
+            put_thread = threading.Thread(target=put_request)
+            put_thread.start()
+            self.assertTrue(put_started.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertTrue(put_thread.is_alive())
+            release_rollback.set()
+            apply_thread.join(timeout=3)
+            put_thread.join(timeout=3)
+        self.assertFalse(apply_thread.is_alive())
+        self.assertFalse(put_thread.is_alive())
+        self.assertEqual(apply_result[0][0], 500, apply_result)
+        self.assertEqual(apply_result[0][1]["reason"], "transaction_recovery_required")
+        self.assertEqual(put_result[0][0], 503, put_result)
+        self.assertEqual(put_result[0][1]["reason"], "transaction_recovery_required")
+        self.assertTrue(put_result[0][1]["restart_required"])
+        self.assertEqual(
+            put_result[0][1]["journal"],
+            str(editor_server.CAPTION_PRESET_TXN_JOURNAL_REL),
+        )
+        journal = self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
+        self.assertEqual(json.loads(journal.read_text())["phase"], "prepared")
+
+        for method, path in (
+            ("PUT", "/api/edit-decisions"),
+            ("PUT", "/api/voice-selection"),
+            ("POST", "/api/fx/apply"),
+            ("POST", "/api/director"),
+            ("POST", "/api/fx-previews/" + "0" * 32 + "/confirm"),
+            ("POST", "/api/approve"),
+        ):
+            with self.subTest(method=method, path=path):
+                blocked_status, blocked = self.request(method, path, {})
+                self.assertEqual(blocked_status, 503, blocked)
+                self.assertEqual(blocked["reason"], "transaction_recovery_required")
+
+        blocked_status, blocked = self.request("GET", "/api/project")
+        self.assertEqual(blocked_status, 503, blocked)
+        self.assertEqual(blocked["reason"], "transaction_recovery_required")
+        blocked_status, blocked = self.request(
+            "POST", "/api/fx-previews", self.harness._candidate()
+        )
+        self.assertEqual(blocked_status, 503, blocked)
+        self.assertEqual(blocked["reason"], "transaction_recovery_required")
+
+        # The cross-project preset library is not project authority and remains
+        # repairable while this project waits for restart recovery.
+        status, library = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, library)
+        status, caption = self.request("POST", "/api/style-presets", {
+            "expected_library_revision": library["revision"],
+            "name": "Recovery-independent caption",
+            "kind": "caption",
+            "settings": {"style": {"color": "#445566"}},
+        })
+        self.assertEqual(status, 201, caption)
+
+        editor_server.recover_caption_preset_transaction(self.harness.project)
+        self.assertFalse(journal.exists())
+
+    def test_committed_journal_cleanup_never_rolls_back_a_later_http_edit(self) -> None:
+        state, project_revision = self.install_caption()
+        journal_path = (
+            self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
+        )
+        journal = editor_server.begin_caption_preset_transaction(self.harness.project)
+        real_unlink = Path.unlink
+        failed_cleanup = False
+
+        def fail_cleanup_once(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal failed_cleanup
+            if Path(path) == journal_path and not failed_cleanup:
+                failed_cleanup = True
+                raise OSError("injected committed journal unlink failure")
+            real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=fail_cleanup_once):
+            editor_server.commit_caption_preset_transaction(
+                self.harness.project, journal
+            )
+        self.assertEqual(json.loads(journal_path.read_text())["phase"], "committed")
+
+        later = copy.deepcopy(state)
+        target = next(
+            item for item in later["overlays"]
+            if item["id"] == "caption-preset-target"
+        )
+        target["style"]["color"] = "#A1B2C3"
+        later["x_expected_revision"] = project_revision
+        state_path = self.harness.project / "working/editor_state.json"
+        before_blocked_cleanup = state_path.read_bytes()
+
+        def keep_failing_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+            if Path(path).resolve() == journal_path.resolve():
+                raise OSError("injected persistent committed journal unlink failure")
+            real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=keep_failing_cleanup):
+            blocked_status, blocked = self.request(
+                "PUT", "/api/editor-state", copy.deepcopy(later)
+            )
+        self.assertEqual(blocked_status, 503, blocked)
+        self.assertEqual(blocked["reason"], "transaction_recovery_required")
+        self.assertEqual(state_path.read_bytes(), before_blocked_cleanup)
+        self.assertEqual(json.loads(journal_path.read_text())["phase"], "committed")
+
+        status, saved = self.request("PUT", "/api/editor-state", later)
+        self.assertEqual(status, 200, saved)
+        later_bytes = state_path.read_bytes()
+
+        restarted = editor_server.EditorServer(("127.0.0.1", 0), self.harness.project)
+        restarted.server_close()
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(
+            (self.harness.project / "working/editor_state.json").read_bytes(),
+            later_bytes,
+        )
+
+    def test_non_string_animation_and_placement_are_typed_and_corrupt_store_is_preserved(self) -> None:
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        invalid_requests = (
+            ("caption", {**caption_settings(), "style": {**caption_settings()["style"], "animation": []}}),
+            ("fx", {**fx_settings(), "placement": {}}),
+        )
+        for kind, settings in invalid_requests:
+            with self.subTest(kind=kind):
+                status, rejected = self.request("POST", "/api/style-presets", {
+                    "expected_library_revision": empty["revision"],
+                    "name": f"invalid-{kind}",
+                    "kind": kind,
+                    "settings": settings,
+                })
+                self.assertEqual(status, 422, rejected)
+                self.assertEqual(rejected["reason"], "settings_invalid")
+
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        for kind, settings in invalid_requests:
+            document = {
+                "schema_version": 1,
+                "presets": [{
+                    "id": "preset_" + ("1" if kind == "caption" else "2") * 32,
+                    "name": f"corrupt-{kind}",
+                    "kind": kind,
+                    "settings": settings,
+                    "created_at": "2026-11-08T00:00:00+00:00",
+                    "updated_at": "2026-11-08T00:00:00+00:00",
+                }],
+            }
+            raw = json.dumps(document, ensure_ascii=False).encode("utf-8")
+            (self.store_dir / "presets.json").write_bytes(raw)
+            with self.subTest(corrupt_kind=kind):
+                status, corrupt = self.request("GET", "/api/style-presets")
+                self.assertEqual(status, 409, corrupt)
+                self.assertEqual(corrupt["reason"], "store_corrupt")
+                self.assertEqual((self.store_dir / "presets.json").read_bytes(), raw)
+
+    def test_studio_pipeline_reservation_serializes_before_caption_apply(self) -> None:
+        _state, project_revision = self.install_caption()
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": project_revision,
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+
+        studio = studio_server.StudioServer(
+            ("127.0.0.1", 0), self.harness.project.parent, auto_process=True
+        )
+        studio.editor_servers.append((self.harness.server, self.harness.thread))
+        reservation_written = threading.Event()
+        release_reservation = threading.Event()
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        apply_started = threading.Event()
+        apply_result: list[tuple[int, dict]] = []
+        start_errors: list[BaseException] = []
+        real_atomic = studio_server.atomic_write_json
+
+        def blocking_atomic(path: Path, payload: object) -> None:
+            real_atomic(path, payload)
+            if (
+                isinstance(payload, dict)
+                and payload.get("state") == "running"
+                and payload.get("phase") == "reserved"
+            ):
+                reservation_written.set()
+                self.assertTrue(release_reservation.wait(timeout=3))
+
+        def parked_worker(*_args: object, **_kwargs: object) -> None:
+            worker_started.set()
+            release_worker.wait(timeout=3)
+            with studio.pipeline_lock:
+                studio.active_pipeline_project = None
+
+        def start_pipeline() -> None:
+            try:
+                studio.start_local_pipeline(self.harness.project, "teacher-punch", "")
+            except BaseException as exc:
+                start_errors.append(exc)
+
+        def apply_preset() -> None:
+            apply_started.set()
+            apply_result.append(self.request("POST", "/api/style-presets/caption-apply", {
+                **base,
+                "plan_digest": plan["plan_digest"],
+            }))
+
+        try:
+            with (
+                patch.object(studio_server, "atomic_write_json", side_effect=blocking_atomic),
+                patch.object(studio, "pipeline_worker", side_effect=parked_worker),
+            ):
+                start_thread = threading.Thread(target=start_pipeline)
+                start_thread.start()
+                self.assertTrue(reservation_written.wait(timeout=3))
+                apply_thread = threading.Thread(target=apply_preset)
+                apply_thread.start()
+                self.assertTrue(apply_started.wait(timeout=1))
+                time.sleep(0.05)
+                self.assertTrue(apply_thread.is_alive())
+                release_reservation.set()
+                start_thread.join(timeout=3)
+                self.assertTrue(worker_started.wait(timeout=3))
+                apply_thread.join(timeout=3)
+            self.assertEqual(start_errors, [])
+            self.assertEqual(apply_result[0][0], 409, apply_result)
+            self.assertEqual(apply_result[0][1]["reason"], "project_busy")
+            status_path = self.harness.project / "working/pipeline_status.json"
+            reservation_bytes = status_path.read_bytes()
+            studio.start_local_pipeline(self.harness.project, "teacher-punch", "")
+            self.assertEqual(status_path.read_bytes(), reservation_bytes)
+            self.assertEqual(len(studio.pipeline_threads), 1)
+            self.assertFalse(
+                (self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL).exists()
+            )
+        finally:
+            release_reservation.set()
+            release_worker.set()
+            for thread in list(studio.pipeline_threads):
+                thread.join(timeout=3)
+            studio.pipeline_threads.clear()
+            studio.editor_servers.clear()
+            studio.server_close()
+
+    def test_studio_pipeline_start_failure_clears_reservation(self) -> None:
+        studio = studio_server.StudioServer(
+            ("127.0.0.1", 0), self.harness.project.parent, auto_process=True
+        )
+        studio.editor_servers.append((self.harness.server, self.harness.thread))
+        try:
+            with patch.object(
+                studio_server.threading.Thread,
+                "start",
+                side_effect=RuntimeError("injected thread start failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected thread start failure"):
+                    studio.start_local_pipeline(
+                        self.harness.project, "teacher-punch", ""
+                    )
+            self.assertIsNone(studio.active_pipeline_project)
+            self.assertEqual(studio.pipeline_threads, [])
+            status = json.loads(
+                (self.harness.project / "working/pipeline_status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["error_code"], "pipeline_start_failed")
+
+            journal = editor_server.begin_caption_preset_transaction(
+                self.harness.project
+            )
+            self.assertEqual(journal["phase"], "prepared")
+            status_before = (
+                self.harness.project / "working/pipeline_status.json"
+            ).read_bytes()
+            with self.assertRaises(editor_server.CaptionPresetRecoveryError):
+                studio.start_local_pipeline(
+                    self.harness.project, "teacher-punch", ""
+                )
+            self.assertIsNone(studio.active_pipeline_project)
+            self.assertEqual(
+                (self.harness.project / "working/pipeline_status.json").read_bytes(),
+                status_before,
+            )
+            editor_server.recover_caption_preset_transaction(self.harness.project)
+        finally:
+            studio.editor_servers.clear()
+            studio.server_close()
 
     def test_portable_font_resolves_same_bytes_to_current_project_asset(self) -> None:
         item1, _receipt1 = publish_verified_font(self.harness.project, "ProjectOne")

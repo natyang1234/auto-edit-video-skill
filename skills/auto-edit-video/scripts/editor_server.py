@@ -1043,6 +1043,60 @@ def begin_caption_preset_transaction(project_dir: Path) -> dict[str, Any]:
     return journal
 
 
+def _read_caption_preset_transaction_journal(journal_path: Path) -> dict[str, Any]:
+    descriptor = os.open(
+        journal_path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024 * 1024:
+            raise ValueError("caption preset transaction journal is unsafe")
+        raw = b""
+        while len(raw) <= 32 * 1024 * 1024:
+            chunk = os.read(descriptor, min(65536, 32 * 1024 * 1024 + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > 32 * 1024 * 1024:
+            raise ValueError("caption preset transaction journal is too large")
+    finally:
+        os.close(descriptor)
+    journal = json.loads(raw.decode("utf-8"))
+    if (
+        not isinstance(journal, dict)
+        or set(journal) != {"schema_version", "phase", "before", "after_sha256"}
+        or type(journal.get("schema_version")) is not int
+        or journal.get("schema_version") != 1
+        or not isinstance(journal.get("phase"), str)
+        or journal.get("phase") not in {"prepared", "committed"}
+        or not isinstance(journal.get("before"), dict)
+        or set(journal["before"]) != {"state", "manifest"}
+    ):
+        raise ValueError("caption preset transaction journal is invalid")
+    # Both phases carry the same exact before-snapshot schema. A committed
+    # journal will never use these bytes for rollback, but still must not gain
+    # a more permissive parser merely because it is cleanup-only.
+    for name in ("state", "manifest"):
+        _caption_preset_snapshot_bytes(journal["before"][name])
+    if journal["phase"] == "prepared":
+        if journal["after_sha256"] is not None:
+            raise ValueError("prepared caption preset journal has after hashes")
+    else:
+        hashes = journal["after_sha256"]
+        if (
+            not isinstance(hashes, dict)
+            or set(hashes) != {"state", "manifest"}
+            or any(
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in hashes.values()
+            )
+        ):
+            raise ValueError("committed caption preset journal hashes are invalid")
+    return journal
+
+
 def recover_caption_preset_transaction(project_dir: Path) -> None:
     """Recover an interrupted caption preset apply without accepting partial state."""
     journal_path = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
@@ -1052,38 +1106,9 @@ def recover_caption_preset_transaction(project_dir: Path) -> None:
         if not os.path.lexists(journal_path):
             return
         try:
-            descriptor = os.open(
-                journal_path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            )
-            try:
-                info = os.fstat(descriptor)
-                if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024 * 1024:
-                    raise ValueError("caption preset transaction journal is unsafe")
-                raw = b""
-                while len(raw) <= 32 * 1024 * 1024:
-                    chunk = os.read(descriptor, min(65536, 32 * 1024 * 1024 + 1 - len(raw)))
-                    if not chunk:
-                        break
-                    raw += chunk
-                if len(raw) > 32 * 1024 * 1024:
-                    raise ValueError("caption preset transaction journal is too large")
-            finally:
-                os.close(descriptor)
-            journal = json.loads(raw.decode("utf-8"))
-            if (
-                not isinstance(journal, dict)
-                or set(journal) != {"schema_version", "phase", "before", "after_sha256"}
-                or journal.get("schema_version") != 1
-                or journal.get("phase") not in {"prepared", "committed"}
-                or not isinstance(journal.get("before"), dict)
-                or set(journal["before"]) != {"state", "manifest"}
-            ):
-                raise ValueError("caption preset transaction journal is invalid")
+            journal = _read_caption_preset_transaction_journal(journal_path)
             targets = _caption_preset_target_paths(project_dir)
             if journal["phase"] == "prepared":
-                if journal["after_sha256"] is not None:
-                    raise ValueError("prepared caption preset journal has after hashes")
                 for name in ("manifest", "state"):
                     raw = _caption_preset_snapshot_bytes(journal["before"][name])
                     if raw is None:
@@ -1096,20 +1121,10 @@ def recover_caption_preset_transaction(project_dir: Path) -> None:
                     if current["exists"] != expected["exists"] or current["sha256"] != expected["sha256"]:
                         raise OSError("caption preset rollback verification failed")
             else:
-                hashes = journal["after_sha256"]
-                if (
-                    not isinstance(hashes, dict)
-                    or set(hashes) != {"state", "manifest"}
-                    or any(
-                        not isinstance(value, str)
-                        or re.fullmatch(r"[0-9a-f]{64}", value) is None
-                        for value in hashes.values()
-                    )
-                ):
-                    raise ValueError("committed caption preset journal hashes are invalid")
-                for name, path in targets.items():
-                    if _caption_preset_snapshot(path)["sha256"] != hashes[name]:
-                        raise OSError("committed caption preset files changed before cleanup")
+                # A committed journal is cleanup-only. Later valid edits make
+                # its after hashes stale but must never turn it into a rollback
+                # record or permanently block restart.
+                pass
             journal_path.unlink()
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CaptionPresetRecoveryError(
@@ -1134,6 +1149,37 @@ def commit_caption_preset_transaction(project_dir: Path, journal: dict[str, Any]
         # The committed journal is safe to retain: recovery only verifies the
         # exact committed hashes and removes it, never rolls the change back.
         pass
+
+
+def ensure_caption_preset_mutation_ready(project_dir: Path) -> None:
+    """Refuse project mutations while a prepared/corrupt journal needs restart.
+
+    A committed journal may be left only by a cleanup failure. Its strictly
+    validated record is safe to remove even if later edits superseded the
+    recorded after hashes; it is never used to restore before-snapshots.
+    """
+    journal_path = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
+    if not os.path.lexists(journal_path):
+        return
+    with _CAPTION_PRESET_TXN_LOCK:
+        if not os.path.lexists(journal_path):
+            return
+        try:
+            journal = _read_caption_preset_transaction_journal(journal_path)
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CaptionPresetRecoveryError(
+                "caption preset transaction journal is corrupt; restart recovery required"
+            ) from exc
+        if journal["phase"] == "prepared":
+            raise CaptionPresetRecoveryError(
+                "prepared caption preset transaction requires restart recovery"
+            )
+        try:
+            journal_path.unlink()
+        except OSError as exc:
+            raise CaptionPresetRecoveryError(
+                "committed caption preset transaction cleanup failed; journal retained"
+            ) from exc
 
 
 def recover_layer_transaction(project_dir: Path) -> None:
@@ -3934,6 +3980,14 @@ class EditorServer(ThreadingHTTPServer):
     def fx_preview_context(self) -> dict[str, Any]:
         """Return a read-only, revision-bound snapshot for the preview manager."""
         with self.project_lock:
+            try:
+                ensure_caption_preset_mutation_ready(self.project_dir)
+            except CaptionPresetRecoveryError as exc:
+                raise FxPreviewJobError(
+                    503,
+                    "transaction_recovery_required",
+                    "字幕預設交易尚未安全復原，請重新啟動編輯器",
+                ) from exc
             manifest = read_json(self.project_dir / "project.json", {}) or {}
             state = read_json(self.project_dir / STATE_REL)
             if state is None:
@@ -4123,6 +4177,38 @@ class EditorHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "missing or invalid CSRF token"}, status=403)
             return False
         return True
+
+    def _send_caption_transaction_blocked(
+        self, exc: CaptionPresetRecoveryError
+    ) -> None:
+        # The gate runs before handlers consume their request body. Closing the
+        # HTTP/1.1 connection prevents those bytes from being parsed as a
+        # second request while still preserving the original CSRF/origin gate.
+        self.close_connection = True
+        self.send_json(
+            {
+                "ok": False,
+                "reason": "transaction_recovery_required",
+                "error": (
+                    "字幕預設交易尚未安全復原；請停止編輯並重新啟動編輯器。"
+                    "復原紀錄必須保留，若重啟仍失敗請依啟動診斷修復磁碟或權限。"
+                ),
+                "journal": str(CAPTION_PRESET_TXN_JOURNAL_REL),
+                "restart_required": True,
+                "detail": str(exc),
+            },
+            status=503,
+        )
+
+    def _dispatch_project_mutation(self, handler: Any) -> None:
+        """Serialize journal gate and the whole authoritative handler."""
+        with self.server.project_lock:
+            try:
+                ensure_caption_preset_mutation_ready(self.server.project_dir)
+            except CaptionPresetRecoveryError as exc:
+                self._send_caption_transaction_blocked(exc)
+                return
+            handler()
 
     def read_body(self, maximum: int) -> bytes:
         try:
@@ -4606,6 +4692,19 @@ class EditorHandler(BaseHTTPRequestHandler):
             body = self._require_exact_fields(self.read_json_body(), fields, "字幕預設套用")
             plan_body = {key: value for key, value in body.items() if key != "plan_digest"}
             with self.server.project_lock:
+                pipeline_status = read_json(
+                    self.server.project_dir / "working/pipeline_status.json", {}
+                ) or {}
+                if (
+                    self.server.render_status.get("state") in {"running", "rendering"}
+                    or not isinstance(pipeline_status, dict)
+                    or pipeline_status.get("state") == "running"
+                ):
+                    raise style_presets.StylePresetError(
+                        409,
+                        "project_busy",
+                        "專案仍有會寫入狀態的背景工作，請完成後重新計畫並套用",
+                    )
                 with self.server.style_preset_store.locked_collection() as collection:
                     try:
                         recover_caption_preset_transaction(self.server.project_dir)
@@ -5640,6 +5739,107 @@ class EditorHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self.do_GET()
 
+    def handle_project_get(self, project: Path) -> None:
+        manifest = read_json(project / "project.json", {}) or {}
+        state = read_json(project / STATE_REL)
+        span_warnings: list[str] = []
+        if state is None:
+            state = default_editor_state(project, manifest)
+        else:
+            state, _migrated = migrate_editor_state_v1_to_v2(project, manifest, state)
+            span_warnings = migrate_caption_spans(state)
+            if span_warnings:
+                state["updated_at"] = now_utc()
+                state["revision"] = editor_state_revision(state)
+                atomic_write_json(project / STATE_REL, state)
+            upgraded = upgrade_editor_state_layout_effects(project, state)
+            upgraded = upgrade_video_template_state(state) or upgraded
+            state["asset_digests"] = referenced_asset_digests(project, state)
+            revision = editor_state_revision(state)
+            if upgraded or state.get("revision") != revision:
+                state["revision"] = revision
+                atomic_write_json(project / STATE_REL, state)
+        source_rel = str(manifest.get("source", {}).get("staged_path", ""))
+        payload = {
+            "csrf_token": self.server.csrf_token,
+            "caption_span_migration": span_warnings,
+            "caption_engine": caption_engine.engine_descriptor(),
+            "manifest": manifest,
+            "state": state,
+            "audio_event_timeline": audio_event_timeline(project, state),
+            "platform_presets": PLATFORM_PRESETS,
+            "director_presets": DIRECTOR_PRESETS,
+            "style_packs": public_style_pack_catalog(),
+            "viral_structure_plan": read_json(
+                project / "working/viral_structure_plan.json", None
+            ),
+            "narrative_plan": read_json(
+                project / "working/narrative_edit_plan.json", None
+            ),
+            "video_templates": public_template_catalog(),
+            "fx_catalog": fx_overlay.catalog(),
+            "template_capabilities": {
+                "cutout": {
+                    key: value
+                    for key, value in cutout_capability().items()
+                    if key not in {"python", "model_path"}
+                }
+            },
+            "voice_catalog": self.server.voice_catalog,
+            "edit_candidates": read_json(project / "working/edit_candidates.json", {"items": []}),
+            "edit_decisions": read_json(project / "working/edit_decisions.json", {"items": []}),
+            "transcript_review": read_json(
+                project / "working/transcript_review.json",
+                {
+                    "status": "needs_review",
+                    "risk_status": "semantic_review_required",
+                    "mechanical_issue_count": 0,
+                    "semantic_calibration": {"status": "not_configured"},
+                },
+            ),
+            "transcript_calibration": read_json(
+                project / "working/transcript_calibration.json",
+                {
+                    "status": "not_configured",
+                    "rule_count": 0,
+                    "correction_count": 0,
+                    "human_review_required": True,
+                },
+            ),
+            "transcript_semantic_review": read_json(
+                project / "working/transcript_semantic_review.json",
+                {
+                    "status": "not_configured",
+                    "coverage_status": "not_started",
+                    "reviewed_unit_count": 0,
+                    "total_unit_count": 0,
+                    "accepted_count": 0,
+                    "pending_count": 0,
+                    "applied_correction_count": 0,
+                    "human_review_required": True,
+                },
+            ),
+            "highlight_plan": read_json(project / "working/highlight_plan.json", {}),
+            "pipeline_status": read_json(
+                project / "working/pipeline_status.json",
+                {
+                    "state": "not_started",
+                    "phase": "idle",
+                    "message": "這個專案尚未啟動本機自動處理。",
+                },
+            ),
+            "approval_revisions": approval_revisions(project, state),
+            "approval_current": {
+                gate: approval_is_current(project, manifest, gate, state)
+                for gate in sorted(GATES)
+            },
+            "qa": read_json(project / "qa/source-qa.json", {}),
+            "delivery_qa": read_json(project / LATEST_DELIVERY_QA_REL, {}),
+            "media_url": "/media/source" if source_rel else None,
+            "render_status": self.server.render_status,
+        }
+        self.send_json(payload)
+
     def do_GET(self) -> None:
         if not self.allow_request():
             return
@@ -5676,104 +5876,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "project": str(project)})
             return
         if path == "/api/project":
-            manifest = read_json(project / "project.json", {}) or {}
-            state = read_json(project / STATE_REL)
-            if state is None:
-                state = default_editor_state(project, manifest)
-            else:
-                state, _migrated = migrate_editor_state_v1_to_v2(project, manifest, state)
-                span_warnings = migrate_caption_spans(state)
-                if span_warnings:
-                    state["updated_at"] = now_utc()
-                    state["revision"] = editor_state_revision(state)
-                    atomic_write_json(project / STATE_REL, state)
-                upgraded = upgrade_editor_state_layout_effects(project, state)
-                upgraded = upgrade_video_template_state(state) or upgraded
-                state["asset_digests"] = referenced_asset_digests(project, state)
-                revision = editor_state_revision(state)
-                if upgraded or state.get("revision") != revision:
-                    state["revision"] = revision
-                    atomic_write_json(project / STATE_REL, state)
-            source_rel = str(manifest.get("source", {}).get("staged_path", ""))
-            payload = {
-                "csrf_token": self.server.csrf_token,
-                "caption_span_migration": locals().get("span_warnings") or [],
-                "caption_engine": caption_engine.engine_descriptor(),
-                "manifest": manifest,
-                "state": state,
-                "audio_event_timeline": audio_event_timeline(project, state),
-                "platform_presets": PLATFORM_PRESETS,
-                "director_presets": DIRECTOR_PRESETS,
-                "style_packs": public_style_pack_catalog(),
-                "viral_structure_plan": read_json(
-                    project / "working/viral_structure_plan.json", None
-                ),
-                "narrative_plan": read_json(
-                    project / "working/narrative_edit_plan.json", None
-                ),
-                "video_templates": public_template_catalog(),
-                "fx_catalog": fx_overlay.catalog(),
-                "template_capabilities": {
-                    "cutout": {
-                        key: value
-                        for key, value in cutout_capability().items()
-                        if key not in {"python", "model_path"}
-                    }
-                },
-                "voice_catalog": self.server.voice_catalog,
-                "edit_candidates": read_json(project / "working/edit_candidates.json", {"items": []}),
-                "edit_decisions": read_json(project / "working/edit_decisions.json", {"items": []}),
-                "transcript_review": read_json(
-                    project / "working/transcript_review.json",
-                    {
-                        "status": "needs_review",
-                        "risk_status": "semantic_review_required",
-                        "mechanical_issue_count": 0,
-                        "semantic_calibration": {"status": "not_configured"},
-                    },
-                ),
-                "transcript_calibration": read_json(
-                    project / "working/transcript_calibration.json",
-                    {
-                        "status": "not_configured",
-                        "rule_count": 0,
-                        "correction_count": 0,
-                        "human_review_required": True,
-                    },
-                ),
-                "transcript_semantic_review": read_json(
-                    project / "working/transcript_semantic_review.json",
-                    {
-                        "status": "not_configured",
-                        "coverage_status": "not_started",
-                        "reviewed_unit_count": 0,
-                        "total_unit_count": 0,
-                        "accepted_count": 0,
-                        "pending_count": 0,
-                        "applied_correction_count": 0,
-                        "human_review_required": True,
-                    },
-                ),
-                "highlight_plan": read_json(project / "working/highlight_plan.json", {}),
-                "pipeline_status": read_json(
-                    project / "working/pipeline_status.json",
-                    {
-                        "state": "not_started",
-                        "phase": "idle",
-                        "message": "這個專案尚未啟動本機自動處理。",
-                    },
-                ),
-                "approval_revisions": approval_revisions(project, state),
-                "approval_current": {
-                    gate: approval_is_current(project, manifest, gate, state)
-                    for gate in sorted(GATES)
-                },
-                "qa": read_json(project / "qa/source-qa.json", {}),
-                "delivery_qa": read_json(project / LATEST_DELIVERY_QA_REL, {}),
-                "media_url": "/media/source" if source_rel else None,
-                "render_status": self.server.render_status,
-            }
-            self.send_json(payload)
+            self._dispatch_project_mutation(lambda: self.handle_project_get(project))
             return
         if path == "/api/render-status":
             self.send_json(self.server.render_status)
@@ -6018,14 +6121,17 @@ class EditorHandler(BaseHTTPRequestHandler):
             self.handle_style_preset_update(preset_match.group(1))
             return
         if path == "/api/edit-decisions":
-            self.handle_edit_decisions()
+            self._dispatch_project_mutation(self.handle_edit_decisions)
             return
         if path == "/api/voice-selection":
-            self.handle_voice_selection()
+            self._dispatch_project_mutation(self.handle_voice_selection)
             return
         if path != "/api/editor-state":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        self._dispatch_project_mutation(self.handle_editor_state_put)
+
+    def handle_editor_state_put(self) -> None:
         try:
             state = self.read_json_body()
             expected_revision = None
@@ -6351,10 +6457,10 @@ class EditorHandler(BaseHTTPRequestHandler):
             self.handle_style_preset_create()
             return
         if path == "/api/style-presets/caption-plan":
-            self.handle_caption_preset_plan()
+            self._dispatch_project_mutation(self.handle_caption_preset_plan)
             return
         if path == "/api/style-presets/caption-apply":
-            self.handle_caption_preset_apply()
+            self._dispatch_project_mutation(self.handle_caption_preset_apply)
             return
         if path == "/api/fx-previews":
             self.handle_fx_preview_submit()
@@ -6369,61 +6475,63 @@ class EditorHandler(BaseHTTPRequestHandler):
             r"/api/fx-previews/([0-9a-f]{32})/confirm", path
         )
         if preview_confirm:
-            self.handle_fx_preview_confirm(preview_confirm.group(1))
+            self._dispatch_project_mutation(
+                lambda: self.handle_fx_preview_confirm(preview_confirm.group(1))
+            )
             return
         if path == "/api/assets":
-            self.handle_asset_upload(query)
+            self._dispatch_project_mutation(lambda: self.handle_asset_upload(query))
             return
         if path == "/api/providers/consent":
-            self.handle_provider_consent()
+            self._dispatch_project_mutation(self.handle_provider_consent)
             return
         if path == "/api/assets/search":
             self.handle_provider_search()
             return
         if path == "/api/assets/import-provider":
-            self.handle_provider_import()
+            self._dispatch_project_mutation(self.handle_provider_import)
             return
         if path == "/api/auto-visuals":
-            self.handle_auto_visuals()
+            self._dispatch_project_mutation(self.handle_auto_visuals)
             return
         if path == "/api/generate-image":
-            self.handle_generate_image()
+            self._dispatch_project_mutation(self.handle_generate_image)
             return
         if path == "/api/copy-draft":
             self.handle_copy_draft()
             return
         if path == "/api/plan-highlights":
-            self.handle_plan_highlights()
+            self._dispatch_project_mutation(self.handle_plan_highlights)
             return
         if path == "/api/director":
-            self.handle_director_switch()
+            self._dispatch_project_mutation(self.handle_director_switch)
             return
         if path == "/api/captions/snap":
             self.handle_caption_snap()
             return
         if path == "/api/captions/apply-style":
-            self.handle_caption_apply_style()
+            self._dispatch_project_mutation(self.handle_caption_apply_style)
             return
         if path == "/api/fx/apply":
-            self.handle_fx_apply()
+            self._dispatch_project_mutation(self.handle_fx_apply)
             return
         if path == "/api/structured-layers":
-            self.handle_structured_layers()
+            self._dispatch_project_mutation(self.handle_structured_layers)
             return
         if path == "/api/rights/assert":
-            self.handle_rights_assert()
+            self._dispatch_project_mutation(self.handle_rights_assert)
             return
         if path == "/api/render-variant":
-            self.handle_render_variant()
+            self._dispatch_project_mutation(self.handle_render_variant)
             return
         if path == "/api/approve":
-            self.handle_approval()
+            self._dispatch_project_mutation(self.handle_approval)
             return
         if path == "/api/render":
-            self.handle_render()
+            self._dispatch_project_mutation(self.handle_render)
             return
         if path == "/api/render-batch":
-            self.handle_render_batch()
+            self._dispatch_project_mutation(self.handle_render_batch)
             return
         if path == "/api/cover":
             self.handle_cover()
@@ -7619,6 +7727,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             )
 
             with self.server.project_lock:
+                ensure_caption_preset_mutation_ready(self.server.project_dir)
                 current_state = read_json(self.server.project_dir / STATE_REL, {}) or {}
                 manifest_path = self.server.project_dir / "project.json"
                 manifest = read_json(manifest_path, {}) or {}
@@ -8182,6 +8291,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                     delivery_qa,
                 )
                 with self.server.project_lock:
+                    ensure_caption_preset_mutation_ready(self.server.project_dir)
                     manifest_path = self.server.project_dir / "project.json"
                     manifest = read_json(manifest_path, {}) or {}
                     final_approval = manifest.setdefault("approvals", {}).get("final")

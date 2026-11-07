@@ -134,7 +134,7 @@ def normalize_caption_settings(value: Any) -> dict[str, Any]:
                 raise StylePresetError(422, "settings_invalid", f"{key} 必須是 #RRGGBB")
             style[key] = item.upper()
         elif key == "animation":
-            if item not in CAPTION_ANIMATIONS:
+            if not isinstance(item, str) or item not in CAPTION_ANIMATIONS:
                 raise StylePresetError(422, "settings_invalid", "字幕動畫不受支援")
             style[key] = item
     return {"style": style, "font": normalize_font_descriptor(value.get("font"))}
@@ -169,7 +169,7 @@ def _normalize_fx_settings_static(value: Any) -> dict[str, Any]:
     if total > 8192:
         raise StylePresetError(422, "settings_invalid", "FX 文字參數總長度過長")
     placement = value.get("placement")
-    if placement not in {"", "top", "bottom", "left", "right"}:
+    if not isinstance(placement, str) or placement not in {"", "top", "bottom", "left", "right"}:
         raise StylePresetError(422, "settings_invalid", "FX placement 無效")
     scheme = value.get("scheme")
     if (
