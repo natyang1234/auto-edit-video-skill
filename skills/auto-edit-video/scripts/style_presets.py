@@ -74,6 +74,28 @@ def _classified_store_os_error(
     )
 
 
+def _classified_failed_open_error(
+    exc: OSError,
+    *,
+    directory_fd: int,
+    name: str,
+    unsafe_message: str,
+    writing: bool,
+) -> StylePresetError:
+    """Classify a failed no-follow open while its pinned directory fd is valid."""
+    try:
+        failed_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        failed_info = None
+    if failed_info is not None and not stat.S_ISREG(failed_info.st_mode):
+        return StylePresetError(409, "store_unsafe", unsafe_message)
+    return _classified_store_os_error(
+        exc,
+        unsafe_message=unsafe_message,
+        writing=writing,
+    )
+
+
 def _canonical_bytes(value: Any) -> bytes:
     try:
         return json.dumps(
@@ -408,27 +430,16 @@ class StylePresetStore:
                 os.close(directory_fd)
             return empty_document()
         except OSError as exc:
-            try:
-                failed_info = os.stat(
-                    "presets.json",
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                failed_info = None
+            classified = _classified_failed_open_error(
+                exc,
+                directory_fd=directory_fd,
+                name="presets.json",
+                unsafe_message="預設資料檔類型不安全",
+                writing=False,
+            )
             if owned_fd:
                 os.close(directory_fd)
-            if failed_info is not None and not stat.S_ISREG(failed_info.st_mode):
-                raise StylePresetError(
-                    409,
-                    "store_unsafe",
-                    "預設資料檔類型不安全",
-                ) from exc
-            raise _classified_store_os_error(
-                exc,
-                unsafe_message="無法安全讀取預設資料",
-                writing=False,
-            ) from exc
+            raise classified from exc
         try:
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode):
@@ -603,13 +614,16 @@ class StylePresetStore:
                 last_error = exc
                 break
         if lock_fd < 0:
-            os.close(directory_fd)
             assert last_error is not None
-            raise _classified_store_os_error(
+            classified = _classified_failed_open_error(
                 last_error,
-                unsafe_message="無法安全讀取預設鎖",
+                directory_fd=directory_fd,
+                name=".presets.lock",
+                unsafe_message="預設鎖檔不安全",
                 writing=False,
-            ) from last_error
+            )
+            os.close(directory_fd)
+            raise classified from last_error
         try:
             try:
                 if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
@@ -717,13 +731,16 @@ class StylePresetStore:
                 last_error = exc
                 break
         if lock_fd < 0:
-            os.close(directory_fd)
             assert last_error is not None
-            raise _classified_store_os_error(
+            classified = _classified_failed_open_error(
                 last_error,
-                unsafe_message="無法鎖定預設資料",
+                directory_fd=directory_fd,
+                name=".presets.lock",
+                unsafe_message="預設鎖檔不安全",
                 writing=True,
-            ) from last_error
+            )
+            os.close(directory_fd)
+            raise classified from last_error
         try:
             if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                 raise StylePresetError(409, "store_unsafe", "預設鎖檔不安全")
