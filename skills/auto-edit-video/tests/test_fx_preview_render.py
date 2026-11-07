@@ -2,6 +2,7 @@
 """Unit contracts for the isolated Studio FX preview worker."""
 import json
 import hashlib
+import fcntl
 import os
 import shutil
 import sys
@@ -14,6 +15,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import fx_preview_render as worker  # noqa: E402
+import fx_preview_jobs as jobs  # noqa: E402
 import render_editor_timeline as timeline  # noqa: E402
 
 
@@ -35,6 +37,33 @@ class FxPreviewRequestTests(unittest.TestCase):
             "state_snapshot": {}, "manifest_snapshot": {"source": {"duration_s": 10}},
             "dependency_snapshot": {"source": {"relative": "source/source.mp4", "sha256": hashlib.sha256(b"fixture").hexdigest()}},
         }
+
+    def _simple_timeline_inputs(self):
+        cache = self.project / "working/fx-preview/renderer-cache"
+        output = self.project / "working/fx-preview/runtime/out.mp4"
+        cache.mkdir(parents=True)
+        output.parent.mkdir(parents=True)
+        dependencies = {
+            "source": {
+                "relative": "source/source.mp4",
+                "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            },
+            "timeline_project_inputs": {},
+        }
+        snapshot = {
+            "manifest": {"source": {"duration_s": 10, "path": "source/source.mp4"}},
+            "state": {"segments": [{"source_start": 0, "source_end": 10}], "overlays": []},
+        }
+        return cache, output, dependencies, snapshot
+
+    @staticmethod
+    def _write_simple_timeline_output(
+        _shadow,
+        full,
+        _quality,
+        **_kwargs,
+    ):
+        Path(full).write_bytes(b"full")
 
     def test_broll_is_rejected_before_source_probe(self):
         request = json.loads(json.dumps(self.base)); request["overlay"]["code"] = "B1"
@@ -377,6 +406,213 @@ class FxPreviewRequestTests(unittest.TestCase):
                 self.assertFalse(captured["shadow"].exists())
                 self.assertFalse(any(cache.glob("timeline-project-*")))
                 self.assertFalse(any(cache.glob(".timeline-owner-*.lock")))
+
+    def test_direct_timeline_cleanup_removes_shadow_then_owned_lease(self):
+        cache, output, dependencies, snapshot = self._simple_timeline_inputs()
+        owner = "a" * 32
+        with (
+            mock.patch.dict(os.environ, {"FX_PREVIEW_SCRATCH_LEASE_FD": ""}),
+            mock.patch.object(
+                timeline,
+                "render_project",
+                side_effect=self._write_simple_timeline_output,
+            ),
+            mock.patch.object(worker, "media_ok", return_value=True),
+        ):
+            worker.timeline_preview(
+                self.project,
+                cache,
+                output,
+                snapshot,
+                1.0,
+                2.0,
+                dependencies,
+                scratch_owner=owner,
+            )
+
+        self.assertEqual(output.read_bytes(), b"full")
+        self.assertFalse(any(cache.glob(f"timeline-project-{owner}-*")))
+        self.assertFalse((cache / f".timeline-owner-{owner}.lock").exists())
+
+    def test_direct_timeline_rmtree_permission_error_keeps_lease_for_manager_retry(self):
+        cache, output, dependencies, snapshot = self._simple_timeline_inputs()
+        owner = "b" * 32
+        lease = cache / f".timeline-owner-{owner}.lock"
+        original_unlink = os.unlink
+        injected = False
+
+        def fail_shadow_project_json(path, *args, **kwargs):
+            nonlocal injected
+            if not injected and path == "project.json" and kwargs.get("dir_fd") is not None:
+                injected = True
+                raise PermissionError("injected shadow cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.dict(os.environ, {"FX_PREVIEW_SCRATCH_LEASE_FD": ""}),
+            mock.patch.object(
+                timeline,
+                "render_project",
+                side_effect=self._write_simple_timeline_output,
+            ),
+            mock.patch.object(worker, "media_ok", return_value=True),
+            mock.patch.object(worker.os, "unlink", side_effect=fail_shadow_project_json),
+        ):
+            worker.timeline_preview(
+                self.project,
+                cache,
+                output,
+                snapshot,
+                1.0,
+                2.0,
+                dependencies,
+                scratch_owner=owner,
+            )
+
+        shadows = list(cache.glob(f"timeline-project-{owner}-*"))
+        self.assertTrue(injected)
+        self.assertEqual(len(shadows), 1)
+        self.assertTrue(lease.is_file())
+        manager = jobs.FxPreviewJobManager(self.project, context_provider=lambda: {})
+        try:
+            self.assertFalse(shadows[0].exists())
+            self.assertFalse(lease.exists())
+        finally:
+            manager.close()
+
+    def test_inherited_parent_lease_is_never_unlinked_by_direct_timeline(self):
+        cache, output, dependencies, snapshot = self._simple_timeline_inputs()
+        owner = "c" * 32
+        lease = cache / f".timeline-owner-{owner}.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        lease_fd = os.open(lease, flags, 0o600)
+        self.addCleanup(os.close, lease_fd)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease_identity = (os.fstat(lease_fd).st_dev, os.fstat(lease_fd).st_ino)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"FX_PREVIEW_SCRATCH_LEASE_FD": str(lease_fd)},
+            ),
+            mock.patch.object(
+                timeline,
+                "render_project",
+                side_effect=self._write_simple_timeline_output,
+            ),
+            mock.patch.object(worker, "media_ok", return_value=True),
+        ):
+            worker.timeline_preview(
+                self.project,
+                cache,
+                output,
+                snapshot,
+                1.0,
+                2.0,
+                dependencies,
+                scratch_owner=owner,
+            )
+
+        self.assertTrue(lease.is_file())
+        self.assertEqual((lease.stat().st_dev, lease.stat().st_ino), lease_identity)
+        self.assertFalse(any(cache.glob(f"timeline-project-{owner}-*")))
+
+    def test_direct_timeline_replaced_shadow_keeps_lease_without_following_symlink(self):
+        cache, output, dependencies, snapshot = self._simple_timeline_inputs()
+        owner = "d" * 32
+        lease = cache / f".timeline-owner-{owner}.lock"
+        external = self.tmp / "external-shadow-target"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        foreign = cache / "foreign.keep"
+        foreign.write_text("keep", encoding="utf-8")
+        original_rmtree = shutil.rmtree
+
+        def replace_shadow_with_symlink(path, ignore_errors=False):
+            original_rmtree(path, ignore_errors=ignore_errors)
+            Path(path).symlink_to(external, target_is_directory=True)
+
+        with (
+            mock.patch.dict(os.environ, {"FX_PREVIEW_SCRATCH_LEASE_FD": ""}),
+            mock.patch.object(
+                timeline,
+                "render_project",
+                side_effect=self._write_simple_timeline_output,
+            ),
+            mock.patch.object(worker, "media_ok", return_value=True),
+            mock.patch.object(
+                worker.shutil,
+                "rmtree",
+                side_effect=replace_shadow_with_symlink,
+            ),
+        ):
+            worker.timeline_preview(
+                self.project,
+                cache,
+                output,
+                snapshot,
+                1.0,
+                2.0,
+                dependencies,
+                scratch_owner=owner,
+            )
+
+        shadows = list(cache.glob(f"timeline-project-{owner}-*"))
+        self.assertEqual(len(shadows), 1)
+        self.assertTrue(shadows[0].is_symlink())
+        self.assertTrue(lease.is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
+
+        manager = jobs.FxPreviewJobManager(self.project, context_provider=lambda: {})
+        try:
+            self.assertFalse(shadows[0].exists())
+            self.assertFalse(lease.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
+        finally:
+            manager.close()
+
+    def test_direct_timeline_keeps_lease_for_older_same_owner_shadow(self):
+        cache, output, dependencies, snapshot = self._simple_timeline_inputs()
+        owner = "e" * 32
+        lease = cache / f".timeline-owner-{owner}.lock"
+        old_shadow = (
+            cache
+            / f"timeline-project-{owner}-ffffffffffffffff-older-crash"
+        )
+        old_shadow.mkdir()
+        (old_shadow / "partial.mp4").write_bytes(b"old")
+
+        with (
+            mock.patch.dict(os.environ, {"FX_PREVIEW_SCRATCH_LEASE_FD": ""}),
+            mock.patch.object(
+                timeline,
+                "render_project",
+                side_effect=self._write_simple_timeline_output,
+            ),
+            mock.patch.object(worker, "media_ok", return_value=True),
+        ):
+            worker.timeline_preview(
+                self.project,
+                cache,
+                output,
+                snapshot,
+                1.0,
+                2.0,
+                dependencies,
+                scratch_owner=owner,
+            )
+
+        self.assertTrue(old_shadow.is_dir())
+        self.assertTrue(lease.is_file())
+        manager = jobs.FxPreviewJobManager(self.project, context_provider=lambda: {})
+        try:
+            self.assertFalse(old_shadow.exists())
+            self.assertFalse(lease.exists())
+        finally:
+            manager.close()
 
     def test_timeline_setup_failure_removes_only_its_locked_direct_lease(self):
         cache = self.project / "working/fx-preview/renderer-cache"

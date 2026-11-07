@@ -144,6 +144,30 @@ class FxPreviewBrowserTests(unittest.TestCase):
             self.assertIn("依近期同設定估算", estimated)
             self.assertIn("已用 20 秒", ready)
             self.assertNotIn("計算中", ready)
+            elapsed_only = page.evaluate(
+                """() => {
+                    const cancellingJob = {
+                        state: 'running', phase: 'cancelling', elapsed_s: 7,
+                        eta_remaining_s: 12, eta_sample_count: 3,
+                    };
+                    const erroredJob = {
+                        state: 'running', phase: 'encoding', elapsed_s: 8,
+                        eta_remaining_s: 11, eta_sample_count: 3,
+                        error: {code: 'termination_unverified', message: 'retry cancel'},
+                    };
+                    return [
+                        fxPreviewTimingSuffix(cancellingJob),
+                        fxPreviewTimingSuffix(erroredJob),
+                        fxPreviewStatusForJob(cancellingJob),
+                        fxPreviewStatusForJob(erroredJob),
+                    ];
+                }"""
+            )
+            self.assertEqual(elapsed_only[0:2], [" · 已用 7 秒", " · 已用 8 秒"])
+            for rendered in elapsed_only:
+                self.assertNotIn("預估", rendered)
+                self.assertNotIn("計算中", rendered)
+                self.assertNotIn("還需", rendered)
             page.evaluate("""() => { elements['fx-preview-dialog'].showModal();
                 fxPreviewGeneration = 123; fxPreviewDraftSignature = 'test'; fxPreviewUpgradeStarted = true; }""")
             for job, expected in [
