@@ -51,6 +51,29 @@ def test_output_window_rejects_final_and_unfrozen_preview(tmp_path):
                                 variant_id="other", preview_fx_quality="draft", preview_output_window=(1, 1))
 
 
+@pytest.mark.parametrize("window", [(10**400, 1), (0, 10**400)])
+def test_output_window_rejects_oversized_integer_at_both_entries(tmp_path, window):
+    with pytest.raises(ValueError, match="^invalid preview output window$"):
+        timeline.render_project(
+            tmp_path,
+            tmp_path / "x.mp4",
+            "preview",
+            snapshot_path=tmp_path / "s.json",
+            preview_fx_quality="draft",
+            preview_output_window=window,
+        )
+    with pytest.raises(ValueError, match="^invalid preview output window$"):
+        timeline.build_render_command(
+            tmp_path,
+            {},
+            {},
+            tmp_path / "x.mp4",
+            "preview",
+            preview_fx_quality="draft",
+            preview_output_window=window,
+        )
+
+
 FFMPEG_DEPENDENCY_SKIP = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are required for real media timing coverage",

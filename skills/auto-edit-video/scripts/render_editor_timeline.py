@@ -1669,6 +1669,20 @@ def _preview_window_map_indices(command: list[str], current: str) -> tuple[int, 
     return graph, video, audio
 
 
+def _valid_preview_output_window(window: object) -> bool:
+    if not isinstance(window, tuple) or len(window) != 2:
+        return False
+    for value in window:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            if not math.isfinite(value):
+                return False
+        except OverflowError:
+            return False
+    return window[0] >= 0 and window[1] > 0
+
+
 def build_render_command(
     project_dir: Path,
     state: dict[str, Any],
@@ -1688,11 +1702,7 @@ def build_render_command(
 ) -> list[str]:
     if preview_output_window is not None and (quality != "preview" or preview_fx_quality not in {"draft", "standard"}):
         raise ValueError("output window is only available for FX preview")
-    if preview_output_window is not None and (
-        not isinstance(preview_output_window, tuple) or len(preview_output_window) != 2
-        or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in preview_output_window)
-        or preview_output_window[0] < 0 or preview_output_window[1] <= 0
-    ):
+    if preview_output_window is not None and not _valid_preview_output_window(preview_output_window):
         raise ValueError("invalid preview output window")
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -2651,9 +2661,7 @@ def render_project(
     if preview_output_window is not None:
         if quality != "preview" or snapshot_path is None or variant_id is not None or preview_fx_quality not in {"draft", "standard"}:
             raise ValueError("output window requires a frozen FX preview")
-        if (not isinstance(preview_output_window, tuple) or len(preview_output_window) != 2
-                or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in preview_output_window)
-                or preview_output_window[0] < 0 or preview_output_window[1] <= 0):
+        if not _valid_preview_output_window(preview_output_window):
             raise ValueError("invalid preview output window")
     direct_final = quality == "final" and snapshot_path is None and variant_id is None
     # Phase 4 sub-slice 3: a variant final is a single, self-contained delivery
