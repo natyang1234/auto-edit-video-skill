@@ -12,6 +12,22 @@ import fx_preview_jobs as jobs
 import render_editor_timeline as timeline
 
 
+@pytest.mark.parametrize("command,current", [
+    (["-filter_complex", "graph", "-map", "[v]", "-map", "[aout]", "-map", "[extra]"], "v"),
+    (["-filter_complex", "graph", "-map", "[wrong]", "-map", "0:a?"], "v"),
+    (["-filter_complex", "graph", "-map", "[v]", "-map", "[wrong]"], "v"),
+    (["-filter_complex", "graph", "-filter_complex", "other", "-map", "[v]", "-map", "[aout]"], "v"),
+])
+def test_window_mapping_rejects_unfamiliar_graph(command, current):
+    with pytest.raises(ValueError, match="preview output window"):
+        timeline._preview_window_map_indices(command, current)
+
+
+def test_window_mapping_accepts_expected_streams():
+    assert timeline._preview_window_map_indices(["-filter_complex", "graph", "-map", "[v]", "-map", "0:a?"], "v") == (1, 3, 5)
+    assert timeline._preview_window_map_indices(["-filter_complex", "graph", "-map", "[v]", "-map", "[aout]"], "v") == (1, 3, 5)
+
+
 def test_output_window_rejects_final_and_unfrozen_preview(tmp_path):
     for quality, snapshot, fx_quality in [("final", tmp_path / "s.json", "standard"),
                                           ("preview", None, "standard"),

@@ -1670,11 +1670,7 @@ class FxPreviewJobManager:
                 self._set_timing_phase(current, "ready")
                 elapsed = max(0.0, time.monotonic() - current["timing_started"])
                 group = self._timing_group(current)
-                if group not in self._timing_samples and len(self._timing_samples) >= 100:
-                    del self._timing_samples[next(iter(self._timing_samples))]
-                samples = self._timing_samples.setdefault(group, [])
-                samples.append(elapsed)
-                del samples[:-20]
+                self._record_timing_sample(group, elapsed)
                 current["timing_finished"] = time.monotonic()
                 current.update(
                     {
@@ -1837,6 +1833,7 @@ class FxPreviewJobManager:
         if job is None or job.get("state") in TERMINAL_STATES:
             return
         message = "無法確認 FX 預覽程序已停止，請重試取消"
+        self._set_timing_phase(job, "cancelling")
         job.update(
             {
                 "state": "running",
@@ -1963,6 +1960,13 @@ class FxPreviewJobManager:
         sample = float((job.get("sample_window") or {}).get("duration_s", 0))
         return (str(options.get("mode", "single")), str(options.get("quality", "standard")),
                 str(overlay.get("code", "")), round(duration, 1), round(sample, 1))
+
+    def _record_timing_sample(self, group: tuple[str, str, str, float, float], elapsed: float) -> None:
+        if group not in self._timing_samples and len(self._timing_samples) >= 100:
+            del self._timing_samples[next(iter(self._timing_samples))]
+        samples = self._timing_samples.setdefault(group, [])
+        samples.append(elapsed)
+        del samples[:-20]
 
     @staticmethod
     def _set_timing_phase(job: dict[str, Any], phase: str) -> None:

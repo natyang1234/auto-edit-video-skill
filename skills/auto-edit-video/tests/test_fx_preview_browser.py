@@ -137,11 +137,14 @@ class FxPreviewBrowserTests(unittest.TestCase):
             self.assertIn("已用 7 秒", running)
             self.assertIn("預估時間計算中", running)
             self.assertIn("預估還需 12 秒", estimated)
+            self.assertIn("依近期同設定估算", estimated)
             self.assertIn("已用 20 秒", ready)
             self.assertNotIn("計算中", ready)
             page.evaluate("""() => { elements['fx-preview-dialog'].showModal();
                 fxPreviewGeneration = 123; fxPreviewDraftSignature = 'test'; fxPreviewUpgradeStarted = true; }""")
             for job, expected in [
+                ({"state": "running", "phase": "encoding", "elapsed_s": 20, "eta_remaining_s": None,
+                  "eta_sample_count": 3, "preview_options": {"quality": "standard"}}, "已超過近期預估，仍在處理"),
                 ({"state": "running", "phase": "encoding", "elapsed_s": 7, "eta_remaining_s": None,
                   "preview_options": {"quality": "standard"}}, "預估時間計算中"),
                 ({"state": "ready", "phase": "ready", "elapsed_s": 20, "media_url": "/media/source",

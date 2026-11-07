@@ -998,15 +998,89 @@ class FxPreviewApiTests(unittest.TestCase):
                 "cancel_requested": False,
                 "updated_monotonic": time.time(),
                 "created_monotonic": time.time(),
+                "timing_started": time.monotonic() - 5,
+                "timing_phase_started": time.monotonic() - 3,
+                "phase_timings_s": {},
             }
             manager._active_job_id = job_id
         with patch.object(manager, "_terminate_process", return_value=False):
             first = manager.cancel(job_id)
         self.assertEqual(first["state"], "running")
         self.assertEqual(first["error"]["code"], "termination_unverified")
+        self.assertGreaterEqual(first["phase_timings_s"].get("rendering", 0), 2.9)
         with patch.object(manager, "_terminate_process", return_value=True):
             second = manager.cancel(job_id)
         self.assertEqual(second["state"], "cancelled")
+
+    def test_http_timing_lifecycle_and_sample_limits(self) -> None:
+        manager = self.server.fx_preview_jobs
+        delayed = self.fast_renderer.parent / "delayed-timing.py"
+        marker = 'out=Path(req["output"]);'
+        self.assertIn(marker, FAST_RENDERER)
+        delayed.write_text(FAST_RENDERER.replace(marker, 'import time; time.sleep(1.0)\n' + marker), encoding="utf-8")
+        manager.renderer_script = delayed.resolve()
+
+        def body(start: float) -> dict:
+            candidate = self._candidate()
+            candidate["candidate"]["window"]["start_s"] = start
+            return candidate
+
+        terminal = None
+        for i in range(3):
+            status, created = self._json_request("POST", "/api/fx-previews", body(1.0 + i * 0.1))
+            self.assertEqual(status, 202, created)
+            self.assertIsNone(created["job"]["eta_remaining_s"])
+            terminal = self._wait_terminal(created["job"]["id"])["job"]
+            self.assertEqual(terminal["state"], "ready")
+            self.assertEqual(terminal["eta_sample_count"], i + 1)
+            self.assertIn("rendering", terminal["phase_timings_s"])
+            self.assertIn("validating", terminal["phase_timings_s"])
+        assert terminal is not None
+        time.sleep(0.03)
+        _, repeated = self._json_request("GET", terminal["status_url"])
+        self.assertEqual(repeated["job"]["elapsed_s"], terminal["elapsed_s"])
+
+        _, created = self._json_request("POST", "/api/fx-previews", body(1.4))
+        _, active = self._json_request("GET", created["job"]["status_url"])
+        self.assertEqual(active["job"]["eta_sample_count"], 3)
+        self.assertIsInstance(active["job"]["eta_remaining_s"], (int, float))
+        done = self._wait_terminal(created["job"]["id"])["job"]
+        self.assertEqual(done["eta_sample_count"], 4)
+        _, cached = self._json_request("POST", "/api/fx-previews", body(1.0))
+        self.assertTrue(cached["job"]["cache_hit"])
+        self.assertEqual(cached["job"]["eta_sample_count"], 4)
+
+        failing = self.fast_renderer.parent / "fail-timing.py"
+        failing.write_text("import sys; sys.exit(1)\n", encoding="utf-8")
+        manager.renderer_script = failing.resolve()
+        _, created = self._json_request("POST", "/api/fx-previews", body(1.5))
+        failed = self._wait_terminal(created["job"]["id"])["job"]
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["eta_sample_count"], 4)
+        time.sleep(0.03)
+        _, repeated = self._json_request("GET", failed["status_url"])
+        self.assertEqual(repeated["job"]["elapsed_s"], failed["elapsed_s"])
+
+        manager.renderer_script = self.slow_renderer.resolve()
+        _, created = self._json_request("POST", "/api/fx-previews", body(1.6))
+        _, response = self._json_request("POST", created["job"]["status_url"] + "/cancel", {})
+        cancelled = response["job"]
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertEqual(cancelled["eta_sample_count"], 4)
+        time.sleep(0.03)
+        _, repeated = self._json_request("GET", cancelled["status_url"])
+        self.assertEqual(repeated["job"]["elapsed_s"], cancelled["elapsed_s"])
+
+        # Exercise retention through the same manager's recording method without
+        # launching hundreds of renderer processes.
+        with manager._lock:
+            for i in range(101):
+                manager._record_timing_sample(("single", "draft", f"test-{i}", 2.0, 2.0), 1.0)
+            self.assertEqual(len(manager._timing_samples), 100)
+            key = ("single", "draft", "last", 2.0, 2.0)
+            for i in range(25):
+                manager._record_timing_sample(key, float(i))
+            self.assertEqual(manager._timing_samples[key], list(map(float, range(5, 25))))
 
     def test_sigkill_permission_error_is_caught_and_reported_unverified(self) -> None:
         class FakeProcess:

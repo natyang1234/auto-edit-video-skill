@@ -2676,7 +2676,9 @@ function fxPreviewTimingSuffix(job) {
   if (job.state === "running") {
     const eta = job.eta_remaining_s;
     suffix += typeof eta === "number" && Number.isFinite(eta)
-      ? ` · 預估還需 ${Math.ceil(eta)} 秒` : " · 預估時間計算中";
+      ? ` · 預估還需 ${Math.ceil(eta)} 秒（依近期同設定估算）`
+      : Number.isFinite(job.eta_sample_count) && job.eta_sample_count >= 3
+        ? " · 已超過近期預估，仍在處理" : " · 預估時間計算中";
   }
   return suffix;
 }
