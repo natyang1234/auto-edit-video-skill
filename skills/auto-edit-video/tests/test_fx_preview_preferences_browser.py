@@ -170,6 +170,7 @@ class FxPreviewPreferencesBrowserTests(unittest.TestCase):
             )
 
             page.get_by_role("tab", name="全部").click()
+            page.locator(".fx-preview-window > summary").click()
             source_input = page.locator("#fx-preview-source")
             source_input.fill("0.5")
             source_input.dispatch_event("input")

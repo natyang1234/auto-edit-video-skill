@@ -6,6 +6,7 @@
     <meta name="color-scheme" content="light dark">
     <title>自動剪輯工作室</title>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/fx-preview-panel.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
@@ -641,6 +642,8 @@
             </div>
             <button class="fx-preview-close icon-button" id="fx-preview-close" type="button" aria-label="關閉風格試看">×</button>
           </header>
+          <details class="fx-preview-catalog-disclosure" id="fx-preview-catalog-disclosure" open>
+          <summary>變更風格</summary>
           <p class="fx-preview-catalog-note">卡片為風格示意；選取後用本片試看。</p>
           <div class="fx-preview-toolbar">
             <div class="fx-preview-cats" id="fx-preview-cats" role="tablist" aria-label="風格分類"></div>
@@ -648,6 +651,7 @@
             <input id="fx-preview-search" type="search" placeholder="搜代碼／中文名" autocomplete="off">
           </div>
           <div class="fx-preview-grid" id="fx-preview-grid" role="radiogroup" aria-label="風格效果清單"></div>
+          </details>
         </section>
 
         <section class="fx-preview-editor" aria-labelledby="fx-preview-title">
@@ -657,8 +661,14 @@
               <h2 id="fx-preview-title">用我的影片試風格</h2>
               <p id="fx-preview-description" class="fx-preview-description">試看目前片段與單一特效；完整編輯請用輸出預覽。</p>
             </div>
+            <div class="fx-preview-persistent-summary" aria-live="polite">
+              <strong id="fx-preview-selected-name">—</strong>
+              <span>試看 <output id="fx-preview-window-label">00:00.000 — 00:00.000</output></span>
+              <span>套用 <output id="fx-preview-apply-window-label">00:00.000 — 00:00.000</output></span>
+            </div>
           </header>
 
+          <div class="fx-preview-editor-scroll">
           <div class="fx-preview-player-wrap">
             <div class="fx-preview-compare-heading">
               <div>
@@ -689,11 +699,7 @@
           </div>
 
           <div class="fx-preview-settings">
-            <div class="fx-preview-selection">
-              <span class="field-label">目前選擇</span>
-              <strong id="fx-preview-selected-name">—</strong>
-              <p class="fx-preview-spec" id="fx-preview-spec"></p>
-            </div>
+            <div class="fx-preview-fields" id="fx-preview-fields"></div>
             <div class="fx-preview-draft-notice" id="fx-preview-draft-notice" hidden role="status">
               <p id="fx-preview-draft-copy"></p>
               <div>
@@ -701,27 +707,33 @@
                 <button class="button button-secondary" id="fx-preview-discard-draft" type="button" hidden>丟棄草稿</button>
               </div>
             </div>
-            <div class="fx-preview-window" aria-labelledby="fx-preview-window-title">
-              <div class="fx-preview-subheading" id="fx-preview-window-title">套用範圍</div>
+            <details class="fx-preview-window">
+              <summary id="fx-preview-window-title">調整試看與套用範圍</summary>
+              <div class="fx-preview-subheading">套用範圍</div>
               <div class="fx-preview-time-grid">
                 <label class="field"><span>套用起點（秒）</span><input id="fx-preview-apply-source" type="number" min="0" step="0.1"></label>
                 <label class="field"><span>套用長度（秒）</span><input id="fx-preview-apply-duration" type="number" min="0.1" step="0.1"></label>
               </div>
-              <p class="fx-preview-time-note"><span>實際套用</span> <output id="fx-preview-apply-window-label">00:00.000 — 00:00.000</output></p>
+
               <div class="fx-preview-subheading">試看片段（最多 4 秒）</div>
               <div class="fx-preview-time-grid">
                 <label class="field"><span>來源起點（秒）</span><input id="fx-preview-source" type="number" min="0" step="0.1"></label>
                 <label class="field"><span>試看長度（最多 4 秒）</span><input id="fx-preview-duration" type="number" min="0.1" max="4" step="0.1"></label>
               </div>
-              <p class="fx-preview-time-note"><span>播放範圍</span> <output id="fx-preview-window-label">00:00.000 — 00:00.000</output></p>
+
               <p class="fx-preview-replace-note" id="fx-preview-replace-note" hidden></p>
-            </div>
+            </details>
+            <details class="fx-preview-advanced">
+              <summary>進階設定</summary>
+              <p class="fx-preview-spec" id="fx-preview-spec"></p>
+              <div class="fx-preview-fields" id="fx-preview-advanced-fields"></div>
             <div class="fx-preview-options">
               <label class="field"><span>預覽模式</span><select id="fx-preview-mode"><option value="single">單一效果</option><option value="timeline">時間軸</option></select></label>
               <label class="field"><span>預覽畫質</span><select id="fx-preview-quality"><option value="draft">快速版</option><option value="standard">清晰版</option></select></label>
               <label class="fx-preview-check"><input id="fx-preview-text-fit" type="checkbox" checked> 自動縮放長文</label>
             </div>
-            <div class="fx-preview-fields" id="fx-preview-fields"></div>
+            </details>
+          </div>
           </div>
 
           <footer class="fx-preview-actions">

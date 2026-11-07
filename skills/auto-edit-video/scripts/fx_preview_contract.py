@@ -65,6 +65,27 @@ def normalize_preview_options(value: Any) -> dict[str, str]:
     return {"mode": str(mode), "quality": str(quality)}
 
 
+def normalize_fx_opacity(value: Any) -> float:
+    """Return the canonical FX-layer opacity, rejecting coercion and NaN/Inf."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FxPreviewContractError(
+            "opacity_invalid", "特效透明度必須是 0 到 1 的有限數字"
+        )
+    try:
+        opacity = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise FxPreviewContractError(
+            "opacity_invalid", "特效透明度必須是 0 到 1 的有限數字"
+        ) from exc
+    if not math.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+        raise FxPreviewContractError(
+            "opacity_invalid", "特效透明度必須是 0 到 1 的有限數字"
+        )
+    # JSON preserves the sign of negative zero, but it has no visual meaning;
+    # collapse it so equivalent requests share one cache/confirm identity.
+    return 0.0 if opacity == 0.0 else opacity
+
+
 def _finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FxPreviewContractError("window_invalid", f"{label}必須是有限數字")
@@ -517,6 +538,15 @@ def validate_renderer_request(
     overlay = payload.get("overlay")
     if not isinstance(overlay, dict):
         raise FxPreviewContractError("invalid_request", "renderer overlay 無效")
+    style = overlay.get("style", {})
+    if not isinstance(style, dict):
+        raise FxPreviewContractError("invalid_request", "renderer FX 樣式無效")
+    try:
+        opacity = normalize_fx_opacity(style.get("opacity", 1.0))
+    except FxPreviewContractError as exc:
+        raise FxPreviewContractError("invalid_request", exc.message) from exc
+    overlay = dict(overlay)
+    overlay["style"] = {**style, "opacity": opacity}
     state_snapshot = payload.get("state_snapshot")
     manifest_snapshot = payload.get("manifest_snapshot")
     if not isinstance(state_snapshot, dict) or not isinstance(manifest_snapshot, dict):

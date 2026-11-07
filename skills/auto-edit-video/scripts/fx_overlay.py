@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import fx_preview_contract
+
 FX_VERSION = "fx-overlay-v2-strict-source"
 FX_REL = Path("working/fx")
 MATTE_TIMEOUT_S = 30 * 60
@@ -267,6 +269,14 @@ def canvas_ok(canvas: tuple[int, int] | None) -> bool:
     return w > 0 and h > 0 and abs(w / h - 9 / 16) < 0.01
 
 
+def opacity_alpha_filter_suffix(value: Any) -> str:
+    """FFmpeg filter suffix that multiplies an FX layer's existing alpha."""
+    opacity = fx_preview_contract.normalize_fx_opacity(value)
+    if opacity == 1.0:
+        return ""
+    return f",colorchannelmixer=aa={opacity:.6f}"
+
+
 def validate(overlay: dict[str, Any], state: dict[str, Any] | None = None) -> list[str]:
     """Field checks for one ``fx`` overlay (called from the editor-state validator).
 
@@ -307,6 +317,14 @@ def validate(overlay: dict[str, Any], state: dict[str, Any] | None = None) -> li
         errors.append(f"fx overlay {oid} scheme is invalid")
     for err in validate_font_ids(overlay.get("font_ids")):
         errors.append(f"fx overlay {oid}: {err}")
+    style = overlay.get("style", {})
+    if not isinstance(style, dict):
+        errors.append(f"fx overlay {oid}: style must be an object")
+    else:
+        try:
+            fx_preview_contract.normalize_fx_opacity(style.get("opacity", 1.0))
+        except fx_preview_contract.FxPreviewContractError:
+            errors.append(f"fx overlay {oid}: opacity must be a finite number from 0 to 1")
     try:
         span = float(overlay.get("end", 0)) - float(overlay.get("start", 0))
     except (TypeError, ValueError):
@@ -456,7 +474,6 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
     person = None
     mask = None
     if code == "B1":
-        import fx_preview_contract
         owner = Path(asset_project or project_dir)
         binding = material or overlay.get("material")
         try:
@@ -594,8 +611,9 @@ def as_video_overlay(overlay: dict[str, Any], rendered: dict[str, Any]) -> dict[
     video["type"] = "video"
     video["source"] = rendered["source"]
     video["fx"] = {k: rendered[k] for k in ("code", "block", "theme", "main", "scheme", "person")}
+    style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
     video["style"] = {"x": 50, "y": 50, "width": 100, "animation": "none",
-                      "opacity": float((overlay.get("style") or {}).get("opacity", 1) or 1)}
+                      "opacity": fx_preview_contract.normalize_fx_opacity(style.get("opacity", 1.0))}
     video["provenance"] = f"edit-style-profiles effect {rendered['code']} ({rendered['block']}) via compose.py clip"
     return video
 

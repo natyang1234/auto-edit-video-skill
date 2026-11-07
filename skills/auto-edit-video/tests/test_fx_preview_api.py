@@ -370,6 +370,114 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertTrue(cached["job"]["cache_hit"])
         self.assertEqual(cached["job"]["text_layout"], terminal["job"]["text_layout"])
 
+    def test_opacity_is_strict_cached_and_frozen_through_confirm(self) -> None:
+        default_request = self._candidate()
+        status, default_created = self._json_request(
+            "POST", "/api/fx-previews", default_request
+        )
+        self.assertEqual(status, 202, default_created)
+        default_ready = self._wait_terminal(default_created["job"]["id"])
+        self.assertEqual(default_ready["job"]["state"], "ready", default_ready)
+        with self.server.fx_preview_jobs._lock:
+            default_key = self.server.fx_preview_jobs._jobs[
+                default_created["job"]["id"]
+            ]["cache_key"]
+
+        explicit_one = self._candidate()
+        explicit_one["opacity"] = 1
+        status, one_created = self._json_request(
+            "POST", "/api/fx-previews", explicit_one
+        )
+        self.assertEqual(status, 200, one_created)
+        self.assertTrue(one_created["job"]["cache_hit"])
+        with self.server.fx_preview_jobs._lock:
+            one_key = self.server.fx_preview_jobs._jobs[one_created["job"]["id"]]["cache_key"]
+        self.assertEqual(one_key, default_key)
+
+        half_request = self._candidate()
+        half_request["opacity"] = 0.5
+        status, half_created = self._json_request(
+            "POST", "/api/fx-previews", half_request
+        )
+        self.assertEqual(status, 202, half_created)
+        half_ready = self._wait_terminal(half_created["job"]["id"])
+        with self.server.fx_preview_jobs._lock:
+            half_key = self.server.fx_preview_jobs._jobs[half_created["job"]["id"]]["cache_key"]
+        self.assertNotEqual(half_key, default_key)
+
+        zero_request = self._candidate()
+        zero_request["opacity"] = 0
+        status, zero_created = self._json_request(
+            "POST", "/api/fx-previews", zero_request
+        )
+        self.assertEqual(status, 202, zero_created)
+        zero_ready = self._wait_terminal(zero_created["job"]["id"])
+        with self.server.fx_preview_jobs._lock:
+            frozen_zero = self.server.fx_preview_jobs._jobs[zero_created["job"]["id"]]
+            zero_key = frozen_zero["cache_key"]
+            self.assertEqual(frozen_zero["overlay"]["style"]["opacity"], 0.0)
+            self.assertEqual(
+                frozen_zero["state_snapshot"]["overlays"][-1]["style"]["opacity"],
+                0.0,
+            )
+        negative_zero = self._candidate()
+        negative_zero["opacity"] = -0.0
+        status, negative_zero_created = self._json_request(
+            "POST", "/api/fx-previews", negative_zero
+        )
+        self.assertEqual(status, 200, negative_zero_created)
+        self.assertTrue(negative_zero_created["job"]["cache_hit"])
+        with self.server.fx_preview_jobs._lock:
+            self.assertEqual(
+                self.server.fx_preview_jobs._jobs[
+                    negative_zero_created["job"]["id"]
+                ]["cache_key"],
+                zero_key,
+            )
+
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{half_created['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        self.assertEqual(confirmed["state"]["overlays"][-1]["style"]["opacity"], 0.5)
+
+        replacement = self._candidate()
+        replacement["expected_revision"] = confirmed["revision"]
+        replacement["replace_overlay_id"] = confirmed["overlay_id"]
+        replacement["opacity"] = 0
+        status, replacement_created = self._json_request(
+            "POST", "/api/fx-previews", replacement
+        )
+        self.assertIn(status, {200, 202}, replacement_created)
+        replacement_ready = self._wait_terminal(replacement_created["job"]["id"])
+        self.assertEqual(replacement_ready["job"]["state"], "ready", replacement_ready)
+        status, replaced = self._json_request(
+            "POST",
+            f"/api/fx-previews/{replacement_created['job']['id']}/confirm",
+            {"expected_revision": confirmed["revision"]},
+        )
+        self.assertEqual(status, 200, replaced)
+        self.assertEqual(replaced["overlay_id"], confirmed["overlay_id"])
+        match = next(
+            item for item in replaced["state"]["overlays"]
+            if item["id"] == confirmed["overlay_id"]
+        )
+        self.assertEqual(match["style"]["opacity"], 0.0)
+
+        for invalid in (None, True, False, "0.5", -0.01, 1.01, float("nan"),
+                        float("inf"), 10**400):
+            with self.subTest(invalid=invalid):
+                request = self._candidate()
+                request["expected_revision"] = replaced["revision"]
+                request["opacity"] = invalid
+                status, rejected = self._json_request(
+                    "POST", "/api/fx-previews", request
+                )
+                self.assertEqual(status, 422, rejected)
+                self.assertEqual(rejected["reason"], "opacity_invalid")
+
     def test_b1_unknown_fields_and_nan_fail_closed(self) -> None:
         status, rejected = self._json_request("POST", "/api/fx-previews", self._candidate("B1"))
         self.assertEqual(status, 422, rejected)
