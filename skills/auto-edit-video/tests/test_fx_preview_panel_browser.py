@@ -18,6 +18,86 @@ class FxPreviewPanelTests(unittest.TestCase):
     open_preview = FxPreviewBrowserTests.open_preview
     mock_preview_api = FxPreviewBrowserTests.mock_preview_api
 
+    def test_catalog_disclosure_tracks_breakpoint_without_losing_open_draft(self):
+        host, port = self.server.server_address
+        with sync_playwright() as p:
+            browser = p.chromium.launch(executable_path=str(CHROME), headless=True, args=['--mute-audio'])
+            page = browser.new_page(viewport={'width': 390, 'height': 844})
+            page.goto(f'http://{host}:{port}/', wait_until='networkidle')
+            self.mock_preview_api(page)
+            self.open_preview(page)
+            dialog = page.locator('#fx-preview-dialog')
+            catalog = page.locator('#fx-preview-catalog-disclosure')
+            summary = catalog.locator('summary')
+            page.wait_for_function("() => !document.querySelector('#fx-preview-confirm').disabled")
+            self.assertTrue(dialog.evaluate('el => el.open'))
+            self.assertFalse(catalog.evaluate('el => el.open'))
+            self.assertTrue(summary.is_visible())
+
+            summary.click()
+            self.assertTrue(catalog.evaluate('el => el.open'))
+            page.locator('#fx-preview-search').fill('H1')
+            page.locator('#fx-preview-grid .fx-preview-card').first.click()
+            page.wait_for_function("() => !document.querySelector('#fx-preview-confirm').disabled")
+            opacity = page.locator('.fx-preview-opacity input')
+            opacity.evaluate("el => { el.value = 60; el.dispatchEvent(new Event('input', {bubbles: true})); }")
+            page.wait_for_function("() => !document.querySelector('#fx-preview-confirm').disabled && fxPreviewDraft.opacity === 0.6")
+            draft_before = page.evaluate('''() => ({
+                code: fxPreviewDraft.code,
+                opacity: fxPreviewDraft.opacity,
+                draft: JSON.stringify(fxPreviewDraft),
+                signature: fxPreviewDraftSignature,
+            })''')
+            self.assertEqual(draft_before['code'], 'H1')
+
+            # Closing and resizing within the mobile breakpoint must preserve
+            # the user's disclosure choice until the breakpoint actually changes.
+            page.set_viewport_size({'width': 375, 'height': 812})
+            self.assertTrue(catalog.evaluate('el => el.open'))
+            summary.click()
+            self.assertFalse(catalog.evaluate('el => el.open'))
+            page.set_viewport_size({'width': 390, 'height': 844})
+            self.assertFalse(catalog.evaluate('el => el.open'))
+
+            page.set_viewport_size({'width': 1440, 'height': 900})
+            page.wait_for_function('''() => !window.matchMedia('(max-width: 760px)').matches
+                && document.querySelector('#fx-preview-catalog-disclosure').open''', timeout=2000)
+            self.assertTrue(dialog.evaluate('el => el.open'))
+            self.assertTrue(catalog.evaluate('el => el.open'))
+            self.assertFalse(summary.is_visible())
+            search = page.locator('#fx-preview-search')
+            self.assertTrue(search.is_visible())
+            search.fill('H1')
+            self.assertGreater(page.evaluate("document.querySelectorAll('#fx-preview-grid .fx-preview-card').length"), 0)
+            self.assertEqual(page.evaluate('''() => ({
+                code: fxPreviewDraft.code,
+                opacity: fxPreviewDraft.opacity,
+                draft: JSON.stringify(fxPreviewDraft),
+                signature: fxPreviewDraftSignature,
+            })'''), draft_before)
+
+            # Leaving desktop while the dialog stays open restores the mobile
+            # disclosure, where the same catalog remains operable.
+            page.set_viewport_size({'width': 390, 'height': 844})
+            page.wait_for_function('''() => window.matchMedia('(max-width: 760px)').matches
+                && !document.querySelector('#fx-preview-catalog-disclosure').open''', timeout=2000)
+            self.assertTrue(dialog.evaluate('el => el.open'))
+            self.assertFalse(catalog.evaluate('el => el.open'))
+            self.assertTrue(summary.is_visible())
+            self.assertTrue(summary.evaluate('el => el === document.activeElement'))
+            summary.click()
+            self.assertTrue(catalog.evaluate('el => el.open'))
+            self.assertTrue(search.is_visible())
+            search.fill('H1')
+            self.assertGreater(page.evaluate("document.querySelectorAll('#fx-preview-grid .fx-preview-card').length"), 0)
+            self.assertEqual(page.evaluate('''() => ({
+                code: fxPreviewDraft.code,
+                opacity: fxPreviewDraft.opacity,
+                draft: JSON.stringify(fxPreviewDraft),
+                signature: fxPreviewDraftSignature,
+            })'''), draft_before)
+            browser.close()
+
     def test_panel_responsive_keyboard_and_opacity(self):
         ART.mkdir(parents=True, exist_ok=True)
         host, port = self.server.server_address

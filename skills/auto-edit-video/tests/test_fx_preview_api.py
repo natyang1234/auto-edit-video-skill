@@ -1350,6 +1350,41 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(fx_layers[0]["metadata"], {"editor_note": "keep-me"})
         self.assertTrue(replaced["replaced"])
 
+    def test_replace_omitted_opacity_maps_invalid_existing_value_to_422(self) -> None:
+        status, created = self._json_request(
+            "POST", "/api/fx-previews", self._candidate()
+        )
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{ready['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        existing_id = confirmed["overlay_id"]
+        state = confirmed["state"]
+
+        for invalid in ("bad", None, True, -0.01, 1.01, 10**400):
+            with self.subTest(invalid=invalid):
+                existing = next(
+                    item for item in state["overlays"] if item.get("id") == existing_id
+                )
+                existing["style"]["opacity"] = invalid
+                self._write_json("working/editor_state.json", state)
+                status, refreshed = self._json_request("GET", "/api/project")
+                self.assertEqual(status, 200, refreshed)
+                replacement = self._candidate()
+                replacement["expected_revision"] = refreshed["state"]["revision"]
+                replacement["replace_overlay_id"] = existing_id
+                status, rejected = self._json_request(
+                    "POST", "/api/fx-previews", replacement
+                )
+                self.assertEqual(status, 422, rejected)
+                self.assertEqual(rejected["reason"], "opacity_invalid")
+                status, health = self._json_request("GET", "/api/project")
+                self.assertEqual(status, 200, health)
+
     def test_source_change_during_job_prevents_publication(self) -> None:
         self.server.fx_preview_jobs.renderer_script = self.slow_renderer.resolve()
         status, created = self._json_request("POST", "/api/fx-previews", self._candidate())

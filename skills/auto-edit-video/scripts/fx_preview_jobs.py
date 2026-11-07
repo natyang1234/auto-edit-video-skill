@@ -1047,13 +1047,17 @@ class FxPreviewJobManager:
             overlay = deepcopy(existing)
         overlay.update(candidate_fields)
         style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
-        overlay["style"] = {
-            **style,
-            "opacity": (
+        try:
+            normalized_opacity = (
                 fx_preview_contract.normalize_fx_opacity(style.get("opacity", 1.0))
                 if opacity is None
                 else opacity
-            ),
+            )
+        except fx_preview_contract.FxPreviewContractError as exc:
+            raise FxPreviewJobError(422, exc.code, exc.message) from exc
+        overlay["style"] = {
+            **style,
+            "opacity": normalized_opacity,
         }
         errors = fx_overlay.validate(overlay, state)
         if errors:
