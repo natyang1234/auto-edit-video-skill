@@ -58,6 +58,26 @@ let fxPreviewStaleDraft = null;
 let fxPreviewSyncing = false;
 let fxPreviewUpgradeStarted = false;
 let fxPreviewUpgradeCancelled = false;
+// Comparison keeps independent frozen drafts/jobs.  The original preview
+// remains deliberately single-job; comparison submits its own strict queue.
+let fxCompareActive = false;
+let fxCompareCandidates = [];
+let fxCompareFrozen = null;
+let fxCompareStarting = false;
+let fxCompareRunning = false;
+let fxCompareStopping = false;
+let fxCompareConfirming = false;
+let fxCompareSelectedId = "";
+let fxCompareRun = 0;
+let fxCompareSession = 0;
+let fxCompareSelectionToken = 0;
+let fxCompareCleanupPromise = null;
+let fxCompareQueuePromise = null;
+let fxCompareCloseRequested = false;
+let fxCompareRoundStale = false;
+let fxPreviewPostInFlight = null;
+const fxPreviewLifecycles = new Set();
+let fxPreviewUnverifiedJob = null;
 // Last state both sides agreed on. Diffing against this is what lets a save
 // conflict be replayed: it says which top-level sections *this* window changed,
 // so the background pipeline's writes can be kept and ours re-applied on top.
@@ -159,6 +179,7 @@ function cacheElements() {
     "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output",
     "fx-panel", "fx-panel-note", "fx-cats", "fx-search", "fx-grid", "fx-spec", "fx-vars",
     "fx-preview-dialog", "fx-preview-close", "fx-preview-cats", "fx-preview-search", "fx-preview-grid",
+    "fx-preview-compare-controls", "fx-preview-compare-toggle", "fx-preview-compare-add", "fx-preview-compare-start", "fx-preview-compare-discard", "fx-preview-compare-note", "fx-preview-compare-candidates",
     "fx-preview-selected-name", "fx-preview-spec", "fx-preview-source", "fx-preview-duration",
     "fx-preview-apply-source", "fx-preview-apply-duration", "fx-preview-apply-window-label",
     "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit", "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-advanced-fields", "fx-preview-status",
@@ -614,6 +635,10 @@ function pushHistory() {
 }
 
 function undo() {
+  if (fxCompareRoundLocked()) {
+    fxPreviewSetStatus("比較進行中，已鎖定撤銷；請先停止或丟棄本輪。", "error");
+    return;
+  }
   if (!history.length) {
     showToast("目前沒有可撤銷的變更");
     return;
@@ -628,6 +653,10 @@ function undo() {
 }
 
 function redo() {
+  if (fxCompareRoundLocked()) {
+    fxPreviewSetStatus("比較進行中，已鎖定重做；請先停止或丟棄本輪。", "error");
+    return;
+  }
   if (!redoStack.length) {
     showToast("目前沒有可重做的變更");
     return;
@@ -755,7 +784,11 @@ async function reconcileStateConflict() {
   return { retryable: true, reloaded: true };
 }
 
-async function saveState(showConfirmation = true) {
+async function saveState(showConfirmation = true, allowDuringComparisonStart = false) {
+  if (fxCompareRoundLocked() && !allowDuringComparisonStart) {
+    fxPreviewSetStatus("比較輪次已鎖定，完成、停止或丟棄前不能另行儲存。", "error");
+    return false;
+  }
   const saveGeneration = editGeneration;
   presetSaveInFlight += 1;
   clearTimeout(saveTimer);
@@ -2019,6 +2052,7 @@ function fxPreviewPersistDraft() {
 }
 
 function fxPreviewDiscardSavedDraft() {
+  if (fxCompareRoundLocked()) return;
   const drafts = fxPreviewStorageRead(FX_PREVIEW_DRAFTS_KEY, {});
   delete drafts[fxPreviewDraftKey()];
   fxPreviewStorageWrite(FX_PREVIEW_DRAFTS_KEY, drafts);
@@ -2043,6 +2077,7 @@ function fxPreviewIsFavorite(code) {
 }
 
 function fxPreviewToggleFavorite(code) {
+  if (fxCompareRoundLocked()) return;
   const preferences = fxPreviewPreferences();
   preferences.favorites = preferences.favorites.includes(code)
     ? preferences.favorites.filter((item) => item !== code)
@@ -2079,6 +2114,7 @@ function fxPreviewRenderDraftNotice() {
 }
 
 function fxPreviewRestoreStaleDraft() {
+  if (fxCompareRoundLocked()) return;
   const saved = fxPreviewStaleDraft;
   if (!saved?.draft) return;
   const effect = fxEffectByCode(saved.draft.code);
@@ -2786,17 +2822,514 @@ function fxPreviewCancelCurrentJob() {
   fxPreviewPollTimer = null;
   const job = fxPreviewJob;
   fxPreviewJob = null;
-  if (!job?.id) return Promise.resolve();
-  return fxPreviewCancelJobId(job.id);
+  if (!job?.id) return Promise.resolve(null);
+  return fxPreviewCancelJobId(job.id).then((cancelled) => {
+    if (!fxPreviewJobTerminationVerified(cancelled)) fxPreviewUnverifiedJob = cancelled?.id ? cancelled : job;
+    else if (fxPreviewUnverifiedJob?.id === job.id) fxPreviewUnverifiedJob = null;
+    return cancelled;
+  }).catch((error) => {
+    fxPreviewUnverifiedJob = job;
+    throw error;
+  });
 }
 
 function fxPreviewCancelJobId(jobId) {
-  if (!jobId) return Promise.resolve();
+  if (!jobId) return Promise.resolve(null);
   return request(`/api/fx-previews/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
-  }).catch(() => {});
+  }).then((payload) => payload?.job || payload);
+}
+
+function fxPreviewTrackLifecycle(promise) {
+  fxPreviewLifecycles.add(promise);
+  fxPreviewPostInFlight = promise;
+  const cleanup = () => {
+    fxPreviewLifecycles.delete(promise);
+    fxPreviewPostInFlight = fxPreviewLifecycles.size ? Promise.allSettled([...fxPreviewLifecycles]) : null;
+  };
+  promise.then(cleanup, cleanup);
+  return promise;
+}
+
+async function fxPreviewWaitForLifecycles() {
+  while (fxPreviewLifecycles.size) await Promise.allSettled([...fxPreviewLifecycles]);
+}
+
+function fxPreviewJobState(job) {
+  return String(job?.state || "pending").toLowerCase();
+}
+
+function fxPreviewJobIsTerminal(job) {
+  return ["ready", "cache_hit", "failed", "cancelled", "stale"].includes(fxPreviewJobState(job));
+}
+
+function fxPreviewJobTerminationVerified(job) {
+  if (!fxPreviewJobIsTerminal(job)) return false;
+  return String(job?.error?.code || "").toLowerCase() !== "termination_unverified";
+}
+
+async function fxCompareCancelAndVerify(job, candidate = null, attempts = 3) {
+  if (!job?.id) return { verified: true, job: null };
+  let current = job;
+  try {
+    current = await fxPreviewCancelJobId(job.id) || current;
+    if (!current?.id) current = { ...current, id: job.id, status_url: job.status_url };
+  } catch (error) {
+    if (candidate) candidate.message = `停止請求失敗：${error.message}`;
+    return { verified: false, job: current, error };
+  }
+  for (let attempt = 0; attempt < attempts && !fxPreviewJobTerminationVerified(current); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    try {
+      const payload = await request(current.status_url || `/api/fx-previews/${encodeURIComponent(current.id)}`);
+      current = payload?.job || payload || current;
+    } catch (error) {
+      if (candidate) candidate.message = `停止狀態無法確認：${error.message}`;
+      return { verified: false, job: current, error };
+    }
+  }
+  if (candidate) {
+    candidate.job = current;
+    candidate.state = fxPreviewJobTerminationVerified(current) ? fxPreviewJobState(current) : "stopping";
+    candidate.message = fxPreviewJobTerminationVerified(current)
+      ? fxPreviewStatusForJob(current)
+      : "停止尚未確認；工作仍可能在執行，請重試停止。";
+  }
+  return { verified: fxPreviewJobTerminationVerified(current), job: current };
+}
+
+function fxCompareCandidateUsable(draft) {
+  const effect = fxEffectByCode(draft?.code);
+  if (!effect || effect.available === false) return "此效果目前不可用。";
+  if (fxPreviewIsBlocked(effect)) return "B1 需要B-roll素材，不能加入比較。";
+  if (effect.code === "P5" && !draft?.subject) return "P5 需要先在原片點選主角位置，不能加入比較。";
+  const limit = Number(effect.media_max);
+  if (Number.isFinite(limit) && limit > 0 && Number(draft?.window?.duration_s) > limit + 0.001) {
+    return `此效果最多試看 ${limit} 秒；比較不會暗中縮短片段。`;
+  }
+  return "";
+}
+
+function fxCompareContextForDraft(draft) {
+  return {
+    revision: String(state?.revision || ""),
+    source_sha256: String(state?.source_sha256 || projectPayload?.source_sha256 || ""),
+    replace_overlay_id: fxPreviewReplaceOverlayId || null,
+    window: deepCopy(draft?.window || {}),
+    apply_window: deepCopy(draft?.apply_window || {}),
+    mode: draft?.preview_options?.mode === "timeline" ? "timeline" : "single",
+  };
+}
+
+function fxCompareSameContext(left, right) {
+  if (!left || !right) return false;
+  return left.revision === right.revision
+    && left.source_sha256 === right.source_sha256
+    && left.replace_overlay_id === right.replace_overlay_id
+    && left.mode === right.mode
+    && JSON.stringify(left.window) === JSON.stringify(right.window)
+    && JSON.stringify(left.apply_window) === JSON.stringify(right.apply_window);
+}
+
+function fxCompareRoundLocked() {
+  return Boolean(fxCompareActive && (fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming
+    || fxCompareCandidates.some((item) => item.state !== "queued")));
+}
+
+function fxCompareResetState() {
+  fxCompareActive = false;
+  fxCompareCandidates = [];
+  fxCompareFrozen = null;
+  fxCompareStarting = false;
+  fxCompareRunning = false;
+  fxCompareStopping = false;
+  fxCompareConfirming = false;
+  fxCompareSelectedId = "";
+  fxCompareSelectionToken += 1;
+  fxCompareCloseRequested = false;
+  fxCompareRoundStale = false;
+  fxCompareRun += 1;
+  fxCompareSession += 1;
+  fxPreviewJob = null;
+  fxPreviewReadySignature = "";
+  if (elements["fx-preview-confirm"]) elements["fx-preview-confirm"].disabled = true;
+}
+
+function fxCompareSetInteractionLocks() {
+  const roundLocked = fxCompareRoundLocked();
+  const confirmationLocked = fxCompareConfirming;
+  ["fx-preview-search", "fx-preview-source", "fx-preview-duration", "fx-preview-apply-source",
+    "fx-preview-apply-duration", "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit",
+    "fx-preview-restore-draft", "fx-preview-discard-draft"].forEach((id) => {
+    if (elements[id]) elements[id].disabled = roundLocked;
+  });
+  document.querySelectorAll("#fx-preview-fields input, #fx-preview-fields select, #fx-preview-advanced-fields input, #fx-preview-advanced-fields select")
+    .forEach((node) => { node.disabled = roundLocked; });
+  document.querySelectorAll("#fx-preview-grid .fx-preview-card, #fx-preview-cats button, #fx-preview-grid .fx-preview-favorite")
+    .forEach((node) => {
+      node.setAttribute("aria-disabled", String(roundLocked));
+      if (node instanceof HTMLButtonElement) node.disabled = roundLocked;
+    });
+  ["fx-preview-close", "fx-preview-cancel"].forEach((id) => {
+    if (elements[id]) elements[id].disabled = confirmationLocked;
+  });
+}
+
+function fxCompareRender() {
+  const note = elements["fx-preview-compare-note"];
+  const list = elements["fx-preview-compare-candidates"];
+  if (!note || !list) return;
+  const active = fxCompareActive;
+  const started = fxCompareCandidates.some((item) => item.state !== "queued");
+  elements["fx-preview-compare-toggle"].setAttribute("aria-pressed", String(active));
+  elements["fx-preview-compare-toggle"].textContent = active ? "離開比較" : "比較風格";
+  ["fx-preview-compare-add", "fx-preview-compare-start", "fx-preview-compare-discard"].forEach((id) => { elements[id].hidden = !active; });
+  elements["fx-preview-compare-add"].disabled = !active || started || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareCandidates.length >= 4;
+  elements["fx-preview-compare-start"].disabled = !active || started || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareRoundStale || fxCompareCandidates.length < 3;
+  elements["fx-preview-compare-discard"].disabled = fxCompareConfirming;
+  elements["fx-preview-compare-discard"].textContent = fxCompareStopping ? "重試停止" : "丟棄比較";
+  note.hidden = !active;
+  note.textContent = !active ? "" : fxCompareStopping ? "比較仍停止中；確認工作已終止前不會開始下一輪。"
+    : fxCompareConfirming ? "正在套用已選候選；完成前已鎖定切換、關閉與歷史操作。"
+      : fxCompareStarting ? "正在確認單款工作已停止與凍結版本；尚未送出比較工作。"
+        : fxCompareRoundStale ? "比較內容已過期；整輪不可套用，請丟棄後重新建立。"
+          : fxCompareRunning ? "正依序產生比較，伺服器一次只會有一個工作。"
+      : `已加入 ${fxCompareCandidates.length}/4 款；同一來源、試看片段與套用範圍會在開始後凍結。`;
+  list.replaceChildren(...fxCompareCandidates.map((candidate, index) => {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "fx-compare-card";
+    card.dataset.fxCompareId = candidate.id;
+    card.dataset.state = candidate.state;
+    if (candidate.job?.id) card.dataset.jobId = candidate.job.id;
+    card.setAttribute("aria-pressed", String(candidate.id === fxCompareSelectedId));
+    card.disabled = candidate.state !== "ready" || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareRoundStale;
+    const effect = fxEffectByCode(candidate.draft.code);
+    const title = document.createElement("strong");
+    title.textContent = `${index + 1}. ${effect ? `#${effect.num} ${effect.name}` : candidate.draft.code}`;
+    const status = document.createElement("span");
+    status.textContent = candidate.message || fxPreviewStatusForJob(candidate.job || { state: candidate.state });
+    card.append(title, status);
+    card.addEventListener("click", () => fxCompareSelect(candidate.id));
+    return card;
+  }));
+  fxCompareSetInteractionLocks();
+}
+
+function fxCompareEnter() {
+  if (fxCompareActive) { fxCompareDiscard(); return; }
+  if (fxCompareCleanupPromise || fxCompareStopping) {
+    fxPreviewSetStatus("上一輪仍在確認停止，暫時不能開始新比較。", "error");
+    return;
+  }
+  fxPreviewGeneration += 1;
+  clearTimeout(fxPreviewDebounceTimer); clearTimeout(fxPreviewPollTimer);
+  fxPreviewDebounceTimer = null; fxPreviewPollTimer = null;
+  fxCompareActive = true;
+  fxCompareSession += 1;
+  fxCompareCandidates = [];
+  fxCompareFrozen = null;
+  fxCompareStarting = false;
+  fxCompareConfirming = false;
+  fxCompareRoundStale = false;
+  fxCompareSelectedId = "";
+  fxCompareSelectionToken += 1;
+  fxPreviewReadySignature = "";
+  elements["fx-preview-confirm"].disabled = true;
+  fxPreviewCancelPromise = fxPreviewTrackLifecycle(fxPreviewCancelCurrentJob());
+  fxPreviewCancelPromise.catch((error) => fxPreviewSetStatus(`單款預覽停止失敗：${error.message}`, "error"));
+  fxPreviewSetStatus("比較模式：調整候選後按「加入比較」；準備期間不會產生預覽。", "success");
+  fxCompareRender();
+}
+
+function fxCompareDiscard() {
+  if (fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareCandidates.some((item) => item.job?.id)) {
+    void fxCompareStop();
+    return;
+  }
+  fxCompareResetState();
+  fxCompareRender();
+  fxPreviewSetStatus("已丟棄比較候選，回到單一風格試看。");
+}
+
+function fxCompareAdd() {
+  if (!fxCompareActive || !fxPreviewDraft || fxCompareCandidates.some((item) => item.state !== "queued") || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareCandidates.length >= 4) return;
+  const reason = fxCompareCandidateUsable(fxPreviewDraft);
+  if (reason) { fxPreviewSetStatus(reason, "error"); return; }
+  const draft = deepCopy(fxPreviewDraft);
+  const context = fxCompareContextForDraft(draft);
+  if (!fxCompareFrozen) fxCompareFrozen = context;
+  else if (!fxCompareSameContext(context, fxCompareFrozen)) {
+    fxPreviewSetStatus("候選必須保留首款凍結的版本、來源、替換目標、試看／套用範圍與預覽模式。", "error");
+    return;
+  }
+  const signature = JSON.stringify(draft);
+  if (fxCompareCandidates.some((item) => item.signature === signature)) {
+    fxPreviewSetStatus("這款設定已在比較清單中。", "error"); return;
+  }
+  fxCompareCandidates.push({ id: `fx-compare-${Date.now()}-${fxCompareCandidates.length}`, draft, signature, state: "queued", job: null, message: "等待開始" });
+  fxCompareRender();
+}
+
+function fxCompareRequestBody(candidate, anchorId, frozen) {
+  const draft = candidate.draft;
+  const body = {
+    schema_version: 1, expected_revision: frozen.revision,
+    candidate: { code: draft.code, window: deepCopy(draft.window), apply_window: deepCopy(draft.apply_window), values: deepCopy(draft.values || {}), placement: draft.placement || "", scheme: draft.scheme || "", font_ids: deepCopy(draft.font_ids || {}), text_fit: draft.text_fit !== false },
+    opacity: draft.opacity, preview_options: { ...(draft.preview_options || {}), mode: frozen.mode, quality: "standard" },
+  };
+  if (draft.code === "P5") body.candidate.subject = deepCopy(draft.subject);
+  if (draft.code === "B1") body.candidate.material = deepCopy(draft.material);
+  if (frozen.replace_overlay_id) body.replace_overlay_id = frozen.replace_overlay_id;
+  if (anchorId) body.comparison_anchor_job_id = anchorId;
+  return body;
+}
+
+async function fxCompareStart() {
+  if (!fxCompareActive || fxCompareCandidates.length < 3 || fxCompareCandidates.some((item) => item.state !== "queued") || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareRoundStale) return;
+  fxCompareStarting = true;
+  const session = fxCompareSession;
+  const frozen = deepCopy(fxCompareFrozen);
+  const candidates = fxCompareCandidates.slice();
+  const run = ++fxCompareRun;
+  fxCompareSelectedId = "";
+  fxCompareSelectionToken += 1;
+  elements["fx-preview-confirm"].disabled = true;
+  fxCompareRender();
+  try {
+    // A selection made just before Compare may have already crossed the POST
+    // boundary.  Wait for that response so its late job can be cancelled by
+    // the old generation before this serial queue claims the worker.
+    await fxPreviewWaitForLifecycles();
+    await Promise.resolve(fxPreviewCancelPromise);
+    if (fxPreviewUnverifiedJob?.id) {
+      const stopped = await fxCompareCancelAndVerify(fxPreviewUnverifiedJob);
+      fxPreviewUnverifiedJob = stopped.verified ? null : stopped.job;
+      if (!stopped.verified) throw new Error("上一個單款工作停止尚未確認");
+    }
+    const currentJob = fxPreviewJob;
+    if (currentJob?.id) {
+      const stopped = await fxCompareCancelAndVerify(currentJob);
+      if (!stopped.verified) throw new Error("單款預覽工作停止尚未確認");
+      if (session !== fxCompareSession || !fxCompareActive || fxCompareStopping) return;
+      fxPreviewJob = null;
+    }
+    if (stateDirty || !lastSaveSucceeded) await saveState(false, true);
+    if (stateDirty || !lastSaveSucceeded || !/^[0-9a-f]{64}$/i.test(String(state?.revision || ""))) throw new Error("目前編輯內容尚未成功儲存或版本無法確認");
+  } catch (error) {
+    if (session === fxCompareSession && fxCompareActive && !fxCompareStopping) fxPreviewSetStatus(`無法開始比較：${error.message}`, "error");
+    return;
+  } finally {
+    if (session === fxCompareSession) fxCompareStarting = false;
+  }
+  if (session !== fxCompareSession || !fxCompareActive || fxCompareStopping || run !== fxCompareRun) { fxCompareRender(); return; }
+  const currentContext = fxCompareContextForDraft(candidates[0]?.draft);
+  if (!fxCompareSameContext(currentContext, frozen)) {
+    fxCompareRoundStale = true;
+    fxPreviewSetStatus("專案或凍結比較內容已變更；本輪未送出，請丟棄後重新建立。", "error");
+    fxCompareRender();
+    return;
+  }
+  const mismatch = candidates.some((item) => !fxCompareSameContext(fxCompareContextForDraft(item.draft), frozen));
+  if (mismatch) {
+    fxCompareRoundStale = true;
+    fxPreviewSetStatus("候選的凍結比較內容不一致；本輪未送出。", "error");
+    fxCompareRender();
+    return;
+  }
+  fxCompareRunning = true;
+  fxCompareRender();
+  const queuePromise = fxCompareRunQueue({ id: run, session, frozen, candidates });
+  fxCompareQueuePromise = queuePromise;
+  try { await queuePromise; }
+  finally { if (fxCompareQueuePromise === queuePromise) fxCompareQueuePromise = null; }
+}
+
+function fxCompareErrorIsStale(error) {
+  if (Number(error?.status) !== 409) return false;
+  const reason = String(error?.reason || error?.code || "").toLowerCase();
+  return !["render_busy", "busy", "preview_busy"].includes(reason);
+}
+
+function fxCompareJobIsStale(job) {
+  const stateName = fxPreviewJobState(job);
+  const reason = String(job?.reason || job?.error?.code || job?.error_code || "").toLowerCase();
+  return stateName === "stale" || ["comparison_stale", "revision_conflict", "preview_stale", "source_changed", "source_stale"].includes(reason);
+}
+
+async function fxCompareRunQueue(run) {
+  let anchorId = "";
+  for (const candidate of run.candidates) {
+    if (run.id !== fxCompareRun || run.session !== fxCompareSession || fxCompareStopping || !fxCompareActive) break;
+    candidate.state = "running"; candidate.message = "預覽排隊中（待渲染，不是即時完成）"; fxCompareRender();
+    try {
+      const payload = await request("/api/fx-previews", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fxCompareRequestBody(candidate, anchorId, run.frozen)) });
+      const job = payload.job || payload;
+      candidate.job = job;
+      if (run.id !== fxCompareRun || run.session !== fxCompareSession || fxCompareStopping || !fxCompareActive) {
+        const stopped = await fxCompareCancelAndVerify(job, candidate);
+        if (!stopped.verified) fxCompareStopping = true;
+        break;
+      }
+      const terminal = await fxCompareWaitTerminal(candidate, run);
+      if (run.id !== fxCompareRun || run.session !== fxCompareSession || fxCompareStopping || !fxCompareActive) {
+        const stopped = await fxCompareCancelAndVerify(terminal || candidate.job, candidate);
+        if (!stopped.verified) fxCompareStopping = true;
+        break;
+      }
+      if (fxCompareJobIsStale(terminal)) {
+        candidate.state = "stale";
+        candidate.message = "比較內容已過期，整輪已停止。";
+        fxCompareRoundStale = true;
+        break;
+      }
+      if (!anchorId && terminal?.id && fxPreviewJobState(terminal) !== "cancelled") anchorId = terminal.id;
+    } catch (error) {
+      candidate.state = fxCompareErrorIsStale(error) ? "stale" : "failed";
+      candidate.message = candidate.state === "stale" ? "比較內容已過期，整輪已停止。" : `預覽失敗：${error.message}`;
+      if (candidate.state === "stale") { fxCompareRoundStale = true; break; }
+    }
+    fxCompareRender();
+  }
+  if (run.id !== fxCompareRun || run.session !== fxCompareSession) return;
+  fxCompareRunning = false;
+  if (fxCompareStopping) fxPreviewSetStatus("比較仍在停止；內容未套用。", "error");
+  else if (fxCompareRoundStale) fxPreviewSetStatus("比較內容已過期；整輪不可套用。", "error");
+  else fxPreviewSetStatus("比較完成。請明確選擇一款已完成的風格後再套用。", "success");
+  fxCompareRender();
+}
+
+async function fxCompareWaitTerminal(candidate, run) {
+  let job = candidate.job;
+  while (run.id === fxCompareRun && run.session === fxCompareSession && !fxCompareStopping && fxCompareActive) {
+    const status = String(job?.state || "pending").toLowerCase();
+    if (["ready", "cache_hit", "failed", "cancelled", "stale"].includes(status)) {
+      candidate.state = fxCompareJobIsStale(job) ? "stale" : status === "cache_hit" ? "ready" : status;
+      candidate.message = fxCompareJobIsStale(job) ? "比較內容已過期，整輪已停止。" : fxPreviewStatusForJob(job);
+      return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const payload = await request(job.status_url || `/api/fx-previews/${encodeURIComponent(job.id)}`);
+    job = payload.job || payload; candidate.job = job; candidate.message = fxPreviewStatusForJob(job); fxCompareRender();
+  }
+  return job;
+}
+
+function fxCompareEffectTimeForSourceTime(sourceTime, job) {
+  const map = Array.isArray(job?.time_map) ? job.time_map : [];
+  const point = Math.max(0, Number(sourceTime) || 0);
+  const segment = map.find((item) => point >= Number(item.source_start_s) - 0.001 && point <= Number(item.source_end_s) + 0.001);
+  if (segment) {
+    const sourceSpan = Math.max(0.001, Number(segment.source_end_s) - Number(segment.source_start_s));
+    const progress = Math.max(0, Math.min(1, (point - Number(segment.source_start_s)) / sourceSpan));
+    return Number(segment.output_start_s) + progress * (Number(segment.output_end_s) - Number(segment.output_start_s));
+  }
+  return Math.max(0, point - Number(fxCompareFrozen?.window?.start_s || 0));
+}
+
+function fxCompareSelectionCurrent(session, token, candidateId, jobId) {
+  const candidate = fxCompareCandidates.find((item) => item.id === candidateId);
+  return Boolean(elements["fx-preview-dialog"]?.open
+    && session === fxCompareSession
+    && token === fxCompareSelectionToken
+    && fxCompareSelectedId === candidateId
+    && candidate?.job?.id === jobId);
+}
+
+function fxCompareSelect(id) {
+  const candidate = fxCompareCandidates.find((item) => item.id === id);
+  if (!candidate || candidate.state !== "ready" || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareRoundStale) return;
+  const sourceVideo = elements["fx-preview-source-video"];
+  const video = elements["fx-preview-video"];
+  const sourceTime = Number.isFinite(Number(sourceVideo?.currentTime))
+    ? Number(sourceVideo.currentTime)
+    : fxPreviewSourceTimeForEffectTime(Number(video?.currentTime || 0));
+  const wasPlaying = Boolean((video && !video.paused) || (sourceVideo && !sourceVideo.paused));
+  fxCompareSelectedId = id;
+  const session = fxCompareSession;
+  const selectionToken = ++fxCompareSelectionToken;
+  fxPreviewDraft = deepCopy(candidate.draft);
+  fxPreviewDraftSignature = candidate.signature;
+  fxPreviewJob = deepCopy(candidate.job);
+  fxPreviewReadySignature = candidate.signature;
+  // Keep the persistent editor description bound to the same frozen candidate
+  // as the selected media/job. Rendering does not schedule a new preview; the
+  // comparison render below reapplies the round interaction locks.
+  fxPreviewRenderDialog();
+  fxPreviewSetVisibleMedia(candidate.job);
+  const jobId = candidate.job?.id;
+  const effectTime = fxCompareEffectTimeForSourceTime(sourceTime, candidate.job);
+  const applyMedia = () => {
+    if (!fxCompareSelectionCurrent(session, selectionToken, id, jobId)) return;
+    if (sourceVideo) sourceVideo.currentTime = sourceTime;
+    video.currentTime = effectTime;
+    fxPreviewSyncVideos("effect");
+    if (wasPlaying) {
+      video.play().catch(() => {});
+      sourceVideo?.play().catch(() => {});
+    } else {
+      video.pause();
+      sourceVideo?.pause();
+    }
+  };
+  if (video.src !== new URL(candidate.job.media_url, location.href).href) {
+    video.src = candidate.job.media_url;
+    video.addEventListener("loadedmetadata", applyMedia, { once: true });
+    video.load();
+  } else applyMedia();
+  fxPreviewPrepareSourceVideo();
+  elements["fx-preview-confirm"].disabled = false;
+  fxPreviewSetStatus("已選擇比較候選；尚未套用到時間軸。", "success");
+  fxCompareRender();
+}
+
+async function fxCompareStop(closeAfter = false) {
+  if (closeAfter) fxCompareCloseRequested = true;
+  if (fxCompareConfirming) return false;
+  if (fxCompareCleanupPromise) return fxCompareCleanupPromise;
+  const retrying = fxCompareStopping;
+  if (retrying) fxCompareCandidates.forEach((candidate) => {
+    if (candidate.state === "stopping") candidate.state = "running";
+  });
+  fxCompareStopping = true;
+  fxCompareStarting = false;
+  fxCompareRunning = false;
+  fxCompareRun += 1;
+  fxCompareSelectionToken += 1;
+  elements["fx-preview-confirm"].disabled = true;
+  fxCompareRender();
+  const cleanup = (async () => {
+    await fxPreviewWaitForLifecycles();
+    if (fxCompareQueuePromise) await Promise.allSettled([fxCompareQueuePromise]);
+    let verified = true;
+    for (const candidate of fxCompareCandidates) {
+      if (!candidate.job?.id) continue;
+      if (candidate.state === "stopping") {
+        verified = false;
+        continue;
+      }
+      const stateName = fxPreviewJobState(candidate.job);
+      if (["cancelled", "failed", "stale"].includes(stateName) && fxPreviewJobTerminationVerified(candidate.job)) continue;
+      const result = await fxCompareCancelAndVerify(candidate.job, candidate);
+      if (!result.verified) verified = false;
+    }
+    if (!verified) {
+      fxPreviewSetStatus("停止尚未獲得終止確認；維持停止中，禁止開始新工作。", "error");
+      fxCompareRender();
+      return false;
+    }
+    const shouldClose = fxCompareCloseRequested;
+    fxCompareResetState();
+    fxCompareRender();
+    if (shouldClose && elements["fx-preview-dialog"]?.open) elements["fx-preview-dialog"].close("cancel");
+    else fxPreviewSetStatus("已停止並丟棄比較候選，回到單一風格試看。");
+    return true;
+  })();
+  fxCompareCleanupPromise = cleanup;
+  try { return await cleanup; }
+  finally { if (fxCompareCleanupPromise === cleanup) fxCompareCleanupPromise = null; }
 }
 
 function fxPreviewChangedMessage() {
@@ -2805,6 +3338,12 @@ function fxPreviewChangedMessage() {
 
 function fxPreviewInvalidateAndSchedule(keepVisiblePreview = false) {
   if (!fxPreviewDraft || !elements["fx-preview-dialog"]?.open) return;
+  if (fxCompareActive) {
+    fxPreviewReadySignature = "";
+    elements["fx-preview-confirm"].disabled = true;
+    fxPreviewSetStatus("比較模式中：變更候選不會產生單一預覽，請按「加入比較」。");
+    return;
+  }
   fxPreviewGeneration += 1;
   const generation = fxPreviewGeneration;
   clearTimeout(fxPreviewDebounceTimer);
@@ -2825,8 +3364,9 @@ function fxPreviewInvalidateAndSchedule(keepVisiblePreview = false) {
     }
   }
   fxPreviewSetStatus(fxPreviewChangedMessage());
-  const cancellation = fxPreviewCancelCurrentJob();
+  const cancellation = fxPreviewTrackLifecycle(fxPreviewCancelCurrentJob());
   fxPreviewCancelPromise = cancellation;
+  cancellation.catch(() => {});
   const effect = fxEffectByCode(fxPreviewDraft.code);
   if (fxPreviewIsBlocked(effect)) {
     fxPreviewSetStatus("B1 需要B-roll素材，請先至素材區處理", "error");
@@ -2837,7 +3377,11 @@ function fxPreviewInvalidateAndSchedule(keepVisiblePreview = false) {
     return;
   }
   fxPreviewDebounceTimer = setTimeout(async () => {
-    await cancellation;
+    try { await cancellation; }
+    catch (error) {
+      if (generation === fxPreviewGeneration) fxPreviewSetStatus(`舊預覽停止失敗：${error.message}`, "error");
+      return;
+    }
     if (generation !== fxPreviewGeneration) return;
     await fxPreviewStart(generation, fxPreviewDraftSignature);
   }, 350);
@@ -2876,18 +3420,30 @@ async function fxPreviewStart(generation, signature, _keepExistingPreview = fals
     if (fxPreviewDraft.code === "B1" && fxPreviewDraft.material) body.candidate.material = { ...fxPreviewDraft.material };
     if (fxPreviewReplaceOverlayId) body.replace_overlay_id = fxPreviewReplaceOverlayId;
     fxPreviewSetStatus("預覽排隊中（待渲染，不是即時完成）");
-    const payload = await request("/api/fx-previews", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const job = payload.job || payload;
-    if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature) {
-      // The POST may have completed after the user selected another style or
-      // closed the dialog. Do not orphan that worker: cancel the returned job.
-      if (job?.id) await fxPreviewCancelJobId(job.id);
-      return;
-    }
+    const lifecycle = fxPreviewTrackLifecycle((async () => {
+      const payload = await request("/api/fx-previews", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const job = payload.job || payload;
+      if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !elements["fx-preview-dialog"]?.open) {
+        // A single-preview lifecycle is not complete until a late returned job
+        // has a verified terminal cancellation. Compare/reopen cannot pass it.
+        const stopped = await fxCompareCancelAndVerify(job);
+        if (!stopped.verified) {
+          fxPreviewUnverifiedJob = stopped.job || job;
+          throw new Error("晚回單款預覽的停止狀態未確認");
+        }
+        if (fxPreviewUnverifiedJob?.id === job?.id) fxPreviewUnverifiedJob = null;
+        return { stale: true, job: stopped.job };
+      }
+      return { stale: false, payload, job };
+    })());
+    const outcome = await lifecycle;
+    if (outcome.stale) return;
+    const payload = outcome.payload;
+    const job = outcome.job;
     fxPreviewApplyJob(job, generation, signature);
     const stateName = String(job?.state || "pending").toLowerCase();
     if (!["ready", "cache_hit", "failed", "cancelled"].includes(stateName)) {
@@ -2940,12 +3496,17 @@ async function fxPreviewPoll(statusUrl, generation, signature) {
 }
 
 function fxPreviewDraftChanged() {
+  if (fxCompareRoundLocked()) {
+    fxPreviewSetStatus("比較已開始；請先丟棄本輪再修改候選。", "error");
+    return;
+  }
   fxPreviewUpdateWindowControls();
   fxPreviewPersistDraft();
   fxPreviewInvalidateAndSchedule();
 }
 
 function fxPreviewSelectEffect(code) {
+  if (fxCompareRoundLocked()) return;
   const effect = fxEffectByCode(code);
   if (!effect) return;
   const overlay = fxPreviewReplaceOverlay();
@@ -2982,6 +3543,10 @@ function fxPreviewInstallCatalogBreakpointListener() {
 function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "", portablePreset = null) {
   const dialog = elements["fx-preview-dialog"];
   if (!dialog) return;
+  if (fxCompareCleanupPromise || fxCompareStopping || fxPreviewLifecycles.size || fxPreviewUnverifiedJob) {
+    showToast("上一個預覽仍在確認停止，完成前不能開啟新一輪。", "error");
+    return;
+  }
   if (dialog.open) dialog.close("replace");
   fxPreviewConfirmed = false;
   fxPreviewTrigger = trigger instanceof HTMLElement ? trigger : document.activeElement;
@@ -3038,16 +3603,34 @@ async function confirmFxPreview() {
   const dialog = elements["fx-preview-dialog"];
   const effect = fxEffectByCode(fxPreviewDraft?.code);
   if (!dialog?.open || !fxPreviewJob?.id || !effect || fxPreviewReadySignature !== fxPreviewDraftSignature) return;
+  const selected = fxCompareActive
+    ? fxCompareCandidates.find((item) => item.id === fxCompareSelectedId && item.state === "ready" && item.job?.id === fxPreviewJob.id)
+    : null;
+  if (fxCompareActive && (!selected || fxCompareStarting || fxCompareRunning || fxCompareStopping || fxCompareConfirming || fxCompareRoundStale)) return;
+  const confirmSnapshot = {
+    comparison: Boolean(fxCompareActive),
+    session: fxCompareSession,
+    selection_token: fxCompareSelectionToken,
+    candidate_id: selected?.id || "",
+    job_id: String(selected?.job?.id || fxPreviewJob.id),
+    revision: String(fxCompareActive ? fxCompareFrozen?.revision : state.revision),
+  };
   const before = deepCopy(state);
   const code = fxPreviewDraft.code;
+  if (confirmSnapshot.comparison) fxCompareConfirming = true;
   elements["fx-preview-confirm"].disabled = true;
   fxPreviewSetStatus("正在套用到時間軸…");
+  fxCompareRender();
   try {
-    const result = await request(`/api/fx-previews/${encodeURIComponent(fxPreviewJob.id)}/confirm`, {
+    const result = await request(`/api/fx-previews/${encodeURIComponent(confirmSnapshot.job_id)}/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expected_revision: state.revision }),
+      body: JSON.stringify({ expected_revision: confirmSnapshot.revision }),
     });
+    if (confirmSnapshot.comparison && (!fxCompareSelectionCurrent(confirmSnapshot.session, confirmSnapshot.selection_token, confirmSnapshot.candidate_id, confirmSnapshot.job_id) || !fxCompareConfirming)) {
+      fxCompareRoundStale = true;
+      throw new Error("套用回應已不屬於目前比較輪次，請重新載入確認時間軸");
+    }
     if (!result.state || typeof result.state !== "object") throw new Error("伺服器沒有回傳更新後的時間軸");
     history.push(before);
     if (history.length > 40) history.shift();
@@ -3081,32 +3664,54 @@ async function confirmFxPreview() {
     fxPreviewJob = null;
     clearTimeout(fxPreviewPollTimer);
     elements["fx-preview-video"].pause();
+    if (confirmSnapshot.comparison) fxCompareResetState();
     dialog.close("confirm");
   } catch (error) {
     if (error.status === 409) {
       fxPreviewJob = null;
       fxPreviewReadySignature = "";
-      fxPreviewSetStatus("專案已更新，請關閉試看並重新載入後再試。", "error");
+      if (confirmSnapshot.comparison) {
+        fxCompareRoundStale = true;
+        fxCompareCandidates.forEach((candidate) => {
+          if (["ready", "running", "queued"].includes(candidate.state)) candidate.state = "stale";
+        });
+      }
+      fxPreviewSetStatus(confirmSnapshot.comparison ? "專案已更新；整輪比較已失效，不能套用任何候選。" : "專案已更新，請關閉試看並重新載入後再試。", "error");
       elements["fx-preview-retry"].hidden = true;
       elements["fx-preview-confirm"].disabled = true;
       return;
     }
     fxPreviewSetStatus(`套用失敗：${error.message}`, "error");
-    elements["fx-preview-confirm"].disabled = false;
+    elements["fx-preview-confirm"].disabled = confirmSnapshot.comparison || fxCompareRoundStale;
+  } finally {
+    if (confirmSnapshot.comparison && confirmSnapshot.session === fxCompareSession) {
+      fxCompareConfirming = false;
+      fxCompareRender();
+    }
   }
 }
 
 function closeFxPreviewDialog() {
-  if (elements["fx-preview-dialog"]?.open) elements["fx-preview-dialog"].close("cancel");
+  if (!elements["fx-preview-dialog"]?.open || fxCompareConfirming) return;
+  if (fxCompareActive || fxCompareStopping || fxCompareCleanupPromise) {
+    void fxCompareStop(true);
+    return;
+  }
+  elements["fx-preview-dialog"].close("cancel");
 }
 
 function cleanupFxPreviewDialog() {
+  const comparisonWasActive = fxCompareActive || fxCompareStopping;
+  if (comparisonWasActive && !fxPreviewConfirmed) void fxCompareStop(false);
   clearTimeout(fxPreviewDebounceTimer);
   clearTimeout(fxPreviewPollTimer);
   fxPreviewDebounceTimer = null;
   fxPreviewPollTimer = null;
   fxPreviewGeneration += 1;
-  if (!fxPreviewConfirmed) fxPreviewCancelPromise = fxPreviewCancelCurrentJob();
+  if (!fxPreviewConfirmed && !comparisonWasActive) {
+    fxPreviewCancelPromise = fxPreviewTrackLifecycle(fxPreviewCancelCurrentJob());
+    fxPreviewCancelPromise.catch(() => {});
+  } else if (comparisonWasActive) fxPreviewJob = null;
   const video = elements["fx-preview-video"];
   if (video) {
     video.pause();
@@ -4632,6 +5237,10 @@ function bindEvents() {
   });
   elements["fx-search"].addEventListener("input", () => { const overlay = currentOverlay(); if (overlay?.type === "fx") renderFxPanel(overlay); });
   elements["fx-preview-search"].addEventListener("input", fxPreviewRenderCatalog);
+  elements["fx-preview-compare-toggle"].addEventListener("click", fxCompareEnter);
+  elements["fx-preview-compare-add"].addEventListener("click", fxCompareAdd);
+  elements["fx-preview-compare-start"].addEventListener("click", fxCompareStart);
+  elements["fx-preview-compare-discard"].addEventListener("click", fxCompareDiscard);
   elements["fx-preview-source"].addEventListener("input", () => {
     if (!fxPreviewDraft) return;
     fxPreviewDraft.window.start_s = Number(elements["fx-preview-source"].value) || 0;
@@ -4677,7 +5286,7 @@ function bindEvents() {
     fxPreviewUpgradeCancelled = true;
     elements["fx-preview-cancel-upgrade"].hidden = true;
     elements["fx-preview-confirm"].disabled = true;
-    fxPreviewCancelCurrentJob();
+    fxPreviewTrackLifecycle(fxPreviewCancelCurrentJob()).catch(() => {});
     fxPreviewSetStatus("已取消清晰版；快速版仍可播放，但必須取得清晰版才能套用。", "error");
   });
   elements["fx-preview-layout-check-toggle"].addEventListener("click", fxPreviewToggleTextLayoutDetails);
@@ -4696,16 +5305,26 @@ function bindEvents() {
   elements["fx-preview-confirm"].addEventListener("click", confirmFxPreview);
   elements["fx-preview-cancel"].addEventListener("click", closeFxPreviewDialog);
   elements["fx-preview-close"].addEventListener("click", closeFxPreviewDialog);
+  elements["fx-preview-dialog"].addEventListener("cancel", (event) => {
+    if (!fxCompareActive && !fxCompareStopping && !fxCompareConfirming) return;
+    event.preventDefault();
+    if (!fxCompareConfirming) closeFxPreviewDialog();
+  });
   elements["fx-preview-dialog"].addEventListener("close", cleanupFxPreviewDialog);
   window.addEventListener("beforeunload", () => {
-    const job = fxPreviewJob;
-    if (!job?.id || fxPreviewConfirmed) return;
-    fetch(`/api/fx-previews/${encodeURIComponent(job.id)}/cancel`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Auto-Edit-CSRF": csrfToken },
-      body: JSON.stringify({}),
-      keepalive: true,
-    }).catch(() => {});
+    if (fxPreviewConfirmed) return;
+    const jobs = [fxPreviewJob, ...fxCompareCandidates.map((candidate) => candidate.job)]
+      .filter((job) => job?.id && !["cancelled", "failed", "stale"].includes(fxPreviewJobState(job)));
+    [...new Map(jobs.map((job) => [String(job.id), job])).values()].forEach((job) => {
+      // Unload delivery is best-effort. Do not mutate local state or claim
+      // termination: the next session must still respect any cleanup guard.
+      fetch(`/api/fx-previews/${encodeURIComponent(job.id)}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Auto-Edit-CSRF": csrfToken },
+        body: JSON.stringify({}),
+        keepalive: true,
+      }).catch(() => {});
+    });
   });
   // The 風格菜單 tab (/fx-menu) adds fx layers server-side; pick them up without a manual reload.
   window.addEventListener("message", (event) => {

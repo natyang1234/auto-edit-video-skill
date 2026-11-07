@@ -1,0 +1,13 @@
+/* Comparison is intentionally a small addition to the existing paper/darkroom UI. */
+.fx-compare-sticky-summary { position: relative; z-index: 1; margin: 10px -4px 12px; padding: 8px 4px 6px; background: var(--paper-0); }
+.fx-compare-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.fx-compare-controls .button { min-height: 40px; }
+.fx-compare-note { margin: 0 0 9px; color: oklch(79% .04 75); font-size: .78rem; line-height: 1.45; }
+.fx-compare-candidates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0 0 10px; }
+.fx-compare-card { min-height: 58px; padding: 9px; border: 1px solid oklch(64% .06 67 / .7); color: var(--paper-0); background: oklch(24% .024 55); text-align: left; }
+.fx-compare-card strong, .fx-compare-card span { display: block; }
+.fx-compare-card span { margin-top: 3px; color: oklch(76% .025 73); font-size: .72rem; }
+.fx-compare-card[data-state="failed"], .fx-compare-card[data-state="stale"] { border-color: oklch(62% .15 28 / .8); }
+.fx-compare-card[aria-pressed="true"] { outline: 2px solid var(--vermilion); outline-offset: 1px; }
+.fx-compare-card:disabled { opacity: .72; cursor: default; }
+@media (max-width: 760px) { .fx-compare-candidates { grid-template-columns: 1fr; max-height: 24dvh; overflow: auto; } .fx-compare-controls .button { flex: 1 1 42%; } }
