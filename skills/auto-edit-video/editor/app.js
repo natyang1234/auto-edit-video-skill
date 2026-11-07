@@ -49,6 +49,7 @@ let fxPreviewCancelPromise = null;
 let fxPreviewGeneration = 0;
 let fxPreviewReadySignature = "";
 let fxPreviewDraftSignature = "";
+let fxPreviewCatalogBreakpoint = null;
 let fxPreviewConfirmed = false;
 let activeFxPreviewCategory = "";
 let fxPreviewLibraryFilter = "";
@@ -2941,6 +2942,29 @@ function fxPreviewSelectEffect(code) {
   fxPreviewInvalidateAndSchedule();
 }
 
+function fxPreviewSyncCatalogDisclosure(event) {
+  const dialog = elements["fx-preview-dialog"];
+  const catalogDisclosure = document.getElementById("fx-preview-catalog-disclosure");
+  if (!dialog?.open || !catalogDisclosure) return;
+  const isMobile = typeof event?.matches === "boolean"
+    ? event.matches
+    : (fxPreviewCatalogBreakpoint?.matches ?? window.matchMedia("(max-width: 760px)").matches);
+  const shouldOpen = !isMobile;
+  if (catalogDisclosure.open === shouldOpen) return;
+
+  const summary = catalogDisclosure.querySelector("summary");
+  const activeElement = document.activeElement;
+  const focusWasInCatalog = catalogDisclosure.contains(activeElement);
+  catalogDisclosure.open = shouldOpen;
+  if (!shouldOpen && focusWasInCatalog) summary?.focus();
+}
+
+function fxPreviewInstallCatalogBreakpointListener() {
+  if (fxPreviewCatalogBreakpoint) return;
+  fxPreviewCatalogBreakpoint = window.matchMedia("(max-width: 760px)");
+  fxPreviewCatalogBreakpoint.addEventListener("change", fxPreviewSyncCatalogDisclosure);
+}
+
 function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "") {
   const dialog = elements["fx-preview-dialog"];
   if (!dialog) return;
@@ -2979,8 +3003,8 @@ function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId 
   clearTimeout(fxPreviewPollTimer);
   fxPreviewRenderDialog();
   const catalogDisclosure = document.getElementById("fx-preview-catalog-disclosure");
-  catalogDisclosure.open = !window.matchMedia("(max-width: 760px)").matches;
   dialog.showModal();
+  fxPreviewSyncCatalogDisclosure();
   dialog.querySelector(".fx-preview-editor-scroll").scrollTop = 0;
   fxPreviewPrepareSourceVideo();
   fxPreviewRenderDraftNotice();
@@ -4442,6 +4466,7 @@ function renderAll() {
 }
 
 function bindEvents() {
+  fxPreviewInstallCatalogBreakpointListener();
   elements["save-button"].addEventListener("click", () => saveState(true));
   elements["render-button"].addEventListener("click", () => startRender("preview"));
   elements["render-final"].addEventListener("click", () => startRender("final"));
