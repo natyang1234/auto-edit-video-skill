@@ -2143,7 +2143,7 @@ class StylePresetApiTests(unittest.TestCase):
             self.harness.project / "project.json",
         )
         before = {path: path.read_bytes() for path in paths}
-        journal = self.harness.project / "working/caption-preset-transaction.json"
+        journal = self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
         self.assertFalse(journal.exists())
 
         with patch.object(
@@ -2170,7 +2170,7 @@ class StylePresetApiTests(unittest.TestCase):
         self.addCleanup(os_proxy.stop)
         state_path = self.harness.project / "working/editor_state.json"
         manifest_path = self.harness.project / "project.json"
-        journal_path = self.harness.project / "working/caption-preset-transaction.json"
+        journal_path = self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
         store_path = self.harness.server.style_preset_store.path
 
         def authority_snapshot() -> dict[Path, bytes | None]:
@@ -2407,7 +2407,7 @@ class StylePresetApiTests(unittest.TestCase):
                 store_path = self.harness.server.style_preset_store.path
                 state_path = self.harness.project / "working/editor_state.json"
                 manifest_path = self.harness.project / "project.json"
-                journal_path = self.harness.project / "working/caption-preset-transaction.json"
+                journal_path = self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
                 before = {
                     "store": store_path.read_bytes(),
                     "state": state_path.read_bytes(),
@@ -2470,7 +2470,7 @@ class StylePresetApiTests(unittest.TestCase):
         valid_raw = store_path.read_bytes()
         state_path = self.harness.project / "working/editor_state.json"
         manifest_path = self.harness.project / "project.json"
-        journal_path = self.harness.project / "working/caption-preset-transaction.json"
+        journal_path = self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
         timestamp = "2026-11-08T00:00:00Z"
         surrogate_document = {
             "schema_version": 1,
