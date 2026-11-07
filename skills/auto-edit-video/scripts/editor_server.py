@@ -372,6 +372,71 @@ def atomic_write_json(path: Path, payload: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@dataclasses.dataclass
+class BatchAuxiliaryPublication:
+    """Exact ownership of one batch member's mutable receipt records."""
+
+    render_id: str
+    before: dict[Path, bytes | None] = dataclasses.field(default_factory=dict)
+    published_sha256: dict[Path, str] = dataclasses.field(default_factory=dict)
+
+    @staticmethod
+    def _read_regular(path: Path) -> bytes | None:
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(f"batch auxiliary record is not a regular file: {path}")
+        return path.read_bytes()
+
+    def bind_json(self, path: Path, payload: Any) -> None:
+        if path in self.before:
+            raise RuntimeError(f"batch auxiliary record was bound twice: {path}")
+        raw = (
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        self.before[path] = self._read_regular(path)
+        self.published_sha256[path] = hashlib.sha256(raw).hexdigest()
+
+    def rollback(self) -> tuple[list[str], list[str]]:
+        leaked_paths: list[str] = []
+        rollback_errors: list[str] = []
+        for path in reversed(tuple(self.before)):
+            prior = self.before[path]
+            expected_sha = self.published_sha256[path]
+            try:
+                current = self._read_regular(path)
+                if current == prior:
+                    continue
+                if current is None or hashlib.sha256(current).hexdigest() != expected_sha:
+                    raise RuntimeError("record changed after batch member publication")
+                if prior is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write_exact(path, prior)
+                if self._read_regular(path) != prior:
+                    raise RuntimeError("record did not match its pre-batch bytes after rollback")
+            except (OSError, RuntimeError) as exc:
+                rollback_errors.append(f"{self.render_id}: {path}: {exc}")
+                leaked_paths.append(str(path))
+        return leaked_paths, rollback_errors
+
+
+class BatchAuxiliaryRollbackError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        leaked_paths: list[str],
+        rollback_errors: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.leaked_paths = tuple(leaked_paths)
+        self.rollback_errors = tuple(rollback_errors)
+
+
 def _editor_render_revision_payload(
     state: dict[str, Any], *, include_audio_event_edits: bool
 ) -> dict[str, Any]:
@@ -3956,6 +4021,10 @@ class EditorServer(ThreadingHTTPServer):
         self.asset_provider_service = AssetProviderService(self.project_dir)
         self.style_preset_store = style_presets.StylePresetStore()
         self.project_lock = threading.RLock()
+        # Studio-managed authority writers reserve this project under the same
+        # lock used by caption transactions.  Disk pipeline_status is display
+        # state only and may legitimately survive a crashed Studio process.
+        self.pipeline_active_owner: object | None = None
         self.caption_job_lock = threading.Lock()
         self.caption_render_serial = threading.Lock()
         self.caption_job: dict[str, Any] = {
@@ -3976,6 +4045,39 @@ class EditorServer(ThreadingHTTPServer):
             context_provider=self.fx_preview_context,
             timeline_snapshot_builder=self.fx_preview_timeline_snapshot,
         )
+
+    def public_pipeline_status(self) -> dict[str, Any]:
+        """Project pipeline state with crashed Studio reservations projected idle-safe."""
+        with self.project_lock:
+            payload = read_json(
+                self.project_dir / "working/pipeline_status.json",
+                {
+                    "state": "not_started",
+                    "phase": "idle",
+                    "message": "這個專案尚未啟動本機自動處理。",
+                },
+            )
+            if not isinstance(payload, dict):
+                return {
+                    "state": "needs_attention",
+                    "phase": "interrupted",
+                    "error_code": "pipeline_status_invalid",
+                    "message": "自動處理狀態無法讀取，請重新啟動 Studio。",
+                }
+            projected = dict(payload)
+            if (
+                projected.get("state") == "running"
+                and self.pipeline_active_owner is None
+            ):
+                projected.update(
+                    {
+                        "state": "needs_attention",
+                        "phase": "interrupted",
+                        "error_code": "pipeline_interrupted",
+                        "message": "上次自動處理已中斷；可重新啟動處理。",
+                    }
+                )
+            return projected
 
     def fx_preview_context(self) -> dict[str, Any]:
         """Return a read-only, revision-bound snapshot for the preview manager."""
@@ -4692,13 +4794,9 @@ class EditorHandler(BaseHTTPRequestHandler):
             body = self._require_exact_fields(self.read_json_body(), fields, "字幕預設套用")
             plan_body = {key: value for key, value in body.items() if key != "plan_digest"}
             with self.server.project_lock:
-                pipeline_status = read_json(
-                    self.server.project_dir / "working/pipeline_status.json", {}
-                ) or {}
                 if (
                     self.server.render_status.get("state") in {"running", "rendering"}
-                    or not isinstance(pipeline_status, dict)
-                    or pipeline_status.get("state") == "running"
+                    or self.server.pipeline_active_owner is not None
                 ):
                     raise style_presets.StylePresetError(
                         409,
@@ -5820,14 +5918,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 },
             ),
             "highlight_plan": read_json(project / "working/highlight_plan.json", {}),
-            "pipeline_status": read_json(
-                project / "working/pipeline_status.json",
-                {
-                    "state": "not_started",
-                    "phase": "idle",
-                    "message": "這個專案尚未啟動本機自動處理。",
-                },
-            ),
+            "pipeline_status": self.server.public_pipeline_status(),
             "approval_revisions": approval_revisions(project, state),
             "approval_current": {
                 gate: approval_is_current(project, manifest, gate, state)
@@ -5896,14 +5987,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/pipeline-status":
-            pipeline_status = read_json(
-                project / "working/pipeline_status.json",
-                {
-                    "state": "not_started",
-                    "phase": "idle",
-                    "message": "這個專案尚未啟動本機自動處理。",
-                },
-            )
+            pipeline_status = self.server.public_pipeline_status()
             if (
                 pipeline_status.get("state") == "running"
                 and pipeline_status.get("phase") == "semantic_calibration"
@@ -6534,7 +6618,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             self._dispatch_project_mutation(self.handle_render_batch)
             return
         if path == "/api/cover":
-            self.handle_cover()
+            self._dispatch_project_mutation(self.handle_cover)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -7385,7 +7469,11 @@ class EditorHandler(BaseHTTPRequestHandler):
         batch_id: str,
         job: dict[str, Any],
         state_revision: str,
-    ) -> tuple[dict[str, Any], delivery_envelope.DeferredPublication]:
+    ) -> tuple[
+        dict[str, Any],
+        delivery_envelope.DeferredPublication,
+        BatchAuxiliaryPublication,
+    ]:
         """Render, QA and *reversibly* publish one frozen final snapshot.
 
         Phase 4 batch route: the member is published through the same Phase 0b
@@ -7405,7 +7493,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         output.parent.mkdir(parents=True, exist_ok=True)
         staging: delivery_envelope.StagingAttempt | None = None
         publication: delivery_envelope.DeferredPublication | None = None
+        auxiliary: BatchAuxiliaryPublication | None = None
         handed_off = False
+        publication_lock_held = False
         try:
             staging = delivery_envelope.begin_staging(
                 project_dir, render_id, expected_output=output
@@ -7561,6 +7651,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                 route="batch",
             )
             delivery_envelope.write_prepared_envelope(staging.stage_dir, prepared)
+            self.server.project_lock.acquire()
+            publication_lock_held = True
+            ensure_caption_preset_mutation_ready(self.server.project_dir)
             publication = delivery_envelope.publish_direct_delivery(
                 project_dir,
                 staging,
@@ -7591,6 +7684,8 @@ class EditorHandler(BaseHTTPRequestHandler):
                 / "working/render_receipts"
                 / f"{render_id}.json"
             )
+            auxiliary = BatchAuxiliaryPublication(render_id)
+            auxiliary.bind_json(render_receipt_path, render_receipt)
             atomic_write_json(render_receipt_path, render_receipt)
             # The published report is envelope-bound; rewriting it here would
             # break the finalized hash binding.
@@ -7623,20 +7718,37 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "human_review_required": True,
                 "completed_at": now_utc(),
             }
-            atomic_write_json(
-                self.server.project_dir / "working/delivery_qa" / f"{render_id}.json",
-                delivery,
+            member_qa_path = (
+                self.server.project_dir / "working/delivery_qa" / f"{render_id}.json"
             )
+            auxiliary.bind_json(member_qa_path, delivery)
+            atomic_write_json(member_qa_path, delivery)
             handed_off = True
-            return delivery, publication
+            self.server.project_lock.release()
+            publication_lock_held = False
+            return delivery, publication, auxiliary
         finally:
+            if publication_lock_held:
+                self.server.project_lock.release()
+            cleanup_leaks: list[str] = []
+            cleanup_errors: list[str] = []
             if publication is not None and not handed_off:
                 # The member never reached the batch transaction; restore the
                 # exact prior public state rather than leaking a half member.
                 try:
                     delivery_envelope.abort_deferred_publication(publication)
-                except (OSError, delivery_envelope.DeliveryEnvelopeError):
-                    pass
+                except (OSError, delivery_envelope.DeliveryEnvelopeError) as exc:
+                    cleanup_errors.append(f"{render_id}: {exc}")
+                    paths = [
+                        str(path)
+                        for path in getattr(exc, "leaked_paths", ())
+                    ] or [str(publication.expected_output)]
+                    cleanup_leaks.extend(paths)
+            if auxiliary is not None and not handed_off:
+                with self.server.project_lock:
+                    leaked, errors = auxiliary.rollback()
+                cleanup_leaks.extend(path for path in leaked if path not in cleanup_leaks)
+                cleanup_errors.extend(errors)
             if staging is not None:
                 # Publication never started or failed before taking the
                 # journal; releasing the lease must not mask the real error.
@@ -7646,6 +7758,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                     )
                 except (OSError, delivery_envelope.DeliveryEnvelopeError):
                     pass
+            if cleanup_errors:
+                raise BatchAuxiliaryRollbackError(
+                    "batch member rollback was incomplete",
+                    leaked_paths=cleanup_leaks,
+                    rollback_errors=cleanup_errors,
+                )
 
     def render_batch_worker(
         self,
@@ -7662,6 +7780,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         current_clip_id: str | None = None
         # Every member is published reversibly until the whole batch is bound.
         pending: list[delivery_envelope.DeferredPublication] = []
+        pending_auxiliary: dict[str, BatchAuxiliaryPublication] = {}
         archive_published = False
         delivery_declared = False
         commit_cleanup_pending: list[str] = []
@@ -7675,10 +7794,11 @@ class EditorHandler(BaseHTTPRequestHandler):
                         "current_index": index,
                     }
                 )
-                item, publication = self.render_batch_item(
+                item, publication, auxiliary = self.render_batch_item(
                     batch_id, job, state_revision
                 )
                 pending.append(publication)
+                pending_auxiliary[publication.render_id] = auxiliary
                 item["archive_name"] = f"{index:02d}-{Path(str(item['output'])).name}"
                 completed.append(item)
                 self.server.render_status.update(
@@ -7846,6 +7966,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 # Committed and public; any leftover stage cleanup is replayable
                 # and therefore reported, never rolled back.
                 commit_cleanup_pending = list(cleanup_errors)
+                pending_auxiliary.clear()
                 final_approval = manifest.setdefault("approvals", {}).get("final")
                 if isinstance(final_approval, dict) and final_approval.get("approved"):
                     manifest["approvals"]["final"] = {
@@ -7910,8 +8031,8 @@ class EditorHandler(BaseHTTPRequestHandler):
         ) as exc:
             # A batch is one delivery: no member survives a failed batch, and
             # the previous publication has to come back byte for byte.
-            leaked_paths: list[str] = []
-            rollback_errors: list[str] = []
+            leaked_paths: list[str] = list(getattr(exc, "leaked_paths", ()))
+            rollback_errors: list[str] = list(getattr(exc, "rollback_errors", ()))
             for publication in reversed(pending):
                 try:
                     delivery_envelope.abort_deferred_publication(
@@ -7933,7 +8054,16 @@ class EditorHandler(BaseHTTPRequestHandler):
                     leaked_paths.extend(
                         path for path in paths if path not in leaked_paths
                     )
+                auxiliary = pending_auxiliary.pop(publication.render_id, None)
+                if auxiliary is not None:
+                    with self.server.project_lock:
+                        paths, errors = auxiliary.rollback()
+                    leaked_paths.extend(
+                        path for path in paths if path not in leaked_paths
+                    )
+                    rollback_errors.extend(errors)
             pending.clear()
+            pending_auxiliary.clear()
             try:
                 delivery_envelope.discard_batch_commit(project_dir, batch_id)
             except (OSError, delivery_envelope.DeliveryEnvelopeError) as discard_error:
@@ -8041,6 +8171,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         # legacy in-place temporary because they publish no delivery evidence.
         staging: delivery_envelope.StagingAttempt | None = None
         published = False
+        publication_lock_held = False
         temporary = output.parent / f".{output.stem}.{render_id}.part.mp4"
         try:
             if quality == "final":
@@ -8215,6 +8346,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                     route="single",
                 )
                 delivery_envelope.write_prepared_envelope(staging.stage_dir, prepared)
+                # Publication is one authority mutation: a pending caption
+                # recovery may not appear between the gate and any public
+                # output, receipt, QA pointer, or approval invalidation.
+                self.server.project_lock.acquire()
+                publication_lock_held = True
+                ensure_caption_preset_mutation_ready(self.server.project_dir)
                 finalized = delivery_envelope.publish_direct_delivery(
                     project_dir,
                     staging,
@@ -8236,6 +8373,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             else:
                 output_sha = file_sha256(temporary)
                 os.replace(temporary, output)
+                published = True
             receipt = {
                 "schema_version": 1,
                 "render_id": render_id,
@@ -8311,6 +8449,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                     current_state = read_json(self.server.project_dir / STATE_REL, {}) or {}
                     is_current = editor_state_revision(current_state) == state_revision
                     revisions = approval_revisions(self.server.project_dir, current_state)
+            if publication_lock_held:
+                self.server.project_lock.release()
+                publication_lock_held = False
             self.server.render_status = {
                 "state": "complete",
                 "message": "預覽已完成"
@@ -8346,10 +8487,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 "clip_id": clip_id,
                 "render_id": render_id,
                 "output": None,
-                "previous_publication_preserved": True,
+                "previous_publication_preserved": not published,
                 "finished_at": now_utc(),
             }
         finally:
+            if publication_lock_held:
+                self.server.project_lock.release()
             if staging is not None:
                 # Publication never started or failed before taking the
                 # journal; releasing the lease must not mask the real error.

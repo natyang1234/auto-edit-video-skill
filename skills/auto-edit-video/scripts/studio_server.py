@@ -361,6 +361,8 @@ class StudioServer(ThreadingHTTPServer):
         editing_brief: str,
         contextual_semantic_calibration: bool = False,
         semantic_model: str = "qwen2.5:7b",
+        project_editor: EditorServer | None = None,
+        reservation_owner: object | None = None,
     ) -> None:
         status_path = project_dir / "working/pipeline_status.json"
         started_at = now_utc()
@@ -510,9 +512,23 @@ class StudioServer(ThreadingHTTPServer):
                     detail=str(exc),
                 )
         finally:
-            with self.pipeline_lock:
-                if self.active_pipeline_project == project_dir:
-                    self.active_pipeline_project = None
+            # Match start_local_pipeline's project -> pipeline lock order.  A
+            # cleanup path that inverted these locks could deadlock caption
+            # apply against a completing external writer.
+            project_guard = (
+                project_editor.project_lock
+                if project_editor is not None
+                else nullcontext()
+            )
+            with project_guard:
+                with self.pipeline_lock:
+                    if self.active_pipeline_project == project_dir:
+                        self.active_pipeline_project = None
+                    if (
+                        project_editor is not None
+                        and project_editor.pipeline_active_owner is reservation_owner
+                    ):
+                        project_editor.pipeline_active_owner = None
 
     def start_local_pipeline(
         self,
@@ -579,6 +595,9 @@ class StudioServer(ThreadingHTTPServer):
                     },
                 )
                 self.active_pipeline_project = resolved_project
+                reservation_owner = object()
+                if editor is not None:
+                    editor.pipeline_active_owner = reservation_owner
                 thread = threading.Thread(
                     target=self.pipeline_worker,
                     args=(
@@ -587,6 +606,8 @@ class StudioServer(ThreadingHTTPServer):
                         editing_brief,
                         contextual_semantic_calibration,
                         semantic_model,
+                        editor,
+                        reservation_owner,
                     ),
                     daemon=False,
                     name=f"auto-edit-{resolved_project.name}",
@@ -597,6 +618,11 @@ class StudioServer(ThreadingHTTPServer):
                 except BaseException:
                     self.pipeline_threads.remove(thread)
                     self.active_pipeline_project = None
+                    if (
+                        editor is not None
+                        and editor.pipeline_active_owner is reservation_owner
+                    ):
+                        editor.pipeline_active_owner = None
                     atomic_write_json(
                         status_path,
                         {

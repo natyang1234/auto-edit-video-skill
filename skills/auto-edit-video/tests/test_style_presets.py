@@ -1297,6 +1297,9 @@ class StylePresetApiTests(unittest.TestCase):
                 release_reservation.set()
                 start_thread.join(timeout=3)
                 self.assertTrue(worker_started.wait(timeout=3))
+                status, pipeline = self.request("GET", "/api/pipeline-status")
+                self.assertEqual(status, 200, pipeline)
+                self.assertEqual(pipeline["state"], "running")
                 apply_thread.join(timeout=3)
             self.assertEqual(start_errors, [])
             self.assertEqual(apply_result[0][0], 409, apply_result)
@@ -1318,6 +1321,395 @@ class StylePresetApiTests(unittest.TestCase):
             studio.editor_servers.clear()
             studio.server_close()
 
+    def test_cover_is_blocked_before_subprocess_when_recovery_journal_is_pending(self) -> None:
+        cover = self.harness.project / "renders/cover.png"
+        cover.write_bytes(b"existing-cover")
+        journal = editor_server.begin_caption_preset_transaction(self.harness.project)
+        self.assertEqual(journal["phase"], "prepared")
+
+        def would_replace_cover(command: list[str], **_kwargs: object):
+            output = Path(command[command.index("--output") + 1])
+            output.write_bytes(b"replacement-cover")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        try:
+            with patch.object(
+                editor_server.subprocess, "run", side_effect=would_replace_cover
+            ) as render:
+                status, rejected = self.request("POST", "/api/cover", {
+                    "platform_id": "instagram-reels",
+                    "time": 0,
+                    "text": "must not render",
+                })
+            self.assertEqual(status, 503, rejected)
+            self.assertEqual(rejected["reason"], "transaction_recovery_required")
+            self.assertEqual(cover.read_bytes(), b"existing-cover")
+            render.assert_not_called()
+        finally:
+            editor_server.recover_caption_preset_transaction(self.harness.project)
+
+    def test_stale_pipeline_status_does_not_block_caption_apply_without_live_writer(self) -> None:
+        _state, project_revision = self.install_caption()
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": project_revision,
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status_path = self.harness.project / "working/pipeline_status.json"
+        status_path.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "state": "running",
+                "phase": "transcribe",
+                "message": "stale after crashed Studio process",
+            }),
+            encoding="utf-8",
+        )
+
+        status, project = self.request("GET", "/api/project")
+        self.assertEqual(status, 200, project)
+        self.assertEqual(project["pipeline_status"]["state"], "needs_attention")
+        self.assertEqual(
+            project["pipeline_status"]["error_code"], "pipeline_interrupted"
+        )
+        status, pipeline = self.request("GET", "/api/pipeline-status")
+        self.assertEqual(status, 200, pipeline)
+        self.assertEqual(pipeline["state"], "needs_attention")
+        self.assertEqual(pipeline["error_code"], "pipeline_interrupted")
+        base["expected_revision"] = project["state"]["revision"]
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+
+        status, applied = self.request("POST", "/api/style-presets/caption-apply", {
+            **base,
+            "plan_digest": plan["plan_digest"],
+        })
+        self.assertEqual(status, 200, applied)
+        self.assertEqual(applied["applied_to"], ["caption-preset-target"])
+        self.assertFalse(
+            (self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL).exists()
+        )
+
+    def test_single_render_journal_gate_precedes_all_publication(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            previous = {
+                "schema_version": 1,
+                "status": "pass",
+                "sentinel": "single-publication-must-survive",
+            }
+            case.write_json("working/latest_final_qa.json", previous)
+            state, clip_ids = case.approve_batch_prerequisites()
+            manifest_path = case.project / "project.json"
+            manifest_before = manifest_path.read_bytes()
+            real_gate = editor_server.ensure_caption_preset_mutation_ready
+            calls = 0
+
+            def fail_publication_gate(project: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise editor_server.CaptionPresetRecoveryError(
+                        "injected pending recovery at publication"
+                    )
+                real_gate(project)
+
+            fake_run = case.fake_batch_subprocess()
+            with (
+                patch.object(editor_server.subprocess, "run", side_effect=fake_run),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(
+                    editor_server,
+                    "ensure_caption_preset_mutation_ready",
+                    side_effect=fail_publication_gate,
+                ),
+            ):
+                status, accepted = case.json_request("POST", "/api/render", {
+                    "quality": "final",
+                    "clip_id": clip_ids[0],
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertEqual(failed["state"], "failed", failed)
+            self.assertTrue(failed["previous_publication_preserved"])
+            case.assert_single_route_published_nothing(previous)
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertEqual(
+                sorted((case.project / "working/render_receipts").glob("*.json")),
+                [],
+            )
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_batch_second_member_gate_rolls_back_first_member_auxiliary_records(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            previous = {
+                "schema_version": 1,
+                "status": "pass",
+                "sentinel": "batch-publication-must-survive",
+            }
+            case.write_json("working/latest_final_qa.json", previous)
+            state, _clip_ids = case.approve_batch_prerequisites()
+            manifest_path = case.project / "project.json"
+            manifest_before = manifest_path.read_bytes()
+            real_gate = editor_server.ensure_caption_preset_mutation_ready
+            calls = 0
+
+            def fail_member_gate(project: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    editor_server.begin_caption_preset_transaction(project)
+                real_gate(project)
+
+            fake_run = case.fake_batch_subprocess()
+            with (
+                patch.object(editor_server.subprocess, "run", side_effect=fake_run),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(
+                    editor_server,
+                    "ensure_caption_preset_mutation_ready",
+                    side_effect=fail_member_gate,
+                ),
+            ):
+                status, accepted = case.json_request("POST", "/api/render-batch", {
+                    "quality": "final",
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertEqual(failed["state"], "failed", failed)
+            case.assert_batch_published_nothing(previous)
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertEqual(
+                sorted((case.project / "working/render_receipts").glob("*.json")),
+                [],
+            )
+            self.assertEqual(
+                sorted((case.project / "working/delivery_qa").glob("render_*.json")),
+                [],
+            )
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_batch_auxiliary_rollback_restores_preexisting_exact_bytes(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            previous = {"schema_version": 1, "status": "pass", "sentinel": "prior"}
+            case.write_json("working/latest_final_qa.json", previous)
+            state, _clip_ids = case.approve_batch_prerequisites()
+            real_gate = editor_server.ensure_caption_preset_mutation_ready
+            real_publish = editor_server.delivery_envelope.publish_direct_delivery
+            calls = 0
+            prior: dict[Path, bytes] = {}
+
+            def fail_second_member(project: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    editor_server.begin_caption_preset_transaction(project)
+                real_gate(project)
+
+            def seed_prior_records(*args: object, **kwargs: object):
+                publication = real_publish(*args, **kwargs)
+                if not prior and isinstance(
+                    publication, editor_server.delivery_envelope.DeferredPublication
+                ):
+                    for directory, payload in (
+                        ("working/render_receipts", b"prior-receipt-bytes"),
+                        ("working/delivery_qa", b"prior-pass-qa-bytes"),
+                    ):
+                        path = case.project / directory / f"{publication.render_id}.json"
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(payload)
+                        prior[path] = payload
+                return publication
+
+            fake_run = case.fake_batch_subprocess()
+            with (
+                patch.object(editor_server.subprocess, "run", side_effect=fake_run),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(
+                    editor_server,
+                    "ensure_caption_preset_mutation_ready",
+                    side_effect=fail_second_member,
+                ),
+                patch.object(
+                    editor_server.delivery_envelope,
+                    "publish_direct_delivery",
+                    side_effect=seed_prior_records,
+                ),
+            ):
+                status, accepted = case.json_request("POST", "/api/render-batch", {
+                    "quality": "final",
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertEqual(failed["state"], "failed", failed)
+            self.assertTrue(failed["previous_latest_preserved"], failed)
+            self.assertEqual({path: path.read_bytes() for path in prior}, prior)
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_batch_auxiliary_cas_mismatch_is_reported_and_not_deleted(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            state, _clip_ids = case.approve_batch_prerequisites()
+            real_gate = editor_server.ensure_caption_preset_mutation_ready
+            calls = 0
+            tampered = b"changed-after-member-publication"
+
+            def tamper_then_fail_second_member(project: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    receipts = sorted(
+                        (case.project / "working/render_receipts").glob("render_*.json")
+                    )
+                    self.assertEqual(len(receipts), 1)
+                    receipts[0].write_bytes(tampered)
+                    editor_server.begin_caption_preset_transaction(project)
+                real_gate(project)
+
+            fake_run = case.fake_batch_subprocess()
+            with (
+                patch.object(editor_server.subprocess, "run", side_effect=fake_run),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(
+                    editor_server,
+                    "ensure_caption_preset_mutation_ready",
+                    side_effect=tamper_then_fail_second_member,
+                ),
+            ):
+                status, accepted = case.json_request("POST", "/api/render-batch", {
+                    "quality": "final",
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertEqual(failed["state"], "failed_unclean", failed)
+            self.assertFalse(failed["previous_latest_preserved"])
+            self.assertTrue(failed["rollback_errors"])
+            self.assertTrue(failed["leaked_paths"])
+            leaked_receipt = Path(failed["leaked_paths"][0])
+            self.assertEqual(leaked_receipt.read_bytes(), tampered)
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_batch_member_auxiliary_write_failure_rolls_back_both_records(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            previous = {"schema_version": 1, "status": "pass", "sentinel": "prior"}
+            case.write_json("working/latest_final_qa.json", previous)
+            state, _clip_ids = case.approve_batch_prerequisites()
+            real_atomic = editor_server.atomic_write_json
+            failed_once = False
+
+            def fail_after_member_qa_write(path: Path, payload: object) -> None:
+                nonlocal failed_once
+                real_atomic(path, payload)
+                if (
+                    not failed_once
+                    and path.parent.name == "delivery_qa"
+                    and path.name.startswith("render_")
+                ):
+                    failed_once = True
+                    raise OSError("injected failure after member QA replacement")
+
+            fake_run = case.fake_batch_subprocess()
+            with (
+                patch.object(editor_server.subprocess, "run", side_effect=fake_run),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(
+                    editor_server,
+                    "atomic_write_json",
+                    side_effect=fail_after_member_qa_write,
+                ),
+            ):
+                status, accepted = case.json_request("POST", "/api/render-batch", {
+                    "quality": "final",
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertTrue(failed_once)
+            self.assertEqual(failed["state"], "failed", failed)
+            case.assert_batch_published_nothing(previous)
+            self.assertEqual(
+                sorted((case.project / "working/render_receipts").glob("render_*.json")),
+                [],
+            )
+            self.assertEqual(
+                sorted((case.project / "working/delivery_qa").glob("render_*.json")),
+                [],
+            )
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_preview_failure_after_replace_reports_publication_truthfully(self) -> None:
+        from tests.test_editor_server import EditorServerTests
+
+        case = EditorServerTests(methodName="runTest")
+        case.setUp()
+        try:
+            state, clip_ids = case.approve_batch_prerequisites()
+            fake_run = case.fake_batch_subprocess()
+            real_atomic = editor_server.atomic_write_json
+
+            def fail_receipt(path: Path, payload: object) -> None:
+                if "working/render_receipts" in str(path):
+                    raise OSError("injected preview receipt failure")
+                real_atomic(path, payload)
+
+            with (
+                patch.object(editor_server.subprocess, "run", side_effect=fake_run),
+                patch.object(editor_server, "ffprobe_has_visual_stream", return_value=True),
+                patch.object(editor_server, "atomic_write_json", side_effect=fail_receipt),
+            ):
+                status, accepted = case.json_request("POST", "/api/render", {
+                    "quality": "preview",
+                    "clip_id": clip_ids[0],
+                    "expected_revision": state["revision"],
+                })
+                self.assertEqual(status, 202, accepted)
+                failed = case.wait_for_render_terminal()
+            self.assertEqual(failed["state"], "failed", failed)
+            self.assertFalse(failed["previous_publication_preserved"])
+            self.assertEqual(
+                len(list((case.project / "renders").glob("*-preview.mp4"))), 1
+            )
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
     def test_studio_pipeline_start_failure_clears_reservation(self) -> None:
         studio = studio_server.StudioServer(
             ("127.0.0.1", 0), self.harness.project.parent, auto_process=True
@@ -1334,6 +1726,7 @@ class StylePresetApiTests(unittest.TestCase):
                         self.harness.project, "teacher-punch", ""
                     )
             self.assertIsNone(studio.active_pipeline_project)
+            self.assertIsNone(self.harness.server.pipeline_active_owner)
             self.assertEqual(studio.pipeline_threads, [])
             status = json.loads(
                 (self.harness.project / "working/pipeline_status.json").read_text(
@@ -1361,6 +1754,29 @@ class StylePresetApiTests(unittest.TestCase):
             )
             editor_server.recover_caption_preset_transaction(self.harness.project)
         finally:
+            studio.editor_servers.clear()
+            studio.server_close()
+
+    def test_studio_pipeline_completion_clears_live_project_owner(self) -> None:
+        studio = studio_server.StudioServer(
+            ("127.0.0.1", 0), self.harness.project.parent, auto_process=True
+        )
+        studio.editor_servers.append((self.harness.server, self.harness.thread))
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        try:
+            with (
+                patch.object(studio, "run_pipeline_command", return_value=completed),
+                patch.object(studio, "transcript_has_speech", return_value=True),
+                patch.object(studio, "highlight_review_message", return_value="done"),
+            ):
+                studio.start_local_pipeline(self.harness.project, "teacher-punch", "")
+                self.assertIsNotNone(self.harness.server.pipeline_active_owner)
+                for thread in list(studio.pipeline_threads):
+                    thread.join(timeout=3)
+            self.assertIsNone(studio.active_pipeline_project)
+            self.assertIsNone(self.harness.server.pipeline_active_owner)
+        finally:
+            studio.pipeline_threads.clear()
             studio.editor_servers.clear()
             studio.server_close()
 
