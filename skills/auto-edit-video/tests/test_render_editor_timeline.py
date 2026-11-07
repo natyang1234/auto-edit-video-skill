@@ -1031,28 +1031,62 @@ if __name__ == "__main__":
 
 
 class DesignedFullTimelineTests(unittest.TestCase):
-    def test_every_designed_highlight_is_a_scoped_base_and_gap_is_preserved(self):
+    def test_full_timeline_does_not_add_highlight_package_to_preview_or_final(self):
         import render_editor_timeline as timeline
-        clips = [{"id":"a","start":0,"end":2},{"id":"b","start":3,"end":5}]
-        cards = [{"id":f"{c['id']}-{role}","type":"card","highlight_id":c["id"],"design_role":role,
-                  "start":c["start"],"end":c["end"]} for c in clips for role in timeline.DESIGN_ROLES]
-        caption = {"id":"subtitle","type":"caption","start":0,"end":5,"text":"字幕"}
-        state = {"highlights":clips,"overlays":cards+[caption],"video_template":{"id":"dynamic-craft"}}
-        original = json.loads(json.dumps(state))
-        root = Path("/tmp/project")
-        calls = []
-        def package(project, package_state, manifest, clip):
-            calls.append(clip["id"])
-            self.assertFalse(any(o["type"] == "caption" for o in package_state["overlays"]))
-            return root / "working/graphic_packages" / clip["id"] / "output.mp4"
-        with patch.object(timeline,"ensure_graphic_package",side_effect=package):
-            result=timeline.compose_designed_timeline_state(root,state,{})
-        self.assertEqual(calls,["a","b"])
-        self.assertEqual(state,original)
-        bases=[o for o in result["overlays"] if o.get("source_axis_media")]
-        self.assertEqual([(o["start"],o["end"]) for o in bases],[(0,2),(3,5)])
-        self.assertTrue(all(o["z_index"] < 0 for o in bases))
-        self.assertEqual(sum(o["id"] == "subtitle" for o in result["overlays"]),1)
+
+        # A full timeline has no clip context: its highlight-scoped design
+        # cards must not be baked into an extra package over the canonical plan.
+        state = {
+            "visual_quality_mode": "designed",
+            "highlights": [{"id": "a", "start": 0, "end": 2}],
+            "overlays": [{"id": role, "type": "card", "highlight_id": "a",
+                          "design_role": role, "start": 0, "end": 2}
+                         for role in timeline.DESIGN_ROLES],
+        }
+        class StopAtBuild(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = root / "snapshot.json"
+            snapshot.write_text("{}")
+            for quality, fx_quality in (("preview", "draft"),
+                                        ("preview", "standard"),
+                                        ("final", None)):
+                with (self.subTest(quality=quality, fx_quality=fx_quality),
+                      patch.object(timeline, "load_render_snapshot", return_value=({}, state, None)),
+                      patch.object(timeline, "ensure_graphic_package", side_effect=AssertionError("unexpected highlight package")),
+                      patch.object(timeline, "build_render_command", side_effect=StopAtBuild) as build):
+                    with self.assertRaises(StopAtBuild):
+                        timeline.render_project(root, root / "out.mp4", quality,
+                                                snapshot_path=snapshot, preview_fx_quality=fx_quality)
+                    self.assertEqual(build.call_args.args[1], state)
+
+    def test_selected_highlight_keeps_legacy_graphic_package(self):
+        import render_editor_timeline as timeline
+
+        clip = {"id": "a", "start": 0, "end": 2}
+        state = {"visual_quality_mode": "designed", "highlights": [clip],
+                 "overlays": [{"id": role, "type": "card", "highlight_id": "a",
+                               "design_role": role, "start": 0, "end": 2}
+                              for role in timeline.DESIGN_ROLES]}
+        class StopAtBuild(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = root / "snapshot.json"
+            snapshot.write_text("{}")
+            package = root / "package.mp4"
+            with (patch.object(timeline, "load_render_snapshot", return_value=({}, state, clip)),
+                  patch.object(timeline, "visual_quality_errors", return_value=[]),
+                  patch("editor_server.load_layer_bundle", return_value=({}, {"items": []})),
+                  patch.object(timeline, "ensure_graphic_package", return_value=package) as make_package,
+                  patch.object(timeline, "build_render_command", side_effect=StopAtBuild) as build):
+                with self.assertRaises(StopAtBuild):
+                    timeline.render_project(root, root / "out.mp4", "preview", snapshot_path=snapshot)
+                make_package.assert_called_once()
+                self.assertEqual(build.call_args.args[6], package)
 
     def test_media_offset_seeks_original_animation_after_cut(self):
         import render_editor_timeline as timeline
