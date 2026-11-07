@@ -134,6 +134,10 @@ class FxPreviewBrowserTests(unittest.TestCase):
             running = page.evaluate("() => fxPreviewStatusForJob({state:'running', phase:'encoding', elapsed_s:7, eta_remaining_s:null})")
             estimated = page.evaluate("() => fxPreviewStatusForJob({state:'running', phase:'encoding', elapsed_s:8, eta_remaining_s:12})")
             ready = page.evaluate("() => fxPreviewStatusForJob({state:'ready', phase:'ready', elapsed_s:20, eta_remaining_s:null})")
+            queued = page.evaluate("() => fxPreviewStatusForJob({state:'running', phase:'queued'})")
+            cancelling = page.evaluate("() => fxPreviewStatusForJob({state:'running', phase:'cancelling'})")
+            self.assertIn("排隊中", queued)
+            self.assertIn("取消中", cancelling)
             self.assertIn("已用 7 秒", running)
             self.assertIn("預估時間計算中", running)
             self.assertIn("預估還需 12 秒", estimated)
@@ -148,9 +152,9 @@ class FxPreviewBrowserTests(unittest.TestCase):
                 ({"state": "running", "phase": "encoding", "elapsed_s": 7, "eta_remaining_s": None,
                   "preview_options": {"quality": "standard"}}, "預估時間計算中"),
                 ({"state": "ready", "phase": "ready", "elapsed_s": 20, "media_url": "/media/source",
-                  "preview_options": {"quality": "draft"}}, "已用 20 秒"),
+                  "preview_options": {"quality": "draft"}}, "快速版耗時 20 秒"),
                 ({"state": "failed", "phase": "failed", "elapsed_s": 20,
-                  "preview_options": {"quality": "standard"}}, "已用 20 秒"),
+                  "preview_options": {"quality": "standard"}}, "清晰版耗時 20 秒"),
                 ({"state": "failed", "phase": "failed", "preview_options": {"quality": "standard"}}, "清晰版預覽失敗"),
             ]:
                 page.evaluate('(job) => fxPreviewApplyJob(job, 123, "test")', job)

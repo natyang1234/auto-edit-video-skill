@@ -11,6 +11,7 @@ post-render checks.
 from __future__ import annotations
 
 import ast
+import fcntl
 import hashlib
 import json
 import math
@@ -48,6 +49,11 @@ CACHE_IDLE_TTL_S = 24 * 60 * 60
 CACHE_MAX_ITEMS = 32
 CACHE_MAX_BYTES = 512 * 1024 * 1024
 RENDER_CONTRACT_VERSION = "fx-preview-render-v2"
+TIMELINE_SCRATCH_RE = re.compile(
+    r"^timeline-project-([0-9a-f]{32})-[0-9a-f]{16}-[A-Za-z0-9_-]+$"
+)
+TIMELINE_LEASE_RE = re.compile(r"^\.timeline-owner-([0-9a-f]{32})\.lock$")
+RENDERER_MAINTENANCE_LOCK = ".renderer-maintenance.lock"
 
 _PHASE_MESSAGES = {
     "queued": "已排入本機預覽工作",
@@ -423,6 +429,116 @@ class FxPreviewJobManager:
         selected = names or tuple(self._storage_pins)
         for name in selected:
             self._storage_pins[name].verify()
+
+    @staticmethod
+    def _scratch_lease_name(owner: str) -> str:
+        if JOB_ID_RE.fullmatch(owner) is None:
+            raise OSError("unsafe renderer scratch owner")
+        return f".timeline-owner-{owner}.lock"
+
+    def _try_acquire_scratch_lease(self, owner: str, *, create: bool) -> int | None:
+        """Acquire one pinned per-job lease, or return None when not provably idle."""
+        self._assert_storage_safe("working", "root", "renderer")
+        name = self._scratch_lease_name(owner)
+        flags = os.O_RDWR | (os.O_CREAT if create else 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=self._storage_pins["renderer"].fd,
+            )
+        except (FileNotFoundError, OSError):
+            if create:
+                raise
+            return None
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat(
+                name,
+                dir_fd=self._storage_pins["renderer"].fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            ):
+                raise OSError("unsafe renderer scratch lease")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                os.close(descriptor)
+                return None
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            if create:
+                raise
+            return None
+
+    def _unlink_scratch_lease_if_same(self, owner: str, descriptor: int) -> bool:
+        """Unlink only the still-named regular inode held by this cleanup pass."""
+        name = self._scratch_lease_name(owner)
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat(
+                name,
+                dir_fd=self._storage_pins["renderer"].fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            ):
+                return False
+            os.unlink(name, dir_fd=self._storage_pins["renderer"].fd)
+            return True
+        except OSError:
+            return False
+
+    def _acquire_renderer_maintenance_lock(self, *, exclusive: bool) -> int | None:
+        """Take the fixed renderer guard; exclusive callers skip while a worker is live."""
+        self._assert_storage_safe("working", "root", "renderer")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                RENDERER_MAINTENANCE_LOCK,
+                flags,
+                0o600,
+                dir_fd=self._storage_pins["renderer"].fd,
+            )
+            opened = os.fstat(descriptor)
+            named = os.stat(
+                RENDERER_MAINTENANCE_LOCK,
+                dir_fd=self._storage_pins["renderer"].fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            ):
+                raise OSError("unsafe renderer maintenance lock")
+            operation = fcntl.LOCK_EX | fcntl.LOCK_NB if exclusive else fcntl.LOCK_SH
+            try:
+                fcntl.flock(descriptor, operation)
+            except (BlockingIOError, OSError):
+                os.close(descriptor)
+                return None
+            return descriptor
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if exclusive:
+                return None
+            raise
 
     @staticmethod
     def _open_regular_at(directory_fd: int, name: str) -> tuple[int, os.stat_result]:
@@ -1421,9 +1537,22 @@ class FxPreviewJobManager:
             "dependency_snapshot": deps,
             "pack_id": deps["pack_id"],
             "canvas": deps["canvas"],
+            # Operational ownership only.  This is bound by request_sha256 but
+            # deliberately excluded from visual cache/reuse digests.
+            "scratch_owner": job_id,
         }
         request_fd = -1
+        lease_fd = -1
+        maintenance_fd = -1
         try:
+            acquired_maintenance = self._acquire_renderer_maintenance_lock(exclusive=False)
+            if acquired_maintenance is None:
+                raise OSError("renderer maintenance guard unavailable")
+            maintenance_fd = acquired_maintenance
+            acquired_lease = self._try_acquire_scratch_lease(job_id, create=True)
+            if acquired_lease is None:
+                raise OSError("preview scratch lease is already active")
+            lease_fd = acquired_lease
             request_sha256 = self._atomic_json_in(
                 "runtime", request_path.name, request_payload
             )
@@ -1446,6 +1575,8 @@ class FxPreviewJobManager:
             env = self._worker_environment()
             env["FX_PREVIEW_REQUEST_FD"] = str(request_fd)
             env["FX_PREVIEW_RESULT_DIR_FD"] = str(runtime_fd)
+            env["FX_PREVIEW_SCRATCH_LEASE_FD"] = str(lease_fd)
+            env["FX_PREVIEW_MAINTENANCE_FD"] = str(maintenance_fd)
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -1461,7 +1592,7 @@ class FxPreviewJobManager:
                 text=True,
                 start_new_session=True,
                 env=env,
-                pass_fds=(request_fd, runtime_fd),
+                pass_fds=(request_fd, runtime_fd, lease_fd, maintenance_fd),
             )
             os.close(request_fd)
             request_fd = -1
@@ -1505,6 +1636,8 @@ class FxPreviewJobManager:
                     return
                 time.sleep(0.05)
             progress.join(timeout=1.0)
+            os.close(maintenance_fd)
+            maintenance_fd = -1
             self._assert_storage_safe("working", "root", "runtime")
             try:
                 result = self._read_json_at(
@@ -1715,9 +1848,19 @@ class FxPreviewJobManager:
                         pass
             except (FxPreviewJobError, OSError):
                 pass
+            if lease_fd >= 0:
+                try:
+                    os.close(lease_fd)
+                except OSError:
+                    pass
+            if maintenance_fd >= 0:
+                try:
+                    os.close(maintenance_fd)
+                except OSError:
+                    pass
             try:
-                self._cleanup_renderer_scratch()
-            except FxPreviewJobError:
+                self._cleanup_renderer_scratch(job_id)
+            except (FxPreviewJobError, OSError):
                 pass
 
     @staticmethod
@@ -1962,9 +2105,15 @@ class FxPreviewJobManager:
                 str(overlay.get("code", "")), round(duration, 1), round(sample, 1))
 
     def _record_timing_sample(self, group: tuple[str, str, str, float, float], elapsed: float) -> None:
-        if group not in self._timing_samples and len(self._timing_samples) >= 100:
-            del self._timing_samples[next(iter(self._timing_samples))]
-        samples = self._timing_samples.setdefault(group, [])
+        samples = self._timing_samples.pop(group, None)
+        if samples is None:
+            if len(self._timing_samples) >= 100:
+                del self._timing_samples[next(iter(self._timing_samples))]
+            samples = []
+        # Dict insertion order is the recency index: every successful sample
+        # moves its group to the end so an actively used early group is not
+        # evicted ahead of colder groups.
+        self._timing_samples[group] = samples
         samples.append(elapsed)
         del samples[:-20]
 
@@ -2173,6 +2322,9 @@ class FxPreviewJobManager:
             count -= 1
             total -= size
 
+        renderer_guard = self._acquire_renderer_maintenance_lock(exclusive=True)
+        if renderer_guard is None:
+            return
         renderer_fd = self._storage_pins["renderer"].fd
         renderer_entries: list[tuple[float, int, tuple[str, ...]]] = []
 
@@ -2182,35 +2334,88 @@ class FxPreviewJobManager:
             info: os.stat_result,
             parts: tuple[str, ...],
         ) -> None:
+            if (
+                not parts
+                or parts[0].startswith("timeline-project-")
+                or TIMELINE_LEASE_RE.fullmatch(parts[0]) is not None
+                or parts[0] == RENDERER_MAINTENANCE_LOCK
+            ):
+                return
             if info.st_nlink == 1:
                 renderer_entries.append((info.st_mtime, info.st_size, parts))
 
-        self._walk_files_at(renderer_fd, collect_renderer)
-        renderer_total = sum(item[1] for item in renderer_entries)
-        if self.has_active_job():
-            return
-        for mtime, size, parts in sorted(renderer_entries):
-            expired_by_ttl = now - mtime > CACHE_IDLE_TTL_S
-            if not expired_by_ttl and total + renderer_total <= CACHE_MAX_BYTES:
-                break
+        try:
+            self._walk_files_at(renderer_fd, collect_renderer)
+            renderer_total = sum(item[1] for item in renderer_entries)
+            if self.has_active_job():
+                return
+            for mtime, size, parts in sorted(renderer_entries):
+                expired_by_ttl = now - mtime > CACHE_IDLE_TTL_S
+                if not expired_by_ttl and total + renderer_total <= CACHE_MAX_BYTES:
+                    break
+                try:
+                    self._unlink_relative_at(renderer_fd, parts)
+                except FileNotFoundError:
+                    pass
+                renderer_total -= size
+            self._remove_renderer_empty_dirs()
+        finally:
+            os.close(renderer_guard)
+
+    def _remove_renderer_empty_dirs(self) -> None:
+        """Remove ordinary cache directories without entering live scratch roots."""
+        renderer_fd = self._storage_pins["renderer"].fd
+        for entry in list(os.scandir(renderer_fd)):
+            if (
+                entry.name.startswith("timeline-project-")
+                or TIMELINE_LEASE_RE.fullmatch(entry.name) is not None
+                or entry.name == RENDERER_MAINTENANCE_LOCK
+            ):
+                continue
             try:
-                self._unlink_relative_at(renderer_fd, parts)
-            except FileNotFoundError:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                child_fd = os.open(entry.name, flags, dir_fd=renderer_fd)
+            except OSError:
+                continue
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    continue
+                self._remove_empty_dirs_at(child_fd)
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(entry.name, dir_fd=renderer_fd)
+            except OSError:
                 pass
-            renderer_total -= size
-        self._remove_empty_dirs_at(renderer_fd)
 
     def _touch_renderer_cache(self) -> None:
         """Record successful use so the 24-hour idle TTL is meaningful."""
         self._assert_storage_safe("working", "root", "renderer")
+        renderer_guard = self._acquire_renderer_maintenance_lock(exclusive=True)
+        if renderer_guard is None:
+            return
         now_ns = time.time_ns()
 
         def touch(
             parent_fd: int,
             name: str,
             info: os.stat_result,
-            _parts: tuple[str, ...],
+            parts: tuple[str, ...],
         ) -> None:
+            if (
+                not parts
+                or parts[0].startswith("timeline-project-")
+                or TIMELINE_LEASE_RE.fullmatch(parts[0]) is not None
+                or parts[0] == RENDERER_MAINTENANCE_LOCK
+            ):
+                return
             try:
                 # A killed renderer from an older build may have left hard
                 # links to live project inputs.  Touching such a cache entry
@@ -2226,19 +2431,55 @@ class FxPreviewJobManager:
             except OSError:
                 return
 
-        self._walk_files_at(self._storage_pins["renderer"].fd, touch)
+        try:
+            self._walk_files_at(self._storage_pins["renderer"].fd, touch)
+        finally:
+            os.close(renderer_guard)
 
-    def _cleanup_renderer_scratch(self) -> None:
-        """Remove renderer-owned shadow projects, including killed jobs."""
+    def _cleanup_renderer_scratch(self, owner: str | None = None) -> None:
+        """Remove only idle, leased shadow projects through the pinned cache."""
         self._assert_storage_safe("working", "root", "renderer")
         renderer_fd = self._storage_pins["renderer"].fd
+        owners: set[str] = set()
+        if owner is not None:
+            if JOB_ID_RE.fullmatch(owner) is None:
+                raise FxPreviewJobError(
+                    409, "preview_storage_changed", "FX 預覽暫存 ownership 無效"
+                )
+            owners.add(owner)
         for entry in list(os.scandir(renderer_fd)):
-            if not entry.name.startswith("timeline-project-"):
+            scratch_match = TIMELINE_SCRATCH_RE.fullmatch(entry.name)
+            lease_match = TIMELINE_LEASE_RE.fullmatch(entry.name)
+            match = scratch_match or lease_match
+            found_owner = match.group(1) if match is not None else None
+            if found_owner is not None and (owner is None or found_owner == owner):
+                owners.add(found_owner)
+        for scratch_owner in owners:
+            lease_fd = self._try_acquire_scratch_lease(scratch_owner, create=False)
+            if lease_fd is None:
                 continue
             try:
-                self._remove_tree_at(renderer_fd, entry.name)
-            except (FileNotFoundError, OSError):
-                continue
+                removed_all = True
+                for entry in list(os.scandir(renderer_fd)):
+                    match = TIMELINE_SCRATCH_RE.fullmatch(entry.name)
+                    if match is None or match.group(1) != scratch_owner:
+                        continue
+                    try:
+                        self._remove_tree_at(renderer_fd, entry.name)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        removed_all = False
+                if removed_all:
+                    removed_all = not any(
+                        (match := TIMELINE_SCRATCH_RE.fullmatch(entry.name)) is not None
+                        and match.group(1) == scratch_owner
+                        for entry in os.scandir(renderer_fd)
+                    )
+                if removed_all:
+                    self._unlink_scratch_lease_if_same(scratch_owner, lease_fd)
+            finally:
+                os.close(lease_fd)
 
     def close(self) -> None:
         with self._lock:
@@ -2254,6 +2495,7 @@ class FxPreviewJobManager:
     def _cleanup_orphan_partials(self) -> None:
         self._assert_storage_safe("working", "root", "runtime")
         runtime_fd = self._storage_pins["runtime"].fd
+        owners: set[str] = set()
         for entry in list(os.scandir(runtime_fd)):
             try:
                 info = entry.stat(follow_symlinks=False)
@@ -2261,8 +2503,24 @@ class FxPreviewJobManager:
                 continue
             if not stat.S_ISREG(info.st_mode):
                 continue
-            if re.fullmatch(r"[0-9a-f]{32}\.(?:request\.json|result\.json|part\.mp4)", entry.name):
-                try:
-                    os.unlink(entry.name, dir_fd=runtime_fd)
-                except FileNotFoundError:
-                    pass
+            match = re.fullmatch(
+                r"([0-9a-f]{32})\.(?:request\.json|result\.json|part\.mp4)",
+                entry.name,
+            )
+            if match is not None:
+                owners.add(match.group(1))
+        for scratch_owner in owners:
+            lease_fd = self._try_acquire_scratch_lease(scratch_owner, create=False)
+            if lease_fd is None:
+                continue
+            try:
+                for suffix in ("request.json", "result.json", "part.mp4"):
+                    try:
+                        os.unlink(
+                            f"{scratch_owner}.{suffix}",
+                            dir_fd=runtime_fd,
+                        )
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(lease_fd)
