@@ -228,6 +228,75 @@ class FxComparisonBrowserTests(unittest.TestCase):
             self.assertEqual(len(posted[before:]), 3)
             browser.close()
 
+    def test_compare_start_retries_rejected_single_cancel_promise(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            posted, cancelled, _confirmed, _metrics = self.mock_comparison_api(
+                page, ["still_running", "ready", "ready", "ready"],
+                cancel_states=["generic_404", "cancelled"],
+            )
+            page.locator('[data-add-type="fx"]').click()
+            page.locator("#fx-preview-dialog[open]").wait_for()
+            page.wait_for_function("() => fxPreviewJob?.id")
+            page.locator("#fx-preview-compare-toggle").click()
+            page.wait_for_function("() => fxPreviewLifecycles.size === 0 && fxPreviewUnverifiedJob")
+            for code in ("T3", "H1", "T1"):
+                page.locator(f'#fx-preview-grid .fx-preview-card[data-fx-code="{code}"]').click()
+                page.locator("#fx-preview-compare-add").click()
+            page.locator("#fx-preview-compare-start").click()
+            page.wait_for_timeout(1600)
+            self.assertEqual(len(posted), 4)
+            self.assertEqual(cancelled, ["0" * 31 + "1", "0" * 31 + "1"])
+            self.assertTrue(page.evaluate("() => fxPreviewCancelPromise === null && fxPreviewUnverifiedJob === null"))
+            self.assertTrue(page.evaluate("() => fxCompareCandidates.every(item => item.state === 'ready')"))
+
+            page2 = browser.new_page(viewport={"width": 1100, "height": 900})
+            page2.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            posted2, cancelled2, _confirmed2, _metrics2 = self.mock_comparison_api(
+                page2, ["still_running", "ready", "ready", "ready"],
+                cancel_states=["generic_404", "running", "cancelled"],
+            )
+            page2.locator('[data-add-type="fx"]').click()
+            page2.locator("#fx-preview-dialog[open]").wait_for()
+            page2.wait_for_function("() => fxPreviewJob?.id")
+            page2.locator("#fx-preview-compare-toggle").click()
+            page2.wait_for_function("() => fxPreviewLifecycles.size === 0 && fxPreviewUnverifiedJob")
+            for code in ("T3", "H1", "T1"):
+                page2.locator(f'#fx-preview-grid .fx-preview-card[data-fx-code="{code}"]').click()
+                page2.locator("#fx-preview-compare-add").click()
+            page2.locator("#fx-preview-compare-start").click()
+            page2.wait_for_function("() => !fxCompareStarting")
+            self.assertEqual(len(posted2), 1)
+            self.assertIsNotNone(page2.evaluate("() => fxPreviewUnverifiedJob"))
+            self.assertIn("停止尚未確認", page2.locator("#fx-preview-status").inner_text())
+            page2.locator("#fx-preview-compare-start").click()
+            page2.wait_for_function("() => !fxCompareRunning && fxCompareCandidates.every(item => item.state === 'ready')")
+            self.assertEqual(len(posted2), 4)
+            self.assertEqual(cancelled2, ["0" * 31 + "1", "0" * 31 + "1", "0" * 31 + "1"])
+
+            page3 = browser.new_page(viewport={"width": 1100, "height": 900})
+            page3.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            posted3, _cancelled3, _confirmed3, _metrics3 = self.mock_comparison_api(page3)
+            self.prepare_candidates(page3)
+            before3 = len(posted3)
+            page3.evaluate(
+                """() => {
+                    const rejected = Promise.reject(new Error('cancel failed without known job'));
+                    rejected.catch(() => {});
+                    fxPreviewCancelPromise = rejected;
+                    fxPreviewUnverifiedJob = null;
+                }"""
+            )
+            page3.locator("#fx-preview-compare-start").click()
+            page3.wait_for_function("() => !fxCompareStarting")
+            self.assertEqual(len(posted3), before3)
+            self.assertIn("cancel failed without known job", page3.locator("#fx-preview-status").inner_text())
+            browser.close()
+
     def test_candidate_status_is_text_not_html(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:
@@ -397,6 +466,7 @@ class FxComparisonBrowserTests(unittest.TestCase):
                 else None,
             )
             self.prepare_candidates(page)
+            self.assertEqual(page.get_by_role("group", name="比較候選").count(), 1)
             self.assertTrue(page.locator("#fx-preview-compare-toggle").is_visible())
             page.set_viewport_size({"width": 390, "height": 900})
             if page.locator("#fx-preview-catalog-disclosure").evaluate("node => node.open"):
