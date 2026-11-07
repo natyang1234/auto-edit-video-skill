@@ -54,6 +54,8 @@ _PHASE_MESSAGES = {
     "preparing": "正在準備來源片段",
     "matte": "正在分析人物畫面",
     "rendering": "正在產生動態特效預覽",
+    "composing": "正在準備效果與圖層",
+    "encoding": "正在編碼預覽影片",
     "validating": "正在驗證預覽檔案",
     "ready": "動態預覽已完成",
     "failed": "動態預覽產生失敗",
@@ -392,6 +394,7 @@ class FxPreviewJobManager:
         self.render_timeout_s = float(render_timeout_s)
         self._lock = threading.RLock()
         self._jobs: dict[str, dict[str, Any]] = {}
+        self._timing_samples: dict[tuple[str, str, str, float, float], list[float]] = {}
         self._active_job_id: str | None = None
 
         working = self._safe_project_entry("working", must_exist=True)
@@ -1220,6 +1223,9 @@ class FxPreviewJobManager:
             "message": _PHASE_MESSAGES["queued"],
             "cache_hit": False,
             "created_monotonic": now,
+            "timing_started": time.monotonic(),
+            "timing_phase_started": time.monotonic(),
+            "phase_timings_s": {},
             "updated_monotonic": now,
             "state_revision": dependencies["state_revision"],
             "overlay": overlay,
@@ -1248,6 +1254,8 @@ class FxPreviewJobManager:
                     raise FxPreviewJobError(409, "preview_busy", "同一專案已有 FX 預覽正在產生")
                 self._active_job_id = None
             if cached is not None:
+                self._set_timing_phase(job, "ready")
+                job["timing_finished"] = time.monotonic()
                 job.update(
                     {
                         "state": "ready",
@@ -1466,7 +1474,7 @@ class FxPreviewJobManager:
                         self._mark_termination_unverified(job_id)
                     return
                 current["process"] = process
-                current["phase"] = "preparing"
+                self._set_timing_phase(current, "preparing")
                 current["message"] = _PHASE_MESSAGES["preparing"]
             progress = threading.Thread(
                 target=self._consume_progress,
@@ -1545,7 +1553,7 @@ class FxPreviewJobManager:
                 if current is None or current.get("cancel_requested"):
                     self._finish_cancelled(job_id)
                     return
-                current["phase"] = "validating"
+                self._set_timing_phase(current, "validating")
                 current["message"] = _PHASE_MESSAGES["validating"]
             try:
                 current_context = self.context_provider()
@@ -1659,6 +1667,15 @@ class FxPreviewJobManager:
                             pass
                     self._finish_cancelled(job_id)
                     return
+                self._set_timing_phase(current, "ready")
+                elapsed = max(0.0, time.monotonic() - current["timing_started"])
+                group = self._timing_group(current)
+                if group not in self._timing_samples and len(self._timing_samples) >= 100:
+                    del self._timing_samples[next(iter(self._timing_samples))]
+                samples = self._timing_samples.setdefault(group, [])
+                samples.append(elapsed)
+                del samples[:-20]
+                current["timing_finished"] = time.monotonic()
                 current.update(
                     {
                         "state": "ready",
@@ -1750,7 +1767,7 @@ class FxPreviewJobManager:
                     job = self._jobs.get(job_id)
                     if job is None or job.get("state") != "running":
                         return
-                    job["phase"] = phase
+                    self._set_timing_phase(job, phase)
                     job["message"] = _PHASE_MESSAGES[phase]
                     job["updated_monotonic"] = time.time()
         finally:
@@ -1863,6 +1880,8 @@ class FxPreviewJobManager:
         job = self._jobs.get(job_id)
         if job is None or job.get("state") in TERMINAL_STATES:
             return
+        self._set_timing_phase(job, "failed")
+        job["timing_finished"] = time.monotonic()
         job.update(
             {
                 "state": "failed",
@@ -1880,6 +1899,8 @@ class FxPreviewJobManager:
         job = self._jobs.get(job_id)
         if job is None or job.get("state") == "cancelled":
             return
+        self._set_timing_phase(job, "cancelled")
+        job["timing_finished"] = time.monotonic()
         job.update(
             {
                 "state": "cancelled",
@@ -1935,7 +1956,33 @@ class FxPreviewJobManager:
             return self._public_job_locked(job)
 
     @staticmethod
-    def _public_job_locked(job: dict[str, Any]) -> dict[str, Any]:
+    def _timing_group(job: dict[str, Any]) -> tuple[str, str, str, float, float]:
+        options = job.get("preview_options") or {}
+        overlay = job.get("overlay") or {}
+        duration = max(0.0, float(overlay.get("end", 0)) - float(overlay.get("start", 0)))
+        sample = float((job.get("sample_window") or {}).get("duration_s", 0))
+        return (str(options.get("mode", "single")), str(options.get("quality", "standard")),
+                str(overlay.get("code", "")), round(duration, 1), round(sample, 1))
+
+    @staticmethod
+    def _set_timing_phase(job: dict[str, Any], phase: str) -> None:
+        now = time.monotonic()
+        previous = job.get("phase")
+        if previous != phase and "timing_phase_started" in job:
+            timings = job.setdefault("phase_timings_s", {})
+            timings[previous] = timings.get(previous, 0.0) + max(0.0, now - job["timing_phase_started"])
+            job["timing_phase_started"] = now
+        job["phase"] = phase
+
+    def _public_job_locked(self, job: dict[str, Any]) -> dict[str, Any]:
+        now = job.get("timing_finished", time.monotonic())
+        elapsed = max(0.0, now - job.get("timing_started", now))
+        timings = dict(job.get("phase_timings_s") or {})
+        if job.get("state") == "running":
+            phase = job.get("phase")
+            timings[phase] = timings.get(phase, 0.0) + max(0.0, now - job.get("timing_phase_started", now))
+        samples = self._timing_samples.get(self._timing_group(job), [])
+        estimate = sorted(samples)[len(samples) // 2] if len(samples) >= 3 else None
         public = {
             "id": job["id"],
             "state": job["state"],
@@ -1944,6 +1991,10 @@ class FxPreviewJobManager:
             "status_url": f"/api/fx-previews/{job['id']}",
             "cache_hit": bool(job.get("cache_hit")),
             "preview_options": deepcopy(job.get("preview_options") or {}),
+            "elapsed_s": round(elapsed, 2),
+            "phase_timings_s": {k: round(v, 2) for k, v in timings.items()},
+            "eta_remaining_s": round(estimate - elapsed, 2) if estimate is not None and elapsed < estimate and job.get("state") == "running" else None,
+            "eta_sample_count": len(samples),
         }
         media = job.get("media")
         if job.get("state") == "ready" and isinstance(media, dict):

@@ -425,7 +425,8 @@ class SubjectTrackingError(ValueError):
 
 def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path, pack_id: str | None,
                         quality: str = "draft", canvas: tuple[int, int] | None = None, fit: str = "cover",
-                        material: dict[str, Any] | None = None, asset_project: Path | None = None) -> dict[str, Any] | None:
+                        material: dict[str, Any] | None = None, asset_project: Path | None = None,
+                        progress: Any = None) -> dict[str, Any] | None:
     """Render one fx overlay to a transparent .mov under working/fx/; None on failure."""
     if not available():
         _log({"layer": overlay.get("id"), "reason": "edit-style-profiles skill unavailable"})
@@ -485,11 +486,15 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
         _log({"layer": overlay.get("id"), "reason": f"unknown code {code}"})
         return None
     if eff["needs_person"] or code == "P5":
+        if progress is not None:
+            progress("matte")
         assets = _person_assets(project_dir, source, start, dur, fit)
         if assets is None:
             _log({"layer": overlay.get("id"), "code": code, "reason": "人物去背不足，無法渲染此特效"})
             return None
         person, mask = assets
+    if progress is not None:
+        progress("composing")
     try:
         compose_quality = quality if quality in {"draft", "standard"} else "final"
         rep = compose.render_clip(str(source), start, dur, code, theme, main, scheme, values, placement, None,
