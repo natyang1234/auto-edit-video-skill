@@ -7,6 +7,7 @@
     <title>自動剪輯工作室</title>
     <link rel="stylesheet" href="/styles.css">
     <link rel="stylesheet" href="/fx-preview-panel.css">
+    <link rel="stylesheet" href="/style-presets.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
@@ -250,6 +251,15 @@
             <span id="layer-count">0</span>
           </div>
           <div class="layer-list" id="layer-list" aria-label="時間軸圖層清單"></div>
+          <details class="style-presets" id="style-presets">
+            <summary>我的預設</summary>
+            <p>儲存已確認的字幕或特效設定，跨專案使用。</p>
+            <label>名稱 <input id="preset-name" maxlength="80" autocomplete="off"></label>
+            <label>預設清單 <select id="preset-list"><option value="">選擇預設</option></select></label>
+            <label>字幕套用範圍 <select id="preset-scope"><option value="single">目前字幕</option><option value="selection">同精華</option><option value="track">整軌</option></select></label>
+            <div class="preset-actions"><button type="button" id="preset-create">儲存目前圖層</button><button type="button" id="preset-update">更新</button><button type="button" id="preset-delete">刪除</button><button type="button" id="preset-apply">查看差異並套用</button></div>
+            <p id="preset-status" role="status" aria-live="polite"></p>
+          </details>
           <div class="inspector-empty" id="inspector-empty">
             <p class="eyebrow">SELECT A LAYER</p>
             <h2>選一個時間軸圖層</h2>
@@ -747,6 +757,10 @@
       </div>
     </dialog>
 
+    <dialog id="preset-review" class="preset-review" aria-labelledby="preset-review-title">
+      <h2 id="preset-review-title">確認差異</h2><pre id="preset-review-details"></pre>
+      <div class="preset-actions"><button type="button" id="preset-review-cancel">取消</button><button type="button" id="preset-review-confirm">確認</button></div>
+    </dialog>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <script src="/app.js" defer></script>
   </body>

@@ -32,6 +32,7 @@ const loadedProjectFontIds = new Set();
 const loadingProjectFontIds = new Set();
 let projectFontPreviewError = "";
 let lastSaveSucceeded = true;
+let presetSaveInFlight = 0;
 // FX previews are deliberately local drafts. They never touch editor state
 // until the server compare-and-swap confirm succeeds.
 let fxPreviewDraft = null;
@@ -748,6 +749,7 @@ async function reconcileStateConflict() {
 }
 
 async function saveState(showConfirmation = true) {
+  presetSaveInFlight += 1;
   clearTimeout(saveTimer);
   saveTimer = null;
   try {
@@ -805,6 +807,7 @@ async function saveState(showConfirmation = true) {
       showToast(`儲存失敗：${error.message}`, "error");
     }
   }
+  finally { presetSaveInFlight -= 1; }
 }
 
 function putEditorState() {
@@ -2965,7 +2968,7 @@ function fxPreviewInstallCatalogBreakpointListener() {
   fxPreviewCatalogBreakpoint.addEventListener("change", fxPreviewSyncCatalogDisclosure);
 }
 
-function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "") {
+function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "", portablePreset = null) {
   const dialog = elements["fx-preview-dialog"];
   if (!dialog) return;
   if (dialog.open) dialog.close("replace");
@@ -2989,12 +2992,20 @@ function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId 
   }
   const saved = fxPreviewSavedDraft();
   const savedEffect = fxEffectByCode(saved?.draft?.code);
-  fxPreviewStaleDraft = saved && (overlay || saved.revision !== fxPreviewCurrentRevision()) ? saved : null;
-  if (!overlay && saved?.revision === fxPreviewCurrentRevision() && savedEffect && !fxPreviewIsBlocked(savedEffect)) {
+  fxPreviewStaleDraft = saved && (portablePreset || overlay || saved.revision !== fxPreviewCurrentRevision()) ? saved : null;
+  if (!portablePreset && !overlay && saved?.revision === fxPreviewCurrentRevision() && savedEffect && !fxPreviewIsBlocked(savedEffect)) {
     fxPreviewDraft = fxPreviewBuildDraft(savedEffect, saved.draft, overlay, fxPreviewSourceStart());
     fxPreviewDraft.__restored = true;
   } else {
     fxPreviewDraft = fxPreviewBuildDraft(first, null, overlay, fxPreviewSourceStart());
+    if (portablePreset) {
+      for (const key of ["values", "placement", "scheme", "font_ids", "opacity", "text_fit"]) {
+        if (Object.prototype.hasOwnProperty.call(portablePreset, key)) fxPreviewDraft[key] = deepCopy(portablePreset[key]);
+      }
+      // Material and subject belong to this project, never to the portable preset.
+      if (overlay?.code === first.code && first.code === "B1") fxPreviewDraft.material = overlay.material ? deepCopy(overlay.material) : null;
+      if (overlay?.code === first.code && first.code === "P5") fxPreviewDraft.subject = overlay.subject ? deepCopy(overlay.subject) : null;
+    }
   }
   fxPreviewDraftSignature = fxPreviewSignature();
   fxPreviewJob = null;
@@ -4798,6 +4809,7 @@ function bindEvents() {
 async function initialize() {
   cacheElements();
   bindEvents();
+  bindStylePresets();
   try {
     projectPayload = await request("/api/project");
     renderFormulaPanel(projectPayload);
@@ -4825,6 +4837,7 @@ async function initialize() {
     renderAll();
     updateScrubberBounds();
     renderVoicePanel();
+    presetLoad();
     // Load the production desk only after /api/project has established the
     // CSRF token; firing its POST list request during script startup races
     // initialization and produces a harmless but noisy 403 in the console.
@@ -4848,8 +4861,6 @@ async function initialize() {
     showToast(`專案載入失敗：${error.message}`, "error");
   }
 }
-
-initialize();
 
 async function applyCaptionScopeStyle() {
   const overlay = currentOverlay();
@@ -5872,3 +5883,189 @@ function deskWireAutoVisuals() {
     }
   });
 }
+
+// Portable presets contain only the documented settings, never project state.
+let presetLibrary = { revision: "", presets: [] };
+const presetNode = (id) => document.getElementById(id);
+function presetStatus(message) { presetNode("preset-status").textContent = message; }
+function presetSelected() { return presetLibrary.presets.find((p) => p.id === presetNode("preset-list").value) || null; }
+function presetSetLibrary(result, selected = "") {
+  presetLibrary = { revision: result.revision, presets: Array.isArray(result.presets) ? result.presets : [] };
+  const list = presetNode("preset-list");
+  const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = "選擇預設";
+  list.replaceChildren(placeholder);
+  for (const preset of presetLibrary.presets) {
+    const option = document.createElement("option"); option.value = preset.id;
+    option.textContent = `${preset.name}（${preset.kind === "caption" ? "字幕" : "特效"}）`; list.append(option);
+  }
+  list.value = selected;
+}
+async function presetLoad() {
+  try { const result = await request("/api/style-presets"); const selected = presetNode("preset-list").value; presetSetLibrary(result, selected); presetStatus("預設庫已載入。"); }
+  catch (error) { presetStatus(`預設庫讀取失敗：${error.message}`); }
+}
+function presetCapture() {
+  const overlay = currentOverlay();
+  if (!overlay || !["caption", "fx"].includes(overlay.type) || overlay.design_role) throw new Error("請先選取已確認的字幕或特效圖層。");
+  if (stateDirty || presetSaveInFlight || !lastSaveSucceeded) throw new Error("目前編輯尚未儲存完成，請稍候再試。");
+  if (overlay.type === "fx") {
+    const settings = { code: overlay.code, values: deepCopy(overlay.values || {}), placement: overlay.placement || "", scheme: overlay.scheme || "", font_ids: deepCopy(overlay.font_ids || {}), opacity: overlay.style?.opacity ?? 1, text_fit: overlay.text_fit !== false };
+    return { kind: "fx", settings };
+  }
+  const raw = overlay.style || {};
+  const defaults = state.caption_defaults || {};
+  const style = {
+    font_size: Number(presetNode("font-size").value), color: presetNode("font-color").value.toUpperCase(),
+    emphasis_color: presetNode("emphasis-color").value.toUpperCase(),
+    stroke_color: String(raw.stroke_color ?? defaults.stroke_color ?? "#17130F").toUpperCase(),
+    stroke_width: Number(raw.stroke_width ?? defaults.stroke_width ?? 3),
+    x: Number(presetNode("position-x").value), y: Number(presetNode("position-y").value),
+    max_width: Number(presetNode("overlay-max-width").value), animation: presetNode("overlay-animation").value,
+  };
+  const chosenId = presetNode("font-family").value;
+  if (chosenId.startsWith("__unavailable__:")) throw new Error("目前字型未通過驗證，請重新匯入字型後再儲存。");
+  const assetId = chosenId === "__legacy__" ? "" : chosenId;
+  let font = null;
+  if (assetId) {
+    const verified = projectFonts.find((item) => item.asset_id === assetId);
+    if (!verified || !verified.sha256 || !verified.family || typeof verified.style !== "string" || verified.weight == null) throw new Error("目前字型缺少已驗證的完整資訊，請重新匯入字型後再儲存。");
+    font = Object.fromEntries(["sha256", "family", "style", "weight"].map((key) => [key, verified[key]]));
+  }
+  return { kind: "caption", settings: { style, font } };
+}
+function presetReview(title, details, confirmLabel = "確認") {
+  const dialog = presetNode("preset-review");
+  presetNode("preset-review-title").textContent = title;
+  presetNode("preset-review-details").textContent = details;
+  presetNode("preset-review-confirm").textContent = confirmLabel;
+  dialog.showModal();
+  return new Promise((resolve) => {
+    const confirm = presetNode("preset-review-confirm"); const cancel = presetNode("preset-review-cancel");
+    const cleanup = () => { confirm.removeEventListener("click", yes); cancel.removeEventListener("click", no); dialog.removeEventListener("cancel", no); };
+    const yes = () => { cleanup(); resolve(true); };
+    const no = (event) => { event?.preventDefault(); cleanup(); dialog.close(); resolve(false); };
+    confirm.addEventListener("click", yes); cancel.addEventListener("click", no); dialog.addEventListener("cancel", no);
+    cancel.focus();
+  });
+}
+function presetDiff(before, after) {
+  const lines = [];
+  const labels = { font_size: "字體大小", color: "文字顏色", emphasis_color: "重點顏色", stroke_color: "描邊顏色", stroke_width: "描邊寬度", x: "水平位置", y: "垂直位置", max_width: "最大寬度", animation: "動畫", code: "特效", placement: "擺位", scheme: "字卡色組", opacity: "特效透明度", text_fit: "文字自動調整" };
+  const text = (value) => value === undefined || value === null ? "未設定" : typeof value === "boolean" ? (value ? "開啟" : "關閉") : String(value);
+  const fontText = (font) => font ? [font.family, font.style, font.weight].filter((x) => x !== undefined && x !== null && x !== "").join(" / ") : "保留目標字型";
+  const add = (label, oldValue, newValue) => { if (oldValue !== newValue) lines.push(`${label}：${oldValue} → ${newValue}`); };
+  const oldFont = before?.font, newFont = after?.font;
+  if (Object.prototype.hasOwnProperty.call(after || {}, "font") && JSON.stringify(oldFont) !== JSON.stringify(newFont)) {
+    const oldName = fontText(oldFont), newName = fontText(newFont);
+    if (oldName === newName) lines.push(`字型：${newName}（字型檔已更換）`);
+    else add("字型", oldName, newName);
+  }
+  for (const key of new Set([...Object.keys(before?.style || {}), ...Object.keys(after?.style || {})])) {
+    add(labels[key] || "字幕設定", text(before?.style?.[key]), text(after?.style?.[key]));
+  }
+  const effect = fxEffectByCode(after?.code) || fxEffectByCode(before?.code);
+  const effectName = (code) => code ? (fxEffectByCode(code)?.name || code) : "未設定";
+  if ("code" in (before || {}) || "code" in (after || {})) add("特效", effectName(before?.code), effectName(after?.code));
+  const placements = { "": "跟隨效果", top: "上", bottom: "下", left: "左", right: "右" };
+  for (const key of ["placement", "scheme", "opacity", "text_fit"]) {
+    if (!(key in (before || {})) && !(key in (after || {}))) continue;
+    const format = (value) => {
+      if (value === undefined || value === null) return "未設定";
+      if (key === "placement") return placements[value] ?? text(value);
+      if (key === "scheme") return value ? (fxCatalog().schemes?.[value] || text(value)) : "跟隨風格包";
+      return text(value);
+    };
+    add(labels[key], format(before?.[key]), format(after?.[key]));
+  }
+  for (const key of new Set([...Object.keys(before?.values || {}), ...Object.keys(after?.values || {})])) {
+    const label = (effect?.vars || []).find((item) => item.id === key)?.label || "特效文字";
+    add(label, text(before?.values?.[key]), text(after?.values?.[key]));
+  }
+  for (const role of new Set([...Object.keys(before?.font_ids || {}), ...Object.keys(after?.font_ids || {})])) {
+    const fontName = (id) => id ? ((fxCatalog().fonts || []).find((font) => font.id === id)?.label || "已選字型") : "跟隨風格包";
+    const label = role === "display" ? "標題字型" : role === "body" ? "內文字型" : "特效字型";
+    const oldId = before?.font_ids?.[role] || "", newId = after?.font_ids?.[role] || "";
+    const oldName = fontName(oldId), newName = fontName(newId);
+    if (oldId !== newId && oldName === newName) lines.push(`${label}：字型選擇已變更`);
+    else add(label, oldName, newName);
+  }
+  return lines.join("\n") || "設定沒有差異。";
+}
+async function presetMutate(method) {
+  let selected = presetSelected();
+  try {
+    if (method !== "POST" && !selected) throw new Error("請先選擇預設。");
+    const body = { expected_library_revision: presetLibrary.revision };
+    if (method !== "DELETE") {
+      const captured = presetCapture();
+      body.name = presetNode("preset-name").value; body.kind = captured.kind; body.settings = captured.settings;
+      if (selected && method === "PUT") {
+        if (selected.kind !== body.kind) throw new Error("更新時圖層種類必須與預設相同。");
+        if (!await presetReview(`更新「${selected.name}」`, `名稱：${selected.name} → ${body.name}\n${presetDiff(selected.settings, body.settings)}`, "確認更新")) return;
+      }
+    } else if (!await presetReview(`刪除「${selected.name}」`, `將刪除預設「${selected.name}」。`, "確認刪除")) return;
+    const url = `/api/style-presets${method === "POST" ? "" : `/${encodeURIComponent(selected.id)}`}`;
+    const result = await request(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    presetSetLibrary(result, method === "DELETE" ? "" : selected?.id || ""); presetStatus(method === "DELETE" ? "已刪除預設。" : body.kind === "caption" && !body.settings.font ? "已儲存預設。未包含已驗證字型；套用時保留目標字型。" : "已儲存預設。");
+  } catch (error) { presetStatus(`操作失敗：${error.message}${error.status === 409 ? "；請重新開啟預設庫取得最新清單。" : ""}`); }
+  finally { if (presetNode("preset-review").open) presetNode("preset-review").close(); }
+}
+async function presetApply() {
+  const preset = presetSelected();
+  try {
+    if (!preset) throw new Error("請先選擇預設。");
+    if (stateDirty || presetSaveInFlight || !lastSaveSucceeded) throw new Error("目前編輯尚未儲存完成，請稍候再試。");
+    const overlay = currentOverlay();
+    if (preset.kind === "fx") {
+      const before = overlay?.type === "fx" ? { code: overlay.code, values: overlay.values || {}, placement: overlay.placement || "", scheme: overlay.scheme || "", font_ids: overlay.font_ids || {}, opacity: overlay.style?.opacity ?? 1, text_fit: overlay.text_fit !== false } : {};
+      if (!fxEffectByCode(preset.settings.code)) throw new Error("目前效果庫沒有這個特效。");
+      if (!await presetReview(`試看「${preset.name}」`, `${overlay?.type === "fx" ? "將替換目前特效" : "將在目前位置新增特效"}，確認試看後仍需在試看畫面套用。\n${presetDiff(before, preset.settings)}`, "前往試看")) return;
+      presetNode("preset-review").close();
+      openFxPreviewDialog(presetNode("preset-apply"), overlay?.type === "fx" ? overlay.id : null, preset.settings.code, preset.settings);
+      return;
+    }
+    if (!overlay || overlay.type !== "caption" || overlay.design_role) throw new Error("請先選取字幕圖層。");
+    const generation = editGeneration; const selection = selectedOverlayId; const revision = state.revision;
+    const body = { preset_id: preset.id, expected_library_revision: presetLibrary.revision, expected_revision: revision, overlay_id: selection, scope: presetNode("preset-scope").value };
+    const drifted = () => stateDirty || presetSaveInFlight || !lastSaveSucceeded || editGeneration !== generation || selectedOverlayId !== selection || state.revision !== revision || presetNode("preset-scope").value !== body.scope;
+    const plan = await request("/api/style-presets/caption-plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (drifted()) throw new Error("編輯或選取已變更，請重新查看差異。");
+    const labels = { "style.font_size": "字體大小", "style.color": "文字顏色", "style.emphasis_color": "重點顏色", "style.stroke_color": "描邊顏色", "style.stroke_width": "描邊寬度", "style.x": "水平位置", "style.y": "垂直位置", "style.max_width": "最大寬度", "style.animation": "動畫", font: "字型" };
+    const display = (value, field) => field === "font" && value ? [value.family, value.style, value.weight].filter((part) => part !== undefined && part !== null && part !== "").join(" / ") : value == null ? "未設定" : String(value);
+    const changes = Array.isArray(plan.changes) ? plan.changes : [];
+    const grouped = new Map();
+    for (const change of changes) {
+      const line = `${labels[change.field] || change.field}：${display(change.before, change.field)} → ${display(change.after, change.field)}`;
+      grouped.set(line, (grouped.get(line) || 0) + 1);
+    }
+    const allLines = [...grouped].map(([line, count]) => `${line}${count > 1 ? `（${count} 個字幕）` : ""}`);
+    const description = allLines.slice(0, 30).join("\n") + (allLines.length > 30 ? `\n另有 ${allLines.length - 30} 種差異；共 ${changes.length} 項變更。` : "") || "設定沒有差異。";
+    if (!await presetReview(`套用「${preset.name}」`, `範圍：${({single:"目前字幕",selection:"同精華",track:"整軌"})[body.scope]}\n${preset.settings.font ? "字型將依專案驗證" : "保留目標字幕字型"}\n${description}`, "確認套用")) return;
+    if (drifted()) throw new Error("編輯或選取已變更，請重新查看差異。");
+    const before = deepCopy(state);
+    const result = await request("/api/style-presets/caption-apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, plan_digest: plan.plan_digest }) });
+    if (result.no_change) { presetStatus("設定沒有差異，未新增撤銷步驟。"); return; }
+    if (!result.state) throw new Error("伺服器沒有回傳更新後的時間軸。");
+    history.push(before); if (history.length > 40) history.shift(); redoStack = []; lastHistoryPushAt = 0;
+    state = result.state; if (result.revision) state.revision = result.revision;
+    if (result.approval_revisions) projectPayload.approval_revisions = result.approval_revisions;
+    for (const gate of result.invalidated_gates || []) {
+      if (projectPayload?.manifest?.approvals?.[gate]) projectPayload.manifest.approvals[gate].approved = false;
+      if (gate === "timeline") elements["approve-timeline"].textContent = "核可時間軸";
+      if (gate === "highlight_selection") elements["approve-highlights"].textContent = "核可精華選段";
+      if (gate === "final" && projectPayload.approval_current) projectPayload.approval_current.final = false;
+    }
+    stateDirty = false; lastSaveSucceeded = true; markStateSynced(); setSaveState("已儲存", "saved"); renderAll(); renderDeliveryQa(); pollCaptionPreviews(); presetStatus("字幕預設已套用，可使用撤銷還原。");
+  } catch (error) { presetStatus(`套用失敗：${error.message}`); }
+  finally { if (presetNode("preset-review").open) presetNode("preset-review").close(); }
+}
+function bindStylePresets() {
+  presetNode("style-presets").addEventListener("toggle", (event) => { if (event.currentTarget.open) presetLoad(); });
+  presetNode("preset-list").addEventListener("change", () => { const preset = presetSelected(); if (preset) presetNode("preset-name").value = preset.name; });
+  presetNode("preset-create").addEventListener("click", () => presetMutate("POST"));
+  presetNode("preset-update").addEventListener("click", () => presetMutate("PUT"));
+  presetNode("preset-delete").addEventListener("click", () => presetMutate("DELETE"));
+  presetNode("preset-apply").addEventListener("click", presetApply);
+}
+
+initialize();

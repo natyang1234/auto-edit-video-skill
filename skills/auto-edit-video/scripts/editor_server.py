@@ -8,6 +8,7 @@ and only reads/writes inside the selected project directory.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import dataclasses
 import hashlib
@@ -37,6 +38,7 @@ import fx_overlay
 from fx_preview_jobs import FxPreviewJobError, FxPreviewJobManager
 import fx_preview_contract
 import asset_registry
+import style_presets
 import contract_registry
 import delivery_envelope
 from asset_provider_service import AssetProviderError, AssetProviderService
@@ -939,9 +941,195 @@ def migrate_caption_spans(state: dict[str, Any]) -> list[str]:
 LAYERS_REL = Path("working/structured_layers.json")
 VISUAL_PLAN_REL = Path("working/visual_plan_v2.json")
 LAYER_TXN_JOURNAL_REL = Path("working/.layer-txn-journal.json")
+CAPTION_PRESET_TXN_JOURNAL_REL = Path("working/.caption-preset-txn-journal.json")
 
 
 _LAYER_TXN_LOCK = threading.Lock()
+_CAPTION_PRESET_TXN_LOCK = threading.RLock()
+
+
+def _caption_preset_snapshot(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {"exists": False, "sha256": None, "data_base64": None}
+    return {
+        "exists": True,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "data_base64": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def _caption_preset_snapshot_bytes(snapshot: Any) -> bytes | None:
+    if not isinstance(snapshot, dict) or set(snapshot) != {"exists", "sha256", "data_base64"}:
+        raise ValueError("caption preset transaction snapshot is invalid")
+    if snapshot["exists"] is False:
+        if snapshot["sha256"] is not None or snapshot["data_base64"] is not None:
+            raise ValueError("caption preset transaction absence snapshot is invalid")
+        return None
+    if snapshot["exists"] is not True:
+        raise ValueError("caption preset transaction existence flag is invalid")
+    digest = snapshot["sha256"]
+    encoded = snapshot["data_base64"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("caption preset transaction snapshot hash is invalid")
+    if not isinstance(encoded, str):
+        raise ValueError("caption preset transaction snapshot bytes are invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("caption preset transaction snapshot bytes are invalid") from exc
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("caption preset transaction snapshot hash does not match")
+    return raw
+
+
+def _atomic_write_exact(path: Path, raw: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("caption preset transaction restore made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _caption_preset_target_paths(project_dir: Path) -> dict[str, Path]:
+    return {
+        "state": project_dir / STATE_REL,
+        "manifest": project_dir / "project.json",
+    }
+
+
+def begin_caption_preset_transaction(project_dir: Path) -> dict[str, Any]:
+    journal_path = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
+    if os.path.lexists(journal_path):
+        raise RuntimeError("caption preset transaction recovery is required")
+    journal = {
+        "schema_version": 1,
+        "phase": "prepared",
+        "before": {
+            name: _caption_preset_snapshot(path)
+            for name, path in _caption_preset_target_paths(project_dir).items()
+        },
+        "after_sha256": None,
+    }
+    atomic_write_json(journal_path, journal)
+    return journal
+
+
+def recover_caption_preset_transaction(project_dir: Path) -> None:
+    """Recover an interrupted caption preset apply without accepting partial state."""
+    journal_path = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
+    if not os.path.lexists(journal_path):
+        return
+    with _CAPTION_PRESET_TXN_LOCK:
+        if not os.path.lexists(journal_path):
+            return
+        try:
+            descriptor = os.open(
+                journal_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024 * 1024:
+                    raise ValueError("caption preset transaction journal is unsafe")
+                raw = b""
+                while len(raw) <= 32 * 1024 * 1024:
+                    chunk = os.read(descriptor, min(65536, 32 * 1024 * 1024 + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw += chunk
+                if len(raw) > 32 * 1024 * 1024:
+                    raise ValueError("caption preset transaction journal is too large")
+            finally:
+                os.close(descriptor)
+            journal = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(journal, dict)
+                or set(journal) != {"schema_version", "phase", "before", "after_sha256"}
+                or journal.get("schema_version") != 1
+                or journal.get("phase") not in {"prepared", "committed"}
+                or not isinstance(journal.get("before"), dict)
+                or set(journal["before"]) != {"state", "manifest"}
+            ):
+                raise ValueError("caption preset transaction journal is invalid")
+            targets = _caption_preset_target_paths(project_dir)
+            if journal["phase"] == "prepared":
+                if journal["after_sha256"] is not None:
+                    raise ValueError("prepared caption preset journal has after hashes")
+                for name in ("manifest", "state"):
+                    raw = _caption_preset_snapshot_bytes(journal["before"][name])
+                    if raw is None:
+                        targets[name].unlink(missing_ok=True)
+                    else:
+                        _atomic_write_exact(targets[name], raw)
+                for name, path in targets.items():
+                    expected = journal["before"][name]
+                    current = _caption_preset_snapshot(path)
+                    if current["exists"] != expected["exists"] or current["sha256"] != expected["sha256"]:
+                        raise OSError("caption preset rollback verification failed")
+            else:
+                hashes = journal["after_sha256"]
+                if (
+                    not isinstance(hashes, dict)
+                    or set(hashes) != {"state", "manifest"}
+                    or any(
+                        not isinstance(value, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                        for value in hashes.values()
+                    )
+                ):
+                    raise ValueError("committed caption preset journal hashes are invalid")
+                for name, path in targets.items():
+                    if _caption_preset_snapshot(path)["sha256"] != hashes[name]:
+                        raise OSError("committed caption preset files changed before cleanup")
+            journal_path.unlink()
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "caption preset transaction could not be recovered; journal retained"
+            ) from exc
+
+
+def commit_caption_preset_transaction(project_dir: Path, journal: dict[str, Any]) -> None:
+    targets = _caption_preset_target_paths(project_dir)
+    committed = copy.deepcopy(journal)
+    committed["phase"] = "committed"
+    committed["after_sha256"] = {
+        name: _caption_preset_snapshot(path)["sha256"] for name, path in targets.items()
+    }
+    if any(value is None for value in committed["after_sha256"].values()):
+        raise OSError("caption preset transaction target is missing after commit")
+    journal_path = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
+    atomic_write_json(journal_path, committed)
+    try:
+        journal_path.unlink()
+    except OSError:
+        # The committed journal is safe to retain: recovery only verifies the
+        # exact committed hashes and removes it, never rolls the change back.
+        pass
 
 
 def recover_layer_transaction(project_dir: Path) -> None:
@@ -3707,6 +3895,7 @@ class EditorServer(ThreadingHTTPServer):
         # render id to be staged again, which for a one-off render is never.
         for skipped in delivery_envelope.sweep_orphan_staging(resolved_project):
             print(f"[editor] stranded delivery stage kept: {skipped}", file=sys.stderr)
+        recover_caption_preset_transaction(resolved_project)
         super().__init__(address, EditorHandler)
         self.project_dir = resolved_project
         # Per-server CSRF token; browsers learn it from GET /api/project and
@@ -3715,6 +3904,7 @@ class EditorServer(ThreadingHTTPServer):
         # threat model (contracts/policies/DOWNLOAD_GATE.md).
         self.csrf_token = secrets.token_urlsafe(32)
         self.asset_provider_service = AssetProviderService(self.project_dir)
+        self.style_preset_store = style_presets.StylePresetStore()
         self.project_lock = threading.RLock()
         self.caption_job_lock = threading.Lock()
         self.caption_render_serial = threading.Lock()
@@ -4082,6 +4272,402 @@ class EditorHandler(BaseHTTPRequestHandler):
         "color", "font_size", "stroke_color", "stroke_width", "box", "box_color",
         "max_width", "animation", "font_weight", "font_family", "font_asset_id", "emphasis_color",
     }
+
+    @staticmethod
+    def _preset_error_payload(exc: style_presets.StylePresetError) -> dict[str, Any]:
+        return {"ok": False, "reason": exc.code, "error": exc.message}
+
+    def _send_preset_error(self, exc: style_presets.StylePresetError) -> None:
+        self.send_json(self._preset_error_payload(exc), status=exc.status)
+
+    @staticmethod
+    def _require_exact_fields(body: Any, fields: set[str], label: str) -> dict[str, Any]:
+        if not isinstance(body, dict) or set(body) != fields:
+            raise style_presets.StylePresetError(
+                422, "request_invalid", f"{label}欄位不符合 API 規格"
+            )
+        return body
+
+    @staticmethod
+    def _font_descriptor(binding: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "sha256": binding.get("sha256"),
+            "family": binding.get("family"),
+            "style": binding.get("style"),
+            "weight": binding.get("weight"),
+        }
+
+    def _resolve_portable_font(
+        self, descriptor: dict[str, Any], *, required_text: str = ""
+    ) -> dict[str, Any]:
+        expected = style_presets.normalize_font_descriptor(descriptor)
+        if expected is None:
+            raise style_presets.StylePresetError(422, "font_invalid", "字型描述不可為空")
+        try:
+            fonts = asset_registry.list_project_fonts(self.server.project_dir)
+        except asset_registry.AssetRegistryError as exc:
+            raise style_presets.StylePresetError(
+                409, "font_unavailable", "目前專案沒有可驗證的相符字型"
+            ) from exc
+        matches = [item for item in fonts if self._font_descriptor(item) == expected]
+        if not matches:
+            raise style_presets.StylePresetError(
+                409, "font_unavailable", "目前專案缺少相同實體字型，請先匯入"
+            )
+        if len(matches) != 1:
+            raise style_presets.StylePresetError(
+                409, "font_ambiguous", "目前專案有多個相同字型紀錄，無法安全套用"
+            )
+        try:
+            verified = asset_registry.resolve_project_font(
+                self.server.project_dir,
+                str(matches[0]["asset_id"]),
+                required_text=required_text,
+            )
+        except asset_registry.AssetRegistryError as exc:
+            raise style_presets.StylePresetError(
+                409, "font_coverage_failed", "相符字型無法涵蓋目前字幕文字"
+            ) from exc
+        if self._font_descriptor(verified) != expected:
+            raise style_presets.StylePresetError(
+                409, "font_changed", "字型驗證結果已變更，請重新載入"
+            )
+        return verified
+
+    def _verified_preset_settings(self, kind: Any, settings: Any) -> dict[str, Any]:
+        normalized = style_presets.normalize_settings(kind, settings)
+        if kind == "caption" and normalized["font"] is not None:
+            self._resolve_portable_font(normalized["font"])
+        return normalized
+
+    def handle_style_presets_get(self) -> None:
+        try:
+            collection = self.server.style_preset_store.collection()
+        except style_presets.StylePresetError as exc:
+            self._send_preset_error(exc)
+            return
+        self.send_json({"ok": True, **collection})
+
+    def handle_style_preset_create(self) -> None:
+        try:
+            body = self._require_exact_fields(
+                self.read_json_body(),
+                {"expected_library_revision", "name", "kind", "settings"},
+                "建立預設",
+            )
+            settings = self._verified_preset_settings(body["kind"], body["settings"])
+            result = self.server.style_preset_store.create(
+                body["expected_library_revision"], body["name"], body["kind"], settings
+            )
+        except ValueError as exc:
+            if isinstance(exc, style_presets.StylePresetError):
+                self._send_preset_error(exc)
+            else:
+                self.send_json({"ok": False, "reason": "request_invalid", "error": str(exc)}, status=400)
+            return
+        self.send_json({"ok": True, **result}, status=201)
+
+    def handle_style_preset_update(self, preset_id: str) -> None:
+        try:
+            body = self._require_exact_fields(
+                self.read_json_body(),
+                {"expected_library_revision", "name", "kind", "settings"},
+                "更新預設",
+            )
+            settings = self._verified_preset_settings(body["kind"], body["settings"])
+            result = self.server.style_preset_store.update(
+                preset_id,
+                body["expected_library_revision"],
+                body["name"],
+                body["kind"],
+                settings,
+            )
+        except ValueError as exc:
+            if isinstance(exc, style_presets.StylePresetError):
+                self._send_preset_error(exc)
+            else:
+                self.send_json({"ok": False, "reason": "request_invalid", "error": str(exc)}, status=400)
+            return
+        self.send_json({"ok": True, **result})
+
+    def handle_style_preset_delete(self, preset_id: str) -> None:
+        try:
+            body = self._require_exact_fields(
+                self.read_json_body(), {"expected_library_revision"}, "刪除預設"
+            )
+            result = self.server.style_preset_store.delete(
+                preset_id, body["expected_library_revision"]
+            )
+        except ValueError as exc:
+            if isinstance(exc, style_presets.StylePresetError):
+                self._send_preset_error(exc)
+            else:
+                self.send_json({"ok": False, "reason": "request_invalid", "error": str(exc)}, status=400)
+            return
+        self.send_json({"ok": True, **result})
+
+    @staticmethod
+    def _caption_recipients(
+        state: dict[str, Any], overlay_id: str, scope: str
+    ) -> list[dict[str, Any]]:
+        plain = [
+            overlay
+            for overlay in state.get("overlays", [])
+            if isinstance(overlay, dict)
+            and overlay.get("type") in {"caption", "emphasis"}
+            and not overlay.get("design_role")
+        ]
+        target = next((item for item in plain if str(item.get("id")) == overlay_id), None)
+        if target is None:
+            raise style_presets.StylePresetError(422, "target_invalid", "找不到目標字幕")
+        if scope == "single":
+            return [target]
+        if scope == "selection":
+            highlight = target.get("highlight_id")
+            return (
+                [item for item in plain if item.get("highlight_id") == highlight]
+                if highlight
+                else [target]
+            )
+        if scope == "track":
+            if not plain:
+                raise style_presets.StylePresetError(422, "target_invalid", "字幕軌沒有可套用項目")
+            return plain
+        raise style_presets.StylePresetError(422, "scope_invalid", "scope 必須是 single/selection/track")
+
+    @staticmethod
+    def _caption_style_values_equal(key: str, before: Any, after: Any) -> bool:
+        if key in style_presets.CAPTION_STYLE_BOUNDS:
+            if (
+                isinstance(before, bool)
+                or isinstance(after, bool)
+                or not isinstance(before, (int, float))
+                or not isinstance(after, (int, float))
+            ):
+                return False
+            try:
+                return math.isfinite(float(before)) and math.isfinite(float(after)) and float(before) == float(after)
+            except (OverflowError, TypeError, ValueError):
+                return False
+        if key in style_presets.CAPTION_COLOR_KEYS:
+            return (
+                isinstance(before, str)
+                and isinstance(after, str)
+                and re.fullmatch(r"#[0-9A-Fa-f]{6}", before) is not None
+                and re.fullmatch(r"#[0-9A-Fa-f]{6}", after) is not None
+                and before.casefold() == after.casefold()
+            )
+        return before == after and type(before) is type(after)
+
+    def _caption_preset_plan(
+        self,
+        body: dict[str, Any],
+        collection: dict[str, Any],
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if body["expected_library_revision"] != collection["revision"]:
+            raise style_presets.StylePresetError(
+                409, "library_revision_conflict", "預設清單已變更，請重新載入"
+            )
+        current_revision = str(state.get("revision") or editor_state_revision(state))
+        if body["expected_revision"] != current_revision:
+            raise style_presets.StylePresetError(
+                409, "revision_conflict", "時間軸已變更，請重新計畫"
+            )
+        preset_id = body["preset_id"]
+        matches = [item for item in collection["presets"] if item["id"] == preset_id]
+        if len(matches) != 1:
+            raise style_presets.StylePresetError(404, "preset_not_found", "找不到預設")
+        preset = matches[0]
+        if preset["kind"] != "caption":
+            raise style_presets.StylePresetError(422, "kind_invalid", "所選預設不是字幕預設")
+        overlay_id = body["overlay_id"]
+        if not isinstance(overlay_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,80}", overlay_id) is None:
+            raise style_presets.StylePresetError(422, "target_invalid", "目標字幕識別碼無效")
+        scope = body["scope"]
+        recipients = self._caption_recipients(state, overlay_id, scope)
+        settings = preset["settings"]
+        required_text = "\n".join(str(item.get("text") or "") for item in recipients)
+        target_font = (
+            self._resolve_portable_font(settings["font"], required_text=required_text)
+            if settings["font"] is not None
+            else None
+        )
+        candidate = copy.deepcopy(state)
+        candidate_by_id = {
+            str(item.get("id")): item
+            for item in candidate.get("overlays", [])
+            if isinstance(item, dict)
+        }
+        changes: list[dict[str, Any]] = []
+        for source in recipients:
+            recipient_id = str(source.get("id"))
+            target = candidate_by_id[recipient_id]
+            before_style = source.get("style") if isinstance(source.get("style"), dict) else {}
+            after_style = target.get("style") if isinstance(target.get("style"), dict) else {}
+            after_style = dict(after_style)
+            target["style"] = after_style
+            for key, after in settings["style"].items():
+                before = before_style.get(key)
+                if not self._caption_style_values_equal(key, before, after):
+                    changes.append({
+                            "overlay_id": recipient_id,
+                            "field": f"style.{key}",
+                            "before": before,
+                            "after": after,
+                        })
+                    after_style[key] = after
+            if target_font is not None:
+                current_asset_id = str(before_style.get("font_asset_id") or "")
+                before_font = None
+                if current_asset_id:
+                    try:
+                        current_binding = asset_registry.resolve_project_font(
+                            self.server.project_dir,
+                            current_asset_id,
+                            required_text=str(source.get("text") or ""),
+                        )
+                    except asset_registry.AssetRegistryError as exc:
+                        raise style_presets.StylePresetError(
+                            409, "font_changed", "目前字幕字型已失效，請重新載入"
+                        ) from exc
+                    before_font = self._font_descriptor(current_binding)
+                after_font = self._font_descriptor(target_font)
+                if before_font != after_font:
+                    changes.append({
+                        "overlay_id": recipient_id,
+                        "field": "font",
+                        "before": before_font,
+                        "after": after_font,
+                    })
+                after_style["font_asset_id"] = target_font["asset_id"]
+                after_style["font_family"] = target_font["family"]
+                after_style["font_weight"] = target_font["weight"]
+        applied_to = [str(item.get("id")) for item in recipients]
+        digest_material = {
+            "preset_id": preset["id"],
+            "preset_name": preset["name"],
+            "library_revision": collection["revision"],
+            "project_revision": current_revision,
+            "overlay_id": overlay_id,
+            "scope": scope,
+            "settings": settings,
+            "changes": changes,
+            "applied_to": applied_to,
+        }
+        plan = {
+            "ok": True,
+            "preset_id": preset["id"],
+            "preset_name": preset["name"],
+            "library_revision": collection["revision"],
+            "project_revision": current_revision,
+            "plan_digest": contract_registry.canonical_hash(digest_material),
+            "changes": changes,
+            "applied_to": applied_to,
+            "no_change": not changes,
+        }
+        return plan, candidate
+
+    def handle_caption_preset_plan(self) -> None:
+        fields = {
+            "preset_id", "expected_library_revision", "expected_revision",
+            "overlay_id", "scope",
+        }
+        try:
+            body = self._require_exact_fields(self.read_json_body(), fields, "字幕預設計畫")
+            with self.server.project_lock:
+                state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                collection = self.server.style_preset_store.collection()
+                plan, _candidate = self._caption_preset_plan(body, collection, state)
+        except ValueError as exc:
+            if isinstance(exc, style_presets.StylePresetError):
+                self._send_preset_error(exc)
+            else:
+                self.send_json({"ok": False, "reason": "request_invalid", "error": str(exc)}, status=400)
+            return
+        self.send_json(plan)
+
+    def handle_caption_preset_apply(self) -> None:
+        fields = {
+            "preset_id", "expected_library_revision", "expected_revision",
+            "overlay_id", "scope", "plan_digest",
+        }
+        try:
+            body = self._require_exact_fields(self.read_json_body(), fields, "字幕預設套用")
+            plan_body = {key: value for key, value in body.items() if key != "plan_digest"}
+            with self.server.project_lock:
+                with self.server.style_preset_store.locked_collection() as collection:
+                    try:
+                        recover_caption_preset_transaction(self.server.project_dir)
+                    except RuntimeError as exc:
+                        raise style_presets.StylePresetError(
+                            500,
+                            "transaction_recovery_required",
+                            "上次字幕預設套用尚未安全復原，已保留復原紀錄",
+                        ) from exc
+                    state = read_json(self.server.project_dir / STATE_REL, {}) or {}
+                    plan, candidate = self._caption_preset_plan(plan_body, collection, state)
+                    if body["plan_digest"] != plan["plan_digest"]:
+                        raise style_presets.StylePresetError(
+                            409, "plan_changed", "套用內容已變更，請重新確認"
+                        )
+                    if plan["no_change"]:
+                        self.send_json({
+                            "ok": True,
+                            "state": state,
+                            "revision": plan["project_revision"],
+                            "invalidated_gates": [],
+                            "applied_to": plan["applied_to"],
+                            "no_change": True,
+                        })
+                        return
+                    journal: dict[str, Any] | None = None
+                    try:
+                        journal = begin_caption_preset_transaction(self.server.project_dir)
+                        try:
+                            errors, response = self.persist_editor_state(
+                                candidate, expected_revision=plan["project_revision"]
+                            )
+                        except EditorRevisionConflict as exc:
+                            raise style_presets.StylePresetError(
+                                409, "revision_conflict", "時間軸已變更，請重新計畫"
+                            ) from exc
+                        if errors:
+                            raise style_presets.StylePresetError(
+                                422, "state_invalid", "; ".join(errors[:5])
+                            )
+                        commit_caption_preset_transaction(self.server.project_dir, journal)
+                    except Exception as exc:
+                        if journal is not None:
+                            try:
+                                recover_caption_preset_transaction(self.server.project_dir)
+                            except RuntimeError as recovery_exc:
+                                raise style_presets.StylePresetError(
+                                    500,
+                                    "transaction_recovery_required",
+                                    "字幕預設套用未完成，復原紀錄已保留，請勿繼續編輯",
+                                ) from recovery_exc
+                        if isinstance(exc, style_presets.StylePresetError):
+                            raise
+                        raise style_presets.StylePresetError(
+                            500,
+                            "transaction_failed",
+                            "字幕預設套用失敗，專案已復原",
+                        ) from exc
+        except ValueError as exc:
+            if isinstance(exc, style_presets.StylePresetError):
+                self._send_preset_error(exc)
+            else:
+                self.send_json({"ok": False, "reason": "request_invalid", "error": str(exc)}, status=400)
+            return
+        self.server.schedule_caption_render()
+        self.send_json({
+            **response,
+            "ok": True,
+            "state": candidate,
+            "applied_to": plan["applied_to"],
+            "no_change": False,
+        })
 
     def handle_caption_apply_style(self) -> None:
         """Server-side style application across a scope (single/selection/track).
@@ -5330,6 +5916,9 @@ class EditorHandler(BaseHTTPRequestHandler):
         if path == "/api/fonts":
             self.handle_font_info(project)
             return
+        if path == "/api/style-presets":
+            self.handle_style_presets_get()
+            return
         caption_match = re.fullmatch(
             r"/captions/([A-Za-z0-9_-]{1,80})/([0-9a-f]{64})\.png", path
         )
@@ -5414,6 +6003,10 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not self.allow_request(mutation=True):
             return
         path, _query = self.route()
+        preset_match = re.fullmatch(r"/api/style-presets/(preset_[0-9a-f]{32})", path)
+        if preset_match:
+            self.handle_style_preset_update(preset_match.group(1))
+            return
         if path == "/api/edit-decisions":
             self.handle_edit_decisions()
             return
@@ -5450,6 +6043,16 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         self.server.schedule_caption_render()
         self.send_json(response)
+
+    def do_DELETE(self) -> None:
+        if not self.allow_request(mutation=True):
+            return
+        path, _query = self.route()
+        preset_match = re.fullmatch(r"/api/style-presets/(preset_[0-9a-f]{32})", path)
+        if preset_match:
+            self.handle_style_preset_delete(preset_match.group(1))
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def handle_fx_apply(self) -> None:
         """Order from the 風格菜單: add its effect codes as fx layers (and pin the theme pack)."""
@@ -5734,6 +6337,15 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not self.allow_request(mutation=True):
             return
         path, query = self.route()
+        if path == "/api/style-presets":
+            self.handle_style_preset_create()
+            return
+        if path == "/api/style-presets/caption-plan":
+            self.handle_caption_preset_plan()
+            return
+        if path == "/api/style-presets/caption-apply":
+            self.handle_caption_preset_apply()
+            return
         if path == "/api/fx-previews":
             self.handle_fx_preview_submit()
             return

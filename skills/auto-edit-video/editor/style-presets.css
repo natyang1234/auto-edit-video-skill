@@ -1,0 +1,12 @@
+.style-presets { border-block: 1px solid #c9bba6; padding: 12px 0; color: #29241f; }
+.style-presets summary { cursor: pointer; font-weight: 700; min-height: 44px; display: flex; align-items: center; }
+.style-presets p { font-size: 13px; line-height: 1.5; }
+.style-presets label { display: grid; gap: 5px; margin: 10px 0; font-size: 13px; }
+.style-presets input, .style-presets select { width: 100%; min-width: 0; min-height: 44px; padding: 8px; border: 1px solid #a99b87; background: #fffdf7; color: #29241f; }
+.preset-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.preset-actions button { min-height: 44px; padding: 8px 12px; border: 1px solid #9c3d2d; background: #fffaf1; color: #792d21; cursor: pointer; }
+.preset-actions button:last-child { background: #9c3d2d; color: white; }
+.style-presets :focus-visible, .preset-review :focus-visible { outline: 3px solid #2e6d91; outline-offset: 2px; }
+.preset-review { max-width: min(620px, calc(100vw - 32px)); max-height: 85vh; padding: 22px; color: #29241f; background: #f8f2e7; border: 1px solid #8d7e6a; }
+.preset-review::backdrop { background: #181713bb; }
+.preset-review pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55vh; overflow: auto; font: inherit; line-height: 1.6; }
