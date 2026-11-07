@@ -13,6 +13,7 @@ import time
 import hashlib
 import copy
 import errno
+from contextlib import contextmanager
 from unittest.mock import patch
 from pathlib import Path
 
@@ -57,6 +58,54 @@ class StylePresetOSProxy:
     def live_fds(self) -> dict[int, object]:
         with self._lock:
             return dict(self._live)
+
+
+@contextmanager
+def short_socket_temporary_directory(prefix: str):
+    """Create a task-owned AF_UNIX fixture path without platform-specific hardcoding."""
+    if not hasattr(socket, "AF_UNIX"):
+        raise unittest.SkipTest("AF_UNIX is unavailable on this platform")
+    bases: list[Path | None] = []
+    for candidate in (Path("/tmp"), Path(tempfile.gettempdir())):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved not in bases:
+            bases.append(resolved)
+    bases.append(None)
+    attempts: list[str] = []
+    temporary = None
+    root = None
+    for base in bases:
+        try:
+            candidate_temp = tempfile.TemporaryDirectory(
+                prefix=prefix,
+                dir=None if base is None else base,
+            )
+        except OSError as exc:
+            attempts.append(f"{base or 'default'}: {type(exc).__name__}")
+            continue
+        candidate_root = Path(candidate_temp.name)
+        longest = max(
+            len(os.fsencode(candidate_root / "presets.json")),
+            len(os.fsencode(candidate_root / ".presets.lock")),
+        )
+        if longest <= 103:
+            temporary = candidate_temp
+            root = candidate_root
+            break
+        attempts.append(f"{base or 'default'}: path-bytes={longest}")
+        candidate_temp.cleanup()
+    if temporary is None or root is None:
+        raise unittest.SkipTest(
+            "no task-owned AF_UNIX fixture path fits the 103-byte portable limit; "
+            + "; ".join(attempts)
+        )
+    try:
+        yield root
+    finally:
+        temporary.cleanup()
 
 
 def publish_verified_font(project: Path, candidate_name: str) -> tuple[dict, dict]:
@@ -2282,8 +2331,7 @@ class StylePresetApiTests(unittest.TestCase):
 
     def test_store_socket_is_unsafe_and_fd_tracker_has_positive_control(self) -> None:
         original_store = self.harness.server.style_preset_store
-        with tempfile.TemporaryDirectory(prefix="p3-store-socket-", dir="/private/tmp") as raw:
-            short_store = Path(raw)
+        with short_socket_temporary_directory("p3-store-socket-") as short_store:
             self.harness.server.style_preset_store = style_presets.StylePresetStore(short_store)
             tracker = StylePresetOSProxy()
             bound = None
@@ -2330,6 +2378,74 @@ class StylePresetApiTests(unittest.TestCase):
                 socket_path = self.harness.server.style_preset_store.path
                 if socket_path.exists() or socket_path.is_socket():
                     socket_path.unlink()
+                self.harness.server.style_preset_store = original_store
+
+    def test_lock_socket_is_unsafe_for_caption_apply_and_mutation(self) -> None:
+        original_store = self.harness.server.style_preset_store
+        with short_socket_temporary_directory("p3-lock-socket-") as short_store:
+            self.harness.server.style_preset_store = style_presets.StylePresetStore(short_store)
+            tracker = StylePresetOSProxy()
+            bound = None
+            try:
+                _state, project_revision = self.install_caption()
+                status, empty = self.request("GET", "/api/style-presets")
+                self.assertEqual(status, 200, empty)
+                created = self.create_caption_preset(empty["revision"])
+                base = {
+                    "preset_id": created["preset"]["id"],
+                    "expected_library_revision": created["revision"],
+                    "expected_revision": project_revision,
+                    "overlay_id": "caption-preset-target",
+                    "scope": "single",
+                }
+                status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+                self.assertEqual(status, 200, plan)
+                lock_path = self.harness.server.style_preset_store.lock_path
+                lock_path.unlink()
+                bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                bound.bind(str(lock_path))
+                store_path = self.harness.server.style_preset_store.path
+                state_path = self.harness.project / "working/editor_state.json"
+                manifest_path = self.harness.project / "project.json"
+                journal_path = self.harness.project / "working/caption-preset-transaction.json"
+                before = {
+                    "store": store_path.read_bytes(),
+                    "state": state_path.read_bytes(),
+                    "manifest": manifest_path.read_bytes(),
+                    "journal": journal_path.read_bytes() if journal_path.exists() else None,
+                }
+                with patch.object(style_presets, "os", tracker):
+                    status, apply_rejected = self.request(
+                        "POST",
+                        "/api/style-presets/caption-apply",
+                        {**base, "plan_digest": plan["plan_digest"]},
+                    )
+                    self.assertEqual(status, 409, apply_rejected)
+                    self.assertEqual(apply_rejected["reason"], "store_unsafe")
+                    self.assertEqual(tracker.live_fds, {})
+                    status, mutation_rejected = self.request("POST", "/api/style-presets", {
+                        "expected_library_revision": created["revision"],
+                        "name": "lock-socket-mutation",
+                        "kind": "caption",
+                        "settings": {"style": {"color": "#123456"}},
+                    })
+                    self.assertEqual(status, 409, mutation_rejected)
+                    self.assertEqual(mutation_rejected["reason"], "store_unsafe")
+                    self.assertEqual(tracker.live_fds, {})
+                self.assertTrue(stat.S_ISSOCK(lock_path.lstat().st_mode))
+                self.assertEqual(store_path.read_bytes(), before["store"])
+                self.assertEqual(state_path.read_bytes(), before["state"])
+                self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+                self.assertEqual(
+                    journal_path.read_bytes() if journal_path.exists() else None,
+                    before["journal"],
+                )
+            finally:
+                if bound is not None:
+                    bound.close()
+                lock_path = self.harness.server.style_preset_store.lock_path
+                if lock_path.exists() or lock_path.is_socket():
+                    lock_path.unlink()
                 self.harness.server.style_preset_store = original_store
 
     def test_extreme_corrupt_json_is_409_and_preserved_across_http_boundaries(self) -> None:
