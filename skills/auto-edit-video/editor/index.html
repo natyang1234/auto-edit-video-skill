@@ -631,6 +631,67 @@
       </section>
     </main>
 
+    <dialog class="fx-preview-dialog" id="fx-preview-dialog" aria-labelledby="fx-preview-title" aria-describedby="fx-preview-description">
+      <div class="fx-preview-shell">
+        <section class="fx-preview-catalog" aria-labelledby="fx-preview-catalog-title">
+          <header class="fx-preview-dialog-heading">
+            <div>
+              <p class="eyebrow">STYLE LIBRARY · 168 EFFECTS</p>
+              <h2 id="fx-preview-catalog-title">選擇風格</h2>
+            </div>
+            <button class="fx-preview-close icon-button" id="fx-preview-close" type="button" aria-label="關閉風格試看">×</button>
+          </header>
+          <p class="fx-preview-catalog-note">卡片為風格示意；選取後用本片試看。</p>
+          <div class="fx-preview-toolbar">
+            <div class="fx-preview-cats" id="fx-preview-cats" role="tablist" aria-label="風格分類"></div>
+            <label class="sr-only" for="fx-preview-search">搜尋風格</label>
+            <input id="fx-preview-search" type="search" placeholder="搜代碼／中文名" autocomplete="off">
+          </div>
+          <div class="fx-preview-grid" id="fx-preview-grid" role="radiogroup" aria-label="風格效果清單"></div>
+        </section>
+
+        <section class="fx-preview-editor" aria-labelledby="fx-preview-title">
+          <header class="fx-preview-dialog-heading fx-preview-editor-heading">
+            <div>
+              <p class="eyebrow">TRY ON YOUR VIDEO</p>
+              <h2 id="fx-preview-title">用我的影片試風格</h2>
+              <p id="fx-preview-description" class="fx-preview-description">試看目前片段與單一特效；完整編輯請用輸出預覽。</p>
+            </div>
+          </header>
+
+          <div class="fx-preview-player-wrap">
+            <video id="fx-preview-video" class="fx-preview-video" controls playsinline muted preload="metadata" aria-label="特效試看影片"></video>
+            <p id="fx-preview-status" class="fx-preview-status" role="status" aria-live="polite">尚未選擇風格。</p>
+          </div>
+
+          <div class="fx-preview-settings">
+            <div class="fx-preview-selection">
+              <span class="field-label">目前選擇</span>
+              <strong id="fx-preview-selected-name">—</strong>
+              <p class="fx-preview-spec" id="fx-preview-spec"></p>
+            </div>
+            <div class="fx-preview-window" aria-labelledby="fx-preview-window-title">
+              <div class="fx-preview-subheading" id="fx-preview-window-title">試看時間</div>
+              <div class="fx-preview-time-grid">
+                <label class="field"><span>來源起點（秒）</span><input id="fx-preview-source" type="number" min="0" step="0.1"></label>
+                <label class="field"><span>試看長度（最多 4 秒）</span><input id="fx-preview-duration" type="number" min="0.1" max="4" step="0.1"></label>
+              </div>
+              <p class="fx-preview-time-note"><span>播放範圍</span> <output id="fx-preview-window-label">00:00.000 — 00:00.000</output></p>
+              <p class="fx-preview-replace-note" id="fx-preview-replace-note" hidden></p>
+            </div>
+            <div class="fx-preview-fields" id="fx-preview-fields"></div>
+          </div>
+
+          <footer class="fx-preview-actions">
+            <button class="button button-secondary" id="fx-preview-retry" type="button" hidden>重試預覽</button>
+            <span class="fx-preview-action-spacer"></span>
+            <button class="button button-secondary" id="fx-preview-cancel" type="button">取消</button>
+            <button class="button button-primary" id="fx-preview-confirm" type="button" disabled>套用到時間軸</button>
+          </footer>
+        </section>
+      </div>
+    </dialog>
+
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <script src="/app.js" defer></script>
   </body>

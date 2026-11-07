@@ -31,6 +31,21 @@ let projectFontInfo = null;
 const loadedProjectFontIds = new Set();
 const loadingProjectFontIds = new Set();
 let projectFontPreviewError = "";
+let lastSaveSucceeded = true;
+// FX previews are deliberately local drafts. They never touch editor state
+// until the server compare-and-swap confirm succeeds.
+let fxPreviewDraft = null;
+let fxPreviewReplaceOverlayId = null;
+let fxPreviewTrigger = null;
+let fxPreviewJob = null;
+let fxPreviewPollTimer = null;
+let fxPreviewDebounceTimer = null;
+let fxPreviewCancelPromise = null;
+let fxPreviewGeneration = 0;
+let fxPreviewReadySignature = "";
+let fxPreviewDraftSignature = "";
+let fxPreviewConfirmed = false;
+let activeFxPreviewCategory = "";
 // Last state both sides agreed on. Diffing against this is what lets a save
 // conflict be replayed: it says which top-level sections *this* window changed,
 // so the background pipeline's writes can be kept and ours re-applied on top.
@@ -97,7 +112,7 @@ function cacheElements() {
     "template-subject-y", "template-subject-y-output", "template-subject-scale", "template-subject-scale-output",
     "background-controls", "template-background-color-row", "template-background-color",
     "template-background-fit-row", "template-background-fit",
-    "template-background-button", "template-background-input", "template-background-status",
+    "template-background-button", "template-background-input", "template-background-status", "open-fx-menu",
     "template-capability-note", "template-background-image", "template-background-video",
     "render-button", "source-file-name", "source-file-detail", "source-preview-button",
     "transcript-calibration-status", "transcript-calibration-title", "transcript-calibration-copy",
@@ -130,7 +145,11 @@ function cacheElements() {
     "audio-event-form", "audio-event-id", "audio-event-role", "audio-event-asset", "audio-event-start-sample",
     "audio-event-gain-db", "audio-event-start-seconds", "audio-event-policy", "audio-event-error",
     "timeline-scroll", "timeline-ruler", "timeline-tracks", "playhead", "toast", "download-output",
-    "fx-panel", "fx-panel-note", "fx-cats", "fx-search", "fx-grid", "fx-spec", "fx-vars"
+    "fx-panel", "fx-panel-note", "fx-cats", "fx-search", "fx-grid", "fx-spec", "fx-vars",
+    "fx-preview-dialog", "fx-preview-close", "fx-preview-cats", "fx-preview-search", "fx-preview-grid",
+    "fx-preview-selected-name", "fx-preview-spec", "fx-preview-source", "fx-preview-duration",
+    "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-status",
+    "fx-preview-video", "fx-preview-retry", "fx-preview-cancel", "fx-preview-confirm"
   ].forEach((id) => { elements[id] = byId(id); });
 }
 
@@ -149,12 +168,25 @@ async function request(url, options = {}) {
     payload = { error: `伺服器回傳 ${response.status}` };
   }
   if (!response.ok) {
-    const message = payload.error || (payload.errors || []).join("；") || `請求失敗（${response.status}）`;
+    const rawError = payload?.error;
+    const errorMessage = typeof rawError === "string"
+      ? rawError
+      : rawError?.message || rawError?.detail || rawError?.error || "";
+    const errors = Array.isArray(payload?.errors)
+      ? payload.errors.map((item) => typeof item === "string" ? item : item?.message || JSON.stringify(item)).join("；")
+      : "";
+    const message = errorMessage || errors || `請求失敗（${response.status}）`;
     const error = new Error(message);
     error.status = response.status;
     // Callers need to tell a compare-and-swap conflict (recoverable: reload and
     // replay) apart from a validation failure (not recoverable by retrying).
     error.code = payload && typeof payload.error_code === "string" ? payload.error_code : null;
+    error.reason = payload && typeof payload.reason === "string"
+      ? payload.reason
+      : payload && typeof payload.error_reason === "string"
+        ? payload.error_reason
+        : error.code;
+    error.payload = payload;
     throw error;
   }
   if (payload && typeof payload.csrf_token === "string") {
@@ -712,6 +744,7 @@ async function saveState(showConfirmation = true) {
       const retryable = await reconcileStateConflict();
       if (!retryable) {
         stateDirty = false;
+        lastSaveSucceeded = false;
         setSaveState("已重載最新版", "saved");
         return;
       }
@@ -743,10 +776,12 @@ async function saveState(showConfirmation = true) {
       renderDeliveryQa();
     }
     markStateSynced();
+    lastSaveSucceeded = true;
     setSaveState("已儲存", "saved");
     pollCaptionPreviews();
     if (showConfirmation) showToast("時間軸已儲存", "success");
   } catch (error) {
+    lastSaveSucceeded = false;
     setSaveState("儲存失敗", "error");
     if (error.code === "revision_conflict") {
       showToast("背景處理中，已重載最新版", "error");
@@ -1889,6 +1924,633 @@ function fxThumbUrl(effect) {
   const rel = byTheme[fxThemeNo()] || effect.thumb || "";
   return rel ? `${fxCatalog().thumb_base || "/fx-thumbs/"}${rel}` : "";
 }
+
+function fxPreviewIsBlocked(effect) {
+  return String(effect?.code || "").toUpperCase() === "B1";
+}
+
+function fxPreviewReplaceOverlay() {
+  if (!fxPreviewReplaceOverlayId || !Array.isArray(state?.overlays)) return null;
+  return state.overlays.find((overlay) => String(overlay.id) === String(fxPreviewReplaceOverlayId)) || null;
+}
+
+function fxPreviewCaptionText(start) {
+  const active = currentOverlay();
+  const candidates = (state?.overlays || [])
+    .filter((overlay) => ["caption", "emphasis", "title", "animation"].includes(overlay.type))
+    .filter((overlay) => Number(overlay.start) <= start + 0.01 && Number(overlay.end) >= start - 0.01)
+    .sort((left, right) => Number(left.start) - Number(right.start));
+  const preferred = active && ["caption", "emphasis", "title", "animation"].includes(active.type)
+    ? active
+    : candidates[0];
+  return String(preferred?.text || candidates[0]?.text || "").trim();
+}
+
+function fxPreviewSourceStart() {
+  const overlay = fxPreviewReplaceOverlay();
+  const current = Number(elements["preview-video"]?.currentTime || 0);
+  if (showingRenderedMedia) {
+    // The rendered output has a different time axis. Preserve the selected FX
+    // layer's source start, or the last visible time before switching back.
+    const fallback = Number.isFinite(Number(overlay?.start)) ? Number(overlay.start) : current;
+    ensureSourcePreview();
+    return fallback;
+  }
+  return Number.isFinite(Number(overlay?.start)) ? Number(overlay.start) : current;
+}
+
+function fxPreviewTextSlotUsesCaption(item) {
+  const id = String(item?.id || "").toLowerCase();
+  const allowed = new Set(["title", "text", "caption", "copy", "subtitle", "headline", "body", "label", "message", "cta", "sub"]);
+  if (!allowed.has(id)) return false;
+  if (Array.isArray(item?.options) || Array.isArray(item?.enum)) return false;
+  const defaultValue = String(item?.default ?? "").trim();
+  return !defaultValue || !Number.isFinite(Number(defaultValue));
+}
+
+function fxPreviewMaxDuration(effect, start) {
+  const sourceDuration = Number(duration() || 0);
+  const sourceTail = Math.max(0.1, sourceDuration - start);
+  const effectMax = Number(effect?.media_max);
+  return Math.max(0.1, Math.min(4, sourceTail, Number.isFinite(effectMax) && effectMax > 0 ? effectMax : 4));
+}
+
+function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart = 0) {
+  if (!effect) return null;
+  const seedWindow = seed?.window || {};
+  const start = Number.isFinite(Number(seedWindow.start_s))
+    ? Number(seedWindow.start_s)
+    : Number.isFinite(Number(overlay?.start)) ? Number(overlay.start) : Number(fallbackStart || 0);
+  const safeStart = Math.max(0, Math.min(start, Math.max(0, Number(duration() || 0) - 0.1)));
+  const maxDuration = fxPreviewMaxDuration(effect, safeStart);
+  const overlayDuration = overlay ? Math.max(0.01, Number(overlay.end) - Number(overlay.start)) : 3;
+  const rawDuration = Number.isFinite(Number(seedWindow.duration_s))
+    ? Number(seedWindow.duration_s)
+    : Math.min(overlayDuration, maxDuration);
+  const text = fxPreviewCaptionText(safeStart);
+  const priorValues = seed?.values || overlay?.values || {};
+  const values = {};
+  (effect.vars || []).filter((item) => item.kind === "text").forEach((item) => {
+    values[item.id] = Object.prototype.hasOwnProperty.call(priorValues, item.id)
+      ? String(priorValues[item.id] ?? "")
+      : (fxPreviewTextSlotUsesCaption(item) && text ? text : String(item.default ?? ""));
+  });
+  const placement = (effect.vars || []).find((item) => item.kind === "placement");
+  const priorFonts = seed?.font_ids || overlay?.font_ids || {};
+  return {
+    code: effect.code,
+    window: {
+      start_s: safeStart,
+      duration_s: Math.max(0.1, Math.min(maxDuration, Number.isFinite(rawDuration) ? rawDuration : maxDuration)),
+    },
+    values,
+    placement: seed?.placement ?? overlay?.placement ?? placement?.default ?? "",
+    scheme: seed?.scheme ?? overlay?.scheme ?? "",
+    font_ids: { ...priorFonts },
+  };
+}
+
+function fxPreviewSignature() {
+  return fxPreviewDraft ? JSON.stringify(fxPreviewDraft) : "";
+}
+
+function fxPreviewSetStatus(message, tone = "") {
+  const status = elements["fx-preview-status"];
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("is-error", tone === "error");
+  status.classList.toggle("is-success", tone === "success");
+}
+
+function fxPreviewUpdateWindowControls() {
+  if (!fxPreviewDraft) return;
+  const effect = fxEffectByCode(fxPreviewDraft.code);
+  const sourceDuration = Number(duration() || 0);
+  const maxStart = Math.max(0, sourceDuration - 0.1);
+  const start = Math.max(0, Math.min(maxStart, Number(fxPreviewDraft.window.start_s) || 0));
+  const maxDuration = fxPreviewMaxDuration(effect, start);
+  const clipDuration = Math.max(0.1, Math.min(maxDuration, Number(fxPreviewDraft.window.duration_s) || maxDuration));
+  fxPreviewDraft.window.start_s = start;
+  fxPreviewDraft.window.duration_s = clipDuration;
+  elements["fx-preview-source"].value = String(start);
+  elements["fx-preview-source"].max = String(maxStart);
+  elements["fx-preview-duration"].value = String(clipDuration);
+  elements["fx-preview-duration"].max = String(maxDuration);
+  elements["fx-preview-window-label"].textContent = `${formatTime(start)} — ${formatTime(start + clipDuration)}`;
+  const overlay = fxPreviewReplaceOverlay();
+  const originalDuration = overlay ? Math.max(0, Number(overlay.end) - Number(overlay.start)) : 0;
+  const note = elements["fx-preview-replace-note"];
+  if (note) {
+    note.hidden = !overlay || originalDuration <= 4.0001;
+    if (!note.hidden) {
+      note.textContent = `原特效長度 ${originalDuration.toFixed(2)} 秒；這次試看 ${formatTime(start)} — ${formatTime(start + clipDuration)}。確認套用後將縮短為此次試看範圍；未確認前原層不變。`;
+    }
+  }
+}
+
+function fxPreviewRenderCatalog() {
+  const catalog = fxCatalog();
+  const categories = catalog.categories || {};
+  const tabs = [["", "全部"], ...Object.entries(categories)];
+  elements["fx-preview-cats"].replaceChildren(...tabs.map(([key, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(key === activeFxPreviewCategory));
+    button.className = key === activeFxPreviewCategory ? "is-selected" : "";
+    button.textContent = key ? `${key} ${label}` : label;
+    button.addEventListener("click", () => {
+      activeFxPreviewCategory = key;
+      fxPreviewRenderCatalog();
+    });
+    return button;
+  }));
+  const query = String(elements["fx-preview-search"].value || "").trim().toLowerCase();
+  const list = fxEffects().filter((effect) => (!activeFxPreviewCategory || effect.category === activeFxPreviewCategory)
+    && (!query || [effect.code, effect.name, effect.spec].join(" ").toLowerCase().includes(query)));
+  elements["fx-preview-grid"].replaceChildren(...list.map((effect) => {
+    const selected = effect.code === fxPreviewDraft?.code;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `fx-card fx-preview-card${selected ? " is-selected" : ""}`;
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(selected));
+    button.dataset.fxCode = effect.code;
+    button.title = fxPreviewIsBlocked(effect)
+      ? `#${effect.num} ${effect.name}\n需要B-roll素材，請先至素材區處理`
+      : `#${effect.num} ${effect.name}\n卡片為風格示意；選取後用本片試看`;
+    const thumb = fxThumbUrl(effect);
+    if (thumb) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = thumb;
+      img.alt = `${effect.name} 風格示意`;
+      button.append(img);
+    }
+    const code = document.createElement("span");
+    code.className = "fx-code";
+    code.textContent = effect.code;
+    button.append(code);
+    if (effect.matte) {
+      const m = document.createElement("span");
+      m.className = "fx-m";
+      m.textContent = "ⓜ";
+      m.title = "需要人物去背";
+      button.append(m);
+    }
+    const name = document.createElement("span");
+    name.className = "fx-name";
+    name.textContent = effect.name;
+    button.append(name);
+    button.addEventListener("click", () => fxPreviewSelectEffect(effect.code));
+    return button;
+  }));
+}
+
+function fxPreviewRenderFields() {
+  const effect = fxEffectByCode(fxPreviewDraft?.code);
+  if (!effect || !fxPreviewDraft) {
+    elements["fx-preview-fields"].replaceChildren();
+    return;
+  }
+  const rows = [];
+  const textVars = (effect.vars || []).filter((item) => item.kind === "text");
+  textVars.forEach((item) => {
+    const label = document.createElement("label");
+    label.className = "field fx-preview-field";
+    const span = document.createElement("span");
+    span.textContent = item.label || item.id;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 200;
+    input.value = fxPreviewDraft.values?.[item.id] ?? item.default ?? "";
+    input.addEventListener("input", () => {
+      fxPreviewDraft.values[item.id] = input.value;
+      fxPreviewDraftChanged();
+    });
+    label.append(span, input);
+    rows.push(label);
+  });
+  const placement = document.createElement("label");
+  placement.className = "field fx-preview-field";
+  const placementLabel = document.createElement("span");
+  placementLabel.textContent = "擺位（避開臉）";
+  const placementSelect = document.createElement("select");
+  [["", "跟隨效果"], ["top", "上"], ["bottom", "下"], ["left", "左"], ["right", "右"]].forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    placementSelect.append(option);
+  });
+  placementSelect.value = fxPreviewDraft.placement || "";
+  placementSelect.addEventListener("change", () => {
+    fxPreviewDraft.placement = placementSelect.value;
+    fxPreviewDraftChanged();
+  });
+  placement.append(placementLabel, placementSelect);
+  rows.push(placement);
+
+  const scheme = document.createElement("label");
+  scheme.className = "field fx-preview-field";
+  const schemeLabel = document.createElement("span");
+  schemeLabel.textContent = `字卡色組（主題 ${fxThemeNo()}）`;
+  const schemeSelect = document.createElement("select");
+  [["", "跟隨風格包"], ...Object.entries(fxCatalog().schemes || {})].forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    schemeSelect.append(option);
+  });
+  schemeSelect.value = fxPreviewDraft.scheme || "";
+  schemeSelect.addEventListener("change", () => {
+    fxPreviewDraft.scheme = schemeSelect.value;
+    fxPreviewDraftChanged();
+  });
+  scheme.append(schemeLabel, schemeSelect);
+  rows.push(scheme);
+
+  const fonts = (fxCatalog().fonts || []).filter((font) => font.verified !== false);
+  if (fonts.length) {
+    ["display", "body"].forEach((role) => {
+      const label = document.createElement("label");
+      label.className = "field fx-preview-field";
+      const span = document.createElement("span");
+      span.textContent = role === "display" ? "標題字型（已驗證）" : "內文字型（已驗證）";
+      const select = document.createElement("select");
+      const inherit = document.createElement("option");
+      inherit.value = "";
+      inherit.textContent = "跟隨風格包";
+      select.append(inherit);
+      fonts.forEach((font) => {
+        const option = document.createElement("option");
+        option.value = font.id;
+        option.textContent = font.label || font.id;
+        option.style.fontFamily = font.family || "inherit";
+        select.append(option);
+      });
+      select.value = fxPreviewDraft.font_ids?.[role] || "";
+      select.addEventListener("change", () => {
+        fxPreviewDraft.font_ids = fxPreviewDraft.font_ids || {};
+        if (select.value) fxPreviewDraft.font_ids[role] = select.value;
+        else delete fxPreviewDraft.font_ids[role];
+        fxPreviewDraftChanged();
+      });
+      label.append(span, select);
+      rows.push(label);
+    });
+  }
+  elements["fx-preview-fields"].replaceChildren(...rows);
+}
+
+function fxPreviewRenderDialog() {
+  const effect = fxEffectByCode(fxPreviewDraft?.code);
+  if (!effect || !fxPreviewDraft) return;
+  elements["fx-preview-selected-name"].textContent = `#${effect.num} ${effect.name}`;
+  const notes = [effect.spec || "", effect.matte ? "ⓜ 需要人物去背" : ""].filter(Boolean);
+  elements["fx-preview-spec"].textContent = notes.join("｜");
+  fxPreviewUpdateWindowControls();
+  fxPreviewRenderFields();
+  fxPreviewRenderCatalog();
+}
+
+function fxPreviewStatusForJob(job) {
+  const stateName = String(job?.state || "pending").toLowerCase();
+  const labels = {
+    pending: "預覽排隊中（待渲染，不是即時完成）",
+    running: "預覽渲染中",
+    matting: "人物去背處理中",
+    rendering: "預覽渲染中",
+    ready: "預覽已完成",
+    cache_hit: "預覽已完成（快取）",
+    failed: "預覽失敗",
+    cancelled: "預覽已取消",
+  };
+  let message = labels[stateName] || `預覽狀態：${stateName}`;
+  if (job?.cache_hit && stateName !== "cache_hit") message += "（快取）";
+  const phaseLabels = {
+    pending: "排隊中",
+    running: "處理中",
+    matting: "人物去背中",
+    rendering: "渲染中",
+    ready: "完成",
+    cache_hit: "快取完成",
+  };
+  if (job?.phase && ![stateName, "ready", "cache_hit"].includes(String(job.phase))) {
+    message += ` · ${phaseLabels[String(job.phase)] || "處理中"}`;
+  }
+  if (job?.message) message += `：${job.message}`;
+  if (job?.error && stateName === "failed") {
+    const error = typeof job.error === "string"
+      ? job.error
+      : job.error.message || job.error.detail || job.error.error || JSON.stringify(job.error);
+    message += `：${error}`;
+  }
+  return message;
+}
+
+function fxPreviewApplyJob(job, generation, signature) {
+  if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !elements["fx-preview-dialog"].open) return false;
+  fxPreviewJob = job || null;
+  const stateName = String(job?.state || "pending").toLowerCase();
+  const ready = ["ready", "cache_hit"].includes(stateName) && Boolean(job?.media_url);
+  const failed = stateName === "failed";
+  fxPreviewSetStatus(fxPreviewStatusForJob(job), failed ? "error" : ready ? "success" : "");
+  elements["fx-preview-retry"].hidden = !failed;
+  fxPreviewReadySignature = ready ? signature : "";
+  elements["fx-preview-confirm"].disabled = !ready || fxPreviewReadySignature !== fxPreviewDraftSignature;
+  if (ready) {
+    const video = elements["fx-preview-video"];
+    const nextUrl = String(job.media_url);
+    if (video.src !== new URL(nextUrl, location.href).href) {
+      video.src = nextUrl;
+      video.load();
+    }
+    video.play().catch(() => {});
+  }
+  return true;
+}
+
+function fxPreviewCancelCurrentJob() {
+  clearTimeout(fxPreviewPollTimer);
+  fxPreviewPollTimer = null;
+  const job = fxPreviewJob;
+  fxPreviewJob = null;
+  if (!job?.id) return Promise.resolve();
+  return fxPreviewCancelJobId(job.id);
+}
+
+function fxPreviewCancelJobId(jobId) {
+  if (!jobId) return Promise.resolve();
+  return request(`/api/fx-previews/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  }).catch(() => {});
+}
+
+function fxPreviewChangedMessage() {
+  return "候選設定已變更，正在準備新的預覽（待渲染，不是即時完成）";
+}
+
+function fxPreviewInvalidateAndSchedule() {
+  if (!fxPreviewDraft || !elements["fx-preview-dialog"]?.open) return;
+  fxPreviewGeneration += 1;
+  const generation = fxPreviewGeneration;
+  clearTimeout(fxPreviewDebounceTimer);
+  fxPreviewDebounceTimer = null;
+  fxPreviewReadySignature = "";
+  fxPreviewDraftSignature = fxPreviewSignature();
+  elements["fx-preview-confirm"].disabled = true;
+  elements["fx-preview-retry"].hidden = true;
+  const oldVideo = elements["fx-preview-video"];
+  if (oldVideo) {
+    oldVideo.pause();
+    oldVideo.removeAttribute("src");
+    oldVideo.load();
+  }
+  fxPreviewSetStatus(fxPreviewChangedMessage());
+  const cancellation = fxPreviewCancelCurrentJob();
+  fxPreviewCancelPromise = cancellation;
+  const effect = fxEffectByCode(fxPreviewDraft.code);
+  if (fxPreviewIsBlocked(effect)) {
+    fxPreviewSetStatus("B1 需要B-roll素材，請先至素材區處理", "error");
+    return;
+  }
+  if (effect?.available === false) {
+    fxPreviewSetStatus("此效果目前不可用，未送出預覽。", "error");
+    return;
+  }
+  fxPreviewDebounceTimer = setTimeout(async () => {
+    await cancellation;
+    if (generation !== fxPreviewGeneration) return;
+    await fxPreviewStart(generation, fxPreviewDraftSignature);
+  }, 350);
+}
+
+async function fxPreviewStart(generation, signature) {
+  if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !fxPreviewDraft || !elements["fx-preview-dialog"].open) return;
+  try {
+    if (stateDirty || !lastSaveSucceeded) {
+      await saveState(false);
+      if (stateDirty || !lastSaveSucceeded) throw new Error("目前編輯內容尚未成功儲存");
+    }
+    if (!/^[0-9a-f]{64}$/i.test(String(state?.revision || ""))) {
+      throw new Error("目前專案版本無法確認，請先重新載入專案");
+    }
+    const body = {
+      schema_version: 1,
+      expected_revision: state.revision,
+      candidate: {
+        code: fxPreviewDraft.code,
+        window: {
+          start_s: Number(fxPreviewDraft.window.start_s),
+          duration_s: Number(fxPreviewDraft.window.duration_s),
+        },
+        values: { ...(fxPreviewDraft.values || {}) },
+        placement: fxPreviewDraft.placement || "",
+        scheme: fxPreviewDraft.scheme || "",
+        font_ids: { ...(fxPreviewDraft.font_ids || {}) },
+      },
+    };
+    if (fxPreviewReplaceOverlayId) body.replace_overlay_id = fxPreviewReplaceOverlayId;
+    fxPreviewSetStatus("預覽排隊中（待渲染，不是即時完成）");
+    const payload = await request("/api/fx-previews", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const job = payload.job || payload;
+    if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature) {
+      // The POST may have completed after the user selected another style or
+      // closed the dialog. Do not orphan that worker: cancel the returned job.
+      if (job?.id) await fxPreviewCancelJobId(job.id);
+      return;
+    }
+    fxPreviewApplyJob(job, generation, signature);
+    const stateName = String(job?.state || "pending").toLowerCase();
+    if (!["ready", "cache_hit", "failed", "cancelled"].includes(stateName)) {
+      const statusUrl = job.status_url || `/api/fx-previews/${encodeURIComponent(job.id)}`;
+      fxPreviewPollTimer = setTimeout(() => fxPreviewPoll(statusUrl, generation, signature), 450);
+    }
+  } catch (error) {
+    if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature) return;
+    if (error.status === 409) {
+      const reason = String(error.reason || error.code || "").toLowerCase();
+      if (["render_busy", "busy", "preview_busy"].includes(reason)) {
+        fxPreviewSetStatus("預覽工作忙碌中，請稍候。", "error");
+        elements["fx-preview-retry"].hidden = false;
+      } else {
+        fxPreviewSetStatus("專案已更新，請關閉試看並重新載入後再試。", "error");
+        elements["fx-preview-retry"].hidden = true;
+      }
+    } else {
+      fxPreviewSetStatus(`預覽失敗：${error.message}`, "error");
+      elements["fx-preview-retry"].hidden = false;
+    }
+    elements["fx-preview-confirm"].disabled = true;
+  }
+}
+
+async function fxPreviewPoll(statusUrl, generation, signature) {
+  if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature) return;
+  try {
+    const payload = await request(statusUrl);
+    if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature) return;
+    const job = payload.job || payload;
+    fxPreviewApplyJob(job, generation, signature);
+    const stateName = String(job?.state || "pending").toLowerCase();
+    if (!["ready", "cache_hit", "failed", "cancelled"].includes(stateName)) {
+      fxPreviewPollTimer = setTimeout(() => fxPreviewPoll(statusUrl, generation, signature), 450);
+    }
+  } catch (error) {
+    if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature) return;
+    if (error.status === 409) {
+      fxPreviewJob = null;
+      fxPreviewReadySignature = "";
+      fxPreviewSetStatus("專案已更新，請關閉試看並重新載入後再試。", "error");
+      elements["fx-preview-retry"].hidden = true;
+      elements["fx-preview-confirm"].disabled = true;
+    } else {
+      fxPreviewSetStatus(`預覽狀態讀取失敗：${error.message}`, "error");
+      elements["fx-preview-retry"].hidden = false;
+    }
+  }
+}
+
+function fxPreviewDraftChanged() {
+  fxPreviewUpdateWindowControls();
+  fxPreviewInvalidateAndSchedule();
+}
+
+function fxPreviewSelectEffect(code) {
+  const effect = fxEffectByCode(code);
+  if (!effect) return;
+  const overlay = fxPreviewReplaceOverlay();
+  fxPreviewDraft = fxPreviewBuildDraft(effect, fxPreviewDraft, overlay, fxPreviewSourceStart());
+  fxPreviewRenderDialog();
+  fxPreviewInvalidateAndSchedule();
+}
+
+function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "") {
+  const dialog = elements["fx-preview-dialog"];
+  if (!dialog) return;
+  if (dialog.open) dialog.close("replace");
+  fxPreviewConfirmed = false;
+  fxPreviewTrigger = trigger instanceof HTMLElement ? trigger : document.activeElement;
+  fxPreviewReplaceOverlayId = replaceOverlayId || null;
+  activeFxPreviewCategory = "";
+  elements["fx-preview-search"].value = "";
+  const overlay = fxPreviewReplaceOverlay();
+  const first = fxEffectByCode(initialCode)
+    || fxEffectByCode(overlay?.code)
+    || fxEffectByCode(lastFxCode)
+    || fxEffectByCode("T3")
+    || fxEffectByCode("H1")
+    || fxEffects().find((effect) => effect.available !== false && !fxPreviewIsBlocked(effect))
+    || fxEffects()[0];
+  if (!first) {
+    showToast("找不到效果庫（edit-style-profiles）", "error");
+    return;
+  }
+  fxPreviewDraft = fxPreviewBuildDraft(first, null, overlay, fxPreviewSourceStart());
+  fxPreviewDraftSignature = fxPreviewSignature();
+  fxPreviewJob = null;
+  clearTimeout(fxPreviewDebounceTimer);
+  clearTimeout(fxPreviewPollTimer);
+  fxPreviewRenderDialog();
+  dialog.showModal();
+  elements["fx-preview-search"].focus();
+  fxPreviewInvalidateAndSchedule();
+}
+
+async function confirmFxPreview() {
+  const dialog = elements["fx-preview-dialog"];
+  const effect = fxEffectByCode(fxPreviewDraft?.code);
+  if (!dialog?.open || !fxPreviewJob?.id || !effect || fxPreviewReadySignature !== fxPreviewDraftSignature) return;
+  const before = deepCopy(state);
+  const code = fxPreviewDraft.code;
+  elements["fx-preview-confirm"].disabled = true;
+  fxPreviewSetStatus("正在套用到時間軸…");
+  try {
+    const result = await request(`/api/fx-previews/${encodeURIComponent(fxPreviewJob.id)}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_revision: state.revision }),
+    });
+    if (!result.state || typeof result.state !== "object") throw new Error("伺服器沒有回傳更新後的時間軸");
+    history.push(before);
+    if (history.length > 40) history.shift();
+    redoStack = [];
+    state = result.state;
+    if (result.revision) state.revision = result.revision;
+    if (result.approval_revisions) projectPayload.approval_revisions = result.approval_revisions;
+    const invalidated = Array.isArray(result.invalidated_gates) ? result.invalidated_gates : [];
+    invalidated.forEach((gate) => {
+      if (projectPayload?.manifest?.approvals?.[gate]) projectPayload.manifest.approvals[gate].approved = false;
+      if (gate === "highlight_selection") elements["approve-highlights"].textContent = "核可精華選段";
+      if (gate === "timeline") elements["approve-timeline"].textContent = "核可時間軸";
+      if (gate === "final") {
+        projectPayload.approval_current = projectPayload.approval_current || {};
+        projectPayload.approval_current.final = false;
+      }
+    });
+    selectedOverlayId = result.overlay_id
+      || state.review?.selected_overlay_id
+      || state.overlays[0]?.id
+      || null;
+    lastFxCode = code;
+    stateDirty = false;
+    markStateSynced();
+    renderAll();
+    if (invalidated.includes("final")) renderDeliveryQa();
+    updateScrubberBounds();
+    showToast(result.overlay_id && fxPreviewReplaceOverlayId ? "特效已替換到時間軸" : "特效已加入時間軸", "success");
+    fxPreviewConfirmed = true;
+    fxPreviewJob = null;
+    clearTimeout(fxPreviewPollTimer);
+    elements["fx-preview-video"].pause();
+    dialog.close("confirm");
+  } catch (error) {
+    if (error.status === 409) {
+      fxPreviewJob = null;
+      fxPreviewReadySignature = "";
+      fxPreviewSetStatus("專案已更新，請關閉試看並重新載入後再試。", "error");
+      elements["fx-preview-retry"].hidden = true;
+      elements["fx-preview-confirm"].disabled = true;
+      return;
+    }
+    fxPreviewSetStatus(`套用失敗：${error.message}`, "error");
+    elements["fx-preview-confirm"].disabled = false;
+  }
+}
+
+function closeFxPreviewDialog() {
+  if (elements["fx-preview-dialog"]?.open) elements["fx-preview-dialog"].close("cancel");
+}
+
+function cleanupFxPreviewDialog() {
+  clearTimeout(fxPreviewDebounceTimer);
+  clearTimeout(fxPreviewPollTimer);
+  fxPreviewDebounceTimer = null;
+  fxPreviewPollTimer = null;
+  fxPreviewGeneration += 1;
+  if (!fxPreviewConfirmed) fxPreviewCancelPromise = fxPreviewCancelCurrentJob();
+  const video = elements["fx-preview-video"];
+  if (video) {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }
+  const trigger = fxPreviewTrigger;
+  fxPreviewDraft = null;
+  fxPreviewReplaceOverlayId = null;
+  fxPreviewReadySignature = "";
+  fxPreviewDraftSignature = "";
+  fxPreviewTrigger = null;
+  fxPreviewConfirmed = false;
+  if (trigger && typeof trigger.focus === "function" && document.contains(trigger)) trigger.focus();
+}
+
 function applyFxCode(overlay, code) {
   const effect = fxEffectByCode(code);
   if (!effect) return;
@@ -1937,11 +2599,7 @@ function renderFxPanel(overlay) {
     if (effect.matte) { const m = document.createElement("span"); m.className = "fx-m"; m.textContent = "ⓜ"; button.append(m); }
     const name = document.createElement("span"); name.className = "fx-name"; name.textContent = effect.name; button.append(name);
     button.addEventListener("click", () => {
-      if (effect.code === overlay.code) return;
-      pushHistory();
-      applyFxCode(overlay, effect.code);
-      markDirty("換效果，儲存中…");
-      renderInspector(); renderLayerList(); renderTimeline(); renderPreviewOverlays(true);
+      openFxPreviewDialog(button, overlay.id, effect.code);
     });
     return button;
   }));
@@ -2167,6 +2825,12 @@ function selectAudioEvent(id, seek = false) {
 }
 
 function addOverlay(type, source = null) {
+  if (type === "fx") {
+    // FX is a server-rendered candidate. Opening the dialog must not create a
+    // local layer, history entry, dirty state, or approval invalidation.
+    openFxPreviewDialog(document.activeElement, null);
+    return;
+  }
   pushHistory();
   const start = Math.min(elements["preview-video"].currentTime || 0, Math.max(0, duration() - 0.2));
   const end = Math.min(duration(), start + (type === "title" ? 2.5 : 3));
@@ -2182,13 +2846,6 @@ function addOverlay(type, source = null) {
     style, source, provenance: source ? "user-uploaded-through-local-editor" : "manual editor layer",
     highlight_id: activeHighlight()?.id || null,
   };
-  if (type === "fx") {
-    const first = fxEffects().find((effect) => effect.available !== false);
-    if (!first) { showToast("找不到效果庫（edit-style-profiles）", "error"); return; }
-    overlay.style = { x: 50, y: 50, width: 100, animation: "none", opacity: 1 };
-    applyFxCode(overlay, lastFxCode && fxEffects().some((effect) => effect.code === lastFxCode) ? lastFxCode : first.code);
-    overlay.provenance = "edit-style-profiles effect chosen in the local editor";
-  }
   state.overlays.push(overlay);
   selectOverlay(id, true);
   markDirty("新增圖層，儲存中…");
@@ -3384,7 +4041,43 @@ function bindEvents() {
     }
   });
   document.querySelectorAll("[data-add-type]").forEach((button) => button.addEventListener("click", () => addOverlay(button.dataset.addType)));
+  elements["open-fx-menu"].addEventListener("click", (event) => {
+    // Keep the href as a no-JS fallback, but keep the Studio flow in this
+    // dialog when the editor is running.
+    event.preventDefault();
+    const overlay = currentOverlay();
+    openFxPreviewDialog(event.currentTarget, overlay?.type === "fx" ? overlay.id : null);
+  });
   elements["fx-search"].addEventListener("input", () => { const overlay = currentOverlay(); if (overlay?.type === "fx") renderFxPanel(overlay); });
+  elements["fx-preview-search"].addEventListener("input", fxPreviewRenderCatalog);
+  elements["fx-preview-source"].addEventListener("input", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.window.start_s = Number(elements["fx-preview-source"].value) || 0;
+    fxPreviewDraftChanged();
+  });
+  elements["fx-preview-duration"].addEventListener("input", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.window.duration_s = Number(elements["fx-preview-duration"].value) || 0.01;
+    fxPreviewDraftChanged();
+  });
+  elements["fx-preview-retry"].addEventListener("click", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewInvalidateAndSchedule();
+  });
+  elements["fx-preview-confirm"].addEventListener("click", confirmFxPreview);
+  elements["fx-preview-cancel"].addEventListener("click", closeFxPreviewDialog);
+  elements["fx-preview-close"].addEventListener("click", closeFxPreviewDialog);
+  elements["fx-preview-dialog"].addEventListener("close", cleanupFxPreviewDialog);
+  window.addEventListener("beforeunload", () => {
+    const job = fxPreviewJob;
+    if (!job?.id || fxPreviewConfirmed) return;
+    fetch(`/api/fx-previews/${encodeURIComponent(job.id)}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Auto-Edit-CSRF": csrfToken },
+      body: JSON.stringify({}),
+      keepalive: true,
+    }).catch(() => {});
+  });
   // The 風格菜單 tab (/fx-menu) adds fx layers server-side; pick them up without a manual reload.
   window.addEventListener("message", (event) => {
     if (event.origin !== location.origin || event.data?.type !== "fx-applied") return;

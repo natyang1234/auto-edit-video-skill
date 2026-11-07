@@ -33,6 +33,7 @@ from typing import Any
 
 import caption_engine
 import fx_overlay
+from fx_preview_jobs import FxPreviewJobError, FxPreviewJobManager
 import asset_registry
 import contract_registry
 import delivery_envelope
@@ -139,6 +140,7 @@ ALLOWED_ASSET_MIME_TYPES = {
     ".mov": {"video/quicktime"},
 }
 MAX_JSON_BYTES = 2 * 1024 * 1024
+MAX_FX_PREVIEW_JSON_BYTES = 32 * 1024
 MAX_ASSET_BYTES = 50 * 1024 * 1024
 GATES = ("destructive_edit", "highlight_selection", "timeline", "final")
 VOICE_LANGUAGES = {"zh-TW", "zh-CN", "en-US", "en-GB"}
@@ -3680,6 +3682,7 @@ class EditorServer(ThreadingHTTPServer):
         # threat model (contracts/policies/DOWNLOAD_GATE.md).
         self.csrf_token = secrets.token_urlsafe(32)
         self.asset_provider_service = AssetProviderService(self.project_dir)
+        self.project_lock = threading.RLock()
         self.caption_job_lock = threading.Lock()
         self.caption_render_serial = threading.Lock()
         self.caption_job: dict[str, Any] = {
@@ -3689,13 +3692,33 @@ class EditorServer(ThreadingHTTPServer):
             "sequence": 0,
         }
         self.voice_catalog = load_voice_catalog()
-        self.project_lock = threading.RLock()
         self.render_lock = threading.Lock()
         self.render_status: dict[str, Any] = {
             "state": "idle",
             "message": "尚未輸出預覽",
             "output": None,
         }
+        self.fx_preview_jobs = FxPreviewJobManager(
+            self.project_dir,
+            context_provider=self.fx_preview_context,
+        )
+
+    def fx_preview_context(self) -> dict[str, Any]:
+        """Return a read-only, revision-bound snapshot for the preview manager."""
+        with self.project_lock:
+            manifest = read_json(self.project_dir / "project.json", {}) or {}
+            state = read_json(self.project_dir / STATE_REL)
+            if state is None:
+                state = default_editor_state(self.project_dir, manifest)
+            return {
+                "manifest": manifest,
+                "state": state,
+                "state_revision": editor_state_revision(state),
+            }
+
+    def server_close(self) -> None:
+        self.fx_preview_jobs.close()
+        super().server_close()
 
     def schedule_caption_render(self) -> None:
         """Latest-wins background caption rendering after a state save."""
@@ -3772,6 +3795,16 @@ class EditorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_fx_preview_error(self, exc: FxPreviewJobError) -> None:
+        self.send_json(
+            {
+                "ok": False,
+                "error": {"code": exc.code, "message": exc.message},
+                "reason": exc.code,
+            },
+            status=exc.status,
+        )
 
     def request_host_allowed(self) -> bool:
         """Reject DNS-rebinding style Host headers on a loopback server."""
@@ -4563,15 +4596,24 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         with self.server.project_lock:
             state = read_json(self.server.project_dir / STATE_REL, {}) or {}
-        if find_variant(state, variant_id) is None:
-            self.send_json({"ok": False, "error": "unknown variant"}, status=404)
-            return
-        if not self.server.render_lock.acquire(blocking=False):
-            self.send_json({"ok": False, "error": "another render is already running"}, status=409)
-            return
-        output_rel = f"renders/variant-{variant_id}-{quality}.mp4"
-        job_token = secrets.token_hex(8)
-        with self.server.project_lock:
+            if find_variant(state, variant_id) is None:
+                self.send_json({"ok": False, "error": "unknown variant"}, status=404)
+                return
+            if self.server.render_status.get("state") in {"running", "rendering"}:
+                self.send_json({"ok": False, "error": "another render is already running"}, status=409)
+                return
+            if not self.server.render_lock.acquire(blocking=False):
+                self.send_json({"ok": False, "error": "another render is already running"}, status=409)
+                return
+            if self.server.fx_preview_jobs.has_active_job():
+                self.server.render_lock.release()
+                self.send_json(
+                    {"ok": False, "error": "an FX preview is already running", "reason": "fx_preview_busy"},
+                    status=409,
+                )
+                return
+            output_rel = f"renders/variant-{variant_id}-{quality}.mp4"
+            job_token = secrets.token_hex(8)
             self.server.render_status = {
                 "state": "rendering",
                 "message": f"變體 {variant_id} 輸出中（{quality}）",
@@ -4617,25 +4659,26 @@ class EditorHandler(BaseHTTPRequestHandler):
                     "variant_id": variant_id,
                 }
             finally:
+                # Do not wait for project_lock while owning render_lock; every
+                # reservation path uses project_lock -> render_lock.
+                self.server.render_lock.release()
                 with self.server.project_lock:
-                    # Only this job may write its terminal state, and the
-                    # lock is released inside the same critical section so a
-                    # successor cannot interleave (Codex review).
                     if self.server.render_status.get("job") == job_token:
                         status_payload["job"] = job_token
                         self.server.render_status = status_payload
-                    self.server.render_lock.release()
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except RuntimeError:
+            self.server.render_lock.release()
             with self.server.project_lock:
-                self.server.render_lock.release()
-                self.server.render_status = {
-                    "state": "error",
-                    "message": "無法啟動輸出執行緒",
-                    "output": None,
-                }
+                if self.server.render_status.get("job") == job_token:
+                    self.server.render_status = {
+                        "state": "error",
+                        "message": "無法啟動輸出執行緒",
+                        "output": None,
+                        "job": job_token,
+                    }
             self.send_json({"ok": False, "error": "could not start render worker"}, status=500)
             return
         self.send_json({"ok": True, "output": output_rel, "status_url": "/api/render-status"})
@@ -4677,12 +4720,143 @@ class EditorHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def read_json_body(self) -> Any:
-        raw = self.read_body(MAX_JSON_BYTES)
+    def read_json_body(self, maximum: int = MAX_JSON_BYTES) -> Any:
+        raw = self.read_body(maximum)
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("request body must be valid UTF-8 JSON") from exc
+
+    def handle_fx_preview_submit(self) -> None:
+        try:
+            body = self.read_json_body(MAX_FX_PREVIEW_JSON_BYTES)
+        except ValueError as exc:
+            self.send_json(
+                {
+                    "ok": False,
+                    "error": {"code": "malformed_request", "message": "FX 預覽請求不是有效 JSON"},
+                    "reason": "malformed_request",
+                },
+                status=400,
+            )
+            return
+        # Global ordering is project_lock -> render_lock.  submit() snapshots
+        # project state through context_provider, so taking render_lock first
+        # creates an AB-BA cycle with full-render reservation.
+        with self.server.project_lock:
+            if not self.server.render_lock.acquire(blocking=False):
+                self.send_fx_preview_error(
+                    FxPreviewJobError(409, "render_busy", "目前已有影片輸出正在執行")
+                )
+                return
+            try:
+                if self.server.render_status.get("state") in {"running", "rendering"}:
+                    raise FxPreviewJobError(409, "render_busy", "目前已有影片輸出正在執行")
+                job = self.server.fx_preview_jobs.submit(body)
+            except FxPreviewJobError as exc:
+                self.send_fx_preview_error(exc)
+                return
+            finally:
+                self.server.render_lock.release()
+        response = self.server.fx_preview_jobs.response(str(job["id"]))
+        self.send_json(response, status=200 if job["state"] == "ready" else 202)
+
+    def handle_fx_preview_cancel(self, job_id: str) -> None:
+        try:
+            # Cancel has no user-controlled parameters; accepting only an empty
+            # object keeps accidental or future fields from gaining semantics.
+            raw = self.read_body(MAX_FX_PREVIEW_JSON_BYTES)
+            if raw.strip():
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid JSON") from exc
+                if body != {}:
+                    raise FxPreviewJobError(400, "malformed_request", "取消預覽不接受其他欄位")
+            self.server.fx_preview_jobs.cancel(job_id)
+            self.send_json(self.server.fx_preview_jobs.response(job_id))
+        except ValueError:
+            self.send_fx_preview_error(
+                FxPreviewJobError(400, "malformed_request", "取消預覽請求不是有效 JSON")
+            )
+        except FxPreviewJobError as exc:
+            self.send_fx_preview_error(exc)
+
+    def handle_fx_preview_confirm(self, job_id: str) -> None:
+        try:
+            body = self.read_json_body(MAX_FX_PREVIEW_JSON_BYTES)
+            if not isinstance(body, dict) or set(body) != {"expected_revision"}:
+                raise FxPreviewJobError(400, "malformed_request", "confirm 只接受 expected_revision")
+            expected_revision = body.get("expected_revision")
+            with self.server.project_lock:
+                frozen = self.server.fx_preview_jobs.confirmable(
+                    job_id, expected_revision
+                )
+                state = read_json(self.server.project_dir / STATE_REL)
+                manifest = read_json(self.server.project_dir / "project.json", {}) or {}
+                if state is None:
+                    state = default_editor_state(self.server.project_dir, manifest)
+                if editor_state_revision(state) != expected_revision:
+                    raise FxPreviewJobError(
+                        409,
+                        "preview_stale",
+                        "預覽後時間軸已變更，請重新產生再套用",
+                    )
+                overlay = dict(frozen["overlay"])
+                replace_id = frozen.get("replace_overlay_id")
+                overlays = state.get("overlays")
+                if not isinstance(overlays, list):
+                    raise FxPreviewJobError(409, "state_invalid", "目前時間軸圖層格式無效")
+                if replace_id:
+                    replacement_index = next(
+                        (
+                            index
+                            for index, item in enumerate(overlays)
+                            if isinstance(item, dict)
+                            and item.get("type") == "fx"
+                            and item.get("id") == replace_id
+                        ),
+                        None,
+                    )
+                    if replacement_index is None:
+                        raise FxPreviewJobError(409, "replace_target_stale", "要替換的 FX 圖層已不存在")
+                    overlay["id"] = str(replace_id)
+                    overlays[replacement_index] = overlay
+                else:
+                    overlay["id"] = f"fx-preview-{uuid.uuid4().hex[:16]}"
+                    overlays.append(overlay)
+                validation_errors = fx_overlay.validate(overlay, state)
+                if validation_errors:
+                    raise FxPreviewJobError(422, "candidate_invalid", "FX 圖層未通過儲存驗證")
+                try:
+                    errors, saved = self.persist_editor_state(
+                        state,
+                        expected_revision=str(expected_revision),
+                    )
+                except EditorRevisionConflict as exc:
+                    raise FxPreviewJobError(
+                        409,
+                        "preview_stale",
+                        "預覽後時間軸已變更，請重新產生再套用",
+                    ) from exc
+                if errors:
+                    raise FxPreviewJobError(422, "candidate_invalid", "FX 圖層未通過儲存驗證")
+            self.send_json(
+                {
+                    "ok": True,
+                    "state": state,
+                    "revision": saved["revision"],
+                    "overlay_id": overlay["id"],
+                    "replaced": bool(replace_id),
+                    "invalidated_gates": saved.get("invalidated_gates", []),
+                }
+            )
+        except ValueError:
+            self.send_fx_preview_error(
+                FxPreviewJobError(400, "malformed_request", "confirm 請求不是有效 JSON")
+            )
+        except FxPreviewJobError as exc:
+            self.send_fx_preview_error(exc)
 
     def serve_file(self, path: Path, allow_range: bool = False) -> None:
         if not path.is_file():
@@ -4797,6 +4971,33 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         path, _query = self.route()
         project = self.server.project_dir
+        preview_status = re.fullmatch(r"/api/fx-previews/([0-9a-f]{32})", path)
+        if preview_status:
+            try:
+                self.send_json(
+                    self.server.fx_preview_jobs.response(preview_status.group(1))
+                )
+            except FxPreviewJobError as exc:
+                self.send_fx_preview_error(exc)
+            return
+        preview_media = re.fullmatch(
+            r"/fx-preview-media/([0-9a-f]{32})/([0-9a-f]{64})\.mp4",
+            path,
+        )
+        if preview_media:
+            try:
+                media = self.server.fx_preview_jobs.media_path(
+                    preview_media.group(1), preview_media.group(2)
+                )
+            except FxPreviewJobError as exc:
+                self.send_fx_preview_error(exc)
+                return
+            self._cache_immutable = True
+            try:
+                self.serve_file(media, allow_range=True)
+            finally:
+                self._cache_immutable = False
+            return
         if path == "/api/health":
             self.send_json({"ok": True, "project": str(project)})
             return
@@ -5455,6 +5656,21 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not self.allow_request(mutation=True):
             return
         path, query = self.route()
+        if path == "/api/fx-previews":
+            self.handle_fx_preview_submit()
+            return
+        preview_cancel = re.fullmatch(
+            r"/api/fx-previews/([0-9a-f]{32})/cancel", path
+        )
+        if preview_cancel:
+            self.handle_fx_preview_cancel(preview_cancel.group(1))
+            return
+        preview_confirm = re.fullmatch(
+            r"/api/fx-previews/([0-9a-f]{32})/confirm", path
+        )
+        if preview_confirm:
+            self.handle_fx_preview_confirm(preview_confirm.group(1))
+            return
         if path == "/api/assets":
             self.handle_asset_upload(query)
             return
@@ -6120,7 +6336,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 else f"{safe_clip}-{version}-final.mp4"
             )
             with self.server.render_lock:
-                if self.server.render_status.get("state") == "running":
+                if self.server.render_status.get("state") in {"running", "rendering"} or self.server.fx_preview_jobs.has_active_job():
                     self.send_json({"ok": False, "error": "a render is already running"}, status=409)
                     return
                 self.server.render_status = {
@@ -6327,7 +6543,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 )
 
             with self.server.render_lock:
-                if self.server.render_status.get("state") == "running":
+                if self.server.render_status.get("state") in {"running", "rendering"} or self.server.fx_preview_jobs.has_active_job():
                     self.send_json(
                         {"ok": False, "error": "a render is already running"},
                         status=409,
