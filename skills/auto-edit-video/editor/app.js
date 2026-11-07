@@ -709,17 +709,24 @@ function changedStateKeys(before, after) {
   return changed;
 }
 
+function stateMatchesLastSynced() {
+  return Boolean(lastSyncedState && state && changedStateKeys(lastSyncedState, state).length === 0);
+}
+
 /**
  * A background pipeline write (semantic caption calibration and friends) bumps
  * the revision under us, so our compare-and-swap save 409s. Reload the server's
  * copy, replay the sections this window actually changed on top of it, and only
  * fall back to "we reloaded, your change to that section is gone" for sections
- * both sides touched. Returns true when the save can be retried.
+ * both sides touched. The result distinguishes a valid reload from an
+ * unusable response so callers never infer sync from a false retry result.
  */
 async function reconcileStateConflict() {
   const payload = await request("/api/project");
   const fresh = payload.state;
-  if (!fresh || typeof fresh !== "object") return false;
+  if (!fresh || typeof fresh !== "object" || Array.isArray(fresh)) {
+    return { retryable: false, reloaded: false };
+  }
   const localChanges = changedStateKeys(lastSyncedState, state);
   const serverChanges = changedStateKeys(lastSyncedState, fresh);
   // Without a synced baseline there is no honest diff, so never guess: adopt
@@ -743,12 +750,13 @@ async function reconcileStateConflict() {
   if (PIPELINE_BUSY_STATES.includes(payload.pipeline_status?.state)) pollPipelineStatus();
   if (collisions.length) {
     showToast("背景處理中，已重載最新版", "error");
-    return false;
+    return { retryable: false, reloaded: true };
   }
-  return true;
+  return { retryable: true, reloaded: true };
 }
 
 async function saveState(showConfirmation = true) {
+  const saveGeneration = editGeneration;
   presetSaveInFlight += 1;
   clearTimeout(saveTimer);
   saveTimer = null;
@@ -759,11 +767,14 @@ async function saveState(showConfirmation = true) {
     } catch (error) {
       if (error.code !== "revision_conflict") throw error;
       // Somebody (almost always the local pipeline) wrote while we were editing.
-      const retryable = await reconcileStateConflict();
-      if (!retryable) {
-        stateDirty = false;
-        lastSaveSucceeded = false;
-        setSaveState("已重載最新版", "saved");
+      const reconciliation = await reconcileStateConflict();
+      if (!reconciliation.retryable) {
+        const ready = reconciliation.reloaded
+          && saveGeneration === editGeneration
+          && stateMatchesLastSynced();
+        stateDirty = !ready;
+        lastSaveSucceeded = ready;
+        setSaveState(ready ? "已重載最新版" : "仍有編輯尚未儲存", ready ? "saved" : "dirty");
         return;
       }
       payload = await putEditorState();

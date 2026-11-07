@@ -157,6 +157,301 @@ class PresetBrowserTests(unittest.TestCase):
                 self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
             browser.close()
 
+    def test_conflict_reload_only_restores_preset_ready_when_state_is_synced(self):
+        host, port = self.server.server_address
+        evidence_dir = Path(os.environ.get("P3_UI_EVIDENCE", self._tmp.name))
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        preset_id = "preset_" + "a" * 32
+        preset = {
+            "id": preset_id,
+            "name": "同步預設",
+            "kind": "caption",
+            "settings": {"style": {"color": "#FFFFFF"}, "font": None},
+        }
+
+        def open_scenario(browser, scenario):
+            counters = {"project": 0, "editor": 0, "preset_post": 0, "plan": 0, "apply": 0}
+            records = []
+
+            def route_handler(route):
+                request = route.request
+                path = urlparse(request.url).path
+                if path == "/api/project":
+                    counters["project"] += 1
+                    if scenario == "reload-failure" and counters["project"] >= 2:
+                        route.fulfill(status=503, json={"ok": False, "error": "mock reload failure"})
+                        return
+                    response = route.fetch()
+                    payload = response.json()
+                    if scenario == "malformed" and counters["project"] >= 2:
+                        route.fulfill(status=response.status, json={"ok": True, "state": None})
+                        return
+                    if counters["project"] >= 2 and scenario in {"synced", "replayable"}:
+                        payload = copy.deepcopy(payload)
+                        payload["state"]["revision"] = "server-revision"
+                        caption = next(item for item in payload["state"]["overlays"] if item.get("type") == "caption")
+                        caption.setdefault("style", {})["color"] = "#112233"
+                    route.fulfill(
+                        status=response.status,
+                        content_type="application/json",
+                        body=json.dumps(payload, ensure_ascii=False),
+                    )
+                    return
+                if path == "/api/editor-state":
+                    counters["editor"] += 1
+                    route.fulfill(
+                        status=409,
+                        json={"ok": False, "error": "forced conflict", "error_code": "revision_conflict"},
+                    )
+                    return
+                if path == "/api/style-presets/caption-plan":
+                    counters["plan"] += 1
+                    route.fulfill(
+                        json={
+                            "ok": True,
+                            "plan_digest": "plan-digest",
+                            "changes": [],
+                            "applied_to": [request.post_data_json["overlay_id"]],
+                            "no_change": False,
+                        }
+                    )
+                    return
+                if path == "/api/style-presets/caption-apply":
+                    counters["apply"] += 1
+                    route.fulfill(json={"ok": True, "no_change": True})
+                    return
+                if path == "/api/style-presets":
+                    if request.method == "GET":
+                        route.fulfill(json={"ok": True, "revision": "lib-1", "presets": records})
+                        return
+                    body = request.post_data_json
+                    counters["preset_post"] += 1
+                    records[:] = [{**preset, "name": body["name"], "settings": body["settings"]}]
+                    route.fulfill(json={"ok": True, "revision": "lib-2", "presets": records})
+                    return
+                route.fallback()
+
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.route("**/api/**", route_handler)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            return page, counters
+
+        with base.sync_playwright() as p:
+            browser = p.chromium.launch(executable_path=str(base.CHROME), headless=True)
+
+            synced_page, synced_calls = open_scenario(browser, "synced")
+            synced = synced_page.evaluate(
+                """async (preset) => {
+                    await presetLoad();
+                    const caption = state.overlays.find(item => item.type === 'caption');
+                    selectedOverlayId = caption.id;
+                    renderInspector();
+                    caption.style.color = '#FF0000';
+                    markDirty('重現衝突後同步');
+                    await saveState(false);
+                    let captureError = null;
+                    try { presetCapture(); } catch (error) { captureError = error.message; }
+                    const oldReview = presetReview;
+                    presetReview = async () => true;
+                    presetNode('preset-name').value = '衝突後可用';
+                    await presetMutate('POST');
+                    presetNode('preset-list').value = preset.id;
+                    await presetApply();
+                    presetReview = oldReview;
+                    return {
+                        captureError,
+                        applyStatus: presetNode('preset-status').textContent,
+                        stateDirty,
+                        lastSaveSucceeded,
+                        presetSaveInFlight,
+                        stateEqualsLastSynced: JSON.stringify(state) === JSON.stringify(lastSyncedState),
+                        revision: state.revision,
+                        serverColor: currentOverlay()?.style?.color,
+                    };
+                }""",
+                preset,
+            )
+            synced_page.screenshot(path=str(evidence_dir / "conflict-synced-ready.png"), full_page=True)
+            self.assertEqual(synced_calls["project"], 2)
+            self.assertEqual(synced_calls["editor"], 1)
+            self.assertEqual(synced_calls["preset_post"], 1)
+            self.assertEqual(synced_calls["plan"], 1)
+            self.assertEqual(synced_calls["apply"], 1)
+            self.assertIsNone(synced["captureError"])
+            self.assertIn("設定沒有差異", synced["applyStatus"])
+            self.assertFalse(synced["stateDirty"])
+            self.assertTrue(synced["lastSaveSucceeded"])
+            self.assertEqual(synced["presetSaveInFlight"], 0)
+            self.assertTrue(synced["stateEqualsLastSynced"])
+            self.assertEqual(synced["serverColor"], "#112233")
+            synced_page.close()
+
+            failed_page, failed_calls = open_scenario(browser, "reload-failure")
+            failed = failed_page.evaluate(
+                """async (preset) => {
+                    await presetLoad();
+                    const caption = state.overlays.find(item => item.type === 'caption');
+                    selectedOverlayId = caption.id;
+                    renderInspector();
+                    state.editing_brief = '載入失敗仍保留的輸入';
+                    markDirty('等待重載');
+                    await saveState(false);
+                    presetSetLibrary({revision: 'lib-1', presets: [preset]}, preset.id);
+                    let captureError = null;
+                    try { presetCapture(); } catch (error) { captureError = error.message; }
+                    await presetApply();
+                    return {
+                        captureError,
+                        applyStatus: presetNode('preset-status').textContent,
+                        stateDirty,
+                        lastSaveSucceeded,
+                        presetSaveInFlight,
+                        editingBrief: state.editing_brief,
+                    };
+                }""",
+                preset,
+            )
+            failed_page.screenshot(path=str(evidence_dir / "conflict-reload-failure-blocked.png"), full_page=True)
+            self.assertEqual(failed_calls["project"], 2)
+            self.assertEqual(failed_calls["editor"], 1)
+            self.assertIn("目前編輯尚未儲存完成", failed["captureError"])
+            self.assertIn("目前編輯尚未儲存完成", failed["applyStatus"])
+            self.assertTrue(failed["stateDirty"])
+            self.assertFalse(failed["lastSaveSucceeded"])
+            self.assertEqual(failed["presetSaveInFlight"], 0)
+            self.assertEqual(failed["editingBrief"], "載入失敗仍保留的輸入")
+            failed_page.close()
+
+            replayable_page, replayable_calls = open_scenario(browser, "replayable")
+            replayable = replayable_page.evaluate(
+                """async (preset) => {
+                    await presetLoad();
+                    const caption = state.overlays.find(item => item.type === 'caption');
+                    selectedOverlayId = caption.id;
+                    renderInspector();
+                    caption.style.color = '#FF0000';
+                    state.editing_brief = '衝突後仍待儲存的輸入';
+                    markDirty('保留未儲存輸入');
+                    await saveState(false);
+                    presetSetLibrary({revision: 'lib-1', presets: [preset]}, preset.id);
+                    let captureError = null;
+                    try { presetCapture(); } catch (error) { captureError = error.message; }
+                    await presetApply();
+                    return {
+                        captureError,
+                        applyStatus: presetNode('preset-status').textContent,
+                        stateDirty,
+                        lastSaveSucceeded,
+                        stateEqualsLastSynced: JSON.stringify(state) === JSON.stringify(lastSyncedState),
+                        editingBrief: state.editing_brief,
+                    };
+                }""",
+                preset,
+            )
+            replayable_page.screenshot(path=str(evidence_dir / "conflict-replayable-dirty-blocked.png"), full_page=True)
+            self.assertEqual(replayable_calls["project"], 2)
+            self.assertEqual(replayable_calls["editor"], 1)
+            self.assertIn("目前編輯尚未儲存完成", replayable["captureError"])
+            self.assertIn("目前編輯尚未儲存完成", replayable["applyStatus"])
+            self.assertTrue(replayable["stateDirty"])
+            self.assertFalse(replayable["lastSaveSucceeded"])
+            self.assertFalse(replayable["stateEqualsLastSynced"])
+            self.assertEqual(replayable["editingBrief"], "衝突後仍待儲存的輸入")
+            replayable_page.close()
+
+            malformed_page, malformed_calls = open_scenario(browser, "malformed")
+            malformed = malformed_page.evaluate(
+                """async (preset) => {
+                    await presetLoad();
+                    const caption = state.overlays.find(item => item.type === 'caption');
+                    selectedOverlayId = caption.id;
+                    renderInspector();
+                    state.editing_brief = 'malformed 200 仍保留的輸入';
+                    markDirty('等待有效重載');
+                    await saveState(false);
+                    presetSetLibrary({revision: 'lib-1', presets: [preset]}, preset.id);
+                    let captureError = null;
+                    try { presetCapture(); } catch (error) { captureError = error.message; }
+                    await presetApply();
+                    return {
+                        captureError,
+                        applyStatus: presetNode('preset-status').textContent,
+                        stateDirty,
+                        lastSaveSucceeded,
+                        editingBrief: state.editing_brief,
+                    };
+                }""",
+                preset,
+            )
+            malformed_page.screenshot(path=str(evidence_dir / "conflict-malformed-reload-blocked.png"), full_page=True)
+            self.assertEqual(malformed_calls["project"], 2)
+            self.assertEqual(malformed_calls["editor"], 1)
+            self.assertIn("目前編輯尚未儲存完成", malformed["captureError"])
+            self.assertIn("目前編輯尚未儲存完成", malformed["applyStatus"])
+            self.assertTrue(malformed["stateDirty"])
+            self.assertFalse(malformed["lastSaveSucceeded"])
+            self.assertEqual(malformed["editingBrief"], "malformed 200 仍保留的輸入")
+            malformed_page.close()
+
+            no_baseline_page, no_baseline_calls = open_scenario(browser, "no-baseline")
+            no_baseline = no_baseline_page.evaluate(
+                """async (preset) => {
+                    await presetLoad();
+                    const caption = state.overlays.find(item => item.type === 'caption');
+                    selectedOverlayId = caption.id;
+                    renderInspector();
+                    lastSyncedState = null;
+                    stateDirty = false;
+                    const oldReview = presetReview;
+                    presetReview = async () => true;
+                    await saveState(false);
+                    presetSetLibrary({revision: 'lib-1', presets: [preset]}, preset.id);
+                    let captureError = null;
+                    try { presetCapture(); } catch (error) { captureError = error.message; }
+                    await presetApply();
+                    presetReview = oldReview;
+                    return {
+                        captureError,
+                        applyStatus: presetNode('preset-status').textContent,
+                        stateDirty,
+                        lastSaveSucceeded,
+                        stateEqualsLastSynced: JSON.stringify(state) === JSON.stringify(lastSyncedState),
+                        presetSaveInFlight,
+                    };
+                }""",
+                preset,
+            )
+            no_baseline_page.screenshot(path=str(evidence_dir / "conflict-no-baseline-ready.png"), full_page=True)
+            self.assertEqual(no_baseline_calls["project"], 2)
+            self.assertEqual(no_baseline_calls["editor"], 1)
+            self.assertEqual(no_baseline_calls["plan"], 1)
+            self.assertEqual(no_baseline_calls["apply"], 1)
+            self.assertIsNone(no_baseline["captureError"])
+            self.assertIn("設定沒有差異", no_baseline["applyStatus"])
+            self.assertFalse(no_baseline["stateDirty"])
+            self.assertTrue(no_baseline["lastSaveSucceeded"])
+            self.assertTrue(no_baseline["stateEqualsLastSynced"])
+            self.assertEqual(no_baseline["presetSaveInFlight"], 0)
+            no_baseline_page.close()
+            browser.close()
+
+            if os.environ.get("P3_UI_EVIDENCE"):
+                (evidence_dir / "conflict-sync-regression.json").write_text(
+                    json.dumps(
+                        {
+                            "synced": synced,
+                            "failed_reload": failed,
+                            "replayable_dirty": replayable,
+                            "malformed_reload": malformed,
+                            "no_baseline": no_baseline,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
     def test_422_failures_preserve_input_state_and_history(self):
         host, port = self.server.server_address
         preset_id = "preset_" + "a" * 32

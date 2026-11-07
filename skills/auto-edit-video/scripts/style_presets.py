@@ -401,7 +401,14 @@ class StylePresetStore:
         return {"schema_version": SCHEMA_VERSION, "presets": presets}
 
     def collection(self) -> dict[str, Any]:
-        document = self._load_unlocked()
+        try:
+            document = self._load_unlocked()
+        except OSError as exc:
+            raise StylePresetError(
+                503,
+                "store_io_error",
+                "預設資料暫時無法讀取；原檔未變更，請檢查磁碟或權限後重試",
+            ) from exc
         return self._public_collection(document)
 
     @staticmethod
@@ -523,11 +530,19 @@ class StylePresetStore:
             os.close(directory_fd)
             raise StylePresetError(409, "store_unsafe", "無法安全讀取預設鎖") from last_error
         try:
-            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-                raise StylePresetError(409, "store_unsafe", "預設鎖檔不安全")
-            fcntl.flock(lock_fd, fcntl.LOCK_SH)
-            document = self._load_unlocked(directory_fd)
-            yield self._public_collection(document)
+            try:
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    raise StylePresetError(409, "store_unsafe", "預設鎖檔不安全")
+                fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                document = self._load_unlocked(directory_fd)
+                collection = self._public_collection(document)
+            except OSError as exc:
+                raise StylePresetError(
+                    503,
+                    "store_io_error",
+                    "預設資料暫時無法讀取；原檔未變更，請檢查磁碟或權限後重試",
+                ) from exc
+            yield collection
         finally:
             os.close(lock_fd)
             os.close(directory_fd)
@@ -578,6 +593,16 @@ class StylePresetStore:
     def _mutate(self, expected_revision: Any, operation) -> dict[str, Any]:
         if not isinstance(expected_revision, str) or SHA256_RE.fullmatch(expected_revision) is None:
             raise StylePresetError(409, "library_revision_required", "必須提供目前的預設版本")
+        try:
+            return self._mutate_io(expected_revision, operation)
+        except OSError as exc:
+            raise StylePresetError(
+                503,
+                "store_io_error",
+                "預設寫入結果未能完整確認；請重新載入清單確認後再試，並檢查磁碟空間與權限",
+            ) from exc
+
+    def _mutate_io(self, expected_revision: str, operation) -> dict[str, Any]:
         directory_fd = self._open_directory(create=True)
         assert directory_fd is not None
         lock_fd = -1
