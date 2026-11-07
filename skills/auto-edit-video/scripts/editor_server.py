@@ -8,6 +8,7 @@ and only reads/writes inside the selected project directory.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
@@ -34,6 +35,7 @@ from typing import Any
 import caption_engine
 import fx_overlay
 from fx_preview_jobs import FxPreviewJobError, FxPreviewJobManager
+import fx_preview_contract
 import asset_registry
 import contract_registry
 import delivery_envelope
@@ -1299,7 +1301,26 @@ def referenced_render_inputs(
             }
 
     for overlay in state.get("overlays", []):
-        if isinstance(overlay, dict) and overlay.get("type") in {"image", "gif", "video"}:
+        if not isinstance(overlay, dict):
+            continue
+        if overlay.get("type") == "fx" and overlay.get("code") == "B1":
+            material_id = str((overlay.get("material") or {}).get("asset_id") or "unknown")
+            try:
+                binding = fx_preview_contract.verify_material_binding(
+                    project_dir, overlay.get("material")
+                )
+                add(binding["path"], "fx-broll-material")
+            except fx_preview_contract.FxPreviewContractError:
+                inputs[f"fx-material:{material_id}"] = {
+                    "path": f"fx-material:{material_id}",
+                    "kind": "fx-broll-material",
+                    "asset_id": material_id,
+                    "sha256": "",
+                    "requires_assertion": True,
+                    "license_status": "provider-provenance-invalid",
+                }
+            continue
+        if overlay.get("type") in {"image", "gif", "video"}:
             add(str(overlay.get("source") or ""), "overlay-asset")
     template = state.get("video_template") or {}
     background = template.get("background") or {}
@@ -2094,7 +2115,18 @@ def referenced_asset_digests(project_dir: Path, state: dict[str, Any]) -> dict[s
     digests: dict[str, str] = {}
     sources: list[str] = []
     for overlay in state.get("overlays", []):
-        if not isinstance(overlay, dict) or overlay.get("type") not in {"image", "gif", "video"}:
+        if not isinstance(overlay, dict):
+            continue
+        if overlay.get("type") == "fx" and overlay.get("code") == "B1":
+            try:
+                binding = fx_preview_contract.verify_material_binding(
+                    project_dir, overlay.get("material")
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                raise ValueError(exc.message) from exc
+            sources.append(binding["path"])
+            continue
+        if overlay.get("type") not in {"image", "gif", "video"}:
             continue
         source = str(overlay.get("source", ""))
         if source:
@@ -3701,6 +3733,7 @@ class EditorServer(ThreadingHTTPServer):
         self.fx_preview_jobs = FxPreviewJobManager(
             self.project_dir,
             context_provider=self.fx_preview_context,
+            timeline_snapshot_builder=self.fx_preview_timeline_snapshot,
         )
 
     def fx_preview_context(self) -> dict[str, Any]:
@@ -3710,11 +3743,75 @@ class EditorServer(ThreadingHTTPServer):
             state = read_json(self.project_dir / STATE_REL)
             if state is None:
                 state = default_editor_state(self.project_dir, manifest)
+            try:
+                state["asset_digests"] = referenced_asset_digests(
+                    self.project_dir, state
+                )
+            except ValueError as exc:
+                raise FxPreviewJobError(
+                    409, "asset_changed", "專案素材已變更，請重新載入"
+                ) from exc
             return {
                 "manifest": manifest,
                 "state": state,
                 "state_revision": editor_state_revision(state),
             }
+
+    def fx_preview_timeline_snapshot(
+        self,
+        state: dict[str, Any],
+        manifest: dict[str, Any],
+        overlay: dict[str, Any],
+        replace_overlay_id: str | None,
+    ) -> dict[str, Any]:
+        """Build an isolated, candidate-applied render snapshot without I/O."""
+        frozen_state = copy.deepcopy(state)
+        frozen_manifest = copy.deepcopy(manifest)
+        overlays = frozen_state.get("overlays")
+        if not isinstance(overlays, list):
+            raise FxPreviewJobError(409, "state_invalid", "目前時間軸圖層格式無效")
+        frozen_overlay = copy.deepcopy(overlay)
+        if replace_overlay_id:
+            index = next(
+                (
+                    i
+                    for i, item in enumerate(overlays)
+                    if isinstance(item, dict)
+                    and item.get("type") == "fx"
+                    and item.get("id") == replace_overlay_id
+                ),
+                None,
+            )
+            if index is None:
+                raise FxPreviewJobError(409, "replace_target_stale", "要替換的 FX 圖層已不存在")
+            frozen_overlay["id"] = replace_overlay_id
+            overlays[index] = frozen_overlay
+        else:
+            # Snapshot-only identity: deterministic, non-persistent and
+            # deliberately excluded from the single-effect visual cache key.
+            frozen_overlay["id"] = "fx-preview-candidate"
+            overlays.append(frozen_overlay)
+        try:
+            frozen_state["asset_digests"] = referenced_asset_digests(
+                self.project_dir, frozen_state
+            )
+        except ValueError as exc:
+            raise FxPreviewJobError(409, "asset_changed", "專案素材已變更，請重新載入") from exc
+        frozen_state["revision"] = editor_state_revision(frozen_state)
+        return {
+            "schema_version": 1,
+            "render_id": "fx-preview",
+            "created_at": now_utc(),
+            "quality": "preview",
+            "project_id": frozen_manifest.get("project_id"),
+            "state_revision": frozen_state["revision"],
+            "approval_revisions": {},
+            "clip": None,
+            "visual_quality": {},
+            "manifest": frozen_manifest,
+            "state": frozen_state,
+            "authorization": {},
+        }
 
     def server_close(self) -> None:
         self.fx_preview_jobs.close()
@@ -4405,10 +4502,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         write_output_variant_set(project, state, manifest, variants)
         self.send_json({"ok": True, "variants": variants})
 
-    _ASSET_DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
-
     def handle_assets_library(self, project: Path) -> None:
-        assets_dir = project / "assets"
         registry_error: str | None = None
         try:
             registry = asset_registry.load_registry(project)
@@ -4427,60 +4521,43 @@ class EditorHandler(BaseHTTPRequestHandler):
             if item.get("asserted")
         }
         items = []
-        if assets_dir.is_dir():
-            for path in sorted(assets_dir.rglob("*")):
-                if not path.is_file() or path.is_symlink() or path.name.startswith("."):
-                    continue
-                if path.suffix.lower() not in {
-                    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".m4v",
-                }:
-                    continue
-                stat = path.stat()
-                cache_key = (str(path), stat.st_size, stat.st_mtime_ns)
-                digest = self._ASSET_DIGEST_CACHE.get(cache_key)
-                if digest is None:
-                    digest = file_sha256(path)
-                    if len(self._ASSET_DIGEST_CACHE) > 2048:
-                        self._ASSET_DIGEST_CACHE.clear()
-                    self._ASSET_DIGEST_CACHE[cache_key] = digest
-                if len(items) >= 500:
-                    break
-                relative = path.relative_to(project).as_posix()
-                current_registry = next(
-                    (
-                        registry_item
-                        for registry_item in registry_by_path.get(relative, [])
-                        if registry_item.get("sha256") == digest
-                    ),
-                    None,
-                )
-                item_registry_error = registry_error
-                if current_registry is None and registry_by_path.get(relative):
-                    item_registry_error = "asset provenance hash is stale"
-                license_info = (
-                    current_registry.get("license", {}) if current_registry else {}
-                )
-                items.append(
-                    {
-                        "path": relative,
-                        "kind": "video" if path.suffix.lower() in {".mp4", ".mov", ".m4v"} else "image",
-                        "sha256": digest,
-                        "asserted": digest in asserted,
-                        "provider_id": (
-                            current_registry.get("provider_id") if current_registry else None
-                        ),
-                        "license_spdx": license_info.get("spdx"),
-                        "review_status": (
-                            current_registry.get("review_status")
-                            if current_registry
-                            else "unregistered"
-                        ),
-                        "attribution_required": bool(
-                            license_info.get("attribution_required")
-                        ),
-                        "registry_error": item_registry_error,
-                    }
-                )
+        try:
+            safe_assets = fx_preview_contract.list_material_assets(
+                project,
+                decode_probe=lambda path: ffprobe_visual_dimensions(path) is not None,
+            )
+        except fx_preview_contract.FxPreviewContractError:
+            safe_assets = []
+            registry_error = registry_error or "asset provenance registry is invalid"
+        for safe_asset in safe_assets:
+            relative = str(safe_asset["path"])
+            digest = str(safe_asset["sha256"])
+            current_registry = next(
+                (
+                    registry_item
+                    for registry_item in registry_by_path.get(relative, [])
+                    if registry_item.get("sha256") == digest
+                ),
+                None,
+            )
+            item_registry_error = registry_error
+            if current_registry is None and registry_by_path.get(relative):
+                item_registry_error = "asset provenance hash is stale"
+            license_info = current_registry.get("license", {}) if current_registry else {}
+            items.append(
+                {
+                    "asset_id": safe_asset["asset_id"],
+                    "path": relative,
+                    "kind": safe_asset["kind"],
+                    "sha256": digest,
+                    "asserted": digest in asserted,
+                    "provider_id": current_registry.get("provider_id") if current_registry else None,
+                    "license_spdx": license_info.get("spdx"),
+                    "review_status": current_registry.get("review_status") if current_registry else "unregistered",
+                    "attribution_required": bool(license_info.get("attribution_required")),
+                    "registry_error": item_registry_error,
+                }
+            )
         self.send_json(
             {"ok": True, "assets": items, "registry_error": registry_error}
         )
@@ -5796,6 +5873,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         self.send_json(
             {
                 "ok": True,
+                "asset_id": item["asset_id"],
                 "source": relative,
                 "url": f"/assets/{urllib.parse.quote(stored_name)}",
                 "sha256": digest,

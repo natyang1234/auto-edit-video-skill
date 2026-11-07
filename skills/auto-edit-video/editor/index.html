@@ -660,8 +660,32 @@
           </header>
 
           <div class="fx-preview-player-wrap">
-            <video id="fx-preview-video" class="fx-preview-video" controls playsinline muted preload="metadata" aria-label="特效試看影片"></video>
+            <div class="fx-preview-compare-heading">
+              <div>
+                <span class="field-label">原片／效果同步比較</span>
+                <p>兩側維持同一來源時間；左側會從設定的來源起點開始。</p>
+              </div>
+              <button class="button button-secondary fx-preview-resync" id="fx-preview-resync" type="button">重新同步</button>
+            </div>
+            <div class="fx-preview-compare" aria-label="原片與效果預覽比較">
+              <figure>
+                <figcaption>原片 <output id="fx-preview-source-time">00:00.000</output></figcaption>
+                <video id="fx-preview-source-video" class="fx-preview-video" controls playsinline muted preload="metadata" aria-label="原片試看片段"></video>
+              </figure>
+              <figure>
+                <figcaption>效果預覽 <output id="fx-preview-effect-time">00:00.000</output></figcaption>
+                <video id="fx-preview-video" class="fx-preview-video" controls playsinline muted preload="metadata" aria-label="特效試看影片"></video>
+              </figure>
+            </div>
             <p id="fx-preview-status" class="fx-preview-status" role="status" aria-live="polite">尚未選擇風格。</p>
+            <div class="fx-preview-layout-check" id="fx-preview-layout-check" hidden aria-labelledby="fx-preview-layout-check-heading">
+              <div class="fx-preview-layout-check-head">
+                <h3 class="fx-preview-subheading" id="fx-preview-layout-check-heading">畫面檢查</h3>
+                <button class="button button-secondary fx-preview-layout-check-toggle" id="fx-preview-layout-check-toggle" type="button" aria-expanded="false" aria-controls="fx-preview-layout-check-list">查看細節</button>
+              </div>
+              <p class="fx-preview-layout-check-summary" id="fx-preview-layout-check-summary"></p>
+              <ul class="fx-preview-layout-check-list" id="fx-preview-layout-check-list" hidden></ul>
+            </div>
           </div>
 
           <div class="fx-preview-settings">
@@ -670,8 +694,21 @@
               <strong id="fx-preview-selected-name">—</strong>
               <p class="fx-preview-spec" id="fx-preview-spec"></p>
             </div>
+            <div class="fx-preview-draft-notice" id="fx-preview-draft-notice" hidden role="status">
+              <p id="fx-preview-draft-copy"></p>
+              <div>
+                <button class="button button-secondary" id="fx-preview-restore-draft" type="button" hidden>還原草稿</button>
+                <button class="button button-secondary" id="fx-preview-discard-draft" type="button" hidden>丟棄草稿</button>
+              </div>
+            </div>
             <div class="fx-preview-window" aria-labelledby="fx-preview-window-title">
-              <div class="fx-preview-subheading" id="fx-preview-window-title">試看時間</div>
+              <div class="fx-preview-subheading" id="fx-preview-window-title">套用範圍</div>
+              <div class="fx-preview-time-grid">
+                <label class="field"><span>套用起點（秒）</span><input id="fx-preview-apply-source" type="number" min="0" step="0.1"></label>
+                <label class="field"><span>套用長度（秒）</span><input id="fx-preview-apply-duration" type="number" min="0.1" step="0.1"></label>
+              </div>
+              <p class="fx-preview-time-note"><span>實際套用</span> <output id="fx-preview-apply-window-label">00:00.000 — 00:00.000</output></p>
+              <div class="fx-preview-subheading">試看片段（最多 4 秒）</div>
               <div class="fx-preview-time-grid">
                 <label class="field"><span>來源起點（秒）</span><input id="fx-preview-source" type="number" min="0" step="0.1"></label>
                 <label class="field"><span>試看長度（最多 4 秒）</span><input id="fx-preview-duration" type="number" min="0.1" max="4" step="0.1"></label>
@@ -679,11 +716,17 @@
               <p class="fx-preview-time-note"><span>播放範圍</span> <output id="fx-preview-window-label">00:00.000 — 00:00.000</output></p>
               <p class="fx-preview-replace-note" id="fx-preview-replace-note" hidden></p>
             </div>
+            <div class="fx-preview-options">
+              <label class="field"><span>預覽模式</span><select id="fx-preview-mode"><option value="single">單一效果</option><option value="timeline">時間軸</option></select></label>
+              <label class="field"><span>預覽畫質</span><select id="fx-preview-quality"><option value="draft">快速版</option><option value="standard">清晰版</option></select></label>
+              <label class="fx-preview-check"><input id="fx-preview-text-fit" type="checkbox" checked> 自動縮放長文</label>
+            </div>
             <div class="fx-preview-fields" id="fx-preview-fields"></div>
           </div>
 
           <footer class="fx-preview-actions">
             <button class="button button-secondary" id="fx-preview-retry" type="button" hidden>重試預覽</button>
+            <button class="button button-secondary" id="fx-preview-cancel-upgrade" type="button" hidden>取消清晰版</button>
             <span class="fx-preview-action-spacer"></span>
             <button class="button button-secondary" id="fx-preview-cancel" type="button">取消</button>
             <button class="button button-primary" id="fx-preview-confirm" type="button" disabled>套用到時間軸</button>

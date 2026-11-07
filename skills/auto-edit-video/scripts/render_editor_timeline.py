@@ -1100,7 +1100,7 @@ def image_filter(
     animation = str(style.get("animation", "none"))
     scaled = f"{output_label}_asset"
     asset_filters = (
-        f"[{asset_label}]scale={asset_width}:-2,format=rgba,"
+        f"[{asset_label}]trim=start={float(overlay.get('media_offset_s', 0)):.6f},scale={asset_width}:-2,format=rgba,"
         f"setpts=PTS-STARTPTS+{start:.3f}/TB"
     )
     if animation in MOTION_ANIMATIONS:
@@ -1670,6 +1670,7 @@ def build_render_command(
     dialogue_priority_sfx: Path | None = None,
     visual_authority: FrozenVisualAuthority | None = None,
     motion_base_output: Path | None = None,
+    preview_fx_quality: str | None = None,
 ) -> list[str]:
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
@@ -1818,46 +1819,33 @@ def build_render_command(
         if source_overlay.get("type") == "fx":
             # A 風格菜單 effect block: rendered now to a transparent .mov over
             # exactly this source window (compose.py clip), then drawn as a
-            # full-frame video layer like an animated card. A failed render
-            # skips the effect and reports it; it never blocks the delivery.
+            # full-frame video layer like an animated card. A failed effect
+            # stops the render so a preview cannot silently omit the layer.
             import fx_overlay
 
-            # The clip is one animation over one source window. If a cut
-            # removes part of that window the pieces would replay or show
-            # removed footage, so the effect is re-fitted to the longest
-            # surviving piece (and says so) instead of being split.
-            pieces = sorted(
-                ((max(raw_start, seg_start), min(raw_end, seg_end))
-                 for seg_start, seg_end in segments
-                 if min(raw_end, seg_end) - max(raw_start, seg_start) > 0.05),
-                key=lambda piece: piece[1] - piece[0], reverse=True,
-            )
-            if not pieces:
-                continue  # entirely inside removed material, like any overlay
-            if abs(pieces[0][0] - raw_start) > 1e-6 or abs(pieces[0][1] - raw_end) > 1e-6:
-                print(json.dumps({"fx_refit": {
-                    "layer": source_overlay.get("id"), "code": source_overlay.get("code"),
-                    "from": [raw_start, raw_end], "to": list(pieces[0]),
-                }}, ensure_ascii=False), file=sys.stderr)
-                raw_start, raw_end = pieces[0]
-                source_overlay = dict(source_overlay, start=raw_start, end=raw_end)
+            # Render on the original source axis, then seek each surviving
+            # piece into that same animation. Cuts must never restart/refit it.
+            if not map_source_range_to_post_cut(segments, raw_start, raw_end):
+                continue
             rendered = fx_overlay.render_for_timeline(
                 project_dir,
                 source_overlay,
                 project_dir / str(manifest.get("source", {}).get("staged_path", "")),
                 str(style_pack_for_clip(state, clip).get("id") or ""),
-                quality,
+                preview_fx_quality if quality == "preview" and preview_fx_quality in {"draft", "standard"} else quality,
                 canvas=(width, height),
                 fit=fit,
             )
             if rendered is None:
-                if quality == "final":
-                    raise ValueError(
-                        f"effect {source_overlay.get('code')} ({source_overlay.get('id')}) "
-                        "failed to render; fix it or remove the layer before a final render "
-                        "(see fx_fallback on stderr)"
-                    )
-                continue
+                raise ValueError(
+                    f"effect {source_overlay.get('code')} ({source_overlay.get('id')}) "
+                    "failed to render; fix it or remove the layer before rendering "
+                    "(see fx_fallback on stderr)"
+                )
+            report_path = project_dir / "working" / "fx_text_layout.json"
+            reports = read_json(report_path, {}) or {}
+            reports[str(source_overlay.get("id"))] = rendered.get("text_layout")
+            atomic_write_json(report_path, reports)
             source_overlay = fx_overlay.as_video_overlay(source_overlay, rendered)
         # Overlay times are stored on the source axis; project them onto the
         # post-cut axis. Crossing a removed region yields one window per
@@ -1869,13 +1857,19 @@ def build_render_command(
         # identity, so its pieces — adjacent on the final axis, because
         # what separated them is gone — are drawn as one.
         raw_windows = map_source_range_to_post_cut(segments, raw_start, raw_end)
-        if source_overlay.get("type") not in {"caption", "emphasis"}:
+        is_fx_video = source_overlay.get("type") == "video" and bool(source_overlay.get("fx") or source_overlay.get("source_axis_media"))
+        if source_overlay.get("type") not in {"caption", "emphasis"} and not is_fx_video:
             raw_windows = merge_contiguous_windows(raw_windows)
-        for window_start, window_end in raw_windows:
+        fx_offsets = [max(raw_start, a) - raw_start for a, b in segments
+                      if min(raw_end, b) > max(raw_start, a)] if is_fx_video else []
+        for window_index, (window_start, window_end) in enumerate(raw_windows):
             overlay = dict(source_overlay)
             overlay["style"] = dict(source_overlay.get("style") or {})
             overlay["start"] = window_start
             overlay["end"] = window_end
+            if is_fx_video:
+                overlay["media_offset_s"] = fx_offsets[window_index]
+                overlay["id"] = str(overlay.get("id", "fx")) + f"-piece-{window_index}"
             if overlay.get("type") == "caption" and delivery_items:
                 source_id = str(source_overlay.get("caption_source_id") or "")
                 key = (
@@ -2599,6 +2593,29 @@ def load_render_snapshot(
     return manifest, state, clip
 
 
+def compose_designed_timeline_state(project_dir: Path, state: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    """Package every authored highlight without altering the saved timeline."""
+    # Designed templates are authored per highlight. Composite each
+    # complete package on its original source interval; the ordinary
+    # cut mapping below seeks it without restarting its animations.
+    state = copy.deepcopy(state)
+    package_state = strip_caption_overlays(state)
+    package_layers = []
+    for designed_clip in state.get("highlights", []):
+        if not isinstance(designed_clip, dict): continue
+        roles = {str(o.get("design_role")) for o in overlays_for_clip(state, designed_clip) if o.get("design_role")}
+        if not roles: continue
+        if not set(DESIGN_ROLES).issubset(roles):
+            raise ValueError("designed timeline highlight is missing reviewed design cards")
+        package = ensure_graphic_package(project_dir, package_state, manifest, designed_clip)
+        package_layers.append({"id": "template-" + str(designed_clip.get("id")), "type": "video",
+            "source": str(package.relative_to(project_dir)), "start": float(designed_clip["start"]),
+            "end": float(designed_clip["end"]), "source_axis_media": True, "z_index": -100000,
+            "style": {"x":50,"y":50,"width":100,"animation":"none","opacity":1}})
+    state["overlays"] = package_layers + list(state.get("overlays", []))
+    return state
+
+
 def render_project(
     project_dir: Path,
     output: Path,
@@ -2607,6 +2624,7 @@ def render_project(
     variant_id: str | None = None,
     *,
     defer_delivery_handoff: bool = False,
+    preview_fx_quality: str | None = None,
 ) -> delivery_envelope.DeferredPublication | None:
     direct_final = quality == "final" and snapshot_path is None and variant_id is None
     # Phase 4 sub-slice 3: a variant final is a single, self-contained delivery
@@ -2734,6 +2752,8 @@ def render_project(
         if temporary is None:
             raise RuntimeError("render output staging was not initialized")
         visual_source: Path | None = None
+        if clip is None and state.get("visual_quality_mode") == "designed":
+            state = compose_designed_timeline_state(project_dir, state, manifest)
         if clip is not None and state.get("visual_quality_mode") == "designed":
             quality_errors = visual_quality_errors(state, manifest, clip)
             if quality_errors:
@@ -2793,6 +2813,7 @@ def render_project(
             visual_evidence=raw_visual_evidence,
             visual_authority=visual_authority,
             motion_base_output=motion_base_output,
+            preview_fx_quality=preview_fx_quality,
         )
         if direct_final and state.get("director_style") == "kinetic-explainer":
             if direct_stage is None or render_id is None or raw_visual_evidence is None:
@@ -2827,6 +2848,7 @@ def render_project(
                 dialogue_priority_sfx=dialogue_priority_paths[1],
                 visual_authority=visual_authority,
                 motion_base_output=motion_base_output,
+                preview_fx_quality=preview_fx_quality,
             )
         try:
             result = subprocess.run(

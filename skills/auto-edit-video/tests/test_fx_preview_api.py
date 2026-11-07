@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import os
+import base64
 import signal
 import sys
 import tempfile
@@ -20,31 +21,96 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import editor_server  # noqa: E402
+import fx_overlay  # noqa: E402
+import fx_preview_contract  # noqa: E402
 import fx_preview_jobs  # noqa: E402
 from editor_server import EditorServer  # noqa: E402
 
 
 FAST_RENDERER = r'''#!/usr/bin/env python3
-import argparse, json, os
+import argparse, hashlib, json, os
 from pathlib import Path
 p=argparse.ArgumentParser(); p.add_argument("--request"); p.add_argument("--result"); a=p.parse_args()
-req=json.loads(Path(a.request).read_text())
+request_fd=os.environ.get("FX_PREVIEW_REQUEST_FD")
+if request_fd:
+    fd=int(request_fd); os.lseek(fd,0,os.SEEK_SET); raw=b""
+    while True:
+        chunk=os.read(fd,65536)
+        if not chunk: break
+        raw += chunk
+else:
+    raw=Path(a.request).read_bytes()
+req=json.loads(raw)
 print(json.dumps({"phase":"rendering","message":"ignored"}), file=__import__('sys').stderr, flush=True)
 out=Path(req["output"]); out.write_bytes(b"synthetic-mp4-" + req["overlay"]["code"].encode())
-tmp=Path(a.result + ".tmp")
-tmp.write_text(json.dumps({"ok":True,"out":str(out),"duration_s":req["overlay"]["end"]-req["overlay"]["start"]}))
-os.replace(tmp, a.result)
+sample=req["sample_window"]
+duration=sample["duration_s"]
+keys=("project_dir","source","cache_dir","output","overlay","sample_window","preview_options","state_snapshot","manifest_snapshot","timeline_snapshot","dependency_snapshot","pack_id","canvas")
+render_raw=json.dumps({key:req.get(key) for key in keys},ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode()
+payload=json.dumps({
+    "ok":True,
+    "out":str(out),
+    "request_sha256":hashlib.sha256(raw).hexdigest(),
+    "render_request_sha256":hashlib.sha256(render_raw).hexdigest(),
+    "render_duration_s":duration,
+    "time_map":[{
+        "source_start_s":sample["start_s"],
+        "source_end_s":sample["start_s"]+duration,
+        "output_start_s":0.0,
+        "output_end_s":duration,
+    }],
+    "text_layout":{
+        "version":2,
+        "measurement":"composition-dom",
+        "status":"pass",
+        "analysis_scope":"single-fx-and-source-frame",
+        "face_measurement":"unavailable",
+        "samples":[{"at":0.0,"boxes":[{"id":"title","text":"must-not-leak","x":1,"y":2,"width":3,"height":4,"visible":True,"fitted":True}]}],
+        "boxes":[],"findings":[],"subject_samples":[],"detail":"private-detail"
+    },
+})
+result_dir_fd=os.environ.get("FX_PREVIEW_RESULT_DIR_FD")
+if result_dir_fd:
+    dfd=int(result_dir_fd); name=Path(a.result).name; tmp=name+".tmp"
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=dfd)
+    with os.fdopen(fd,"w") as stream: stream.write(payload)
+    os.replace(tmp,name,src_dir_fd=dfd,dst_dir_fd=dfd)
+else:
+    tmp=Path(a.result + ".tmp"); tmp.write_text(payload); os.replace(tmp,a.result)
 '''
 
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
 SLOW_RENDERER = r'''#!/usr/bin/env python3
-import argparse, json, os, time
+import argparse, hashlib, json, os, time
 from pathlib import Path
 p=argparse.ArgumentParser(); p.add_argument("--request"); p.add_argument("--result"); a=p.parse_args()
-req=json.loads(Path(a.request).read_text())
+request_fd=os.environ.get("FX_PREVIEW_REQUEST_FD")
+if request_fd:
+    fd=int(request_fd); os.lseek(fd,0,os.SEEK_SET); raw=b""
+    while True:
+        chunk=os.read(fd,65536)
+        if not chunk: break
+        raw += chunk
+else:
+    raw=Path(a.request).read_bytes()
+req=json.loads(raw)
 print(json.dumps({"phase":"rendering"}), file=__import__('sys').stderr, flush=True)
 time.sleep(0.5)
 out=Path(req["output"]); out.write_bytes(b"late-mp4")
-tmp=Path(a.result + ".tmp"); tmp.write_text(json.dumps({"ok":True,"out":str(out)})); os.replace(tmp, a.result)
+keys=("project_dir","source","cache_dir","output","overlay","sample_window","preview_options","state_snapshot","manifest_snapshot","timeline_snapshot","dependency_snapshot","pack_id","canvas")
+render_raw=json.dumps({key:req.get(key) for key in keys},ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode()
+payload=json.dumps({"ok":True,"out":str(out),"request_sha256":hashlib.sha256(raw).hexdigest(),"render_request_sha256":hashlib.sha256(render_raw).hexdigest()})
+result_dir_fd=os.environ.get("FX_PREVIEW_RESULT_DIR_FD")
+if result_dir_fd:
+    dfd=int(result_dir_fd); name=Path(a.result).name; tmp=name+".tmp"
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=dfd)
+    with os.fdopen(fd,"w") as stream: stream.write(payload)
+    os.replace(tmp,name,src_dir_fd=dfd,dst_dir_fd=dfd)
+else:
+    tmp=Path(a.result + ".tmp"); tmp.write_text(payload); os.replace(tmp,a.result)
 '''
 
 GRANDCHILD_RENDERER = r'''#!/usr/bin/env python3
@@ -212,6 +278,20 @@ class FxPreviewApiTests(unittest.TestCase):
             },
         }
 
+    def _upload_asset(self, filename: str, data: bytes = PNG_1X1) -> dict:
+        status, _headers, raw = self._request(
+            "POST",
+            f"/api/assets?filename={filename}",
+            data,
+            {
+                "Content-Type": "image/png",
+                "X-Auto-Edit-CSRF": self.csrf,
+            },
+        )
+        payload = json.loads(raw or b"{}")
+        self.assertEqual(status, 200, payload)
+        return payload
+
     def _wait_terminal(self, job_id: str, timeout: float = 5.0) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -247,6 +327,9 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(status, 202, created)
         terminal = self._wait_terminal(created["job"]["id"])
         self.assertEqual(terminal["job"]["state"], "ready", terminal)
+        self.assertEqual(terminal["job"]["text_layout"]["version"], 2)
+        self.assertNotIn("text", terminal["job"]["text_layout"]["samples"][0]["boxes"][0])
+        self.assertNotIn("detail", terminal["job"]["text_layout"])
         with self.server.fx_preview_jobs._lock:
             frozen_canvas = self.server.fx_preview_jobs._jobs[created["job"]["id"]]["dependencies"]["canvas"]
         self.assertEqual(frozen_canvas["fit"], "contain")
@@ -285,6 +368,7 @@ class FxPreviewApiTests(unittest.TestCase):
         status, cached = self._json_request("POST", "/api/fx-previews", self._candidate())
         self.assertEqual(status, 200, cached)
         self.assertTrue(cached["job"]["cache_hit"])
+        self.assertEqual(cached["job"]["text_layout"], terminal["job"]["text_layout"])
 
     def test_b1_unknown_fields_and_nan_fail_closed(self) -> None:
         status, rejected = self._json_request("POST", "/api/fx-previews", self._candidate("B1"))
@@ -307,6 +391,344 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(status, 422, raw)
         self.assertEqual(json.loads(raw)["reason"], "window_invalid")
 
+    def test_short_sample_confirms_the_full_apply_window(self) -> None:
+        request = self._candidate()
+        request["candidate"]["window"] = {"start_s": 2.0, "duration_s": 2.0}
+        request["candidate"]["apply_window"] = {"start_s": 0.0, "duration_s": 8.0}
+        status, created = self._json_request("POST", "/api/fx-previews", request)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        self.assertEqual(ready["job"]["state"], "ready", ready)
+        self.assertEqual(ready["job"]["render_duration_s"], 2.0)
+        with self.server.fx_preview_jobs._lock:
+            job = self.server.fx_preview_jobs._jobs[created["job"]["id"]]
+            self.assertEqual(job["sample_window"], {"start_s": 2.0, "duration_s": 2.0})
+            self.assertEqual((job["overlay"]["start"], job["overlay"]["end"]), (0.0, 8.0))
+            self.assertEqual(
+                (job["state_snapshot"]["overlays"][-1]["start"], job["state_snapshot"]["overlays"][-1]["end"]),
+                (0.0, 8.0),
+            )
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{created['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        self.assertEqual(
+            (confirmed["state"]["overlays"][-1]["start"], confirmed["state"]["overlays"][-1]["end"]),
+            (0.0, 8.0),
+        )
+
+    def test_same_visual_add_then_replace_hits_single_preview_cache(self) -> None:
+        candidate = self._candidate()
+        status, created = self._json_request("POST", "/api/fx-previews", candidate)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{ready['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        self.revision = confirmed["revision"]
+        replacement = self._candidate()
+        replacement["replace_overlay_id"] = confirmed["overlay_id"]
+        status, cached = self._json_request("POST", "/api/fx-previews", replacement)
+        self.assertEqual(status, 200, cached)
+        self.assertTrue(cached["job"]["cache_hit"], cached)
+
+    def test_preview_options_and_subject_change_the_cache_identity(self) -> None:
+        baseline = self._candidate()
+        status, first = self._json_request("POST", "/api/fx-previews", baseline)
+        self.assertEqual(status, 202, first)
+        self.assertEqual(self._wait_terminal(first["job"]["id"])["job"]["state"], "ready")
+
+        timeline = self._candidate()
+        timeline["preview_options"] = {"mode": "timeline", "quality": "standard"}
+        status, second = self._json_request("POST", "/api/fx-previews", timeline)
+        self.assertEqual(status, 202, second)
+        self.assertFalse(second["job"]["cache_hit"])
+        self.assertEqual(second["job"]["preview_options"], timeline["preview_options"])
+        self.assertEqual(self._wait_terminal(second["job"]["id"])["job"]["state"], "ready")
+        with self.server.fx_preview_jobs._lock:
+            dependencies = self.server.fx_preview_jobs._jobs[second["job"]["id"]]["dependencies"]
+        self.assertIn("fx_preview_contract", dependencies["dependencies"])
+        self.assertIn("text_fit", dependencies["dependencies"])
+        self.assertIn("spotlight_track", dependencies["dependencies"])
+        self.assertEqual(
+            dependencies["dependencies"]["yunet_model"],
+            "ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0",
+        )
+        self.assertIn("render_editor_timeline.py", dependencies["timeline_python_dependencies"])
+        self.assertIn("T3", dependencies["timeline_fx_blocks"])
+
+        draft = self._candidate()
+        draft["preview_options"] = {"mode": "single", "quality": "draft"}
+        status, third = self._json_request("POST", "/api/fx-previews", draft)
+        self.assertEqual(status, 202, third)
+        self.assertFalse(third["job"]["cache_hit"])
+        self.assertEqual(self._wait_terminal(third["job"]["id"])["job"]["state"], "ready")
+
+        subject_a = self._candidate("P5")
+        subject_a["candidate"]["subject"] = {"x": 0.25, "y": 0.5}
+        status, fourth = self._json_request("POST", "/api/fx-previews", subject_a)
+        self.assertEqual(status, 202, fourth)
+        self.assertEqual(self._wait_terminal(fourth["job"]["id"])["job"]["state"], "ready")
+        subject_b = self._candidate("P5")
+        subject_b["candidate"]["subject"] = {"x": 0.75, "y": 0.5}
+        status, fifth = self._json_request("POST", "/api/fx-previews", subject_b)
+        self.assertEqual(status, 202, fifth)
+        self.assertFalse(fifth["job"]["cache_hit"])
+        self.assertEqual(self._wait_terminal(fifth["job"]["id"])["job"]["state"], "ready")
+
+    def test_b1_uses_only_opaque_owned_asset_binding_and_rights_gate(self) -> None:
+        uploaded = self._upload_asset("material.png")
+        status, library = self._json_request("GET", "/api/assets/library")
+        self.assertEqual(status, 200, library)
+        material = next(item for item in library["assets"] if item["sha256"] == uploaded["sha256"])
+        self.assertEqual(material["asset_id"], uploaded["asset_id"])
+
+        request = self._candidate("B1")
+        request["candidate"]["material"] = {
+            "asset_id": material["asset_id"],
+            "sha256": material["sha256"],
+        }
+        status, created = self._json_request("POST", "/api/fx-previews", request)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        self.assertEqual(ready["job"]["state"], "ready", ready)
+
+        second_uploaded = self._upload_asset("other-material.png")
+        second_request = self._candidate("B1")
+        second_request["candidate"]["material"] = {
+            "asset_id": second_uploaded["asset_id"],
+            "sha256": second_uploaded["sha256"],
+        }
+        status, second = self._json_request("POST", "/api/fx-previews", second_request)
+        self.assertEqual(status, 202, second)
+        self.assertFalse(second["job"]["cache_hit"])
+        self.assertEqual(self._wait_terminal(second["job"]["id"])["job"]["state"], "ready")
+
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{created['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        binding = confirmed["state"]["overlays"][-1]["material"]
+        self.assertEqual(set(binding), {"asset_id", "path", "sha256", "kind"})
+        self.assertEqual(binding["asset_id"], material["asset_id"])
+        self.assertEqual(
+            confirmed["state"]["asset_digests"][binding["path"]], binding["sha256"]
+        )
+        rights_errors = editor_server.rights_gate_errors(self.project, confirmed["state"])
+        self.assertTrue(any(binding["path"] in error for error in rights_errors), rights_errors)
+
+        tampered = json.loads(json.dumps(confirmed["state"]))
+        tampered["overlays"][-1]["material"]["path"] = "assets/client-smuggled.png"
+        status, rejected = self._json_request("PUT", "/api/editor-state", tampered)
+        self.assertEqual(status, 422, rejected)
+        self.assertTrue(
+            any("素材" in error or "material" in error for error in rejected.get("errors", [])),
+            rejected,
+        )
+
+    def test_timeline_b1_freezes_candidate_asset_and_registry_authority(self) -> None:
+        uploaded = self._upload_asset("timeline-material.png")
+        request = self._candidate("B1")
+        request["candidate"]["material"] = {
+            "asset_id": uploaded["asset_id"],
+            "sha256": uploaded["sha256"],
+        }
+        request["preview_options"] = {"mode": "timeline", "quality": "standard"}
+        status, created = self._json_request("POST", "/api/fx-previews", request)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        self.assertEqual(ready["job"]["state"], "ready", ready)
+        with self.server.fx_preview_jobs._lock:
+            job = self.server.fx_preview_jobs._jobs[created["job"]["id"]]
+            dependencies = job["dependencies"]
+            frozen_state = job["timeline_snapshot"]["state"]
+        relative = uploaded["source"]
+        self.assertEqual(frozen_state["asset_digests"][relative], uploaded["sha256"])
+        self.assertEqual(dependencies["asset_digests"][relative], uploaded["sha256"])
+        self.assertIn("assets/provenance.json", dependencies["provenance_digests"])
+
+    def test_timeline_b1_across_cut_preview_confirms_and_persists(self) -> None:
+        status, current = self._json_request("GET", "/api/project")
+        self.assertEqual(status, 200, current)
+        state = current["state"]
+        state["segments"] = [
+            {
+                "id": "segment-before-cut",
+                "source_start": 0.0,
+                "source_end": 5.0,
+                "origin": "manual",
+            },
+            {
+                "id": "segment-after-cut",
+                "source_start": 6.0,
+                "source_end": 8.0,
+                "origin": "manual",
+            },
+        ]
+        state["x_expected_revision"] = self.revision
+        status, saved = self._json_request("PUT", "/api/editor-state", state)
+        self.assertEqual(status, 200, saved)
+        self.revision = saved["revision"]
+
+        uploaded = self._upload_asset("timeline-confirm.png")
+        request = self._candidate("B1")
+        request["candidate"]["window"] = {"start_s": 3.0, "duration_s": 4.0}
+        request["candidate"]["material"] = {
+            "asset_id": uploaded["asset_id"],
+            "sha256": uploaded["sha256"],
+        }
+        request["preview_options"] = {"mode": "timeline", "quality": "standard"}
+        status, created = self._json_request("POST", "/api/fx-previews", request)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        self.assertEqual(ready["job"]["state"], "ready", ready)
+
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{created['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        persisted = confirmed["state"]["overlays"][-1]
+        self.assertEqual((persisted["start"], persisted["end"]), (3.0, 7.0))
+        self.assertEqual(persisted["material"]["asset_id"], uploaded["asset_id"])
+        self.assertEqual(
+            confirmed["state"]["asset_digests"][uploaded["source"]],
+            uploaded["sha256"],
+        )
+        self.assertEqual(
+            [(segment["source_start"], segment["source_end"]) for segment in confirmed["state"]["segments"]],
+            [(0.0, 5.0), (6.0, 8.0)],
+        )
+
+    def test_timeline_t3_preview_confirms_and_persists(self) -> None:
+        request = self._candidate("T3")
+        request["preview_options"] = {"mode": "timeline", "quality": "draft"}
+        status, created = self._json_request("POST", "/api/fx-previews", request)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        self.assertEqual(ready["job"]["state"], "ready", ready)
+        status, confirmed = self._json_request(
+            "POST",
+            f"/api/fx-previews/{created['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 200, confirmed)
+        self.assertEqual(confirmed["state"]["overlays"][-1]["code"], "T3")
+
+    def test_timeline_b1_confirm_rejects_asset_registry_and_code_drift(self) -> None:
+        uploaded = self._upload_asset("timeline-drift.png")
+        request = self._candidate("B1")
+        request["candidate"]["material"] = {
+            "asset_id": uploaded["asset_id"],
+            "sha256": uploaded["sha256"],
+        }
+        request["preview_options"] = {"mode": "timeline", "quality": "standard"}
+
+        def ready_job() -> str:
+            status, created = self._json_request("POST", "/api/fx-previews", request)
+            self.assertIn(status, {200, 202}, created)
+            ready = self._wait_terminal(created["job"]["id"])
+            self.assertEqual(ready["job"]["state"], "ready", ready)
+            return created["job"]["id"]
+
+        def rejected_confirm(job_id: str) -> dict:
+            status, rejected = self._json_request(
+                "POST",
+                f"/api/fx-previews/{job_id}/confirm",
+                {"expected_revision": self.revision},
+            )
+            self.assertEqual(status, 409, rejected)
+            return rejected
+
+        asset = self.project / uploaded["source"]
+        asset_before = asset.read_bytes()
+        job_id = ready_job()
+        asset.write_bytes(b"changed-after-timeline-preview")
+        try:
+            rejected = rejected_confirm(job_id)
+            self.assertIn(
+                rejected["reason"],
+                {"asset_changed", "material_changed", "material_unavailable"},
+            )
+        finally:
+            asset.write_bytes(asset_before)
+
+        registry = self.project / "assets/provenance.json"
+        registry_before = registry.read_bytes()
+        job_id = ready_job()
+        registry.write_bytes(registry_before + b"\n")
+        try:
+            self.assertEqual(rejected_confirm(job_id)["reason"], "preview_stale")
+        finally:
+            registry.write_bytes(registry_before)
+
+        renderer_before = self.fast_renderer.read_bytes()
+        job_id = ready_job()
+        self.fast_renderer.write_bytes(renderer_before + b"\n# code drift\n")
+        try:
+            self.assertEqual(rejected_confirm(job_id)["reason"], "preview_stale")
+        finally:
+            self.fast_renderer.write_bytes(renderer_before)
+
+    def test_b1_rejects_client_paths_and_asset_changes_before_confirm(self) -> None:
+        uploaded = self._upload_asset("material.png")
+        malicious = self._candidate("B1")
+        malicious["candidate"]["material"] = {
+            "asset_id": uploaded["asset_id"],
+            "sha256": uploaded["sha256"],
+            "path": "/tmp/private.png",
+        }
+        status, rejected = self._json_request("POST", "/api/fx-previews", malicious)
+        self.assertEqual(status, 422, rejected)
+        self.assertEqual(rejected["reason"], "material_invalid")
+
+        request = self._candidate("B1")
+        request["candidate"]["material"] = {
+            "asset_id": uploaded["asset_id"],
+            "sha256": uploaded["sha256"],
+        }
+        status, created = self._json_request("POST", "/api/fx-previews", request)
+        self.assertEqual(status, 202, created)
+        ready = self._wait_terminal(created["job"]["id"])
+        self.assertEqual(ready["job"]["state"], "ready", ready)
+        (self.project / uploaded["source"]).write_bytes(b"changed-after-preview")
+        status, rejected = self._json_request(
+            "POST",
+            f"/api/fx-previews/{created['job']['id']}/confirm",
+            {"expected_revision": self.revision},
+        )
+        self.assertEqual(status, 409, rejected)
+        self.assertIn(
+            rejected["reason"],
+            {"material_changed", "material_unavailable", "material_invalid"},
+        )
+
+    def test_asset_library_omits_symlink_ancestors_svg_fonts_and_undecodable(self) -> None:
+        uploaded = self._upload_asset("safe.png")
+        outside = self.project.parent / "outside-assets"
+        outside.mkdir()
+        (outside / "stolen.png").write_bytes(PNG_1X1)
+        (self.project / "assets/linked").symlink_to(outside, target_is_directory=True)
+        (self.project / "assets/icon.svg").write_text("<svg/>", encoding="utf-8")
+        (self.project / "assets/font.ttf").write_bytes(b"not-a-font")
+        (self.project / "assets/broken.png").write_bytes(b"not-a-png")
+        status, library = self._json_request("GET", "/api/assets/library")
+        self.assertEqual(status, 200, library)
+        paths = {item["path"] for item in library["assets"]}
+        self.assertIn(uploaded["source"], paths)
+        self.assertNotIn("assets/linked/stolen.png", paths)
+        self.assertNotIn("assets/icon.svg", paths)
+        self.assertNotIn("assets/font.ttf", paths)
+        self.assertNotIn("assets/broken.png", paths)
+
     def test_extreme_integer_window_fields_return_422_without_disconnect(self) -> None:
         for field in ("start_s", "duration_s"):
             with self.subTest(field=field):
@@ -315,6 +737,302 @@ class FxPreviewApiTests(unittest.TestCase):
                 status, rejected = self._json_request("POST", "/api/fx-previews", payload)
                 self.assertEqual(status, 422, rejected)
                 self.assertEqual(rejected["reason"], "window_invalid")
+
+    def test_timeline_time_map_allows_deleted_source_gap(self) -> None:
+        normalized = fx_preview_jobs.FxPreviewJobManager._normalized_time_map(
+            [
+                {
+                    "source_start_s": 3.0,
+                    "source_end_s": 5.0,
+                    "output_start_s": 0.0,
+                    "output_end_s": 2.0,
+                },
+                {
+                    "source_start_s": 6.0,
+                    "source_end_s": 7.0,
+                    "output_start_s": 2.0,
+                    "output_end_s": 3.0,
+                },
+            ],
+            {"start_s": 3.0, "duration_s": 4.0},
+            3.0,
+            mode="timeline",
+        )
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual(normalized[-1]["output_end_s"], 3.0)
+
+    def test_text_layout_metadata_is_bounded_and_projected(self) -> None:
+        box = {
+            "id": "x" * 300,
+            "text": "secret" * 1000,
+            "x": 1,
+            "y": 2,
+            "width": 3,
+            "height": 4,
+            "fontFamily": "font" * 100,
+            "visible": True,
+            "fitted": False,
+            "unknown": {"deep": "object"},
+        }
+        raw = {
+            "version": 2,
+            "measurement": "composition-dom",
+            "status": "warn",
+            "face_measurement": "source-opencv-yunet",
+            "analysis_scope": "individual-fx-layout",
+            "samples": [{"at": index, "boxes": [box] * 100} for index in range(20)],
+            "boxes": [box] * 400,
+            "findings": [
+                {"kind": "face_overlap", "id": "title", "at": 1, "private": "drop"}
+            ] * 200,
+            "subject_samples": [
+                {"at": 0, "source_at": 1, "boxes": [{"x": 1, "y": 2, "width": 3, "height": 4}] * 40}
+            ] * 20,
+            "detail": "drop",
+            "layers": {
+                f"layer-{index}": {
+                    "version": 2,
+                    "measurement": "composition-dom",
+                    "status": "pass",
+                    "samples": [],
+                    "boxes": [],
+                    "findings": [],
+                }
+                for index in range(100)
+            },
+        }
+        clean = fx_preview_jobs._sanitize_text_layout(raw)
+        self.assertEqual(len(clean["samples"]), 8)
+        self.assertLessEqual(sum(len(sample["boxes"]) for sample in clean["samples"]), 512)
+        self.assertLessEqual(len(clean["findings"]), 128)
+        self.assertLessEqual(len(clean["layers"]), 64)
+        self.assertNotIn("detail", clean)
+        self.assertNotIn("text", clean["samples"][0]["boxes"][0])
+        self.assertEqual(clean["findings"][0]["kind"], "face_overlap")
+        self.assertEqual(clean["analysis_scope"], "individual-fx-layout")
+
+    def test_text_layout_unknown_finding_cannot_remain_pass(self) -> None:
+        clean = fx_preview_jobs._sanitize_text_layout(
+            {
+                "version": 2,
+                "measurement": "composition-dom",
+                "status": "pass",
+                "findings": [{"kind": "future_warning_kind", "private": "drop"}],
+            }
+        )
+        self.assertEqual(clean["status"], "warn")
+        self.assertEqual(clean["findings"], [{"kind": "unrecognized_warning"}])
+
+    def test_text_layout_truncated_or_nested_findings_cannot_remain_pass(self) -> None:
+        saturated = [{"kind": "safe_area"} for _ in range(128)]
+        saturated.append({"kind": "future_warning_kind", "private": "drop"})
+        clean = fx_preview_jobs._sanitize_text_layout(
+            {
+                "version": 2,
+                "measurement": "composition-dom",
+                "status": "pass",
+                "findings": saturated,
+                "layers": {
+                    "candidate": {
+                        "version": 2,
+                        "measurement": "composition-dom",
+                        "status": "pass",
+                        "findings": saturated,
+                    }
+                },
+            }
+        )
+        self.assertEqual(len(clean["findings"]), 128)
+        self.assertEqual(clean["status"], "warn")
+        self.assertEqual(clean["layers"]["candidate"]["status"], "warn")
+
+        layer_overflow = fx_preview_jobs._sanitize_text_layout(
+            {
+                "version": 2,
+                "measurement": "composition-dom",
+                "status": "pass",
+                "findings": [],
+                "layers": {
+                    f"layer-{index}": {
+                        "version": 2,
+                        "measurement": "composition-dom",
+                        "status": "pass",
+                        "findings": [],
+                    }
+                    for index in range(65)
+                },
+            }
+        )
+        self.assertEqual(len(layer_overflow["layers"]), 64)
+        self.assertEqual(layer_overflow["status"], "warn")
+
+    def test_unregistered_material_is_visible_but_not_b1_selectable(self) -> None:
+        loose = self.project / "assets/loose.png"
+        loose.write_bytes(PNG_1X1)
+        assets = fx_preview_contract.list_material_assets(
+            self.project, decode_probe=lambda _path: True
+        )
+        item = next(asset for asset in assets if asset["path"] == "assets/loose.png")
+        self.assertIsNone(item["asset_id"])
+        self.assertIsNone(item["registry_item"])
+        with self.assertRaises(fx_preview_contract.FxPreviewContractError) as raised:
+            fx_preview_contract.resolve_material_binding(
+                self.project,
+                {
+                    "asset_id": "asset-local-"
+                    + hashlib.sha256(b"assets/loose.png").hexdigest(),
+                    "sha256": item["sha256"],
+                },
+                decode_probe=lambda _path: True,
+            )
+        self.assertEqual(raised.exception.code, "material_unavailable")
+
+    def test_directory_identity_swap_fails_closed_without_touching_external_sentinel(self) -> None:
+        manager = self.server.fx_preview_jobs
+        external = self.project.parent / "external-sentinel"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        (external / "timeline-project-trap").mkdir()
+        original = manager.renderer_cache_dir
+        backup = original.with_name("renderer-cache-pinned")
+        original.rename(backup)
+        original.symlink_to(external, target_is_directory=True)
+        try:
+            with self.assertRaises(fx_preview_jobs.FxPreviewJobError):
+                manager._cleanup_renderer_scratch()
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            self.assertTrue((external / "timeline-project-trap").is_dir())
+        finally:
+            original.unlink()
+            backup.rename(original)
+
+    def test_each_preview_storage_directory_swap_fails_closed(self) -> None:
+        manager = self.server.fx_preview_jobs
+        external = self.project.parent / "external-storage-trap"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        cases = (
+            ("root", manager.root, manager.prune),
+            ("cache", manager.cache_dir, manager.prune),
+            ("runtime", manager.runtime_dir, manager._cleanup_orphan_partials),
+        )
+        for label, original, operation in cases:
+            with self.subTest(directory=label):
+                backup = original.with_name(f"{original.name}-pinned-{label}")
+                original.rename(backup)
+                original.symlink_to(external, target_is_directory=True)
+                try:
+                    with self.assertRaises(fx_preview_jobs.FxPreviewJobError):
+                        operation()
+                    self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+                finally:
+                    original.unlink()
+                    backup.rename(original)
+
+    def test_timeline_dependency_rejects_replaced_working_ancestor(self) -> None:
+        manager = self.server.fx_preview_jobs
+        working = self.project / "working"
+        backup = self.project / "working-pinned"
+        external = self.project.parent / "outside-working"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        working.rename(backup)
+        working.symlink_to(external, target_is_directory=True)
+        try:
+            with self.assertRaises(fx_preview_jobs.FxPreviewJobError):
+                manager._timeline_project_input_digests()
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        finally:
+            working.unlink()
+            backup.rename(working)
+
+    def test_tool_identity_hash_catches_same_size_same_mtime_rewrite(self) -> None:
+        tool = self.project.parent / "fake-tool"
+        tool.write_bytes(b"first-version")
+        stamp = tool.stat()
+        with patch.object(fx_preview_jobs.shutil, "which", return_value=str(tool)):
+            first = fx_preview_jobs.FxPreviewJobManager._tool_identities()
+            tool.write_bytes(b"other-version")
+            os.utime(tool, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            second = fx_preview_jobs.FxPreviewJobManager._tool_identities()
+        self.assertNotEqual(first["ffmpeg"]["sha256"], second["ffmpeg"]["sha256"])
+
+    def test_font_digest_rehashes_same_size_same_mtime_rewrite(self) -> None:
+        font = self.project.parent / "fixture-font.ttf"
+        font.write_bytes(b"font-version-a")
+        stamp = font.stat()
+        first = fx_overlay._file_digest(font)
+        font.write_bytes(b"font-version-b")
+        os.utime(font, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        second = fx_overlay._file_digest(font)
+        self.assertNotEqual(first, second)
+
+    def test_owned_asset_hardlink_is_rejected(self) -> None:
+        uploaded = self._upload_asset("hardlink.png")
+        asset = self.project / uploaded["source"]
+        os.link(asset, self.project.parent / "second-link.png")
+        with self.assertRaises(fx_preview_contract.FxPreviewContractError) as raised:
+            fx_preview_contract.resolve_material_binding(
+                self.project,
+                {"asset_id": uploaded["asset_id"], "sha256": uploaded["sha256"]},
+            )
+        self.assertEqual(raised.exception.code, "material_unavailable")
+
+    def test_cancel_permission_race_is_retryable_and_never_claims_cancelled(self) -> None:
+        manager = self.server.fx_preview_jobs
+        job_id = "a" * 32
+        fake_process = object()
+        with manager._lock:
+            manager._jobs[job_id] = {
+                "id": job_id,
+                "state": "running",
+                "phase": "rendering",
+                "message": "running",
+                "cache_hit": False,
+                "preview_options": {"mode": "single", "quality": "standard"},
+                "process": fake_process,
+                "cancel_requested": False,
+                "updated_monotonic": time.time(),
+                "created_monotonic": time.time(),
+            }
+            manager._active_job_id = job_id
+        with patch.object(manager, "_terminate_process", return_value=False):
+            first = manager.cancel(job_id)
+        self.assertEqual(first["state"], "running")
+        self.assertEqual(first["error"]["code"], "termination_unverified")
+        with patch.object(manager, "_terminate_process", return_value=True):
+            second = manager.cancel(job_id)
+        self.assertEqual(second["state"], "cancelled")
+
+    def test_sigkill_permission_error_is_caught_and_reported_unverified(self) -> None:
+        class FakeProcess:
+            pid = 424242
+
+            @staticmethod
+            def wait(timeout: float) -> None:
+                raise __import__("subprocess").TimeoutExpired("fake", timeout)
+
+            @staticmethod
+            def poll() -> None:
+                return None
+
+        def signal_group(_pgid: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                raise PermissionError("race")
+
+        with (
+            patch.object(fx_preview_jobs.os, "killpg", side_effect=signal_group),
+            patch.object(fx_preview_jobs.FxPreviewJobManager, "_process_group_exists", return_value=True),
+            patch.object(fx_preview_jobs.time, "monotonic", side_effect=[0.0, 4.0, 4.0, 7.0]),
+            patch.object(fx_preview_jobs.time, "sleep", return_value=None),
+        ):
+            self.assertFalse(
+                fx_preview_jobs.FxPreviewJobManager._terminate_process(FakeProcess())
+            )
 
     def test_full_render_and_preview_reservation_cannot_abba_deadlock(self) -> None:
         coordinated = CoordinatedRenderLock()

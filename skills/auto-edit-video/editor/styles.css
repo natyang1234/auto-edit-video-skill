@@ -3491,10 +3491,23 @@ a.quick-tool { text-decoration: none; color: inherit; }
 .fx-preview-editor-heading { margin-bottom: 16px; }
 .fx-preview-description { max-width: 54ch; margin: 7px 0 0; color: oklch(88% 0.012 75); font-size: .82rem; }
 .fx-preview-player-wrap { display: grid; gap: 9px; min-width: 0; }
+.fx-preview-compare-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; }
+.fx-preview-compare-heading p { margin: 3px 0 0; color: oklch(77% 0.016 75); font-size: .76rem; }
+.fx-preview-resync { min-height: 44px; white-space: nowrap; }
+.fx-preview-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.fx-preview-compare figure { min-width: 0; margin: 0; }
+.fx-preview-compare figcaption { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 5px; color: oklch(88% 0.012 75); font-size: .76rem; }
+.fx-preview-compare figcaption output { color: var(--amber); font-family: ui-monospace, Menlo, monospace; }
 .fx-preview-video { display: block; width: 100%; max-height: 46dvh; min-height: 180px; border: 1px solid var(--stage-line); background: var(--stage-raised); object-fit: contain; }
 .fx-preview-status { min-height: 1.5em; margin: 0; color: var(--amber); font-size: .82rem; }
 .fx-preview-status.is-error { color: #ffb29c; }
 .fx-preview-status.is-success { color: #bfe8bd; }
+.fx-preview-layout-check { display: grid; gap: 7px; padding: 9px 11px; border: 1px solid var(--stage-line); background: var(--stage-raised); }
+.fx-preview-layout-check-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.fx-preview-layout-check-head h3 { margin: 0; }
+.fx-preview-layout-check-toggle { flex: 0 0 auto; min-height: 44px; white-space: nowrap; }
+.fx-preview-layout-check-summary { margin: 0; color: oklch(88% 0.012 75); font-size: .78rem; line-height: 1.45; }
+.fx-preview-layout-check-list { display: grid; gap: 4px; max-height: 7rem; margin: 0; padding: 0 0 0 1.2rem; overflow: auto; color: oklch(80% 0.02 75); font-size: .76rem; line-height: 1.4; }
 .fx-preview-settings { display: grid; gap: 14px; margin-top: 16px; }
 .fx-preview-selection, .fx-preview-window { display: grid; gap: 4px; padding-top: 12px; border-top: 1px solid var(--stage-line); }
 .fx-preview-selection strong { font-family: var(--font-display); font-size: 1.15rem; }
@@ -3512,6 +3525,12 @@ a.quick-tool { text-decoration: none; color: inherit; }
 .fx-preview-replace-note { margin: 2px 0 0; color: #ffcf89; font-size: .75rem; line-height: 1.45; }
 .fx-preview-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .fx-preview-fields .fx-preview-field:first-child:last-child { grid-column: 1 / -1; }
+.fx-preview-draft-notice { display: grid; gap: 9px; padding: 11px; border: 1px solid oklch(73% 0.11 72 / .65); background: oklch(28% 0.035 61); }
+.fx-preview-draft-notice p { margin: 0; color: oklch(92% 0.025 81); font-size: .78rem; line-height: 1.45; }
+.fx-preview-draft-notice div { display: flex; flex-wrap: wrap; gap: 8px; }
+.fx-preview-draft-notice .button { min-height: 44px; }
+.fx-preview-favorite { position: absolute; z-index: 1; top: 4px; right: 4px; display: grid; width: 44px; min-width: 44px; height: 44px; min-height: 44px; padding: 0; place-items: center; border: 1px solid oklch(96% 0.02 80 / .8); border-radius: 50%; color: var(--paper-0); background: oklch(18% 0.02 55 / .72); font-size: 1rem; line-height: 1; }
+.fx-preview-favorite.is-favorite { color: var(--amber); }
 .fx-preview-actions { position: sticky; bottom: -22px; z-index: 2; display: flex; align-items: center; gap: 10px; padding: 18px 0 22px; margin-top: 18px; border-top: 1px solid var(--stage-line); background: var(--stage); }
 .fx-preview-action-spacer { flex: 1; }
 .fx-preview-actions .button { min-height: 44px; }
@@ -3525,8 +3544,10 @@ a.quick-tool { text-decoration: none; color: inherit; }
   .fx-preview-editor { padding: 16px; overflow: visible; }
   .fx-preview-grid { max-height: 30dvh; }
   .fx-preview-video { min-height: 140px; max-height: 32dvh; }
+  .fx-preview-compare { grid-template-columns: 1fr; }
   .fx-preview-fields { grid-template-columns: 1fr; }
   .fx-preview-time-grid { grid-template-columns: 1fr; }
+  .fx-preview-layout-check-head { align-items: flex-start; }
   .fx-preview-actions { flex-wrap: wrap; }
   .fx-preview-action-spacer { display: none; }
   .fx-preview-actions .button { flex: 1 1 44%; }
