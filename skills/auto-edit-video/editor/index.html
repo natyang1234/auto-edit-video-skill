@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/styles.css">
     <link rel="stylesheet" href="/fx-preview-panel.css">
     <link rel="stylesheet" href="/style-presets.css">
+    <link rel="stylesheet" href="/fx-comparison.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
@@ -652,6 +653,16 @@
             </div>
             <button class="fx-preview-close icon-button" id="fx-preview-close" type="button" aria-label="關閉風格試看">×</button>
           </header>
+          <div class="fx-compare-sticky-summary">
+            <div class="fx-compare-controls" id="fx-preview-compare-controls">
+              <button class="button button-secondary" id="fx-preview-compare-toggle" type="button" aria-pressed="false">比較風格</button>
+              <button class="button button-secondary" id="fx-preview-compare-add" type="button" hidden>加入比較</button>
+              <button class="button button-primary" id="fx-preview-compare-start" type="button" hidden disabled>開始比較</button>
+              <button class="button button-secondary" id="fx-preview-compare-discard" type="button" hidden>丟棄比較</button>
+            </div>
+            <p class="fx-compare-note" id="fx-preview-compare-note" hidden role="status"></p>
+            <div class="fx-compare-candidates" id="fx-preview-compare-candidates" aria-label="比較候選"></div>
+          </div>
           <details class="fx-preview-catalog-disclosure" id="fx-preview-catalog-disclosure" open>
           <summary>變更風格</summary>
           <p class="fx-preview-catalog-note">卡片為風格示意；選取後用本片試看。</p>

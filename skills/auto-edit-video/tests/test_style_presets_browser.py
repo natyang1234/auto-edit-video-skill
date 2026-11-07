@@ -35,6 +35,20 @@ class PresetBrowserTests(unittest.TestCase):
         rev = ["lib-1"]
         failed = [False]
         apply_state = [None]
+        fx_jobs = {}
+        fx_job_ids = []
+
+        def fx_job(job_id, state="running"):
+            return {
+                "id": job_id,
+                "state": state,
+                "phase": "queued" if state == "running" else state,
+                "message": "mock preview",
+                "status_url": f"/api/fx-previews/{job_id}",
+                "cache_hit": False,
+                "preview_options": {"mode": "single", "quality": "standard"},
+            }
+
         with base.sync_playwright() as p:
             browser = p.chromium.launch(executable_path=str(base.CHROME), headless=True)
             page = browser.new_page(viewport={"width": 1100, "height": 900})
@@ -44,9 +58,42 @@ class PresetBrowserTests(unittest.TestCase):
                 if path.startswith("/api/fx-previews"):
                     if req.method == "POST" and path == "/api/fx-previews":
                         posts.append(json.loads(req.post_data))
-                        route.fulfill(json={"ok": True, "job": {"id": "mock", "state": "failed", "error": "mock preview"}})
-                    else:
-                        route.fulfill(json={"ok": True})
+                        job_id = f"{len(posts):032x}"
+                        fx_jobs[job_id] = fx_job(job_id)
+                        fx_job_ids.append(job_id)
+                        route.fulfill(
+                            status=202,
+                            json={"ok": True, "job": copy.deepcopy(fx_jobs[job_id])},
+                        )
+                        return
+                    parts = path.strip("/").split("/")
+                    job_id = parts[2] if len(parts) >= 3 else ""
+                    current = fx_jobs.get(job_id)
+                    if current is None:
+                        route.fulfill(
+                            status=404,
+                            json={"ok": False, "reason": "job_not_found"},
+                        )
+                        return
+                    if req.method == "POST" and len(parts) == 4 and parts[3] == "cancel":
+                        if current["state"] not in {"ready", "failed", "cancelled"}:
+                            current.update(
+                                {
+                                    "state": "cancelled",
+                                    "phase": "cancelled",
+                                    "message": "mock preview cancelled",
+                                }
+                            )
+                        route.fulfill(
+                            json={"ok": True, "job": copy.deepcopy(current)}
+                        )
+                        return
+                    if req.method == "GET" and len(parts) == 3:
+                        route.fulfill(
+                            json={"ok": True, "job": copy.deepcopy(current)}
+                        )
+                        return
+                    route.fulfill(status=405, json={"ok": False, "reason": "method_not_allowed"})
                     return
                 if not path.startswith("/api/style-presets"):
                     route.fallback(); return
@@ -137,6 +184,14 @@ class PresetBrowserTests(unittest.TestCase):
             self.assertNotIn("material", posts[-1]["candidate"])
             self.assertNotIn("subject", posts[-1]["candidate"])
             page.locator("#fx-preview-cancel").click()
+            page.wait_for_function("() => !document.querySelector('#fx-preview-dialog').open")
+            page.wait_for_timeout(100)
+            self.assertEqual(fx_jobs[fx_job_ids[0]]["state"], "cancelled")
+            self.assertEqual(fx_jobs[fx_job_ids[0]]["id"], fx_job_ids[0])
+            self.assertEqual(
+                fx_jobs[fx_job_ids[0]]["status_url"],
+                f"/api/fx-previews/{fx_job_ids[0]}",
+            )
             records[0]["settings"]["opacity"] = 0.5
             page.evaluate("""() => {
                 const key = `${fxPreviewProjectIdentity()}::new`;
@@ -155,6 +210,16 @@ class PresetBrowserTests(unittest.TestCase):
                 page.set_viewport_size({"width": width, "height": 900})
                 page.screenshot(path=str(Path(os.environ.get("P3_UI_EVIDENCE", self._tmp.name)) / f"preset-{width}.png"), full_page=True)
                 self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
+            ready_id = "f" * 32
+            fx_jobs[ready_id] = fx_job(ready_id, "ready")
+            ready_cancel = page.evaluate(
+                """async (jobId) => request(`/api/fx-previews/${jobId}/cancel`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+                })""",
+                ready_id,
+            )
+            self.assertEqual(ready_cancel["job"]["state"], "ready")
+            self.assertEqual(fx_jobs[ready_id]["state"], "ready")
             browser.close()
 
     def test_conflict_reload_only_restores_preset_ready_when_state_is_synced(self):

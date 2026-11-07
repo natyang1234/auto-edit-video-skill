@@ -832,6 +832,30 @@ class FxPreviewJobManager:
         if unknown or missing:
             raise FxPreviewJobError(400, "malformed_request", f"{label}欄位不符合 API 規格")
 
+    @staticmethod
+    def _comparison_anchor_id(body: Any) -> str | None:
+        if not isinstance(body, dict) or "comparison_anchor_job_id" not in body:
+            return None
+        anchor_id = body.get("comparison_anchor_job_id")
+        if not isinstance(anchor_id, str) or JOB_ID_RE.fullmatch(anchor_id) is None:
+            raise FxPreviewJobError(
+                422,
+                "comparison_anchor_invalid",
+                "比較錨點工作識別碼無效",
+            )
+        return anchor_id
+
+    @staticmethod
+    def _comparison_anchor_usable(job: dict[str, Any] | None) -> bool:
+        if job is None or job.get("state") == "cancelled":
+            return False
+        error = job.get("error")
+        return not (
+            job.get("state") == "failed"
+            and isinstance(error, dict)
+            and error.get("code") == "preview_stale"
+        )
+
     def _normalize_candidate(
         self, body: Any, context: dict[str, Any]
     ) -> tuple[
@@ -845,12 +869,14 @@ class FxPreviewJobManager:
             {
                 "schema_version", "expected_revision", "candidate",
                 "replace_overlay_id", "preview_options", "opacity",
+                "comparison_anchor_job_id",
             },
             {"schema_version", "expected_revision", "candidate"},
             "請求",
         )
         if body.get("schema_version") != 1:
             raise FxPreviewJobError(400, "unsupported_schema", "不支援的 FX 預覽 API 版本")
+        self._comparison_anchor_id(body)
         try:
             preview_options = fx_preview_contract.normalize_preview_options(
                 body.get("preview_options")
@@ -1214,6 +1240,126 @@ class FxPreviewJobManager:
             snapshot["timeline_fonts_digest"] = fx_overlay.fonts_digest_for(state)
         return snapshot
 
+    def _comparison_fingerprint(
+        self,
+        context: dict[str, Any],
+        source_identity: dict[str, Any],
+        sample_window: dict[str, float],
+        overlay: dict[str, Any],
+        replace_overlay_id: str | None,
+        preview_options: dict[str, str],
+        dependencies: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Freeze only inputs that must be identical across one comparison round.
+
+        The candidate overlay, its effect block, fonts, subject and material are
+        intentionally absent.  Timeline mode also uses the raw editor context,
+        not the candidate-injected renderer snapshot.
+        """
+        dependency_digests = dependencies.get("dependencies")
+        common_dependency_digests = {
+            key: value
+            for key, value in (
+                dependency_digests.items()
+                if isinstance(dependency_digests, dict)
+                else ()
+            )
+            if key != "block"
+        }
+        common_renderer: dict[str, Any] = {
+            key: deepcopy(dependencies[key])
+            for key in (
+                "contract",
+                "project_namespace",
+                "pack_id",
+                "theme",
+                "main",
+                "canvas",
+                "timeline_project_inputs",
+                "timeline_python_dependencies",
+            )
+            if key in dependencies
+        }
+        common_renderer["dependencies"] = common_dependency_digests
+        common_renderer["tools"] = deepcopy(dependencies.get("tools") or {})
+        if preview_options.get("mode") == "timeline":
+            base_state = deepcopy(
+                context.get("state")
+                if isinstance(context.get("state"), dict)
+                else {}
+            )
+            overlays = base_state.get("overlays")
+            if isinstance(overlays, list) and replace_overlay_id is not None:
+                base_state["overlays"] = [
+                    item
+                    for item in overlays
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("type") == "fx"
+                        and item.get("id") == replace_overlay_id
+                    )
+                ]
+            base_codes = {
+                str(item.get("code"))
+                for item in base_state.get("overlays", [])
+                if isinstance(item, dict)
+                and item.get("type") == "fx"
+                and isinstance(item.get("code"), str)
+            }
+            rendered_blocks = dependencies.get("timeline_fx_blocks")
+            if not isinstance(rendered_blocks, dict) or any(
+                code not in rendered_blocks for code in base_codes
+            ):
+                raise FxPreviewJobError(
+                    503,
+                    "renderer_unavailable",
+                    "時間軸 FX 元件依賴不完整",
+                )
+            common_renderer["timeline_fx_blocks"] = {
+                code: rendered_blocks[code] for code in sorted(base_codes)
+            }
+            common_renderer["timeline_fonts_digest"] = fx_overlay.fonts_digest_for(
+                base_state
+            )
+            try:
+                common_renderer["timeline_material_authority"] = (
+                    fx_preview_contract.material_authority_digests(
+                        self.project_dir, base_state
+                    )
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                raise FxPreviewJobError(409, exc.code, exc.message) from exc
+        apply_start = float(overlay["start"])
+        apply_duration = float(overlay["end"]) - apply_start
+        return {
+            "version": 1,
+            "state_revision": self._state_revision(context),
+            "source": {
+                key: source_identity[key]
+                for key in ("relative", "sha256", "bytes", "duration_s")
+            },
+            "context": {
+                "state": deepcopy(
+                    context.get("state")
+                    if isinstance(context.get("state"), dict)
+                    else {}
+                ),
+                "manifest": deepcopy(
+                    context.get("manifest")
+                    if isinstance(context.get("manifest"), dict)
+                    else {}
+                ),
+            },
+            "sample_window": deepcopy(sample_window),
+            "apply_window": {
+                "start_s": round(apply_start, 3),
+                "duration_s": round(apply_duration, 3),
+            },
+            "preview_options": deepcopy(preview_options),
+            "replace_overlay_id": replace_overlay_id,
+            "renderer": common_renderer,
+        }
+
     def _timeline_project_input_digests(self) -> dict[str, str]:
         """Digest every live working input the isolated timeline renderer copies."""
         self._assert_storage_safe("working", "root", "renderer", "runtime")
@@ -1324,11 +1470,35 @@ class FxPreviewJobManager:
 
     def submit(self, body: Any) -> dict[str, Any]:
         self.prune()
+        comparison_anchor_job_id = self._comparison_anchor_id(body)
+        if comparison_anchor_job_id is not None:
+            with self._lock:
+                anchor = self._jobs.get(comparison_anchor_job_id)
+                if not self._comparison_anchor_usable(anchor):
+                    raise FxPreviewJobError(
+                        409,
+                        "comparison_stale",
+                        "比較錨點已失效，請重新產生這輪候選",
+                    )
         context = self.context_provider()
-        (
-            overlay, replace_overlay_id, source_identity, sample_window,
-            preview_options, state_snapshot, manifest_snapshot, timeline_snapshot,
-        ) = self._normalize_candidate(body, context)
+        try:
+            (
+                overlay, replace_overlay_id, source_identity, sample_window,
+                preview_options, state_snapshot, manifest_snapshot, timeline_snapshot,
+            ) = self._normalize_candidate(body, context)
+        except FxPreviewJobError as exc:
+            if comparison_anchor_job_id is not None and exc.code in {
+                "source_changed",
+                "source_missing",
+                "source_invalid",
+                "source_duration_invalid",
+            }:
+                raise FxPreviewJobError(
+                    409,
+                    "comparison_stale",
+                    "比較期間來源影片已變更，請重新產生這輪候選",
+                ) from exc
+            raise
         dependencies = self._dependency_snapshot(
             context,
             overlay,
@@ -1337,6 +1507,16 @@ class FxPreviewJobManager:
             frozen_state=state_snapshot,
             frozen_manifest=manifest_snapshot,
         )
+        comparison_fingerprint = self._comparison_fingerprint(
+            context,
+            source_identity,
+            sample_window,
+            overlay,
+            replace_overlay_id,
+            preview_options,
+            dependencies,
+        )
+        comparison_fingerprint_hash = _canonical_sha256(comparison_fingerprint)
         # State revision remains part of the job's post-render and confirm CAS
         # snapshot, but is not a media dependency.  Excluding only that field
         # lets an identical candidate reuse an artifact after an unrelated
@@ -1377,6 +1557,9 @@ class FxPreviewJobManager:
             "dependency_hash": _canonical_sha256(dependencies),
             "source_identity": source_identity,
             "cache_key": cache_key,
+            "comparison_anchor_job_id": comparison_anchor_job_id,
+            "comparison_fingerprint": comparison_fingerprint,
+            "comparison_fingerprint_hash": comparison_fingerprint_hash,
             "process": None,
             "cancel_requested": False,
             "media": None,
@@ -1386,6 +1569,21 @@ class FxPreviewJobManager:
         cache_receipt = self.cache_dir / f"{cache_key}.json"
         cached = self._valid_cache_hit(cache_media, cache_receipt, cache_key)
         with self._lock:
+            if comparison_anchor_job_id is not None:
+                anchor = self._jobs.get(comparison_anchor_job_id)
+                if (
+                    not self._comparison_anchor_usable(anchor)
+                    or not isinstance(anchor.get("comparison_fingerprint"), dict)
+                    or anchor.get("comparison_fingerprint_hash")
+                    != comparison_fingerprint_hash
+                    or _canonical_sha256(anchor["comparison_fingerprint"])
+                    != comparison_fingerprint_hash
+                ):
+                    raise FxPreviewJobError(
+                        409,
+                        "comparison_stale",
+                        "比較條件已變更，請重新產生這輪候選",
+                    )
             if self._active_job_id is not None:
                 active = self._jobs.get(self._active_job_id)
                 if active and active.get("state") in RUNNING_STATES:
