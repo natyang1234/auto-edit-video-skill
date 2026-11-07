@@ -78,6 +78,8 @@ let fxCompareRoundStale = false;
 let fxPreviewPostInFlight = null;
 const fxPreviewLifecycles = new Set();
 let fxPreviewUnverifiedJob = null;
+let fxPreviewRecoveryPromise = null;
+let fxPreviewOpenIntent = 0;
 // Last state both sides agreed on. Diffing against this is what lets a save
 // conflict be replayed: it says which top-level sections *this* window changed,
 // so the background pipeline's writes can be kept and ours re-applied on top.
@@ -2823,23 +2825,60 @@ function fxPreviewCancelCurrentJob() {
   const job = fxPreviewJob;
   fxPreviewJob = null;
   if (!job?.id) return Promise.resolve(null);
-  return fxPreviewCancelJobId(job.id).then((cancelled) => {
-    if (!fxPreviewJobTerminationVerified(cancelled)) fxPreviewUnverifiedJob = cancelled?.id ? cancelled : job;
-    else if (fxPreviewUnverifiedJob?.id === job.id) fxPreviewUnverifiedJob = null;
-    return cancelled;
-  }).catch((error) => {
-    fxPreviewUnverifiedJob = job;
-    throw error;
+  if (fxPreviewJobTerminationVerified(job)) {
+    if (fxPreviewUnverifiedJob?.id === job.id) fxPreviewUnverifiedJob = null;
+    return Promise.resolve(job);
+  }
+  return fxCompareCancelAndVerify(job).then((result) => {
+    if (result.verified) {
+      if (fxPreviewUnverifiedJob?.id === job.id) fxPreviewUnverifiedJob = null;
+      return result.job;
+    }
+    fxPreviewUnverifiedJob = result.job || job;
+    throw result.error || new Error("預覽工作停止尚未確認");
   });
 }
 
-function fxPreviewCancelJobId(jobId) {
+// The backend may spend up to about 5.2s verifying TERM/KILL and process-group
+// exit. Give that local operation margin, but never let a missing HTTP response
+// hold the UI recovery promise indefinitely. Status lookups do not terminate a
+// process and therefore use a shorter per-attempt deadline.
+const FX_PREVIEW_CANCEL_REQUEST_TIMEOUT_MS = 6500;
+const FX_PREVIEW_CANCEL_STATUS_TIMEOUT_MS = 2000;
+
+async function fxPreviewRequestWithDeadline(url, options = {}, timeoutMs = FX_PREVIEW_CANCEL_STATUS_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const boundedMs = Math.max(50, Number(timeoutMs) || FX_PREVIEW_CANCEL_STATUS_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), boundedMs);
+  try {
+    // request() includes JSON body consumption, so the signal and timer cover
+    // both response headers and a body that stalls after headers arrive.
+    const payload = await request(url, { ...options, signal: controller.signal });
+    // request() intentionally converts JSON parse failures into an error
+    // payload. If abort happened while response.json() was pending, do not let
+    // that conversion turn a timed-out body into a successful cancellation.
+    if (controller.signal.aborted) throw new DOMException("request deadline exceeded", "AbortError");
+    return payload;
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    const timeoutError = new Error("預覽請求逾時，工作狀態尚未確認");
+    timeoutError.name = "TimeoutError";
+    timeoutError.code = "request_timeout";
+    timeoutError.reason = "request_timeout";
+    timeoutError.cause = error;
+    throw timeoutError;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function fxPreviewCancelJobId(jobId, timeoutMs = FX_PREVIEW_CANCEL_REQUEST_TIMEOUT_MS) {
   if (!jobId) return Promise.resolve(null);
-  return request(`/api/fx-previews/${encodeURIComponent(jobId)}/cancel`, {
+  return fxPreviewRequestWithDeadline(`/api/fx-previews/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
-  }).then((payload) => payload?.job || payload);
+  }, timeoutMs).then((payload) => payload?.job || payload);
 }
 
 function fxPreviewTrackLifecycle(promise) {
@@ -2870,20 +2909,47 @@ function fxPreviewJobTerminationVerified(job) {
   return String(job?.error?.code || "").toLowerCase() !== "termination_unverified";
 }
 
-async function fxCompareCancelAndVerify(job, candidate = null, attempts = 3) {
+function fxPreviewErrorIsTypedJobAbsent(error) {
+  if (Number(error?.status) !== 404) return false;
+  return String(error?.reason || error?.code || "").toLowerCase() === "job_not_found";
+}
+
+async function fxCompareCancelAndVerify(
+  job,
+  candidate = null,
+  attempts = 3,
+  forceTerminalCancel = false,
+  requestTimeoutMs = FX_PREVIEW_CANCEL_REQUEST_TIMEOUT_MS,
+  statusTimeoutMs = Math.min(requestTimeoutMs, FX_PREVIEW_CANCEL_STATUS_TIMEOUT_MS),
+) {
   if (!job?.id) return { verified: true, job: null };
+  if (!forceTerminalCancel && fxPreviewJobTerminationVerified(job)) return { verified: true, job };
   let current = job;
   try {
-    current = await fxPreviewCancelJobId(job.id) || current;
+    current = await fxPreviewCancelJobId(job.id, requestTimeoutMs) || current;
     if (!current?.id) current = { ...current, id: job.id, status_url: job.status_url };
   } catch (error) {
+    if (fxPreviewErrorIsTypedJobAbsent(error)) {
+      if (candidate) {
+        candidate.job = null;
+        candidate.state = "failed";
+        candidate.message = "工作已不在目前預覽管理器中；本輪已停止排程。";
+      }
+      // This proves only that the current API manager no longer owns the job;
+      // it is not a claim about an OS process from an older server instance.
+      return { verified: true, absent: true, job: null };
+    }
     if (candidate) candidate.message = `停止請求失敗：${error.message}`;
     return { verified: false, job: current, error };
   }
   for (let attempt = 0; attempt < attempts && !fxPreviewJobTerminationVerified(current); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 180));
     try {
-      const payload = await request(current.status_url || `/api/fx-previews/${encodeURIComponent(current.id)}`);
+      const payload = await fxPreviewRequestWithDeadline(
+        current.status_url || `/api/fx-previews/${encodeURIComponent(current.id)}`,
+        {},
+        statusTimeoutMs,
+      );
       current = payload?.job || payload || current;
     } catch (error) {
       if (candidate) candidate.message = `停止狀態無法確認：${error.message}`;
@@ -3161,6 +3227,7 @@ function fxCompareJobIsStale(job) {
 
 async function fxCompareRunQueue(run) {
   let anchorId = "";
+  let queueHalted = false;
   for (const candidate of run.candidates) {
     if (run.id !== fxCompareRun || run.session !== fxCompareSession || fxCompareStopping || !fxCompareActive) break;
     candidate.state = "running"; candidate.message = "預覽排隊中（待渲染，不是即時完成）"; fxCompareRender();
@@ -3169,13 +3236,13 @@ async function fxCompareRunQueue(run) {
       const job = payload.job || payload;
       candidate.job = job;
       if (run.id !== fxCompareRun || run.session !== fxCompareSession || fxCompareStopping || !fxCompareActive) {
-        const stopped = await fxCompareCancelAndVerify(job, candidate);
+        const stopped = await fxCompareCancelAndVerify(job, candidate, 3, true);
         if (!stopped.verified) fxCompareStopping = true;
         break;
       }
       const terminal = await fxCompareWaitTerminal(candidate, run);
       if (run.id !== fxCompareRun || run.session !== fxCompareSession || fxCompareStopping || !fxCompareActive) {
-        const stopped = await fxCompareCancelAndVerify(terminal || candidate.job, candidate);
+        const stopped = await fxCompareCancelAndVerify(terminal || candidate.job, candidate, 3, true);
         if (!stopped.verified) fxCompareStopping = true;
         break;
       }
@@ -3187,6 +3254,22 @@ async function fxCompareRunQueue(run) {
       }
       if (!anchorId && terminal?.id && fxPreviewJobState(terminal) !== "cancelled") anchorId = terminal.id;
     } catch (error) {
+      if (error?.fxComparePollUnknown) {
+        queueHalted = true;
+        const stopped = await fxCompareCancelAndVerify(error.fxPreviewJob || candidate.job, candidate);
+        if (!stopped.verified) {
+          fxCompareStopping = true;
+          candidate.state = "stopping";
+          candidate.message = "預覽狀態無法確認，停止也尚未確認；請重試停止。";
+        } else if (stopped.absent) {
+          candidate.state = "failed";
+          candidate.message = "預覽狀態無法確認；目前管理器已無此工作，本輪已停止排程。";
+        } else {
+          candidate.state = fxPreviewJobState(stopped.job);
+          candidate.message = "預覽狀態讀取失敗；工作已確認停止，本輪不再送出後續候選。";
+        }
+        break;
+      }
       candidate.state = fxCompareErrorIsStale(error) ? "stale" : "failed";
       candidate.message = candidate.state === "stale" ? "比較內容已過期，整輪已停止。" : `預覽失敗：${error.message}`;
       if (candidate.state === "stale") { fxCompareRoundStale = true; break; }
@@ -3197,11 +3280,12 @@ async function fxCompareRunQueue(run) {
   fxCompareRunning = false;
   if (fxCompareStopping) fxPreviewSetStatus("比較仍在停止；內容未套用。", "error");
   else if (fxCompareRoundStale) fxPreviewSetStatus("比較內容已過期；整輪不可套用。", "error");
+  else if (queueHalted) fxPreviewSetStatus("預覽狀態讀取失敗；已停止排程，請丟棄本輪後重試。", "error");
   else fxPreviewSetStatus("比較完成。請明確選擇一款已完成的風格後再套用。", "success");
   fxCompareRender();
 }
 
-async function fxCompareWaitTerminal(candidate, run) {
+async function fxCompareWaitTerminal(candidate, run, statusTimeoutMs = FX_PREVIEW_CANCEL_STATUS_TIMEOUT_MS) {
   let job = candidate.job;
   while (run.id === fxCompareRun && run.session === fxCompareSession && !fxCompareStopping && fxCompareActive) {
     const status = String(job?.state || "pending").toLowerCase();
@@ -3211,7 +3295,18 @@ async function fxCompareWaitTerminal(candidate, run) {
       return job;
     }
     await new Promise((resolve) => setTimeout(resolve, 450));
-    const payload = await request(job.status_url || `/api/fx-previews/${encodeURIComponent(job.id)}`);
+    let payload;
+    try {
+      payload = await fxPreviewRequestWithDeadline(
+        job.status_url || `/api/fx-previews/${encodeURIComponent(job.id)}`,
+        {},
+        statusTimeoutMs,
+      );
+    } catch (error) {
+      error.fxComparePollUnknown = true;
+      error.fxPreviewJob = job;
+      throw error;
+    }
     job = payload.job || payload; candidate.job = job; candidate.message = fxPreviewStatusForJob(job); fxCompareRender();
   }
   return job;
@@ -3306,12 +3401,11 @@ async function fxCompareStop(closeAfter = false) {
     let verified = true;
     for (const candidate of fxCompareCandidates) {
       if (!candidate.job?.id) continue;
+      if (fxPreviewJobTerminationVerified(candidate.job)) continue;
       if (candidate.state === "stopping") {
         verified = false;
         continue;
       }
-      const stateName = fxPreviewJobState(candidate.job);
-      if (["cancelled", "failed", "stale"].includes(stateName) && fxPreviewJobTerminationVerified(candidate.job)) continue;
       const result = await fxCompareCancelAndVerify(candidate.job, candidate);
       if (!result.verified) verified = false;
     }
@@ -3430,7 +3524,7 @@ async function fxPreviewStart(generation, signature, _keepExistingPreview = fals
       if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !elements["fx-preview-dialog"]?.open) {
         // A single-preview lifecycle is not complete until a late returned job
         // has a verified terminal cancellation. Compare/reopen cannot pass it.
-        const stopped = await fxCompareCancelAndVerify(job);
+        const stopped = await fxCompareCancelAndVerify(job, null, 3, true);
         if (!stopped.verified) {
           fxPreviewUnverifiedJob = stopped.job || job;
           throw new Error("晚回單款預覽的停止狀態未確認");
@@ -3540,13 +3634,34 @@ function fxPreviewInstallCatalogBreakpointListener() {
   fxPreviewCatalogBreakpoint.addEventListener("change", fxPreviewSyncCatalogDisclosure);
 }
 
-function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "", portablePreset = null) {
+async function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId = null, initialCode = "", portablePreset = null) {
+  const openIntent = ++fxPreviewOpenIntent;
   const dialog = elements["fx-preview-dialog"];
   if (!dialog) return;
-  if (fxCompareCleanupPromise || fxCompareStopping || fxPreviewLifecycles.size || fxPreviewUnverifiedJob) {
+  if (fxCompareCleanupPromise || fxCompareStopping || fxPreviewLifecycles.size) {
     showToast("上一個預覽仍在確認停止，完成前不能開啟新一輪。", "error");
     return;
   }
+  if (fxPreviewUnverifiedJob?.id) {
+    showToast("正在重新確認上一個預覽已停止…");
+    if (!fxPreviewRecoveryPromise) {
+      const recoveryJob = fxPreviewUnverifiedJob;
+      const recovery = (async () => {
+        try { return await fxCompareCancelAndVerify(recoveryJob); }
+        finally { if (fxPreviewRecoveryPromise === recovery) fxPreviewRecoveryPromise = null; }
+      })();
+      fxPreviewRecoveryPromise = recovery;
+    }
+    const stopped = await fxPreviewRecoveryPromise;
+    if (openIntent !== fxPreviewOpenIntent) return;
+    if (!stopped.verified) {
+      fxPreviewUnverifiedJob = stopped.job || fxPreviewUnverifiedJob;
+      showToast("上一個預覽停止尚未確認；請稍後再按一次試看以重試。", "error");
+      return;
+    }
+    fxPreviewUnverifiedJob = null;
+  }
+  if (openIntent !== fxPreviewOpenIntent || fxCompareCleanupPromise || fxCompareStopping || fxPreviewLifecycles.size) return;
   if (dialog.open) dialog.close("replace");
   fxPreviewConfirmed = false;
   fxPreviewTrigger = trigger instanceof HTMLElement ? trigger : document.activeElement;
@@ -5314,7 +5429,7 @@ function bindEvents() {
   window.addEventListener("beforeunload", () => {
     if (fxPreviewConfirmed) return;
     const jobs = [fxPreviewJob, ...fxCompareCandidates.map((candidate) => candidate.job)]
-      .filter((job) => job?.id && !["cancelled", "failed", "stale"].includes(fxPreviewJobState(job)));
+      .filter((job) => job?.id && !fxPreviewJobTerminationVerified(job));
     [...new Map(jobs.map((job) => [String(job.id), job])).values()].forEach((job) => {
       // Unload delivery is best-effort. Do not mutate local state or claim
       // termination: the next session must still respect any cleanup guard.

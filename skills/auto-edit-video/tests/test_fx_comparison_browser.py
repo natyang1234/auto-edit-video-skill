@@ -78,6 +78,12 @@ class FxComparisonBrowserTests(unittest.TestCase):
             if request.method == "GET" and job_id in jobs:
                 job = jobs[job_id]
                 outcome = job["_outcome"]
+                if outcome == "poll_error":
+                    route.fulfill(status=503, json={"error": "temporary status failure", "reason": "status_unavailable"})
+                    return
+                if outcome == "poll_generic404":
+                    route.fulfill(status=404, json={"error": "generic missing", "reason": "missing"})
+                    return
                 if outcome == "still_running":
                     job.update(state="running", phase="cancelling", error={"code": "termination_unverified"})
                 elif outcome == "failed_preview_stale":
@@ -98,6 +104,15 @@ class FxComparisonBrowserTests(unittest.TestCase):
                 job = jobs.get(job_id, {"id": job_id, "status_url": f"/api/fx-previews/{job_id}"})
                 cancel_state = cancel_states.pop(0) if cancel_states else "cancelled"
                 cancelled.append(job_id)
+                if cancel_state == "job_not_found":
+                    route.fulfill(status=404, json={"error": "job not found", "error_code": "job_not_found", "reason": "job_not_found"})
+                    return
+                if cancel_state == "generic_404":
+                    route.fulfill(status=404, json={"error": "generic missing", "reason": "missing"})
+                    return
+                if cancel_state == "transient_error":
+                    route.fulfill(status=503, json={"error": "temporary cancel failure", "reason": "temporarily_unavailable"})
+                    return
                 if cancel_state == "running":
                     job.update(state="running", phase="cancelling", error={"code": "termination_unverified"})
                 else:
@@ -135,7 +150,7 @@ class FxComparisonBrowserTests(unittest.TestCase):
             browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
             page = browser.new_page(viewport={"width": 1440, "height": 1100})
             page.goto(f"http://{host}:{port}/", wait_until="networkidle")
-            posted, _cancelled, _failed = _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
+            posted, cancelled, _failed = _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
             confirmed = []
             page.on(
                 "request",
@@ -181,6 +196,7 @@ class FxComparisonBrowserTests(unittest.TestCase):
             page.wait_for_function("() => !fxCompareActive && fxCompareCandidates.length === 0")
             page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
             self.assertEqual(confirmed, [f"/api/fx-previews/{selected_job}/confirm"])
+            self.assertEqual(cancelled, [])
             self.assertEqual(
                 page.evaluate(
                     "() => ({active: fxCompareActive, candidates: fxCompareCandidates.length, frozen: fxCompareFrozen, selected: fxCompareSelectedId})"
@@ -469,6 +485,298 @@ class FxComparisonBrowserTests(unittest.TestCase):
                     break
                 page.wait_for_timeout(50)
             self.assertEqual(cancelled, ["00000000000000000000000000000001"])
+            browser.close()
+
+    def test_ready_jobs_are_not_recancelled_on_comparison_or_single_close(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _posted, cancelled, _confirmed, _metrics = self.mock_comparison_api(
+                page, ["ready", "ready", "ready"], cancel_states=["job_not_found"]
+            )
+            self.prepare_candidates(page)
+            page.locator("#fx-preview-compare-start").click()
+            page.wait_for_function("() => !fxCompareRunning && fxCompareCandidates.every(item => item.state === 'ready')")
+            page.locator("#fx-preview-cancel").click()
+            page.wait_for_timeout(800)
+            self.assertFalse(page.locator("#fx-preview-dialog").evaluate("node => node.open"))
+            self.assertEqual(cancelled, [])
+
+            page2 = browser.new_page(viewport={"width": 1100, "height": 900})
+            page2.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _posted2, cancelled2, _confirmed2, _metrics2 = self.mock_comparison_api(page2)
+            page2.locator('[data-add-type="fx"]').click()
+            page2.locator("#fx-preview-dialog[open]").wait_for()
+            page2.evaluate(
+                """() => {
+                    clearTimeout(fxPreviewDebounceTimer);
+                    fxPreviewDebounceTimer = null;
+                    fxPreviewJob = {id: 'a'.repeat(32), state: 'ready', phase: 'ready', status_url: '/api/fx-previews/' + 'a'.repeat(32)};
+                    closeFxPreviewDialog();
+                }"""
+            )
+            page2.wait_for_function("() => fxPreviewLifecycles.size === 0")
+            self.assertEqual(cancelled2, [])
+            page2.locator('[data-add-type="fx"]').click()
+            page2.locator("#fx-preview-dialog[open]").wait_for()
+            browser.close()
+
+    def test_single_unverified_cancel_has_typed_absent_and_retry_recovery(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _posted, cancelled, _confirmed, _metrics = self.mock_comparison_api(
+                page, cancel_states=["generic_404", "job_not_found"]
+            )
+            page.locator('[data-add-type="fx"]').click()
+            page.locator("#fx-preview-dialog[open]").wait_for()
+            page.evaluate(
+                """() => {
+                    clearTimeout(fxPreviewDebounceTimer);
+                    fxPreviewDebounceTimer = null;
+                    fxPreviewJob = {id: 'b'.repeat(32), state: 'running', phase: 'rendering', status_url: '/api/fx-previews/' + 'b'.repeat(32)};
+                    closeFxPreviewDialog();
+                }"""
+            )
+            page.wait_for_function("() => fxPreviewLifecycles.size === 0 && fxPreviewUnverifiedJob")
+            page.evaluate(
+                """() => {
+                    const trigger = document.querySelector('[data-add-type="fx"]');
+                    void openFxPreviewDialog(trigger);
+                    void openFxPreviewDialog(trigger);
+                }"""
+            )
+            page.locator("#fx-preview-dialog[open]").wait_for(timeout=2500)
+            self.assertIsNone(page.evaluate("() => fxPreviewUnverifiedJob"))
+            self.assertEqual(cancelled, ["b" * 32, "b" * 32])
+
+            page2 = browser.new_page(viewport={"width": 1100, "height": 900})
+            page2.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _posted2, cancelled2, _confirmed2, _metrics2 = self.mock_comparison_api(
+                page2, cancel_states=["generic_404", "transient_error", "cancelled"]
+            )
+            page2.locator('[data-add-type="fx"]').click()
+            page2.locator("#fx-preview-dialog[open]").wait_for()
+            page2.evaluate(
+                """() => {
+                    clearTimeout(fxPreviewDebounceTimer);
+                    fxPreviewDebounceTimer = null;
+                    fxPreviewJob = {id: 'c'.repeat(32), state: 'running', phase: 'rendering', status_url: '/api/fx-previews/' + 'c'.repeat(32)};
+                    closeFxPreviewDialog();
+                }"""
+            )
+            page2.wait_for_function("() => fxPreviewLifecycles.size === 0 && fxPreviewUnverifiedJob")
+            page2.locator('[data-add-type="fx"]').click()
+            page2.wait_for_timeout(500)
+            self.assertFalse(page2.locator("#fx-preview-dialog").evaluate("node => node.open"))
+            self.assertIsNotNone(page2.evaluate("() => fxPreviewUnverifiedJob"))
+            page2.locator('[data-add-type="fx"]').click()
+            page2.locator("#fx-preview-dialog[open]").wait_for(timeout=2500)
+            self.assertIsNone(page2.evaluate("() => fxPreviewUnverifiedJob"))
+            self.assertEqual(cancelled2, ["c" * 32, "c" * 32, "c" * 32])
+            browser.close()
+
+    def test_poll_error_never_submits_second_candidate_and_requires_verified_cleanup(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            posted, cancelled, _confirmed, _metrics = self.mock_comparison_api(
+                page, ["poll_error", "ready", "ready"], cancel_states=["cancelled"]
+            )
+            self.prepare_candidates(page)
+            page.locator("#fx-preview-compare-start").click()
+            page.wait_for_function("() => !fxCompareRunning")
+            self.assertEqual(len(posted), 1)
+            self.assertEqual(cancelled, ["0" * 31 + "1"])
+            self.assertFalse(page.evaluate("() => fxCompareStopping"))
+            self.assertTrue(page.locator("#fx-preview-confirm").is_disabled())
+
+            page2 = browser.new_page(viewport={"width": 1100, "height": 900})
+            page2.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            posted2, cancelled2, _confirmed2, _metrics2 = self.mock_comparison_api(
+                page2, ["poll_generic404", "ready", "ready"], cancel_states=["running", "cancelled"]
+            )
+            self.prepare_candidates(page2)
+            page2.locator("#fx-preview-compare-start").click()
+            page2.wait_for_function("() => !fxCompareRunning && fxCompareStopping")
+            self.assertEqual(len(posted2), 1)
+            self.assertEqual(cancelled2, ["0" * 31 + "1"])
+            page2.locator("#fx-preview-compare-discard").click()
+            page2.wait_for_function("() => !fxCompareActive && !fxCompareStopping")
+            self.assertEqual(len(posted2), 1)
+            self.assertEqual(cancelled2, ["0" * 31 + "1", "0" * 31 + "1"])
+            browser.close()
+
+    def test_cancel_and_verify_requests_have_real_deadlines_and_retry(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+
+            cancel_job = "d" * 32
+            cancel_mode = {"delay": True}
+
+            def delayed_cancel(route):
+                if cancel_mode["delay"]:
+                    time.sleep(0.4)
+                try:
+                    route.fulfill(json={"ok": True, "job": {
+                        "id": cancel_job, "state": "cancelled", "phase": "cancelled",
+                        "status_url": f"/api/fx-previews/{cancel_job}",
+                    }})
+                except BaseException:  # the browser deadline may already have aborted this fixture response
+                    pass
+
+            page.route(f"**/api/fx-previews/{cancel_job}/cancel", delayed_cancel)
+            first = page.evaluate(
+                """async (jobId) => {
+                    const started = performance.now();
+                    const result = await fxCompareCancelAndVerify({
+                        id: jobId, state: 'running', phase: 'rendering',
+                        status_url: '/api/fx-previews/' + jobId,
+                    }, null, 1, false, 80);
+                    return {verified: result.verified, jobId: result.job?.id, elapsedMs: performance.now() - started};
+                }""",
+                cancel_job,
+            )
+            self.assertFalse(first["verified"])
+            self.assertEqual(first["jobId"], cancel_job)
+            self.assertLess(first["elapsedMs"], 300)
+            cancel_mode["delay"] = False
+            recovered = page.evaluate(
+                """async (jobId) => fxCompareCancelAndVerify({
+                    id: jobId, state: 'running', phase: 'rendering',
+                    status_url: '/api/fx-previews/' + jobId,
+                }, null, 1, false, 200)""",
+                cancel_job,
+            )
+            self.assertTrue(recovered["verified"])
+            self.assertEqual(recovered["job"]["state"], "cancelled")
+
+            status_job = "e" * 32
+            status_mode = {"cancel_count": 0, "delay_status": True}
+
+            def cancel_then_recover(route):
+                status_mode["cancel_count"] += 1
+                state = "running" if status_mode["cancel_count"] == 1 else "cancelled"
+                route.fulfill(json={"ok": True, "job": {
+                    "id": status_job, "state": state,
+                    "phase": "cancelling" if state == "running" else "cancelled",
+                    "status_url": f"/api/fx-previews/{status_job}",
+                    **({"error": {"code": "termination_unverified"}} if state == "running" else {}),
+                }})
+
+            def delayed_status(route):
+                if status_mode["delay_status"]:
+                    time.sleep(0.4)
+                try:
+                    route.fulfill(json={"ok": True, "job": {
+                        "id": status_job, "state": "cancelled", "phase": "cancelled",
+                        "status_url": f"/api/fx-previews/{status_job}",
+                    }})
+                except BaseException:
+                    pass
+
+            page.route(f"**/api/fx-previews/{status_job}/cancel", cancel_then_recover)
+            page.route(f"**/api/fx-previews/{status_job}", delayed_status)
+            status_first = page.evaluate(
+                """async (jobId) => {
+                    const started = performance.now();
+                    const result = await fxCompareCancelAndVerify({
+                        id: jobId, state: 'running', phase: 'rendering',
+                        status_url: '/api/fx-previews/' + jobId,
+                    }, null, 1, false, 80);
+                    return {verified: result.verified, jobId: result.job?.id, elapsedMs: performance.now() - started};
+                }""",
+                status_job,
+            )
+            self.assertFalse(status_first["verified"])
+            self.assertEqual(status_first["jobId"], status_job)
+            self.assertLess(status_first["elapsedMs"], 500)
+            status_mode["delay_status"] = False
+            status_recovered = page.evaluate(
+                """async (jobId) => fxCompareCancelAndVerify({
+                    id: jobId, state: 'running', phase: 'rendering',
+                    status_url: '/api/fx-previews/' + jobId,
+                }, null, 1, false, 200)""",
+                status_job,
+            )
+            self.assertTrue(status_recovered["verified"])
+            self.assertEqual(status_recovered["job"]["state"], "cancelled")
+
+            swallowed_body_abort = page.evaluate(
+                """async () => {
+                    const originalRequest = request;
+                    request = async (_url, _options) => {
+                        await new Promise(resolve => setTimeout(resolve, 120));
+                        return {error: 'simulated request() JSON-abort conversion'};
+                    };
+                    try {
+                        await fxPreviewRequestWithDeadline('/api/fx-previews/body-delay', {}, 50);
+                        return {timedOut: false};
+                    } catch (error) {
+                        return {timedOut: error.code === 'request_timeout', reason: error.reason};
+                    } finally {
+                        request = originalRequest;
+                    }
+                }"""
+            )
+            self.assertEqual(swallowed_body_abort, {"timedOut": True, "reason": "request_timeout"})
+
+            normal_status_job = "f" * 32
+
+            def delayed_normal_status(route):
+                time.sleep(0.4)
+                try:
+                    route.fulfill(json={"ok": True, "job": {
+                        "id": normal_status_job, "state": "ready", "phase": "ready",
+                        "media_url": "/media/source",
+                        "status_url": f"/api/fx-previews/{normal_status_job}",
+                    }})
+                except BaseException:
+                    pass
+
+            page.route(f"**/api/fx-previews/{normal_status_job}", delayed_normal_status)
+            normal_status = page.evaluate(
+                """async (jobId) => {
+                    fxCompareRun = 901;
+                    fxCompareSession = 902;
+                    fxCompareActive = true;
+                    fxCompareStopping = false;
+                    const candidate = {
+                        id: 'normal-status-timeout', state: 'running', message: '',
+                        job: {id: jobId, state: 'running', phase: 'rendering', status_url: '/api/fx-previews/' + jobId},
+                    };
+                    const started = performance.now();
+                    try {
+                        await fxCompareWaitTerminal(candidate, {id: 901, session: 902}, 80);
+                        return {pollUnknown: false, elapsedMs: performance.now() - started};
+                    } catch (error) {
+                        return {
+                            pollUnknown: error.fxComparePollUnknown === true,
+                            jobId: error.fxPreviewJob?.id,
+                            elapsedMs: performance.now() - started,
+                        };
+                    } finally {
+                        fxCompareActive = false;
+                    }
+                }""",
+                normal_status_job,
+            )
+            self.assertTrue(normal_status["pollUnknown"])
+            self.assertEqual(normal_status["jobId"], normal_status_job)
+            # fxCompareWaitTerminal intentionally waits 450ms between polls;
+            # the 80ms request deadline must bound the network portion.
+            self.assertLess(normal_status["elapsedMs"], 700)
             browser.close()
 
 
