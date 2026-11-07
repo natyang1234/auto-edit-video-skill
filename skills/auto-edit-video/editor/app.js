@@ -3169,12 +3169,28 @@ async function fxCompareStart() {
     // boundary.  Wait for that response so its late job can be cancelled by
     // the old generation before this serial queue claims the worker.
     await fxPreviewWaitForLifecycles();
-    await Promise.resolve(fxPreviewCancelPromise);
-    if (fxPreviewUnverifiedJob?.id) {
-      const stopped = await fxCompareCancelAndVerify(fxPreviewUnverifiedJob);
-      fxPreviewUnverifiedJob = stopped.verified ? null : stopped.job;
-      if (!stopped.verified) throw new Error("上一個單款工作停止尚未確認");
+    const priorCancellation = fxPreviewCancelPromise;
+    let priorCancellationError = null;
+    try {
+      await Promise.resolve(priorCancellation);
+    } catch (error) {
+      // fxPreviewCancelCurrentJob records the exact known job before rejecting.
+      // Do not let this permanently rejected promise make the bounded retry
+      // below unreachable; without a known job, the original error still wins.
+      priorCancellationError = error;
     }
+    if (fxPreviewUnverifiedJob?.id) {
+      const retryJob = fxPreviewUnverifiedJob;
+      const stopped = await fxCompareCancelAndVerify(retryJob);
+      if (fxPreviewUnverifiedJob?.id === retryJob.id) {
+        fxPreviewUnverifiedJob = stopped.verified ? null : stopped.job || retryJob;
+      }
+      if (!stopped.verified) throw new Error("上一個單款工作停止尚未確認");
+      if (fxPreviewUnverifiedJob?.id) throw new Error("另一個單款工作停止尚未確認");
+      priorCancellationError = null;
+    }
+    if (priorCancellationError) throw priorCancellationError;
+    if (fxPreviewCancelPromise === priorCancellation) fxPreviewCancelPromise = null;
     const currentJob = fxPreviewJob;
     if (currentJob?.id) {
       const stopped = await fxCompareCancelAndVerify(currentJob);
@@ -3188,7 +3204,13 @@ async function fxCompareStart() {
     if (session === fxCompareSession && fxCompareActive && !fxCompareStopping) fxPreviewSetStatus(`無法開始比較：${error.message}`, "error");
     return;
   } finally {
-    if (session === fxCompareSession) fxCompareStarting = false;
+    if (session === fxCompareSession) {
+      fxCompareStarting = false;
+      // A failed verification is intentionally retryable from this same Start
+      // button. Re-render after the await so it does not remain disabled by the
+      // earlier starting state.
+      fxCompareRender();
+    }
   }
   if (session !== fxCompareSession || !fxCompareActive || fxCompareStopping || run !== fxCompareRun) { fxCompareRender(); return; }
   const currentContext = fxCompareContextForDraft(candidates[0]?.draft);
