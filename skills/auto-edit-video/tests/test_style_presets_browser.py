@@ -292,3 +292,152 @@ class PresetBrowserTests(unittest.TestCase):
             for item in ("a" * 64, "b" * 64, "c" * 64, "sha256", "font /", "text_fit", "opacity"):
                 self.assertNotIn(item, page.locator("#preset-review-details").inner_text())
             browser.close()
+
+    def test_unavailable_preset_and_old_font_display(self):
+        host, port = self.server.server_address
+        fx_id = 'preset_' + '1' * 32
+        caption_id = 'preset_' + '2' * 32
+        fx = {'id': fx_id, 'name': '舊效果', 'kind': 'fx', 'settings': {'code': 'T3', 'values': {}, 'placement': '', 'scheme': '', 'font_ids': {}, 'opacity': 0.5, 'text_fit': True}, 'availability': {'status': 'unavailable', 'reason': 'font_unavailable', 'message': '缺少字型，請更新或刪除。'}}
+        cap = {'id': caption_id, 'name': '字幕', 'kind': 'caption', 'settings': {'style': {'color': '#FFFFFF'}, 'font': {'sha256': 'a' * 64, 'family': '新字型', 'style': 'Regular', 'weight': 400}}, 'availability': {'status': 'available', 'reason': None, 'message': None}}
+        records = [fx, cap]
+        calls = []
+        with base.sync_playwright() as p:
+            browser = p.chromium.launch(executable_path=str(base.CHROME), headless=True)
+            page = browser.new_page(viewport={'width': 1100, 'height': 900})
+            def handler(route):
+                req = route.request; path = urlparse(req.url).path
+                if not path.startswith('/api/style-presets'):
+                    route.fallback(); return
+                body = json.loads(req.post_data or '{}'); calls.append((req.method, path, body))
+                if path.endswith('caption-plan'):
+                    route.fulfill(json={'ok': True, 'plan_digest': 'd', 'changes': [{'overlay_id': body['overlay_id'], 'field': 'font', 'before': None, 'before_unavailable': True, 'after': cap['settings']['font']}], 'applied_to': [body['overlay_id']], 'no_change': False}); return
+                if req.method == 'PUT':
+                    self.assertNotIn('availability', body)
+                    self.assertNotIn('availability', body['settings'])
+                    records[0]['name'] = body['name']
+                if req.method == 'DELETE': records.pop(0)
+                route.fulfill(json={'ok': True, 'revision': 'rev', 'presets': records})
+            page.route('**/api/**', handler)
+            page.goto(f'http://{host}:{port}/', wait_until='networkidle')
+            page.locator('#style-presets summary').click(); page.wait_for_load_state('networkidle')
+            page.locator('#preset-list').select_option(fx_id)
+            page.evaluate('''async () => {
+              const old = request; let release;
+              request = () => new Promise(resolve => { release = resolve; });
+              const pending = presetLoad();
+              release({revision:presetLibrary.revision,presets:presetLibrary.presets});
+              await pending; request = old;
+            }''')
+            self.assertIn('缺字型', page.locator('#preset-list option:checked').inner_text())
+            self.assertIn('缺少字型', page.locator('#preset-status').inner_text())
+            page.locator('#preset-apply').click()
+            self.assertIn('缺少字型', page.locator('#preset-status').inner_text())
+            self.assertFalse(page.locator('#fx-preview-dialog').evaluate('el => el.open'))
+            self.assertFalse(any('/api/fx-previews' in path for _, path, _ in calls))
+            page.evaluate("""() => {
+              const o = currentOverlay(); Object.assign(o, {type:'fx', code:'T3', values:{}, placement:'', scheme:'', font_ids:{}, text_fit:true}); o.style.opacity=0.5; renderInspector();
+            }""")
+            page.locator('#preset-update').click(); page.locator('#preset-review-confirm').click()
+            page.wait_for_function("() => document.querySelector('#preset-status').textContent.includes('已儲存')")
+            self.assertTrue(any(method == 'PUT' for method, _, _ in calls))
+            page.locator('#preset-list').select_option(fx_id)
+            page.locator('#preset-delete').click();page.locator('#preset-review-confirm').click()
+            page.wait_for_function("() => document.querySelector('#preset-status').textContent.includes('已刪除')")
+            self.assertTrue(any(method == 'DELETE' for method, _, _ in calls))
+            page.evaluate("() => {currentOverlay().type='caption'; renderInspector();}")
+            page.locator('#preset-list').select_option(caption_id)
+            page.locator('#preset-apply').click();page.locator('#preset-review[open]').wait_for()
+            diff = page.locator('#preset-review-details').inner_text()
+            self.assertIn('目前字型不可用', diff)
+            self.assertIn('新字型 / Regular / 400', diff)
+            self.assertNotIn('a' * 64, diff)
+            page.locator('#preset-review-cancel').click()
+            browser.close()
+
+    def test_dark_os_native_highlight_inputs_remain_readable(self):
+        host, port = self.server.server_address
+        with base.sync_playwright() as p:
+            browser = p.chromium.launch(executable_path=str(base.CHROME), headless=True)
+            for theme in ('light', 'dark'):
+                page = browser.new_page(color_scheme=theme, viewport={'width': 1440, 'height': 900})
+                page.goto(f'http://{host}:{port}/', wait_until='networkidle')
+                colors = page.evaluate("""() => ['#highlight-title','#highlight-start','#highlight-end'].map(id => {
+                    const s=getComputedStyle(document.querySelector(id));
+                    const rgb=(v)=>{const c=document.createElement('canvas');c.width=c.height=1;const x=c.getContext('2d');x.fillStyle=v;x.fillRect(0,0,1,1);return [...x.getImageData(0,0,1,1).data]};
+                    const lum=a=>{const v=a.slice(0,3).map(n=>{n/=255;return n<=0.04045?n/12.92:((n+0.055)/1.055)**2.4});return .2126*v[0]+.7152*v[1]+.0722*v[2]};
+                    const a=lum(rgb(s.color)),b=lum(rgb(s.backgroundColor));return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);
+                })""")
+                self.assertTrue(all(value >= 4.5 for value in colors), (theme, colors))
+                page.close()
+            browser.close()
+
+    def test_real_handler_unavailable_catalog_drift_remains_deletable(self):
+        """Simulate catalog drift only in a private test store; real handler and UI."""
+        host, port = self.server.server_address
+        with base.sync_playwright() as p:
+            browser = p.chromium.launch(executable_path=str(base.CHROME), headless=True)
+            page = browser.new_page(viewport={'width': 1100, 'height': 900})
+            page.goto(f'http://{host}:{port}/', wait_until='networkidle')
+            saved = page.evaluate("""async () => {
+              const lib=await request('/api/style-presets');
+              return request('/api/style-presets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expected_library_revision:lib.revision,name:'舊目錄效果',kind:'fx',settings:{code:'T3',values:{},placement:'',scheme:'',font_ids:{},opacity:0.5,text_fit:true}})});
+            }""")
+            preset_id = saved['preset']['id']
+            store = Path(os.environ['AUTO_EDIT_PRESETS_DIR']) / 'presets.json'
+            document = json.loads(store.read_text())
+            document['presets'][0]['settings']['code'] = 'Z999'
+            store.write_text(json.dumps(document, ensure_ascii=False))
+            response = page.evaluate("() => request('/api/style-presets')")
+            self.assertEqual(response['presets'][0]['availability']['status'], 'unavailable')
+            self.assertEqual(response['presets'][0]['availability']['reason'], 'effect_unavailable')
+            page.locator('#style-presets summary').click()
+            page.wait_for_function("id => [...document.querySelector('#preset-list').options].some(o=>o.value===id)", arg=preset_id)
+            page.locator('#preset-list').select_option(preset_id)
+            self.assertIn('暫時不可用', page.locator('#preset-list option:checked').inner_text())
+            page.locator('#preset-apply').click()
+            self.assertFalse(page.locator('#fx-preview-dialog').evaluate('e=>e.open'))
+            with page.expect_response(lambda r: r.request.method == 'DELETE' and urlparse(r.url).path.endswith(preset_id)) as pending:
+                page.locator('#preset-delete').click(); page.locator('#preset-review-confirm').click()
+            self.assertEqual(pending.value.status, 200, pending.value.text())
+            self.assertEqual(page.evaluate("async () => (await request('/api/style-presets')).presets.length"), 0)
+            browser.close()
+
+    def test_late_load_cannot_overwrite_successful_mutations(self):
+        host, port = self.server.server_address
+        with base.sync_playwright() as p:
+            browser = p.chromium.launch(executable_path=str(base.CHROME), headless=True)
+            page = browser.new_page(viewport={'width': 1100, 'height': 900})
+            page.goto(f'http://{host}:{port}/', wait_until='networkidle')
+            results = page.evaluate("""async () => {
+              const oldRequest = request, oldReview = presetReview;
+              const item = {id:'p',name:'舊預設',kind:'caption',settings:{style:{color:'#FFFFFF'},font:null}};
+              const fresh = {id:'n',name:'新預設',kind:'caption',settings:{style:{color:'#FFFFFF'},font:null}};
+              const results = [];
+              presetReview = async () => true;
+              for (const method of ['POST','PUT','DELETE']) {
+                const old = {revision:'old',presets:[item]};
+                const latest = {revision:'new-revision',presets:method==='DELETE'?[]:method==='PUT'?[{...item,name:'更新預設'}]:[item,fresh]};
+                presetSetLibrary(old,'p');
+                document.querySelector('#preset-name').value='新預設';
+                let release;
+                request = (url, options={}) => options.method === method
+                  ? Promise.resolve(latest)
+                  : new Promise(resolve=>{release=resolve});
+                const pending = presetLoad();
+                await presetMutate(method);
+                const list=document.querySelector('#preset-list');
+                list.value=latest.presets.at(-1)?.id || '';
+                const expectedStatus=document.querySelector('#preset-status').textContent;
+                release(old);
+                await pending;
+                results.push({method,revision:presetLibrary.revision,names:presetLibrary.presets.map(p=>p.name),selection:list.value,status:document.querySelector('#preset-status').textContent,expectedStatus});
+              }
+              request = oldRequest; presetReview = oldReview;
+              return results;
+            }""")
+            expected = {'POST': (['舊預設', '新預設'], 'n'), 'PUT': (['更新預設'], 'p'), 'DELETE': ([], '')}
+            for result in results:
+                self.assertEqual(result['revision'], 'new-revision')
+                self.assertEqual((result['names'], result['selection']), expected[result['method']])
+                self.assertEqual(result['status'], result['expectedStatus'])
+            browser.close()
