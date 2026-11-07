@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import inspect
+import io
 import shutil
 import sys
 import tempfile
@@ -140,6 +142,326 @@ class FxPreviewWorkerCleanupTests(unittest.TestCase):
         self.assertEqual(cancelled["state"], "cancelled")
         self.assertEqual(self.manager.public_job(job_id)["state"], "cancelled")
         self._assert_only_owned_artifacts_removed(job_id)
+
+    def test_cancel_race_never_exposes_or_records_failed_phase(self) -> None:
+        job_id = "a" * 32
+        thread = self._start_worker(job_id)
+        self._wait_for_worker_scratch(job_id)
+        original_terminate = self.manager._terminate_process
+        observed_states = []
+
+        def terminate_and_yield_to_worker(process):
+            terminated = original_terminate(process)
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                with self.manager._lock:
+                    state = self.manager._jobs[job_id]["state"]
+                observed_states.append(state)
+                if state == "failed":
+                    break
+                time.sleep(0.01)
+            return terminated
+
+        with mock.patch.object(
+            self.manager, "_terminate_process", side_effect=terminate_and_yield_to_worker
+        ):
+            cancelled = self.manager.cancel(job_id)
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("failed", observed_states)
+        self.assertNotIn("cancelled", observed_states)
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertNotIn("failed", cancelled["phase_timings_s"])
+        self._assert_only_owned_artifacts_removed(job_id)
+
+    def test_late_cancel_callback_cannot_rewrite_a_terminal_state(self) -> None:
+        now = time.monotonic()
+        for state in ("ready", "failed"):
+            job_id = ("d" if state == "ready" else "e") * 32
+            self.manager._jobs[job_id] = {
+                "id": job_id,
+                "state": state,
+                "phase": state,
+                "message": state,
+                "timing_started": now - 1,
+                "timing_phase_started": now,
+                "timing_finished": now,
+                "phase_timings_s": {state: 0.0},
+                "updated_monotonic": time.time(),
+                "preview_options": {"mode": "single", "quality": "draft"},
+                "sample_window": {"duration_s": 2},
+                "overlay": {"code": "T3", "start": 0, "end": 2},
+                "error": {"code": "render_failed", "message": "failed"}
+                if state == "failed"
+                else None,
+            }
+            before = dict(self.manager._jobs[job_id])
+            with self.manager._lock:
+                self.manager._finish_cancelled(job_id)
+            self.assertEqual(self.manager._jobs[job_id], before)
+
+    def test_cancel_handler_alone_decides_unverified_or_cancelled(self) -> None:
+        for suffix, terminate_result in (("f", False), ("0", True)):
+            with self.subTest(terminate_result=terminate_result):
+                owner = suffix * 32
+                now = time.monotonic()
+                self.manager._jobs[owner] = {
+                    "id": owner,
+                    "state": "running",
+                    "phase": "rendering",
+                    "message": "rendering",
+                    "cache_key": suffix * 64,
+                    "process": object(),
+                    "cancel_requested": False,
+                    "timing_started": now,
+                    "timing_phase_started": now,
+                    "phase_timings_s": {},
+                    "updated_monotonic": time.time(),
+                    "preview_options": {"mode": "single", "quality": "draft"},
+                    "sample_window": {"duration_s": 2},
+                    "overlay": {"code": "T3", "start": 0, "end": 2},
+                    "error": None,
+                }
+                self.manager._active_job_id = owner
+                terminate_entered = threading.Event()
+                release_terminate = threading.Event()
+                outcome = {}
+
+                def blocked_terminate(_process):
+                    terminate_entered.set()
+                    self.assertTrue(release_terminate.wait(timeout=5))
+                    return terminate_result
+
+                def issue_cancel():
+                    outcome["job"] = self.manager.cancel(owner)
+
+                with mock.patch.object(
+                    self.manager, "_terminate_process", side_effect=blocked_terminate
+                ):
+                    cancel_thread = threading.Thread(target=issue_cancel)
+                    cancel_thread.start()
+                    self.assertTrue(terminate_entered.wait(timeout=5))
+                    with self.manager._lock:
+                        pending = self.manager._jobs[owner]
+                        self.assertTrue(self.manager._worker_cancel_pending(pending))
+                        self.manager._finish_cancelled(owner)
+                        self.assertEqual(
+                            (pending["state"], pending["phase"]),
+                            ("running", "rendering"),
+                        )
+                    self.manager._consume_progress(
+                        owner, io.StringIO('{"phase":"encoding"}\n')
+                    )
+                    with self.manager._lock:
+                        pending = self.manager._jobs[owner]
+                        self.assertEqual(
+                            (pending["state"], pending["phase"]),
+                            ("running", "rendering"),
+                        )
+                    release_terminate.set()
+                    cancel_thread.join(timeout=5)
+                    self.assertFalse(cancel_thread.is_alive())
+
+                status = outcome["job"]
+                if terminate_result:
+                    self.assertEqual(
+                        (status["state"], status["phase"]),
+                        ("cancelled", "cancelled"),
+                    )
+                else:
+                    self.assertEqual(
+                        (status["state"], status["phase"]),
+                        ("running", "cancelling"),
+                    )
+                    self.assertEqual(status["error"]["code"], "termination_unverified")
+                    self.manager._consume_progress(
+                        owner, io.StringIO('{"phase":"preparing"}\n')
+                    )
+                    unchanged = self.manager.public_job(owner)
+                    self.assertEqual(
+                        (unchanged["state"], unchanged["phase"]),
+                        ("running", "cancelling"),
+                    )
+                    with self.manager._lock:
+                        self.manager._active_job_id = None
+                        self.manager._jobs[owner]["process"] = None
+
+    def test_popen_and_process_registration_are_atomic_with_cancel(self) -> None:
+        for suffix, terminate_result in (("6", False), ("7", True)):
+            with self.subTest(terminate_result=terminate_result):
+                owner = suffix * 32
+                now = time.monotonic()
+                job = {
+                    "id": owner,
+                    "state": "running",
+                    "phase": "queued",
+                    "message": "queued",
+                    "cache_hit": False,
+                    "timing_started": now,
+                    "timing_phase_started": now,
+                    "phase_timings_s": {},
+                    "updated_monotonic": time.time(),
+                    "state_revision": "b" * 64,
+                    "overlay": {"id": "fx", "type": "fx", "code": "T3", "start": 0, "end": 2},
+                    "sample_window": {"start_s": 0, "duration_s": 2},
+                    "preview_options": {"mode": "single", "quality": "draft"},
+                    "state_snapshot": {},
+                    "manifest_snapshot": {},
+                    "timeline_snapshot": None,
+                    "replace_overlay_id": None,
+                    "dependencies": {"pack_id": "", "canvas": {"width": 1080, "height": 1920}},
+                    "dependency_hash": "c" * 64,
+                    "source_identity": {"path": self.source},
+                    "cache_key": suffix * 64,
+                    "process": None,
+                    "cancel_requested": False,
+                    "media": None,
+                    "error": None,
+                }
+                with self.manager._lock:
+                    self.manager._jobs[owner] = job
+                    self.manager._active_job_id = owner
+                popen_entered = threading.Event()
+                release_popen = threading.Event()
+                cancel_started = threading.Event()
+                cancel_outcome = {}
+
+                class FakeProcess:
+                    stderr = None
+                    returncode = None
+
+                    @staticmethod
+                    def poll():
+                        return None
+
+                fake_process = FakeProcess()
+
+                def fake_popen(*_args, **_kwargs):
+                    popen_entered.set()
+                    self.assertTrue(release_popen.wait(timeout=5))
+                    return fake_process
+
+                def issue_cancel():
+                    cancel_started.set()
+                    cancel_outcome["job"] = self.manager.cancel(owner)
+
+                with (
+                    mock.patch.object(jobs.subprocess, "Popen", side_effect=fake_popen),
+                    mock.patch.object(
+                        self.manager, "_terminate_process", return_value=terminate_result
+                    ),
+                ):
+                    worker = threading.Thread(
+                        target=self.manager._run_job,
+                        args=(
+                            owner,
+                            self.manager.cache_dir / f"{job['cache_key']}.mp4",
+                            self.manager.cache_dir / f"{job['cache_key']}.json",
+                        ),
+                    )
+                    worker.start()
+                    self.assertTrue(popen_entered.wait(timeout=5))
+                    cancel_thread = threading.Thread(target=issue_cancel)
+                    cancel_thread.start()
+                    self.assertTrue(cancel_started.wait(timeout=5))
+                    self.assertTrue(
+                        cancel_thread.is_alive(),
+                        "cancel must wait until Popen is atomically registered",
+                    )
+                    release_popen.set()
+                    cancel_thread.join(timeout=5)
+                    worker.join(timeout=5)
+                    self.assertFalse(cancel_thread.is_alive())
+                    self.assertFalse(worker.is_alive())
+
+                status = cancel_outcome["job"]
+                if terminate_result:
+                    self.assertEqual(
+                        (status["state"], status["phase"]),
+                        ("cancelled", "cancelled"),
+                    )
+                else:
+                    self.assertEqual(
+                        (status["state"], status["phase"]),
+                        ("running", "cancelling"),
+                    )
+                    self.assertEqual(status["error"]["code"], "termination_unverified")
+                    with self.manager._lock:
+                        self.manager._active_job_id = None
+                        self.manager._jobs[owner]["process"] = None
+
+    def test_post_process_worker_callbacks_never_claim_cancelled(self) -> None:
+        source = inspect.getsource(self.manager._run_job)
+        post_process = source[source.index("progress.join"):source.rindex("self.prune()")]
+        self.assertNotIn("_finish_cancelled", post_process)
+        self.assertGreaterEqual(post_process.count("_worker_cancel_pending"), 3)
+
+    def test_retry_after_unverified_cancel_reclaims_only_that_job_shadow(self) -> None:
+        owner = "b" * 32
+        other_owner = "c" * 32
+        now = time.monotonic()
+        self.manager._jobs[owner] = {
+            "id": owner,
+            "state": "running",
+            "phase": "rendering",
+            "message": "working",
+            "cache_key": "d" * 64,
+            "process": object(),
+            "cancel_requested": False,
+            "timing_started": now,
+            "timing_phase_started": now,
+            "phase_timings_s": {},
+            "updated_monotonic": time.time(),
+            "preview_options": {"mode": "single", "quality": "draft"},
+            "sample_window": {"duration_s": 2},
+            "overlay": {"code": "T3", "start": 0, "end": 2},
+            "error": None,
+        }
+        self.manager._active_job_id = owner
+        lease_fd = self.manager._try_acquire_scratch_lease(owner, create=True)
+        self.assertIsNotNone(lease_fd)
+        owned = self.manager.renderer_cache_dir / f"timeline-project-{owner}-0123456789abcdef-retry"
+        owned.mkdir()
+        (owned / "partial.mp4").write_bytes(b"owned")
+
+        other_lease_fd = self.manager._try_acquire_scratch_lease(other_owner, create=True)
+        self.assertIsNotNone(other_lease_fd)
+        other = self.manager.renderer_cache_dir / f"timeline-project-{other_owner}-0123456789abcdef-other"
+        other.mkdir()
+        (other / "partial.mp4").write_bytes(b"other")
+        legacy = self.manager.renderer_cache_dir / "timeline-project-legacy-unowned"
+        legacy.mkdir()
+        (legacy / "partial.mp4").write_bytes(b"legacy")
+
+        try:
+            with mock.patch.object(self.manager, "_terminate_process", return_value=False):
+                first = self.manager.cancel(owner)
+            self.assertEqual(first["state"], "running")
+            self.assertEqual(first["phase"], "cancelling")
+            self.assertEqual(first["error"]["code"], "termination_unverified")
+            self.assertTrue(owned.is_dir())
+
+            os.close(lease_fd)
+            lease_fd = None
+            with mock.patch.object(self.manager, "_terminate_process", return_value=True):
+                second = self.manager.cancel(owner)
+
+            self.assertEqual(second["state"], "cancelled")
+            self.assertFalse(owned.exists())
+            self.assertFalse(
+                (self.manager.renderer_cache_dir / f".timeline-owner-{owner}.lock").exists()
+            )
+            self.assertTrue(other.is_dir())
+            self.assertTrue(legacy.is_dir())
+            self.assertEqual(
+                (self.manager.renderer_cache_dir / "foreign.keep").read_text(encoding="utf-8"),
+                "keep",
+            )
+        finally:
+            if lease_fd is not None:
+                os.close(lease_fd)
+            os.close(other_lease_fd)
 
     def test_real_worker_timeout_removes_owned_scratch_and_preserves_foreign_files(self) -> None:
         self.manager.render_timeout_s = 0.2

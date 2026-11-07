@@ -2,6 +2,7 @@ import sys
 import time
 import subprocess
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,8 +88,41 @@ def test_eta_requires_three_matching_samples_and_uses_elapsed():
     status = manager._public_job_locked(job)
     assert 8 < status["eta_remaining_s"] < 10
     assert status["phase_timings_s"]["rendering"] >= 1
+    job.update(
+        phase="cancelling",
+        error={"code": "termination_unverified", "message": "retry cancel"},
+    )
+    assert manager._public_job_locked(job)["eta_remaining_s"] is None
+    job.update(phase="rendering")
+    assert manager._public_job_locked(job)["eta_remaining_s"] is None
+    job["error"] = None
     job["preview_options"]["quality"] = "standard"
     assert manager._public_job_locked(job)["eta_remaining_s"] is None
     job.update(state="ready", phase="ready", timing_finished=now + 3)
     with patch.object(jobs.time, "monotonic", return_value=now + 100):
         assert manager._public_job_locked(job)["elapsed_s"] == 5
+
+
+def test_timing_suffix_hides_eta_while_cancelling_or_after_error():
+    app_source = (Path(__file__).resolve().parents[1] / "editor" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        r"function fxPreviewTimingSuffix\(job, label = \"已用\"\) \{.*?\n\}\n\n"
+        r"(?=function fxPreviewApplyJob)",
+        app_source,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "fxPreviewTimingSuffix must remain directly testable"
+    script = match.group(0) + """
+const cases = [
+  {state: 'running', phase: 'cancelling', elapsed_s: 7, eta_remaining_s: 12, eta_sample_count: 3},
+  {state: 'running', phase: 'encoding', elapsed_s: 8, eta_remaining_s: 11, eta_sample_count: 3,
+   error: {code: 'termination_unverified', message: 'retry cancel'}},
+];
+process.stdout.write(JSON.stringify(cases.map((job) => fxPreviewTimingSuffix(job))));
+"""
+    rendered = json.loads(
+        subprocess.check_output(["node", "-e", script], text=True, timeout=10)
+    )
+    assert rendered == [" · 已用 7 秒", " · 已用 8 秒"]
