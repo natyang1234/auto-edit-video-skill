@@ -2593,29 +2593,6 @@ def load_render_snapshot(
     return manifest, state, clip
 
 
-def compose_designed_timeline_state(project_dir: Path, state: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
-    """Package every authored highlight without altering the saved timeline."""
-    # Designed templates are authored per highlight. Composite each
-    # complete package on its original source interval; the ordinary
-    # cut mapping below seeks it without restarting its animations.
-    state = copy.deepcopy(state)
-    package_state = strip_caption_overlays(state)
-    package_layers = []
-    for designed_clip in state.get("highlights", []):
-        if not isinstance(designed_clip, dict): continue
-        roles = {str(o.get("design_role")) for o in overlays_for_clip(state, designed_clip) if o.get("design_role")}
-        if not roles: continue
-        if not set(DESIGN_ROLES).issubset(roles):
-            raise ValueError("designed timeline highlight is missing reviewed design cards")
-        package = ensure_graphic_package(project_dir, package_state, manifest, designed_clip)
-        package_layers.append({"id": "template-" + str(designed_clip.get("id")), "type": "video",
-            "source": str(package.relative_to(project_dir)), "start": float(designed_clip["start"]),
-            "end": float(designed_clip["end"]), "source_axis_media": True, "z_index": -100000,
-            "style": {"x":50,"y":50,"width":100,"animation":"none","opacity":1}})
-    state["overlays"] = package_layers + list(state.get("overlays", []))
-    return state
-
-
 def render_project(
     project_dir: Path,
     output: Path,
@@ -2752,8 +2729,6 @@ def render_project(
         if temporary is None:
             raise RuntimeError("render output staging was not initialized")
         visual_source: Path | None = None
-        if clip is None and state.get("visual_quality_mode") == "designed":
-            state = compose_designed_timeline_state(project_dir, state, manifest)
         if clip is not None and state.get("visual_quality_mode") == "designed":
             quality_errors = visual_quality_errors(state, manifest, clip)
             if quality_errors:
