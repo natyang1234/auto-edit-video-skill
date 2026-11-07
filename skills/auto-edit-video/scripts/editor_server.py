@@ -948,6 +948,10 @@ _LAYER_TXN_LOCK = threading.Lock()
 _CAPTION_PRESET_TXN_LOCK = threading.RLock()
 
 
+class CaptionPresetRecoveryError(RuntimeError):
+    """A retained caption-preset journal could not be recovered safely."""
+
+
 def _caption_preset_snapshot(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
@@ -1108,7 +1112,7 @@ def recover_caption_preset_transaction(project_dir: Path) -> None:
                         raise OSError("committed caption preset files changed before cleanup")
             journal_path.unlink()
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
+            raise CaptionPresetRecoveryError(
                 "caption preset transaction could not be recovered; journal retained"
             ) from exc
 
@@ -4511,15 +4515,16 @@ class EditorHandler(BaseHTTPRequestHandler):
                 before = before_style.get(key)
                 if not self._caption_style_values_equal(key, before, after):
                     changes.append({
-                            "overlay_id": recipient_id,
-                            "field": f"style.{key}",
-                            "before": before,
-                            "after": after,
-                        })
+                        "overlay_id": recipient_id,
+                        "field": f"style.{key}",
+                        "before": before,
+                        "after": after,
+                    })
                     after_style[key] = after
             if target_font is not None:
                 current_asset_id = str(before_style.get("font_asset_id") or "")
                 before_font = None
+                before_unavailable = False
                 if current_asset_id:
                     try:
                         current_binding = asset_registry.resolve_project_font(
@@ -4527,19 +4532,24 @@ class EditorHandler(BaseHTTPRequestHandler):
                             current_asset_id,
                             required_text=str(source.get("text") or ""),
                         )
-                    except asset_registry.AssetRegistryError as exc:
-                        raise style_presets.StylePresetError(
-                            409, "font_changed", "目前字幕字型已失效，請重新載入"
-                        ) from exc
-                    before_font = self._font_descriptor(current_binding)
+                    except asset_registry.AssetRegistryError:
+                        # A broken old binding must never be used as fallback,
+                        # but it also must not block replacement by the newly
+                        # verified portable font above.
+                        before_unavailable = True
+                    else:
+                        before_font = self._font_descriptor(current_binding)
                 after_font = self._font_descriptor(target_font)
-                if before_font != after_font:
-                    changes.append({
+                if before_font != after_font or before_unavailable:
+                    font_change = {
                         "overlay_id": recipient_id,
                         "field": "font",
                         "before": before_font,
                         "after": after_font,
-                    })
+                    }
+                    if before_unavailable:
+                        font_change["before_unavailable"] = True
+                    changes.append(font_change)
                 after_style["font_asset_id"] = target_font["asset_id"]
                 after_style["font_family"] = target_font["family"]
                 after_style["font_weight"] = target_font["weight"]
@@ -8320,7 +8330,21 @@ def main() -> int:
     if not EDITOR_DIR.is_dir():
         print(f"editor assets missing: {EDITOR_DIR}", file=sys.stderr)
         return 2
-    server = EditorServer((args.host, args.port), project_dir)
+    try:
+        server = EditorServer((args.host, args.port), project_dir)
+    except CaptionPresetRecoveryError as exc:
+        journal = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
+        print(
+            "Editor was not started because a caption preset transaction could not "
+            "be recovered safely.\n"
+            f"Recovery journal retained at: {journal}\n"
+            "Do not delete or edit this journal. Fix the project disk space or file "
+            "permissions, then restart the editor. If the journal itself is corrupt, "
+            "contact support to recover the embedded before-backup instead of deleting it.\n"
+            f"Recovery detail: {exc}",
+            file=sys.stderr,
+        )
+        return 3
     url = f"http://{args.host}:{server.server_port}"
     print(json.dumps({"ok": True, "url": url, "project": str(project_dir)}, ensure_ascii=False))
     if args.open_browser:

@@ -9,6 +9,7 @@ import unittest
 import subprocess
 import time
 import hashlib
+import copy
 from unittest.mock import patch
 from pathlib import Path
 
@@ -314,8 +315,214 @@ class StylePresetStoreTests(unittest.TestCase):
         self.assertEqual(process.wait(timeout=5), 0)
         self.assertEqual(len(self.store.collection()["presets"]), 2)
 
+    def test_fx_catalog_drift_is_per_record_and_does_not_change_revision(self) -> None:
+        created = self.store.create(
+            self.store.collection()["revision"], "FX drift", "fx", fx_settings()
+        )
+        persisted_before = self.store.path.read_bytes()
+        revision_before = created["revision"]
+        drift = copy.deepcopy(style_presets.fx_overlay.catalog(refresh=True))
+        for effect in drift.get("effects", []):
+            if effect.get("code") == "T3":
+                effect["available"] = False
+
+        with patch.object(style_presets.fx_overlay, "catalog", return_value=drift) as catalog_mock:
+            collection = self.store.collection()
+            self.assertEqual(catalog_mock.call_count, 1)
+            unavailable = next(
+                item for item in collection["presets"] if item["id"] == created["preset"]["id"]
+            )
+            self.assertEqual(unavailable["availability"]["status"], "unavailable")
+            self.assertEqual(unavailable["availability"]["reason"], "effect_unavailable")
+            self.assertEqual(collection["revision"], revision_before)
+            self.assertEqual(self.store.path.read_bytes(), persisted_before)
+            with self.assertRaises(style_presets.StylePresetError) as unavailable_write:
+                self.store.update(
+                    unavailable["id"],
+                    collection["revision"],
+                    unavailable["name"],
+                    "fx",
+                    unavailable["settings"],
+                )
+            self.assertEqual(unavailable_write.exception.code, "effect_unavailable")
+
+            caption = self.store.create(
+                collection["revision"], "Caption survives drift", "caption", caption_settings()
+            )
+            deleted = self.store.delete(unavailable["id"], caption["revision"])
+            self.assertEqual(deleted["deleted_id"], unavailable["id"])
+            self.assertEqual([item["kind"] for item in deleted["presets"]], ["caption"])
+
+        with patch.object(
+            style_presets.fx_overlay,
+            "catalog",
+            return_value={"effects": None, "schemes": {}, "fonts": []},
+        ):
+            # The remaining library contains only a caption, so runtime FX
+            # catalog corruption is not consulted and cannot block caption CRUD.
+            caption_only = self.store.collection()
+            self.assertEqual([item["kind"] for item in caption_only["presets"]], ["caption"])
+
+        persisted = json.loads(self.store.path.read_text(encoding="utf-8"))
+        self.assertTrue(all("availability" not in record for record in persisted["presets"]))
+
+    def test_fx_missing_global_font_is_unavailable_but_schema_corruption_still_fails(self) -> None:
+        verified = next(
+            (
+                item for item in style_presets.fx_overlay.fonts_catalog().get("fonts", [])
+                if item.get("verified") is True
+            ),
+            None,
+        )
+        if verified is None:
+            self.skipTest("no verified global FX font fixture")
+        settings = fx_settings()
+        settings["font_ids"] = {"display": verified["id"]}
+        created = self.store.create(
+            self.store.collection()["revision"], "FX font", "fx", settings
+        )
+        missing_fonts_catalog = copy.deepcopy(style_presets.fx_overlay.catalog(refresh=True))
+        missing_fonts_catalog["fonts"] = []
+        with patch.object(
+            style_presets.fx_overlay, "catalog", return_value=missing_fonts_catalog
+        ) as catalog_mock:
+            collection = self.store.collection()
+            self.assertEqual(catalog_mock.call_count, 1)
+            record = next(item for item in collection["presets"] if item["id"] == created["preset"]["id"])
+            self.assertEqual(record["availability"]["reason"], "font_unavailable")
+
+        with patch.object(
+            style_presets.fx_overlay,
+            "catalog",
+            return_value={"effects": None, "schemes": {}, "fonts": []},
+        ):
+            malformed_runtime = self.store.collection()
+            self.assertEqual(
+                malformed_runtime["presets"][0]["availability"]["reason"],
+                "catalog_changed",
+            )
+
+        raw = json.loads(self.store.path.read_text(encoding="utf-8"))
+        raw["presets"][0]["settings"]["path"] = "/tmp/unsafe"
+        self.store.path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(style_presets.StylePresetError) as corrupt:
+            self.store.collection()
+        self.assertEqual(corrupt.exception.code, "store_corrupt")
+
+    def test_fx_catalog_import_failure_is_recoverable_but_new_fx_write_fails_closed(self) -> None:
+        created = self.store.create(
+            self.store.collection()["revision"], "FX import drift", "fx", fx_settings()
+        )
+        revision_before = created["revision"]
+        bytes_before = self.store.path.read_bytes()
+        with patch.object(
+            style_presets.fx_overlay,
+            "catalog",
+            side_effect=ImportError("injected missing compose dependency"),
+        ):
+            collection = self.store.collection()
+            self.assertEqual(collection["revision"], revision_before)
+            self.assertEqual(self.store.path.read_bytes(), bytes_before)
+            self.assertEqual(
+                collection["presets"][0]["availability"]["reason"],
+                "catalog_changed",
+            )
+            with self.assertRaises(style_presets.StylePresetError) as rejected_write:
+                self.store.create(
+                    collection["revision"], "new FX", "fx", fx_settings()
+                )
+            self.assertEqual(rejected_write.exception.code, "catalog_changed")
+
+            caption = self.store.create(
+                collection["revision"], "Caption remains usable", "caption", caption_settings()
+            )
+            deleted = self.store.delete(created["preset"]["id"], caption["revision"])
+            self.assertEqual(deleted["deleted_id"], created["preset"]["id"])
+            self.assertEqual([item["kind"] for item in deleted["presets"]], ["caption"])
+
+    def test_fx_catalog_general_exceptions_are_typed_without_swallowing_base_exceptions(self) -> None:
+        class CatalogProbeError(Exception):
+            pass
+
+        for index, failure in enumerate(
+            (
+                KeyError("effects"),
+                AttributeError("catalog root has no get"),
+                CatalogProbeError("unexpected runtime catalog failure"),
+            )
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                store = style_presets.StylePresetStore(
+                    self.temp_root / f"catalog-exception-{index}"
+                )
+                created = store.create(
+                    store.collection()["revision"], "FX", "fx", fx_settings()
+                )
+                revision_before = created["revision"]
+                bytes_before = store.path.read_bytes()
+                with patch.object(
+                    style_presets.fx_overlay, "catalog", side_effect=failure
+                ):
+                    collection = store.collection()
+                    self.assertEqual(collection["revision"], revision_before)
+                    self.assertEqual(store.path.read_bytes(), bytes_before)
+                    self.assertEqual(
+                        collection["presets"][0]["availability"]["reason"],
+                        "catalog_changed",
+                    )
+                    with self.assertRaises(style_presets.StylePresetError) as rejected:
+                        store.create(
+                            collection["revision"], "new FX", "fx", fx_settings()
+                        )
+                    self.assertEqual(rejected.exception.code, "catalog_changed")
+                    caption = store.create(
+                        collection["revision"],
+                        "Caption remains usable",
+                        "caption",
+                        caption_settings(),
+                    )
+                    deleted = store.delete(created["preset"]["id"], caption["revision"])
+                    self.assertEqual(deleted["deleted_id"], created["preset"]["id"])
+                    self.assertEqual(
+                        [item["kind"] for item in deleted["presets"]], ["caption"]
+                    )
+
+        for base_failure in (KeyboardInterrupt(), SystemExit(9)):
+            with self.subTest(base_failure=type(base_failure).__name__):
+                store = style_presets.StylePresetStore(
+                    self.temp_root / f"base-exception-{type(base_failure).__name__}"
+                )
+                store.create(store.collection()["revision"], "FX", "fx", fx_settings())
+                with patch.object(
+                    style_presets.fx_overlay, "catalog", side_effect=base_failure
+                ):
+                    with self.assertRaises(type(base_failure)):
+                        store.collection()
+                    with self.assertRaises(type(base_failure)):
+                        store.create(
+                            style_presets.revision_for_document(
+                                json.loads(store.path.read_text(encoding="utf-8"))
+                            ),
+                            "new FX",
+                            "fx",
+                            fx_settings(),
+                        )
+
     def test_environment_override_is_explicit_and_default_is_not_touched(self) -> None:
         override = self.temp_root / "override"
+        fake_home = self.temp_root / "fake-home"
+        fake_default = fake_home / "AutoEditStudio" / "presets"
+        fake_default.mkdir(parents=True)
+        operator_bytes = (
+            json.dumps(
+                style_presets.empty_document(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        (fake_default / "presets.json").write_bytes(operator_bytes)
         old = os.environ.get("AUTO_EDIT_PRESETS_DIR")
         os.environ["AUTO_EDIT_PRESETS_DIR"] = str(override)
         self.addCleanup(
@@ -323,9 +530,16 @@ class StylePresetStoreTests(unittest.TestCase):
             if old is not None
             else os.environ.pop("AUTO_EDIT_PRESETS_DIR", None)
         )
-        store = style_presets.StylePresetStore()
-        self.assertEqual(store.directory, override)
-        self.assertFalse((Path.home() / "AutoEditStudio" / "presets").exists())
+        with patch.object(Path, "home", return_value=fake_home):
+            store = style_presets.StylePresetStore()
+            self.assertEqual(store.directory, override)
+            self.assertEqual(store.collection()["presets"], [])
+            os.environ.pop("AUTO_EDIT_PRESETS_DIR", None)
+            default_store = style_presets.StylePresetStore()
+            self.assertEqual(default_store.directory, fake_default)
+            self.assertEqual(default_store.collection()["presets"], [])
+        self.assertEqual((fake_default / "presets.json").read_bytes(), operator_bytes)
+        self.assertFalse(override.exists())
 
 
 class StylePresetApiTests(unittest.TestCase):
@@ -426,6 +640,37 @@ class StylePresetApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, deleted)
         self.assertEqual(set(deleted), {"ok", "revision", "presets", "deleted_id"})
+
+    def test_http_fx_drift_metadata_allows_delete_without_revision_change(self) -> None:
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        status, created = self.request("POST", "/api/style-presets", {
+            "expected_library_revision": empty["revision"],
+            "name": "HTTP FX drift",
+            "kind": "fx",
+            "settings": fx_settings(),
+        })
+        self.assertEqual(status, 201, created)
+        persisted_before = self.harness.server.style_preset_store.path.read_bytes()
+        drift = copy.deepcopy(style_presets.fx_overlay.catalog(refresh=True))
+        for effect in drift.get("effects", []):
+            if effect.get("code") == "T3":
+                effect["available"] = False
+        with patch.object(style_presets.fx_overlay, "catalog", return_value=drift):
+            status, collection = self.request("GET", "/api/style-presets")
+            self.assertEqual(status, 200, collection)
+            self.assertEqual(collection["revision"], created["revision"])
+            self.assertEqual(collection["presets"][0]["availability"]["reason"], "effect_unavailable")
+            self.assertEqual(
+                self.harness.server.style_preset_store.path.read_bytes(), persisted_before
+            )
+            status, deleted = self.request(
+                "DELETE",
+                f"/api/style-presets/{created['preset']['id']}",
+                {"expected_library_revision": collection["revision"]},
+            )
+            self.assertEqual(status, 200, deleted)
+            self.assertEqual(deleted["presets"], [])
 
     def test_caption_plan_apply_digest_and_no_change_are_transactional(self) -> None:
         _state, project_revision = self.install_caption()
@@ -613,6 +858,34 @@ class StylePresetApiTests(unittest.TestCase):
             (self.harness.project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL).exists()
         )
 
+    def test_corrupt_recovery_journal_keeps_editor_offline_with_actionable_cli_error(self) -> None:
+        project = self.harness.project.resolve()
+        journal = project / editor_server.CAPTION_PRESET_TXN_JOURNAL_REL
+        journal.write_bytes(b"{corrupt-journal")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "editor_server.py"),
+                "--project-dir",
+                str(project),
+                "--port",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env=dict(os.environ),
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn(str(journal), result.stderr)
+        self.assertIn("Do not delete or edit this journal", result.stderr)
+        self.assertIn("disk space or file permissions", result.stderr)
+        self.assertIn("embedded before-backup", result.stderr)
+        self.assertTrue(journal.is_file())
+        self.assertEqual(journal.read_bytes(), b"{corrupt-journal")
+
     def test_caption_apply_retains_journal_when_rollback_itself_fails(self) -> None:
         _state, project_revision = self.install_caption()
         manifest_path = self.harness.project / "project.json"
@@ -733,6 +1006,97 @@ class StylePresetApiTests(unittest.TestCase):
             self.assertNotEqual(target["style"]["font_asset_id"], item1["asset_id"])
         finally:
             second.doCleanups()
+
+    def test_verified_font_can_replace_invalid_old_font_without_using_fallback(self) -> None:
+        valid_item, _receipt = publish_verified_font(self.harness.project, "Replacement")
+        fonts = asset_registry.list_project_fonts(self.harness.project)
+        descriptor = {
+            key: fonts[0][key] for key in ("sha256", "family", "style", "weight")
+        }
+        state, _revision = self.install_caption()
+        state_path = self.harness.project / "working/editor_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        target = next(
+            item for item in state["overlays"] if item["id"] == "caption-preset-target"
+        )
+        invalid_old_id = "font-google-fonts-" + "0" * 16 + "-" + "1" * 16
+        target["style"]["font_asset_id"] = invalid_old_id
+        target["style"]["font_family"] = "Unverified fallback must not survive"
+        state["revision"] = editor_server.editor_state_revision(state)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        status, created = self.request("POST", "/api/style-presets", {
+            "expected_library_revision": empty["revision"],
+            "name": "修復失效字型",
+            "kind": "caption",
+            "settings": {"style": {"font_size": 44}, "font": descriptor},
+        })
+        self.assertEqual(status, 201, created)
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": state["revision"],
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+        font_change = next(change for change in plan["changes"] if change["field"] == "font")
+        self.assertEqual(font_change["before"], None)
+        self.assertIs(font_change["before_unavailable"], True)
+        self.assertEqual(font_change["after"], descriptor)
+        self.assertNotIn(invalid_old_id, json.dumps(plan))
+
+        status, applied = self.request("POST", "/api/style-presets/caption-apply", {
+            **base,
+            "plan_digest": plan["plan_digest"],
+        })
+        self.assertEqual(status, 200, applied)
+        applied_target = next(
+            item for item in applied["state"]["overlays"]
+            if item["id"] == "caption-preset-target"
+        )
+        self.assertEqual(applied_target["style"]["font_asset_id"], valid_item["asset_id"])
+        self.assertEqual(applied_target["style"]["font_family"], descriptor["family"])
+        self.assertNotEqual(applied_target["style"]["font_asset_id"], invalid_old_id)
+
+    def test_replacement_font_still_blocks_when_new_font_lacks_text_coverage(self) -> None:
+        publish_verified_font(self.harness.project, "CoverageBound")
+        fonts = asset_registry.list_project_fonts(self.harness.project)
+        descriptor = {
+            key: fonts[0][key] for key in ("sha256", "family", "style", "weight")
+        }
+        _state, _revision = self.install_caption()
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        status, created = self.request("POST", "/api/style-presets", {
+            "expected_library_revision": empty["revision"],
+            "name": "Coverage strict",
+            "kind": "caption",
+            "settings": {"style": {"font_size": 44}, "font": descriptor},
+        })
+        self.assertEqual(status, 201, created)
+
+        state_path = self.harness.project / "working/editor_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        target = next(
+            item for item in state["overlays"] if item["id"] == "caption-preset-target"
+        )
+        target["text"] = "龍"
+        target["style"]["font_asset_id"] = "font-google-fonts-" + "0" * 16 + "-" + "1" * 16
+        state["revision"] = editor_server.editor_state_revision(state)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        status, blocked = self.request("POST", "/api/style-presets/caption-plan", {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": state["revision"],
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        })
+        self.assertEqual(status, 409, blocked)
+        self.assertEqual(blocked["reason"], "font_coverage_failed")
 
 
 if __name__ == "__main__":

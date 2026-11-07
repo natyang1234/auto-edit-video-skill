@@ -5886,6 +5886,7 @@ function deskWireAutoVisuals() {
 
 // Portable presets contain only the documented settings, never project state.
 let presetLibrary = { revision: "", presets: [] };
+let presetLibraryEpoch = 0;
 const presetNode = (id) => document.getElementById(id);
 function presetStatus(message) { presetNode("preset-status").textContent = message; }
 function presetSelected() { return presetLibrary.presets.find((p) => p.id === presetNode("preset-list").value) || null; }
@@ -5896,13 +5897,21 @@ function presetSetLibrary(result, selected = "") {
   list.replaceChildren(placeholder);
   for (const preset of presetLibrary.presets) {
     const option = document.createElement("option"); option.value = preset.id;
-    option.textContent = `${preset.name}（${preset.kind === "caption" ? "字幕" : "特效"}）`; list.append(option);
+    const unavailable = preset.availability?.status === "unavailable";
+    option.textContent = `${preset.name}（${preset.kind === "caption" ? "字幕" : "特效"}${unavailable ? preset.availability.reason === "font_unavailable" ? "・缺字型" : "・暫時不可用" : ""}）`; list.append(option);
   }
   list.value = selected;
 }
 async function presetLoad() {
-  try { const result = await request("/api/style-presets"); const selected = presetNode("preset-list").value; presetSetLibrary(result, selected); presetStatus("預設庫已載入。"); }
-  catch (error) { presetStatus(`預設庫讀取失敗：${error.message}`); }
+  const epoch = ++presetLibraryEpoch;
+  try {
+    const result = await request("/api/style-presets");
+    if (epoch !== presetLibraryEpoch) return;
+    const selected = presetNode("preset-list").value;
+    presetSetLibrary(result, selected);
+    const current = presetSelected();
+    presetStatus(current?.availability?.status === "unavailable" ? (current.availability.message || "此預設暫時不可用，可更新或刪除。") : "預設庫已載入。");
+  } catch (error) { if (epoch === presetLibraryEpoch) presetStatus(`預設庫讀取失敗：${error.message}`); }
 }
 function presetCapture() {
   const overlay = currentOverlay();
@@ -6006,6 +6015,7 @@ async function presetMutate(method) {
     } else if (!await presetReview(`刪除「${selected.name}」`, `將刪除預設「${selected.name}」。`, "確認刪除")) return;
     const url = `/api/style-presets${method === "POST" ? "" : `/${encodeURIComponent(selected.id)}`}`;
     const result = await request(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    presetLibraryEpoch += 1;
     presetSetLibrary(result, method === "DELETE" ? "" : selected?.id || ""); presetStatus(method === "DELETE" ? "已刪除預設。" : body.kind === "caption" && !body.settings.font ? "已儲存預設。未包含已驗證字型；套用時保留目標字型。" : "已儲存預設。");
   } catch (error) { presetStatus(`操作失敗：${error.message}${error.status === 409 ? "；請重新開啟預設庫取得最新清單。" : ""}`); }
   finally { if (presetNode("preset-review").open) presetNode("preset-review").close(); }
@@ -6017,6 +6027,7 @@ async function presetApply() {
     if (stateDirty || presetSaveInFlight || !lastSaveSucceeded) throw new Error("目前編輯尚未儲存完成，請稍候再試。");
     const overlay = currentOverlay();
     if (preset.kind === "fx") {
+      if (preset.availability?.status === "unavailable") throw new Error(preset.availability.message || (preset.availability.reason === "font_unavailable" ? "此預設缺少字型，請更新或刪除。" : "此預設暫時不可用，請更新或刪除。"));
       const before = overlay?.type === "fx" ? { code: overlay.code, values: overlay.values || {}, placement: overlay.placement || "", scheme: overlay.scheme || "", font_ids: overlay.font_ids || {}, opacity: overlay.style?.opacity ?? 1, text_fit: overlay.text_fit !== false } : {};
       if (!fxEffectByCode(preset.settings.code)) throw new Error("目前效果庫沒有這個特效。");
       if (!await presetReview(`試看「${preset.name}」`, `${overlay?.type === "fx" ? "將替換目前特效" : "將在目前位置新增特效"}，確認試看後仍需在試看畫面套用。\n${presetDiff(before, preset.settings)}`, "前往試看")) return;
@@ -6035,7 +6046,7 @@ async function presetApply() {
     const changes = Array.isArray(plan.changes) ? plan.changes : [];
     const grouped = new Map();
     for (const change of changes) {
-      const line = `${labels[change.field] || change.field}：${display(change.before, change.field)} → ${display(change.after, change.field)}`;
+      const line = `${labels[change.field] || change.field}：${change.field === "font" && change.before_unavailable ? "目前字型不可用" : display(change.before, change.field)} → ${display(change.after, change.field)}`;
       grouped.set(line, (grouped.get(line) || 0) + 1);
     }
     const allLines = [...grouped].map(([line, count]) => `${line}${count > 1 ? `（${count} 個字幕）` : ""}`);
@@ -6061,7 +6072,13 @@ async function presetApply() {
 }
 function bindStylePresets() {
   presetNode("style-presets").addEventListener("toggle", (event) => { if (event.currentTarget.open) presetLoad(); });
-  presetNode("preset-list").addEventListener("change", () => { const preset = presetSelected(); if (preset) presetNode("preset-name").value = preset.name; });
+  presetNode("preset-list").addEventListener("change", () => {
+    const preset = presetSelected();
+    if (preset) {
+      presetNode("preset-name").value = preset.name;
+      if (preset.availability?.status === "unavailable") presetStatus(preset.availability.message || "此預設暫時不可用，可更新或刪除。");
+    }
+  });
   presetNode("preset-create").addEventListener("click", () => presetMutate("POST"));
   presetNode("preset-update").addEventListener("click", () => presetMutate("PUT"));
   presetNode("preset-delete").addEventListener("click", () => presetMutate("DELETE"));

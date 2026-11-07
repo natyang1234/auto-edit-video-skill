@@ -140,32 +140,24 @@ def normalize_caption_settings(value: Any) -> dict[str, Any]:
     return {"style": style, "font": normalize_font_descriptor(value.get("font"))}
 
 
-def normalize_fx_settings(value: Any) -> dict[str, Any]:
+def _normalize_fx_settings_static(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != FX_KEYS:
         raise StylePresetError(422, "settings_invalid", "FX 預設欄位不符合規格")
     code = value.get("code")
     if not isinstance(code, str) or re.fullmatch(r"[A-Z][0-9]{1,3}", code) is None:
         raise StylePresetError(422, "settings_invalid", "FX code 無效")
-    catalog = fx_overlay.catalog(refresh=True)
-    effect = next(
-        (item for item in catalog.get("effects", []) if isinstance(item, dict) and item.get("code") == code),
-        None,
-    )
-    if effect is None or effect.get("available") is False:
-        raise StylePresetError(422, "settings_invalid", "FX 效果目前不可用")
     values = value.get("values")
     if not isinstance(values, dict) or len(values) > 32:
         raise StylePresetError(422, "settings_invalid", "FX 文字參數格式無效")
-    allowed = {
-        str(item.get("id"))
-        for item in effect.get("vars", [])
-        if isinstance(item, dict) and item.get("kind") == "text"
-    }
     normalized_values: dict[str, str | int | float] = {}
     total = 0
     for key, item in values.items():
-        if not isinstance(key, str) or key not in allowed:
-            raise StylePresetError(422, "settings_invalid", "FX 文字參數含未支援欄位")
+        if (
+            not isinstance(key, str)
+            or not 1 <= len(key) <= 80
+            or any(unicodedata.category(ch) == "Cc" for ch in key)
+        ):
+            raise StylePresetError(422, "settings_invalid", "FX 文字參數欄位無效")
         if isinstance(item, bool) or not isinstance(item, (str, int, float)):
             raise StylePresetError(422, "settings_invalid", "FX 文字參數格式無效")
         if isinstance(item, float) and not math.isfinite(item):
@@ -177,21 +169,29 @@ def normalize_fx_settings(value: Any) -> dict[str, Any]:
     if total > 8192:
         raise StylePresetError(422, "settings_invalid", "FX 文字參數總長度過長")
     placement = value.get("placement")
-    if not isinstance(placement, str):
-        raise StylePresetError(422, "settings_invalid", "FX placement 無效")
-    has_placement = any(
-        isinstance(item, dict) and item.get("kind") == "placement"
-        for item in effect.get("vars", [])
-    )
-    if placement and (not has_placement or placement not in {"top", "bottom", "left", "right"}):
+    if placement not in {"", "top", "bottom", "left", "right"}:
         raise StylePresetError(422, "settings_invalid", "FX placement 無效")
     scheme = value.get("scheme")
-    if not isinstance(scheme, str) or (scheme and scheme not in catalog.get("schemes", {})):
+    if (
+        not isinstance(scheme, str)
+        or len(scheme) > 80
+        or any(unicodedata.category(ch) == "Cc" for ch in scheme)
+    ):
         raise StylePresetError(422, "settings_invalid", "FX scheme 無效")
     font_ids = value.get("font_ids")
-    font_errors = fx_overlay.validate_font_ids(font_ids)
-    if font_errors:
-        raise StylePresetError(422, "settings_invalid", "FX font_ids 未通過驗證")
+    if not isinstance(font_ids, dict) or len(font_ids) > len(fx_overlay.FONT_ROLES):
+        raise StylePresetError(422, "settings_invalid", "FX font_ids 格式無效")
+    normalized_fonts: dict[str, str] = {}
+    for role, font_id in font_ids.items():
+        if role not in fx_overlay.FONT_ROLES:
+            raise StylePresetError(422, "settings_invalid", "FX font role 無效")
+        if (
+            not isinstance(font_id, str)
+            or len(font_id) > 120
+            or any(unicodedata.category(ch) == "Cc" for ch in font_id)
+        ):
+            raise StylePresetError(422, "settings_invalid", "FX font id 無效")
+        normalized_fonts[role] = font_id
     try:
         opacity = fx_preview_contract.normalize_fx_opacity(value.get("opacity"))
     except fx_preview_contract.FxPreviewContractError as exc:
@@ -203,10 +203,53 @@ def normalize_fx_settings(value: Any) -> dict[str, Any]:
         "values": dict(sorted(normalized_values.items())),
         "placement": placement,
         "scheme": scheme,
-        "font_ids": dict(sorted((font_ids or {}).items())),
+        "font_ids": dict(sorted(normalized_fonts.items())),
         "opacity": opacity,
         "text_fit": value["text_fit"],
     }
+
+
+def normalize_fx_settings(
+    value: Any, *, catalog: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Validate an FX preset write against current runtime capabilities."""
+    normalized = _normalize_fx_settings_static(value)
+    try:
+        current_catalog = catalog if catalog is not None else fx_overlay.catalog(refresh=True)
+    except Exception as exc:
+        raise StylePresetError(422, "catalog_changed", "目前無法載入 FX 目錄") from exc
+    if (
+        not isinstance(current_catalog, dict)
+        or not isinstance(current_catalog.get("effects"), list)
+        or not isinstance(current_catalog.get("schemes"), dict)
+    ):
+        raise StylePresetError(422, "catalog_changed", "FX 目錄格式目前無效")
+    effect = next(
+        (
+            item for item in current_catalog.get("effects", [])
+            if isinstance(item, dict) and item.get("code") == normalized["code"]
+        ),
+        None,
+    )
+    if effect is None or effect.get("available") is False:
+        raise StylePresetError(422, "effect_unavailable", "FX 效果目前不可用")
+    allowed = {
+        str(item.get("id")) for item in effect.get("vars", [])
+        if isinstance(item, dict) and item.get("kind") == "text"
+    }
+    if set(normalized["values"]) - allowed:
+        raise StylePresetError(422, "catalog_changed", "FX 文字欄位已不受目前版本支援")
+    has_placement = any(
+        isinstance(item, dict) and item.get("kind") == "placement"
+        for item in effect.get("vars", [])
+    )
+    if normalized["placement"] and not has_placement:
+        raise StylePresetError(422, "catalog_changed", "FX placement 已不受目前版本支援")
+    if normalized["scheme"] and normalized["scheme"] not in current_catalog.get("schemes", {}):
+        raise StylePresetError(422, "catalog_changed", "FX 配色已不受目前版本支援")
+    if fx_overlay.validate_font_ids(normalized["font_ids"]):
+        raise StylePresetError(422, "font_unavailable", "FX 全域字型目前不可用")
+    return normalized
 
 
 def normalize_settings(kind: Any, value: Any) -> dict[str, Any]:
@@ -226,7 +269,12 @@ def _normalize_record(value: Any) -> dict[str, Any]:
         raise StylePresetError(409, "store_corrupt", "預設識別碼毀損")
     name = normalize_name(value.get("name"))
     kind = value.get("kind")
-    settings = normalize_settings(kind, value.get("settings"))
+    if kind == "caption":
+        settings = normalize_caption_settings(value.get("settings"))
+    elif kind == "fx":
+        settings = _normalize_fx_settings_static(value.get("settings"))
+    else:
+        raise StylePresetError(422, "kind_invalid", "預設 kind 必須是 caption 或 fx")
     created_at = value.get("created_at")
     updated_at = value.get("updated_at")
     for timestamp in (created_at, updated_at):
@@ -354,10 +402,99 @@ class StylePresetStore:
 
     def collection(self) -> dict[str, Any]:
         document = self._load_unlocked()
-        return {
-            "revision": revision_for_document(document),
-            "presets": copy.deepcopy(document["presets"]),
+        return self._public_collection(document)
+
+    @staticmethod
+    def _availability(
+        record: dict[str, Any],
+        catalog: dict[str, Any] | None,
+        fonts: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if record["kind"] == "caption":
+            return {"status": "available", "reason": None, "message": None}
+        settings = record["settings"]
+        if catalog is None:
+            return {
+                "status": "unavailable",
+                "reason": "catalog_changed",
+                "message": "目前無法載入 FX 目錄，預設仍可刪除或稍後重試",
+            }
+        effect = next(
+            (
+                item for item in catalog.get("effects", [])
+                if isinstance(item, dict) and item.get("code") == settings["code"]
+            ),
+            None,
+        )
+        if effect is None or effect.get("available") is False:
+            return {
+                "status": "unavailable",
+                "reason": "effect_unavailable",
+                "message": f"FX {settings['code']} 在目前電腦不可用",
+            }
+        allowed = {
+            str(item.get("id")) for item in effect.get("vars", [])
+            if isinstance(item, dict) and item.get("kind") == "text"
         }
+        has_placement = any(
+            isinstance(item, dict) and item.get("kind") == "placement"
+            for item in effect.get("vars", [])
+        )
+        if (
+            set(settings["values"]) - allowed
+            or (settings["placement"] and not has_placement)
+            or (settings["scheme"] and settings["scheme"] not in catalog.get("schemes", {}))
+        ):
+            return {
+                "status": "unavailable",
+                "reason": "catalog_changed",
+                "message": "FX 預設欄位已不受目前目錄版本支援",
+            }
+        by_id = fonts.get("by_id", {}) if isinstance(fonts, dict) else {}
+        if any(
+            font_id
+            and (
+                not isinstance(by_id.get(font_id), dict)
+                or by_id[font_id].get("verified") is not True
+            )
+            for font_id in settings["font_ids"].values()
+        ):
+            return {
+                "status": "unavailable",
+                "reason": "font_unavailable",
+                "message": "FX 預設使用的全域字型在目前電腦缺少或驗證失敗",
+            }
+        return {"status": "available", "reason": None, "message": None}
+
+    def _public_collection(self, document: dict[str, Any]) -> dict[str, Any]:
+        catalog: dict[str, Any] | None = None
+        if any(record["kind"] == "fx" for record in document["presets"]):
+            try:
+                catalog = fx_overlay.catalog(refresh=True)
+            except Exception:
+                catalog = None
+            if (
+                not isinstance(catalog, dict)
+                or not isinstance(catalog.get("effects"), list)
+                or not isinstance(catalog.get("schemes"), dict)
+                or not isinstance(catalog.get("fonts"), list)
+            ):
+                catalog = None
+        fonts = (
+            {
+                "by_id": {
+                    item["id"]: item
+                    for item in catalog.get("fonts", [])
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                }
+            }
+            if isinstance(catalog, dict)
+            else None
+        )
+        presets = copy.deepcopy(document["presets"])
+        for record in presets:
+            record["availability"] = self._availability(record, catalog, fonts)
+        return {"revision": revision_for_document(document), "presets": presets}
 
     @contextmanager
     def locked_collection(self):
@@ -390,10 +527,7 @@ class StylePresetStore:
                 raise StylePresetError(409, "store_unsafe", "預設鎖檔不安全")
             fcntl.flock(lock_fd, fcntl.LOCK_SH)
             document = self._load_unlocked(directory_fd)
-            yield {
-                "revision": revision_for_document(document),
-                "presets": copy.deepcopy(document["presets"]),
-            }
+            yield self._public_collection(document)
         finally:
             os.close(lock_fd)
             os.close(directory_fd)
@@ -477,10 +611,7 @@ class StylePresetStore:
                 raise StylePresetError(409, "library_revision_conflict", "預設清單已變更，請重新載入")
             operation(document)
             self._write_unlocked(document, directory_fd)
-            return {
-                "revision": revision_for_document(document),
-                "presets": copy.deepcopy(document["presets"]),
-            }
+            return self._public_collection(document)
         finally:
             os.close(lock_fd)
             os.close(directory_fd)
@@ -513,7 +644,9 @@ class StylePresetStore:
             created.update(copy.deepcopy(record))
 
         result = self._mutate(expected_revision, operation)
-        result["preset"] = created
+        result["preset"] = next(
+            item for item in result["presets"] if item["id"] == created["id"]
+        )
         return result
 
     def update(self, preset_id: str, expected_revision: Any, name: Any, kind: Any, settings: Any) -> dict[str, Any]:
@@ -537,7 +670,9 @@ class StylePresetStore:
             updated.update(copy.deepcopy(record))
 
         result = self._mutate(expected_revision, operation)
-        result["preset"] = updated
+        result["preset"] = next(
+            item for item in result["presets"] if item["id"] == updated["id"]
+        )
         return result
 
     def delete(self, preset_id: str, expected_revision: Any) -> dict[str, Any]:
