@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -126,27 +127,32 @@ def catalog(refresh: bool = False) -> dict[str, Any]:
 
 FONT_ROLES = ("display", "body", "mono", "hand")
 _FONTS: dict[str, Any] | None = None
-_FILE_DIGESTS: dict[str, tuple[tuple[int, int, int], str]] = {}
-
-
 def _file_digest(path: Path) -> str:
-    """sha256 of a font file, cached by (inode, size, mtime_ns) so a swapped file is re-hashed."""
+    """Reliably hash current font bytes at a render/cache authority boundary."""
     import hashlib
     try:
-        st = path.stat()
+        st = path.lstat()
     except OSError:
         return ""
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink() or not stat.S_ISREG(st.st_mode):
         return ""
-    key = (st.st_ino, st.st_size, st.st_mtime_ns)
-    hit = _FILE_DIGESTS.get(str(path))
-    if hit and hit[0] == key:
-        return hit[1]
     h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    _FILE_DIGESTS[str(path)] = (key, h.hexdigest())
+    try:
+        flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as fh:
+            opened = os.fstat(fh.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                return ""
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+            after = path.lstat()
+            if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                after.st_dev, after.st_ino, after.st_size
+            ):
+                return ""
+    except OSError:
+        return ""
     return h.hexdigest()
 
 
@@ -236,7 +242,7 @@ def font_files_for(font_ids: Any) -> dict[str, str]:
 def fonts_digest_for(state: dict[str, Any]) -> str:
     """Digest of the font catalog version plus the files behind every font id an fx layer uses."""
     import hashlib
-    cat = fonts_catalog()
+    cat = fonts_catalog(refresh=True)
     h = hashlib.sha256(cat["version"].encode())
     for o in state.get("overlays", []) if isinstance(state.get("overlays"), list) else []:
         if isinstance(o, dict) and o.get("type") == "fx" and isinstance(o.get("font_ids"), dict):
@@ -413,8 +419,13 @@ def _person_clip(project_dir: Path, source: Path, start: float, dur: float, fit:
     return assets[0] if assets else None
 
 
+class SubjectTrackingError(ValueError):
+    """The requested subject could not be followed without changing identity."""
+
+
 def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path, pack_id: str | None,
-                        quality: str = "draft", canvas: tuple[int, int] | None = None, fit: str = "cover") -> dict[str, Any] | None:
+                        quality: str = "draft", canvas: tuple[int, int] | None = None, fit: str = "cover",
+                        material: dict[str, Any] | None = None, asset_project: Path | None = None) -> dict[str, Any] | None:
     """Render one fx overlay to a transparent .mov under working/fx/; None on failure."""
     if not available():
         _log({"layer": overlay.get("id"), "reason": "edit-style-profiles skill unavailable"})
@@ -443,6 +454,31 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
     workdir.mkdir(parents=True, exist_ok=True)
     person = None
     mask = None
+    if code == "B1":
+        import fx_preview_contract
+        owner = Path(asset_project or project_dir)
+        binding = material or overlay.get("material")
+        try:
+            binding = fx_preview_contract.verify_material_binding(owner, binding)
+        except fx_preview_contract.FxPreviewContractError as exc:
+            _log({"layer": overlay.get("id"), "code": code, "reason": exc.code})
+            return None
+        import shutil
+        import hashlib
+        original = owner / binding["path"]
+        local = workdir / "bound-assets" / (binding["sha256"] + original.suffix.lower())
+        local.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(original, local)
+        if hashlib.sha256(local.read_bytes()).hexdigest() != binding["sha256"]:
+            local.unlink(missing_ok=True)
+            _log({"layer": overlay.get("id"), "code": code, "reason": "material changed during copy"})
+            return None
+        try:
+            fx_preview_contract.verify_material_binding(owner, binding)
+        except fx_preview_contract.FxPreviewContractError:
+            local.unlink(missing_ok=True)
+            return None
+        material = dict(binding, path=str(local))
     try:
         eff = next(e for e in catalog()["effects"] if e["code"] == code)
     except StopIteration:
@@ -455,15 +491,20 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
             return None
         person, mask = assets
     try:
+        compose_quality = quality if quality in {"draft", "standard"} else "final"
         rep = compose.render_clip(str(source), start, dur, code, theme, main, scheme, values, placement, None,
-                                  str(person) if person else None, "draft" if quality != "final" else "final",
+                                  str(person) if person else None, compose_quality,
                                   str(workdir), "mov", log=lambda m: None, fonts=fonts or None,
                                   font_files=font_files_for(overlay.get("font_ids")) or None,
                                   spotlight_mask={"path": str(mask), "start": 0.0} if mask else None,
-                                  strict_source=True, strict_fit=fit)
+                                  strict_source=True, strict_fit=fit, material=material, subject=overlay.get("subject"),
+                                  text_fit=bool(overlay.get("text_fit", True)),
+                                  face_model=Path(__file__).resolve().parent.parent / "assets/models/yunet/face_detection_yunet_2026may.onnx")
     except SystemExit as exc:
         _log({"layer": overlay.get("id"), "code": code, "error": str(exc)})
         return None
+    if code == "P5" and isinstance(rep.get("spotlight"), dict) and rep["spotlight"].get("status") == "lost":
+        raise SubjectTrackingError("選取的主角已失去追蹤，請換取樣時窗或重新選人")
     if not rep.get("ok"):
         _log({"layer": overlay.get("id"), "code": code, "error": rep.get("log", "")[-400:]})
         return None
@@ -473,7 +514,8 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
     out = Path(rep["out"])
     return {"source": str(out.relative_to(project_dir)), "cached": rep.get("cached"), "seconds": rep.get("seconds"),
             "theme": theme, "main": main, "scheme": scheme or main, "code": code, "block": eff["block"],
-            "fonts": fonts, "person": str(person.relative_to(project_dir)) if person else None}
+            "text_layout": rep.get("text_layout"), "spotlight": rep.get("spotlight"), "fonts": fonts, "person": str(person.relative_to(project_dir)) if person else None,
+            "material": {k: material[k] for k in ("asset_id", "path", "sha256", "kind") if k in material} if material else None}
 
 
 def plan_from_menu(state: dict[str, Any], duration: float, codes: list[str], theme: str = "",

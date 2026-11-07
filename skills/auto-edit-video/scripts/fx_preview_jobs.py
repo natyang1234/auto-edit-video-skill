@@ -10,6 +10,7 @@ post-render checks.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import fx_overlay
+import fx_preview_contract
 
 
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -39,12 +41,13 @@ MAX_REQUEST_VALUES = 32
 MAX_VALUE_CHARS = 500
 MAX_TOTAL_VALUE_CHARS = 8192
 MAX_PREVIEW_BYTES = 256 * 1024 * 1024
+MAX_RESULT_JSON_BYTES = 2 * 1024 * 1024
 RENDER_TIMEOUT_S = 15 * 60
 TERMINAL_TTL_S = 30 * 60
 CACHE_IDLE_TTL_S = 24 * 60 * 60
 CACHE_MAX_ITEMS = 32
 CACHE_MAX_BYTES = 512 * 1024 * 1024
-RENDER_CONTRACT_VERSION = "fx-preview-render-v1"
+RENDER_CONTRACT_VERSION = "fx-preview-render-v2"
 
 _PHASE_MESSAGES = {
     "queued": "已排入本機預覽工作",
@@ -107,12 +110,258 @@ def _read_json(path: Path) -> Any:
         return None
 
 
+def _read_json_limited(path: Path, maximum: int) -> Any:
+    try:
+        if path.stat().st_size > maximum:
+            return None
+    except OSError:
+        return None
+    return _read_json(path)
+
+
+_TEXT_LAYOUT_MEASUREMENTS = {"composition-dom", "unavailable", "disabled"}
+_TEXT_LAYOUT_STATUSES = {"warn", "pass", "skipped"}
+_TEXT_LAYOUT_SCOPES = {"single-fx-and-source-frame", "individual-fx-layout"}
+_FACE_MEASUREMENTS = {
+    "source-person-mask", "source-opencv-haar", "source-opencv-yunet",
+    "source-yunet", "unavailable",
+}
+_TEXT_FINDINGS = {
+    "safe_area", "text_overflow", "subject_overlap", "face_overlap",
+    "subject_measurement_unavailable", "dom_measurement_unavailable",
+    "composite_subject_measurement_unavailable", "unrecognized_warning",
+}
+
+
+def _bounded_text(value: Any, maximum: int = 160) -> str | None:
+    return value[:maximum] if isinstance(value, str) else None
+
+
+def _bounded_number(
+    value: Any, *, minimum: float = -1_000_000, maximum: float = 1_000_000
+) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        return None
+    return round(number, 6)
+
+
+def _sanitize_layout_box(value: Any, budget: dict[str, int]) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or budget["boxes"] <= 0:
+        return None
+    output: dict[str, Any] = {}
+    for key in ("id", "fontFamily"):
+        text_value = _bounded_text(value.get(key), 120 if key == "id" else 160)
+        if text_value is not None:
+            output[key] = text_value
+    for key in (
+        "x", "y", "width", "height", "fontSize", "scrollWidth",
+        "clientWidth", "scrollHeight", "clientHeight", "at",
+    ):
+        number = _bounded_number(value.get(key))
+        if number is not None:
+            output[key] = number
+    for key in ("visible", "fitted"):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    budget["boxes"] -= 1
+    return output
+
+
+def _sanitize_subject_box(value: Any, budget: dict[str, int]) -> dict[str, float] | None:
+    if not isinstance(value, dict) or budget["subject_boxes"] <= 0:
+        return None
+    output: dict[str, float] = {}
+    for key in ("x", "y", "width", "height"):
+        number = _bounded_number(value.get(key))
+        if number is None:
+            return None
+        output[key] = number
+    budget["subject_boxes"] -= 1
+    return output
+
+
+def _sanitize_text_layout(
+    value: Any,
+    *,
+    budget: dict[str, int] | None = None,
+    allow_layers: bool = True,
+) -> dict[str, Any] | None:
+    """Project renderer metadata to a small public/cache-safe v2 receipt."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("version") != 2:
+        raise ValueError("renderer text_layout is invalid")
+    budget = budget or {"boxes": 512, "subject_boxes": 128, "findings": 128, "layers": 64}
+    measurement = value.get("measurement")
+    status = value.get("status")
+    face_measurement = value.get("face_measurement")
+    analysis_scope = value.get("analysis_scope")
+    output: dict[str, Any] = {
+        "version": 2,
+        "measurement": measurement if measurement in _TEXT_LAYOUT_MEASUREMENTS else "unavailable",
+        "status": status if status in _TEXT_LAYOUT_STATUSES else "skipped",
+        "face_measurement": face_measurement if face_measurement in _FACE_MEASUREMENTS else "unavailable",
+        "analysis_scope": analysis_scope if analysis_scope in _TEXT_LAYOUT_SCOPES else "individual-fx-layout",
+    }
+    samples: list[dict[str, Any]] = []
+    raw_samples = value.get("samples") if isinstance(value.get("samples"), list) else []
+    for sample in raw_samples[:8]:
+        if not isinstance(sample, dict):
+            continue
+        at = _bounded_number(sample.get("at"))
+        if at is None:
+            continue
+        boxes = []
+        raw_boxes = sample.get("boxes") if isinstance(sample.get("boxes"), list) else []
+        for box in raw_boxes[:64]:
+            clean = _sanitize_layout_box(box, budget)
+            if clean is not None:
+                boxes.append(clean)
+        samples.append({"at": at, "boxes": boxes})
+    output["samples"] = samples
+    boxes = []
+    raw_boxes = value.get("boxes") if isinstance(value.get("boxes"), list) else []
+    for box in raw_boxes[:320]:
+        clean = _sanitize_layout_box(box, budget)
+        if clean is not None:
+            boxes.append(clean)
+    output["boxes"] = boxes
+    findings = []
+    raw_findings = value.get("findings") if isinstance(value.get("findings"), list) else []
+    bounded_findings = raw_findings[:128]
+    unknown_or_truncated_finding = len(raw_findings) > len(bounded_findings) or any(
+        not isinstance(finding, dict) or finding.get("kind") not in _TEXT_FINDINGS
+        for finding in bounded_findings
+    )
+    if raw_findings and output["status"] == "pass":
+        output["status"] = "warn"
+    for finding in bounded_findings:
+        if not isinstance(finding, dict) or budget["findings"] <= 0:
+            continue
+        kind = finding.get("kind")
+        if kind not in _TEXT_FINDINGS:
+            continue
+        clean_finding: dict[str, Any] = {"kind": kind}
+        for key in ("id", "layer_id"):
+            text_value = _bounded_text(finding.get(key), 120)
+            if text_value is not None:
+                clean_finding[key] = text_value
+        at = _bounded_number(finding.get("at"))
+        if at is not None:
+            clean_finding["at"] = at
+        subject_box = _sanitize_subject_box(finding.get("subject_box"), budget)
+        if subject_box is not None:
+            clean_finding["subject_box"] = subject_box
+        findings.append(clean_finding)
+        budget["findings"] -= 1
+    if unknown_or_truncated_finding and budget["findings"] > 0:
+        findings.append({"kind": "unrecognized_warning"})
+        budget["findings"] -= 1
+    output["findings"] = findings
+    subject_samples = []
+    raw_subject_samples = value.get("subject_samples") if isinstance(value.get("subject_samples"), list) else []
+    for sample in raw_subject_samples[:8]:
+        if not isinstance(sample, dict):
+            continue
+        at = _bounded_number(sample.get("at"))
+        source_at = _bounded_number(sample.get("source_at"))
+        if at is None or source_at is None:
+            continue
+        clean_boxes = []
+        sample_boxes = sample.get("boxes") if isinstance(sample.get("boxes"), list) else []
+        for box in sample_boxes[:16]:
+            clean = _sanitize_subject_box(box, budget)
+            if clean is not None:
+                clean_boxes.append(clean)
+        subject_samples.append({"at": at, "source_at": source_at, "boxes": clean_boxes})
+    output["subject_samples"] = subject_samples
+    if allow_layers and isinstance(value.get("layers"), dict):
+        layers: dict[str, Any] = {}
+        inspected_layers = 0
+        layers_incomplete = False
+        for layer_id, report in value["layers"].items():
+            if budget["layers"] <= 0:
+                break
+            inspected_layers += 1
+            clean_id = _bounded_text(layer_id, 120)
+            if clean_id is None:
+                layers_incomplete = True
+                continue
+            clean_report = _sanitize_text_layout(report, budget=budget, allow_layers=False)
+            if clean_report is not None:
+                layers[clean_id] = clean_report
+                budget["layers"] -= 1
+            else:
+                layers_incomplete = True
+        if inspected_layers < len(value["layers"]):
+            layers_incomplete = True
+        output["layers"] = layers
+        if output["status"] == "pass" and (
+            layers_incomplete
+            or any(report.get("status") != "pass" for report in layers.values())
+        ):
+            output["status"] = "warn"
+    return output
+
+
 def _regular_nonsymlink(path: Path) -> bool:
     try:
         info = path.lstat()
     except OSError:
         return False
     return stat.S_ISREG(info.st_mode) and not path.is_symlink()
+
+
+class _PinnedDirectory:
+    """An opened directory whose pathname identity must never drift."""
+
+    def __init__(self, path: Path, label: str):
+        self.path = path
+        self.label = label
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            self.fd = os.open(path, flags)
+            info = os.fstat(self.fd)
+        except OSError as exc:
+            raise ValueError(f"{label} directory is unsafe") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(self.fd)
+            raise ValueError(f"{label} is not a directory")
+        self.identity = (info.st_dev, info.st_ino)
+
+    def verify(self) -> None:
+        try:
+            opened = os.fstat(self.fd)
+            named = self.path.lstat()
+        except OSError as exc:
+            raise FxPreviewJobError(409, "preview_storage_changed", "FX 預覽工作目錄已變更") from exc
+        if (
+            self.path.is_symlink()
+            or not stat.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != self.identity
+            or (named.st_dev, named.st_ino) != self.identity
+        ):
+            raise FxPreviewJobError(409, "preview_storage_changed", "FX 預覽工作目錄已變更")
+
+    def close(self) -> None:
+        if self.fd < 0:
+            return
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        finally:
+            self.fd = -1
 
 
 class FxPreviewJobManager:
@@ -123,12 +372,17 @@ class FxPreviewJobManager:
         project_dir: Path,
         *,
         context_provider: Callable[[], dict[str, Any]],
+        timeline_snapshot_builder: Callable[
+            [dict[str, Any], dict[str, Any], dict[str, Any], str | None],
+            dict[str, Any],
+        ] | None = None,
         renderer_script: Path | None = None,
         artifact_validator: Callable[[Path, float], dict[str, Any]] | None = None,
         render_timeout_s: float = RENDER_TIMEOUT_S,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self.context_provider = context_provider
+        self.timeline_snapshot_builder = timeline_snapshot_builder
         self.renderer_script = (
             renderer_script
             if renderer_script is not None
@@ -152,7 +406,224 @@ class FxPreviewJobManager:
             if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
                 raise ValueError("FX preview cache path is unsafe")
             directory.mkdir(mode=0o700, exist_ok=True)
+        self._storage_pins = {
+            "working": _PinnedDirectory(working, "working"),
+            "root": _PinnedDirectory(self.root, "FX preview root"),
+            "cache": _PinnedDirectory(self.cache_dir, "FX preview cache"),
+            "renderer": _PinnedDirectory(self.renderer_cache_dir, "FX renderer cache"),
+            "runtime": _PinnedDirectory(self.runtime_dir, "FX preview runtime"),
+        }
         self._cleanup_orphan_partials()
+        self._cleanup_renderer_scratch()
+
+    def _assert_storage_safe(self, *names: str) -> None:
+        selected = names or tuple(self._storage_pins)
+        for name in selected:
+            self._storage_pins[name].verify()
+
+    @staticmethod
+    def _open_regular_at(directory_fd: int, name: str) -> tuple[int, os.stat_result]:
+        if Path(name).name != name:
+            raise OSError("unsafe preview entry name")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            os.close(descriptor)
+            raise OSError("preview entry is not an owned regular file")
+        return descriptor, info
+
+    @classmethod
+    def _sha256_at(cls, directory_fd: int, name: str) -> tuple[str, os.stat_result]:
+        descriptor, info = cls._open_regular_at(directory_fd, name)
+        digest = hashlib.sha256()
+        try:
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            ) != (
+                info.st_dev, info.st_ino, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns,
+            ):
+                raise OSError("preview entry changed while hashing")
+        finally:
+            os.close(descriptor)
+        return digest.hexdigest(), info
+
+    @classmethod
+    def _read_json_at(cls, directory_fd: int, name: str, max_bytes: int) -> Any:
+        descriptor, info = cls._open_regular_at(directory_fd, name)
+        try:
+            if info.st_size < 0 or info.st_size > max_bytes:
+                raise ValueError("preview JSON is too large")
+            data = b""
+            while len(data) <= max_bytes:
+                chunk = os.read(descriptor, min(65536, max_bytes + 1 - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+            after = os.fstat(descriptor)
+            if len(data) > max_bytes or (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            ) != (
+                info.st_dev, info.st_ino, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns,
+            ):
+                raise ValueError("preview JSON changed while reading")
+            return json.loads(data.decode("utf-8"))
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _remove_tree_at(parent_fd: int, name: str) -> None:
+        """Remove one tree without ever following a symlink or renamed root."""
+        if Path(name).name != name:
+            raise OSError("unsafe preview entry name")
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            os.unlink(name, dir_fd=parent_fd)
+            return
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(child_fd)
+            if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise OSError("preview directory changed while opening")
+            for entry in list(os.scandir(child_fd)):
+                FxPreviewJobManager._remove_tree_at(child_fd, entry.name)
+        finally:
+            os.close(child_fd)
+        os.rmdir(name, dir_fd=parent_fd)
+
+    @staticmethod
+    def _walk_files_at(
+        directory_fd: int,
+        callback: Callable[[int, str, os.stat_result, tuple[str, ...]], None],
+        prefix: tuple[str, ...] = (),
+    ) -> None:
+        """Visit regular files under an opened directory without following links."""
+        for entry in list(os.scandir(directory_fd)):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                callback(directory_fd, entry.name, info, prefix + (entry.name,))
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+            except OSError:
+                continue
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino):
+                    FxPreviewJobManager._walk_files_at(
+                        child_fd, callback, prefix + (entry.name,)
+                    )
+            finally:
+                os.close(child_fd)
+
+    @staticmethod
+    def _unlink_relative_at(root_fd: int, parts: tuple[str, ...]) -> None:
+        if not parts or any(Path(part).name != part for part in parts):
+            raise OSError("unsafe preview relative path")
+        current_fd = os.dup(root_fd)
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            for part in parts[:-1]:
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            os.unlink(parts[-1], dir_fd=current_fd)
+        finally:
+            os.close(current_fd)
+
+    @staticmethod
+    def _remove_empty_dirs_at(directory_fd: int) -> None:
+        for entry in list(os.scandir(directory_fd)):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+            except OSError:
+                continue
+            try:
+                FxPreviewJobManager._remove_empty_dirs_at(child_fd)
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(entry.name, dir_fd=directory_fd)
+            except OSError:
+                pass
+
+    def _atomic_json_in(self, directory_name: str, name: str, payload: Any) -> str:
+        if Path(name).name != name:
+            raise FxPreviewJobError(409, "preview_storage_changed", "FX 預覽檔名不安全")
+        self._assert_storage_safe("working", "root", directory_name)
+        pin = self._storage_pins[directory_name]
+        temporary = f".{name}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = -1
+        try:
+            descriptor = os.open(temporary, flags, 0o600, dir_fd=pin.fd)
+            data = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, allow_nan=False
+            ).encode("utf-8")
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._assert_storage_safe("working", "root", directory_name)
+            os.rename(
+                temporary,
+                name,
+                src_dir_fd=pin.fd,
+                dst_dir_fd=pin.fd,
+            )
+            return hashlib.sha256(data).hexdigest()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=pin.fd)
+            except FileNotFoundError:
+                pass
 
     def _safe_project_entry(self, relative: str, *, must_exist: bool) -> Path:
         rel = Path(relative)
@@ -240,17 +711,29 @@ class FxPreviewJobManager:
 
     def _normalize_candidate(
         self, body: Any, context: dict[str, Any]
-    ) -> tuple[dict[str, Any], str | None, dict[str, Any]]:
+    ) -> tuple[
+        dict[str, Any], str | None, dict[str, Any], dict[str, float],
+        dict[str, str], dict[str, Any], dict[str, Any], dict[str, Any] | None,
+    ]:
         if not isinstance(body, dict):
             raise FxPreviewJobError(400, "malformed_request", "請求內容必須是 JSON 物件")
         self._validate_keys(
             body,
-            {"schema_version", "expected_revision", "candidate", "replace_overlay_id"},
+            {
+                "schema_version", "expected_revision", "candidate",
+                "replace_overlay_id", "preview_options",
+            },
             {"schema_version", "expected_revision", "candidate"},
             "請求",
         )
         if body.get("schema_version") != 1:
             raise FxPreviewJobError(400, "unsupported_schema", "不支援的 FX 預覽 API 版本")
+        try:
+            preview_options = fx_preview_contract.normalize_preview_options(
+                body.get("preview_options")
+            )
+        except fx_preview_contract.FxPreviewContractError as exc:
+            raise FxPreviewJobError(422, exc.code, exc.message) from exc
         revision = self._state_revision(context)
         if body.get("expected_revision") != revision:
             raise FxPreviewJobError(409, "revision_conflict", "時間軸已變更，請重新載入後再預覽")
@@ -266,15 +749,16 @@ class FxPreviewJobManager:
             raise FxPreviewJobError(400, "malformed_candidate", "FX candidate 必須是物件")
         self._validate_keys(
             candidate,
-            {"code", "window", "values", "placement", "scheme", "font_ids"},
+            {
+                "code", "window", "apply_window", "values", "placement",
+                "scheme", "font_ids", "subject", "text_fit", "material",
+            },
             {"code", "window", "values", "placement", "scheme", "font_ids"},
             "candidate",
         )
         code = candidate.get("code")
         if not isinstance(code, str) or re.fullmatch(r"[A-Z][0-9]{1,3}", code) is None:
             raise FxPreviewJobError(422, "effect_invalid", "FX 效果代碼無效")
-        if code == "B1":
-            raise FxPreviewJobError(422, "material_required", "B1 需要先選擇本專案素材，這版暫不提供動態預覽")
         catalog = fx_overlay.catalog(refresh=True)
         effect = next(
             (
@@ -287,34 +771,24 @@ class FxPreviewJobManager:
         if effect is None or effect.get("available") is False:
             raise FxPreviewJobError(422, "effect_unavailable", "這個 FX 效果目前無法使用")
 
-        window = candidate.get("window")
-        if not isinstance(window, dict):
-            raise FxPreviewJobError(400, "window_invalid", "預覽時間窗必須是物件")
-        self._validate_keys(window, {"start_s", "duration_s"}, {"start_s", "duration_s"}, "window")
-        start = window.get("start_s")
-        duration = window.get("duration_s")
-        normalized_window: list[float] = []
-        try:
-            for value in (start, duration):
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    raise TypeError
-                normalized = float(value)
-                if not math.isfinite(normalized):
-                    raise ValueError
-                normalized_window.append(normalized)
-        except (OverflowError, TypeError, ValueError):
-            raise FxPreviewJobError(
-                422,
-                "window_invalid",
-                "預覽時間必須是有限數字",
-            ) from None
-        start = round(normalized_window[0], 3)
-        duration = round(normalized_window[1], 3)
         source_identity = self._source_identity(context.get("manifest") or {})
-        if start < 0 or not 0.1 <= duration <= 4.0 or start + duration > source_identity["duration_s"] + 1e-6:
-            raise FxPreviewJobError(422, "window_out_of_range", "預覽時間窗必須位於來源影片內，長度為 0.1 到 4 秒")
+        try:
+            sample_window, apply_window = fx_preview_contract.normalize_sample_window(
+                candidate.get("window"),
+                candidate.get("apply_window"),
+                source_identity["duration_s"],
+            )
+        except fx_preview_contract.FxPreviewContractError as exc:
+            raise FxPreviewJobError(422, exc.code, exc.message) from exc
+        start = apply_window["start_s"]
+        duration = apply_window["duration_s"]
         media_max = effect.get("media_max")
-        if isinstance(media_max, (int, float)) and not isinstance(media_max, bool) and duration > float(media_max) + 1e-6:
+        if (
+            code != "B1"
+            and isinstance(media_max, (int, float))
+            and not isinstance(media_max, bool)
+            and duration > float(media_max) + 1e-6
+        ):
             raise FxPreviewJobError(422, "window_too_long", "這個 FX 效果需要更短的來源片段")
 
         values = candidate.get("values")
@@ -355,6 +829,45 @@ class FxPreviewJobManager:
         if font_errors:
             raise FxPreviewJobError(422, "fonts_invalid", "選取的 FX 字型未通過本機驗證")
 
+        text_fit = candidate.get("text_fit", True)
+        if not isinstance(text_fit, bool):
+            raise FxPreviewJobError(422, "text_fit_invalid", "text_fit 必須是布林值")
+        subject = candidate.get("subject")
+        if code != "P5" and "subject" in candidate:
+            raise FxPreviewJobError(422, "subject_invalid", "只有 P5 可以指定主角位置")
+        if code == "P5" and subject is not None:
+            if not isinstance(subject, dict) or set(subject) != {"x", "y"}:
+                raise FxPreviewJobError(422, "subject_invalid", "主角位置必須包含 x 與 y")
+            normalized_subject: dict[str, float] = {}
+            for axis in ("x", "y"):
+                value = subject.get(axis)
+                try:
+                    numeric_value = float(value)
+                except (OverflowError, TypeError, ValueError):
+                    numeric_value = math.nan
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(numeric_value)
+                    or not 0.0 <= numeric_value <= 1.0
+                ):
+                    raise FxPreviewJobError(422, "subject_invalid", "主角位置必須介於 0 到 1")
+                normalized_subject[axis] = round(numeric_value, 6)
+            subject = normalized_subject
+
+        material_binding: dict[str, str] | None = None
+        if code == "B1":
+            if "material" not in candidate:
+                raise FxPreviewJobError(422, "material_required", "B1 需要先選擇本專案素材")
+            try:
+                material_binding = fx_preview_contract.resolve_material_binding(
+                    self.project_dir, candidate.get("material")
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                raise FxPreviewJobError(422, exc.code, exc.message) from exc
+        elif "material" in candidate:
+            raise FxPreviewJobError(422, "material_invalid", "只有 B1 可以綁定專案素材")
+
         candidate_fields = {
             "code": code,
             "start": start,
@@ -363,9 +876,14 @@ class FxPreviewJobManager:
             "placement": placement,
             "scheme": scheme,
             "font_ids": dict(sorted(font_ids.items())),
+            "text_fit": text_fit,
             "text": str(effect.get("name") or code)[:200],
             "provenance": "FX dynamic preview confirmation",
         }
+        if code == "P5":
+            candidate_fields["subject"] = subject
+        if material_binding is not None:
+            candidate_fields["material"] = material_binding
         overlay = {
             "id": "fx-preview",
             "type": "fx",
@@ -403,15 +921,56 @@ class FxPreviewJobManager:
         errors = fx_overlay.validate(overlay, state)
         if errors:
             raise FxPreviewJobError(422, "candidate_invalid", "FX candidate 未通過伺服器驗證")
-        return overlay, replace_overlay_id, source_identity
+        state_snapshot = deepcopy(state)
+        manifest_snapshot = deepcopy(context.get("manifest") or {})
+        timeline_snapshot = None
+        if self.timeline_snapshot_builder is not None:
+            timeline_snapshot = self.timeline_snapshot_builder(
+                state_snapshot,
+                manifest_snapshot,
+                overlay,
+                replace_overlay_id,
+            )
+            frozen_state = timeline_snapshot.get("state")
+            frozen_manifest = timeline_snapshot.get("manifest")
+            if not isinstance(frozen_state, dict) or not isinstance(frozen_manifest, dict):
+                raise FxPreviewJobError(
+                    500, "snapshot_invalid", "無法建立完整時間軸預覽快照"
+                )
+            state_snapshot = deepcopy(frozen_state)
+            manifest_snapshot = deepcopy(frozen_manifest)
+        return (
+            overlay,
+            replace_overlay_id,
+            source_identity,
+            sample_window,
+            preview_options,
+            state_snapshot,
+            manifest_snapshot,
+            timeline_snapshot,
+        )
 
     def _dependency_snapshot(
         self,
         context: dict[str, Any],
         overlay: dict[str, Any],
         source_identity: dict[str, Any] | None = None,
+        *,
+        preview_options: dict[str, str] | None = None,
+        frozen_state: dict[str, Any] | None = None,
+        frozen_manifest: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        state = context.get("state") if isinstance(context.get("state"), dict) else {}
+        options = fx_preview_contract.normalize_preview_options(preview_options)
+        state = (
+            frozen_state
+            if options["mode"] == "timeline" and isinstance(frozen_state, dict)
+            else context.get("state") if isinstance(context.get("state"), dict) else {}
+        )
+        manifest = (
+            frozen_manifest
+            if options["mode"] == "timeline" and isinstance(frozen_manifest, dict)
+            else context.get("manifest") if isinstance(context.get("manifest"), dict) else {}
+        )
         source = source_identity or self._source_identity(context.get("manifest") or {})
         pack_id = self._pack_id(state)
         theme, main = fx_overlay.theme_for_pack(pack_id)
@@ -437,7 +996,12 @@ class FxPreviewJobManager:
             "schemes": skill / "tools/card_schemes.py",
             "block": skill / "hyperframes-blocks/compositions" / f"{block}.html",
             "fx_overlay": Path(fx_overlay.__file__).resolve(),
+            "fx_preview_contract": Path(fx_preview_contract.__file__).resolve(),
+            "text_fit": Path(__file__).with_name("text_fit.py").resolve(),
+            "spotlight_track": skill / "tools/spotlight_track.py",
             "renderer": self.renderer_script,
+            "yunet_model": Path(__file__).resolve().parents[1]
+            / "assets/models/yunet/face_detection_yunet_2026may.onnx",
         }
         theme_path = skill / "menu/themes" / f"{theme}.json"
         if theme_path.is_file():
@@ -448,7 +1012,15 @@ class FxPreviewJobManager:
                 raise FxPreviewJobError(503, "renderer_unavailable", "本機 FX 預覽元件不完整")
             digests[name] = _file_sha256(path)
         canvas = self._canvas(state)
-        return {
+        material = None
+        if overlay.get("code") == "B1":
+            try:
+                material = fx_preview_contract.verify_material_binding(
+                    self.project_dir, overlay.get("material")
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                raise FxPreviewJobError(409, exc.code, exc.message) from exc
+        snapshot = {
             "contract": RENDER_CONTRACT_VERSION,
             "project_namespace": hashlib.sha256(str(self.project_dir).encode("utf-8")).hexdigest(),
             "state_revision": self._state_revision(context),
@@ -457,10 +1029,136 @@ class FxPreviewJobManager:
             "theme": theme,
             "main": main,
             "canvas": canvas,
-            "fonts_digest": fx_overlay.fonts_digest_for({"overlays": [overlay]}),
+            # fonts_digest_for historically includes the overlay id.  Pin a
+            # synthetic visual identity so add/replace of the same pixels can
+            # share cache while font ids and their verified bytes still bind it.
+            "fonts_digest": fx_overlay.fonts_digest_for(
+                {
+                    "overlays": [
+                        {
+                            "id": "fx-preview-visual",
+                            "type": "fx",
+                            "font_ids": deepcopy(overlay.get("font_ids") or {}),
+                        }
+                    ]
+                }
+            ),
+            "preview_options": options,
+            "material": material,
             "dependencies": digests,
             "tools": self._tool_identities(),
         }
+        if options["mode"] == "timeline":
+            snapshot["state_snapshot"] = deepcopy(state)
+            snapshot["manifest_snapshot"] = deepcopy(manifest)
+            asset_digests = state.get("asset_digests")
+            snapshot["asset_digests"] = (
+                deepcopy(asset_digests) if isinstance(asset_digests, dict) else {}
+            )
+            try:
+                snapshot["provenance_digests"] = (
+                    fx_preview_contract.material_authority_digests(
+                        self.project_dir, state
+                    )
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                raise FxPreviewJobError(409, exc.code, exc.message) from exc
+            snapshot["timeline_project_inputs"] = self._timeline_project_input_digests()
+            snapshot["timeline_python_dependencies"] = self._local_python_dependency_digests(
+                [Path(__file__).with_name("render_editor_timeline.py")]
+            )
+            snapshot["timeline_fx_blocks"] = self._timeline_fx_block_digests(
+                state, overlay, skill
+            )
+            snapshot["timeline_fonts_digest"] = fx_overlay.fonts_digest_for(state)
+        return snapshot
+
+    def _timeline_project_input_digests(self) -> dict[str, str]:
+        """Digest every live working input the isolated timeline renderer copies."""
+        self._assert_storage_safe("working", "root", "renderer", "runtime")
+        result: dict[str, str] = {}
+        working = self.project_dir / "working"
+        for name in (
+            "structured_layers.json",
+            "visual_plan_v2.json",
+            "caption_v2.json",
+            "caption_delivery.json",
+            "graphic_packages",
+        ):
+            root = working / name
+            if root.is_symlink():
+                raise FxPreviewJobError(409, "unsafe_project_path", "時間軸預覽依賴路徑不安全")
+            if root.is_file():
+                result[root.relative_to(self.project_dir).as_posix()] = _file_sha256(root)
+                continue
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*")):
+                if path.is_symlink():
+                    raise FxPreviewJobError(409, "unsafe_project_path", "時間軸預覽依賴路徑不安全")
+                if not path.is_file():
+                    continue
+                result[path.relative_to(self.project_dir).as_posix()] = _file_sha256(path)
+        return result
+
+    @staticmethod
+    def _local_python_dependency_digests(roots: list[Path]) -> dict[str, str]:
+        """Recursively bind local Python imports used by the timeline renderer."""
+        scripts = Path(__file__).resolve().parent
+        pending = [path.resolve() for path in roots]
+        seen: set[Path] = set()
+        result: dict[str, str] = {}
+        while pending:
+            path = pending.pop()
+            if path in seen:
+                continue
+            if scripts != path.parent or not _regular_nonsymlink(path):
+                raise FxPreviewJobError(503, "renderer_unavailable", "完整預覽渲染器依賴不完整")
+            seen.add(path)
+            result[path.name] = _file_sha256(path)
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+                raise FxPreviewJobError(503, "renderer_unavailable", "完整預覽渲染器依賴無法解析") from exc
+            module_names: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    module_names.update(alias.name.split(".", 1)[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    module_names.add(node.module.split(".", 1)[0])
+            for module in module_names:
+                candidate = scripts / f"{module}.py"
+                if candidate.is_file():
+                    pending.append(candidate.resolve())
+        return dict(sorted(result.items()))
+
+    @staticmethod
+    def _timeline_fx_block_digests(
+        state: dict[str, Any], overlay: dict[str, Any], skill: Path
+    ) -> dict[str, str]:
+        catalog = fx_overlay.catalog(refresh=True)
+        block_by_code = {
+            str(item.get("code")): str(item.get("block"))
+            for item in catalog.get("effects", [])
+            if isinstance(item, dict) and isinstance(item.get("block"), str)
+        }
+        codes = {
+            str(item.get("code"))
+            for item in state.get("overlays", [])
+            if isinstance(item, dict) and item.get("type") == "fx"
+        }
+        codes.add(str(overlay.get("code")))
+        result: dict[str, str] = {}
+        root = skill / "hyperframes-blocks/compositions"
+        for code in sorted(codes):
+            block = block_by_code.get(code)
+            if not block or Path(block).name != block:
+                raise FxPreviewJobError(503, "renderer_unavailable", "時間軸 FX 元件依賴不完整")
+            path = root / f"{block}.html"
+            if not _regular_nonsymlink(path):
+                raise FxPreviewJobError(503, "renderer_unavailable", "時間軸 FX 元件依賴不完整")
+            result[code] = _file_sha256(path)
+        return result
 
     @staticmethod
     def _tool_identities() -> dict[str, Any]:
@@ -477,6 +1175,7 @@ class FxPreviewJobManager:
                     "path": str(path),
                     "bytes": info.st_size,
                     "mtime_ns": info.st_mtime_ns,
+                    "sha256": _file_sha256(path) if _regular_nonsymlink(path) else None,
                 }
             except OSError:
                 identities[name] = None
@@ -485,8 +1184,18 @@ class FxPreviewJobManager:
     def submit(self, body: Any) -> dict[str, Any]:
         self.prune()
         context = self.context_provider()
-        overlay, replace_overlay_id, source_identity = self._normalize_candidate(body, context)
-        dependencies = self._dependency_snapshot(context, overlay, source_identity)
+        (
+            overlay, replace_overlay_id, source_identity, sample_window,
+            preview_options, state_snapshot, manifest_snapshot, timeline_snapshot,
+        ) = self._normalize_candidate(body, context)
+        dependencies = self._dependency_snapshot(
+            context,
+            overlay,
+            source_identity,
+            preview_options=preview_options,
+            frozen_state=state_snapshot,
+            frozen_manifest=manifest_snapshot,
+        )
         # State revision remains part of the job's post-render and confirm CAS
         # snapshot, but is not a media dependency.  Excluding only that field
         # lets an identical candidate reuse an artifact after an unrelated
@@ -497,8 +1206,9 @@ class FxPreviewJobManager:
         cache_key = _canonical_sha256(
             {
                 "dependencies": cache_dependencies,
-                "overlay": overlay,
-                "window_ms": [round(float(overlay["start"]) * 1000), round((float(overlay["end"]) - float(overlay["start"])) * 1000)],
+                "overlay": fx_preview_contract.visual_overlay_projection(overlay),
+                "sample_window": sample_window,
+                "preview_options": preview_options,
             }
         )
         job_id = secrets.token_hex(16)
@@ -513,6 +1223,11 @@ class FxPreviewJobManager:
             "updated_monotonic": now,
             "state_revision": dependencies["state_revision"],
             "overlay": overlay,
+            "sample_window": sample_window,
+            "preview_options": preview_options,
+            "state_snapshot": state_snapshot,
+            "manifest_snapshot": manifest_snapshot,
+            "timeline_snapshot": timeline_snapshot,
             "replace_overlay_id": replace_overlay_id,
             "dependencies": dependencies,
             "dependency_hash": _canonical_sha256(dependencies),
@@ -561,37 +1276,113 @@ class FxPreviewJobManager:
         return self.public_job(job_id)
 
     def _valid_cache_hit(self, media: Path, receipt_path: Path, cache_key: str) -> dict[str, Any] | None:
-        receipt = _read_json(receipt_path)
-        if not isinstance(receipt, dict) or receipt.get("cache_key") != cache_key:
+        self._assert_storage_safe("working", "root", "cache")
+        cache_fd = self._storage_pins["cache"].fd
+        try:
+            receipt = self._read_json_at(cache_fd, receipt_path.name, MAX_RESULT_JSON_BYTES)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             return None
-        if not _regular_nonsymlink(media):
+        if not isinstance(receipt, dict) or receipt.get("cache_key") != cache_key:
             return None
         expected = receipt.get("sha256")
         if not isinstance(expected, str) or SHA256_RE.fullmatch(expected) is None:
             return None
-        if media.stat().st_size <= 0 or media.stat().st_size > MAX_PREVIEW_BYTES:
+        try:
+            actual, media_info = self._sha256_at(cache_fd, media.name)
+        except OSError:
             return None
-        if _file_sha256(media) != expected:
+        if media_info.st_size <= 0 or media_info.st_size > MAX_PREVIEW_BYTES or actual != expected:
             return None
         try:
+            self._assert_storage_safe("working", "root", "cache")
             duration = float(receipt.get("duration_s"))
             self.artifact_validator(media, duration)
+            self._assert_storage_safe("working", "root", "cache")
         except (TypeError, ValueError, OSError, subprocess.SubprocessError):
             return None
         now = time.time()
         try:
-            os.utime(media, (now, now), follow_symlinks=False)
-            os.utime(receipt_path, (now, now), follow_symlinks=False)
+            os.utime(media.name, (now, now), dir_fd=cache_fd, follow_symlinks=False)
+            os.utime(receipt_path.name, (now, now), dir_fd=cache_fd, follow_symlinks=False)
         except OSError:
             return None
         return {
             "path": media,
             "sha256": expected,
-            "bytes": media.stat().st_size,
+            "bytes": media_info.st_size,
             "duration_s": duration,
+            "time_map": receipt.get("time_map", []),
+            "text_layout": _sanitize_text_layout(receipt.get("text_layout")),
         }
 
+    @staticmethod
+    def _normalized_time_map(
+        value: Any,
+        sample_window: dict[str, float],
+        render_duration_s: float,
+        *,
+        mode: str,
+    ) -> list[dict[str, float]]:
+        sample_start = float(sample_window["start_s"])
+        sample_end = sample_start + float(sample_window["duration_s"])
+        if value is None and mode == "single":
+            value = [
+                {
+                    "source_start_s": sample_start,
+                    "source_end_s": sample_end,
+                    "output_start_s": 0.0,
+                    "output_end_s": render_duration_s,
+                }
+            ]
+        if not isinstance(value, list) or not value:
+            raise ValueError("renderer time map is missing")
+        result: list[dict[str, float]] = []
+        previous_source_end = sample_start
+        previous_output_end = 0.0
+        keys = {"source_start_s", "source_end_s", "output_start_s", "output_end_s"}
+        for entry in value:
+            if not isinstance(entry, dict) or set(entry) != keys:
+                raise ValueError("renderer time map entry is malformed")
+            normalized: dict[str, float] = {}
+            for key in keys:
+                raw = entry.get(key)
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    raise ValueError("renderer time map value is invalid")
+                try:
+                    number = float(raw)
+                except (OverflowError, TypeError, ValueError) as exc:
+                    raise ValueError("renderer time map value is invalid") from exc
+                if not math.isfinite(number):
+                    raise ValueError("renderer time map value is invalid")
+                normalized[key] = round(number, 6)
+            if (
+                normalized["source_start_s"] < sample_start - 1e-6
+                or normalized["source_end_s"] > sample_end + 1e-6
+                or normalized["source_start_s"] < previous_source_end - 1e-6
+                or normalized["source_end_s"] <= normalized["source_start_s"]
+                or normalized["output_start_s"] < previous_output_end - 1e-6
+                or normalized["output_end_s"] <= normalized["output_start_s"]
+                or normalized["output_end_s"] > render_duration_s + 1e-6
+            ):
+                raise ValueError("renderer time map is out of range")
+            source_span = normalized["source_end_s"] - normalized["source_start_s"]
+            output_span = normalized["output_end_s"] - normalized["output_start_s"]
+            if abs(source_span - output_span) > 0.02:
+                raise ValueError("renderer time map changes playback speed")
+            result.append(normalized)
+            previous_source_end = normalized["source_end_s"]
+            previous_output_end = normalized["output_end_s"]
+        if abs(previous_output_end - render_duration_s) > 0.05:
+            raise ValueError("renderer time map does not cover the output")
+        return result
+
     def _run_job(self, job_id: str, cache_media: Path, cache_receipt: Path) -> None:
+        try:
+            self._assert_storage_safe()
+        except FxPreviewJobError:
+            with self._lock:
+                self._finish_failed(job_id, "preview_storage_changed", "FX 預覽工作目錄已變更")
+            return
         request_path = self.runtime_dir / f"{job_id}.request.json"
         result_path = self.runtime_dir / f"{job_id}.result.json"
         output_path = self.runtime_dir / f"{job_id}.part.mp4"
@@ -602,18 +1393,51 @@ class FxPreviewJobManager:
             source = dict(job["source_identity"])
             overlay = dict(job["overlay"])
             deps = dict(job["dependencies"])
+            sample_window = dict(job["sample_window"])
+            preview_options = dict(job["preview_options"])
+            state_snapshot = deepcopy(job["state_snapshot"])
+            manifest_snapshot = deepcopy(job["manifest_snapshot"])
+            timeline_snapshot = deepcopy(job.get("timeline_snapshot"))
+            replace_overlay_id = job.get("replace_overlay_id")
         request_payload = {
             "project_dir": str(self.project_dir),
             "source": str(source["path"]),
             "cache_dir": str(self.renderer_cache_dir),
             "output": str(output_path),
             "overlay": overlay,
+            "sample_window": sample_window,
+            "preview_options": preview_options,
+            "state_snapshot": state_snapshot,
+            "manifest_snapshot": manifest_snapshot,
+            "timeline_snapshot": timeline_snapshot,
+            "dependency_snapshot": deps,
             "pack_id": deps["pack_id"],
             "canvas": deps["canvas"],
         }
+        request_fd = -1
         try:
-            _atomic_json(request_path, request_payload)
+            request_sha256 = self._atomic_json_in(
+                "runtime", request_path.name, request_payload
+            )
+            runtime_fd = self._storage_pins["runtime"].fd
+            request_fd, _request_info = self._open_regular_at(
+                runtime_fd, request_path.name
+            )
+            request_digest = hashlib.sha256()
+            while True:
+                chunk = os.read(request_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                request_digest.update(chunk)
+            if request_digest.hexdigest() != request_sha256:
+                raise OSError("preview request changed before worker launch")
+            os.lseek(request_fd, 0, os.SEEK_SET)
+            render_request_sha256 = fx_preview_contract.renderer_request_digest(
+                request_payload
+            )
             env = self._worker_environment()
+            env["FX_PREVIEW_REQUEST_FD"] = str(request_fd)
+            env["FX_PREVIEW_RESULT_DIR_FD"] = str(runtime_fd)
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -629,12 +1453,17 @@ class FxPreviewJobManager:
                 text=True,
                 start_new_session=True,
                 env=env,
+                pass_fds=(request_fd, runtime_fd),
             )
+            os.close(request_fd)
+            request_fd = -1
             with self._lock:
                 current = self._jobs.get(job_id)
                 if current is None or current.get("cancel_requested"):
-                    self._terminate_process(process)
-                    self._finish_cancelled(job_id)
+                    if self._terminate_process(process):
+                        self._finish_cancelled(job_id)
+                    else:
+                        self._mark_termination_unverified(job_id)
                     return
                 current["process"] = process
                 current["phase"] = "preparing"
@@ -651,18 +1480,32 @@ class FxPreviewJobManager:
                     current = self._jobs.get(job_id)
                     cancelled = current is None or bool(current.get("cancel_requested"))
                 if cancelled:
-                    self._terminate_process(process)
+                    terminated = self._terminate_process(process)
                     with self._lock:
-                        self._finish_cancelled(job_id)
+                        if terminated:
+                            self._finish_cancelled(job_id)
+                        else:
+                            self._mark_termination_unverified(job_id)
                     return
                 if time.monotonic() >= deadline:
-                    self._terminate_process(process)
+                    terminated = self._terminate_process(process)
                     with self._lock:
-                        self._finish_failed(job_id, "render_timeout", "FX 預覽超過本機時間上限")
+                        if terminated:
+                            self._finish_failed(job_id, "render_timeout", "FX 預覽超過本機時間上限")
+                        else:
+                            self._mark_termination_unverified(job_id)
                     return
                 time.sleep(0.05)
             progress.join(timeout=1.0)
-            result = _read_json(result_path)
+            self._assert_storage_safe("working", "root", "runtime")
+            try:
+                result = self._read_json_at(
+                    self._storage_pins["runtime"].fd,
+                    result_path.name,
+                    MAX_RESULT_JSON_BYTES,
+                )
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                result = None
             if process.returncode != 0 or not isinstance(result, dict) or result.get("ok") is not True:
                 code = result.get("code") if isinstance(result, dict) else None
                 safe_code = code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,40}", code) else "render_failed"
@@ -671,13 +1514,28 @@ class FxPreviewJobManager:
                     "invalid_source": "來源影片無法用於 FX 預覽",
                     "invalid_canvas": "目前專案畫布無法產生 FX 預覽",
                     "broll_requires_asset": "B1 需要先選擇本專案素材",
+                    "broll_render_failed": "B1 已選素材無法產生預覽畫面",
+                    "broll_render_unverified": "B1 預覽未能證明已包含所選素材",
                     "output_invalid": "FX 預覽輸出未通過媒體驗證",
                     "invalid_request": "本機 FX 預覽工作收到無效資料",
+                    "subject_tracking_lost": "選取的主角已失去追蹤，請換取樣時窗或重新選人",
                 }
                 with self._lock:
                     self._finish_failed(job_id, safe_code, safe_messages.get(safe_code, "FX 預覽產生失敗"))
                 return
+            if (
+                result.get("request_sha256") != request_sha256
+                or result.get("render_request_sha256") != render_request_sha256
+            ):
+                with self._lock:
+                    self._finish_failed(
+                        job_id,
+                        "worker_contract_invalid",
+                        "FX 預覽工作未使用已凍結的請求",
+                    )
+                return
             out_value = result.get("out")
+            self._assert_storage_safe("working", "root", "runtime")
             if not isinstance(out_value, str) or Path(out_value).resolve() != output_path.resolve():
                 with self._lock:
                     self._finish_failed(job_id, "worker_contract_invalid", "FX 預覽工作回傳了無效檔案")
@@ -692,7 +1550,35 @@ class FxPreviewJobManager:
             try:
                 current_context = self.context_provider()
                 current_source = self._source_identity(current_context.get("manifest") or {})
-                current_deps = self._dependency_snapshot(current_context, overlay, current_source)
+                current_frozen_state = None
+                current_frozen_manifest = None
+                if preview_options["mode"] == "timeline":
+                    if self.timeline_snapshot_builder is None:
+                        raise FxPreviewJobError(
+                            500, "snapshot_invalid", "無法建立完整時間軸預覽快照"
+                        )
+                    current_timeline_snapshot = self.timeline_snapshot_builder(
+                        deepcopy(current_context.get("state") or {}),
+                        deepcopy(current_context.get("manifest") or {}),
+                        deepcopy(overlay),
+                        replace_overlay_id,
+                    )
+                    current_frozen_state = current_timeline_snapshot.get("state")
+                    current_frozen_manifest = current_timeline_snapshot.get("manifest")
+                    if not isinstance(current_frozen_state, dict) or not isinstance(
+                        current_frozen_manifest, dict
+                    ):
+                        raise FxPreviewJobError(
+                            500, "snapshot_invalid", "無法建立完整時間軸預覽快照"
+                        )
+                current_deps = self._dependency_snapshot(
+                    current_context,
+                    overlay,
+                    current_source,
+                    preview_options=preview_options,
+                    frozen_state=current_frozen_state,
+                    frozen_manifest=current_frozen_manifest,
+                )
             except FxPreviewJobError:
                 with self._lock:
                     self._finish_failed(
@@ -709,30 +1595,68 @@ class FxPreviewJobManager:
                 if _canonical_sha256(current_deps) != current["dependency_hash"]:
                     self._finish_failed(job_id, "preview_stale", "預覽期間來源或樣式已變更，請重新產生")
                     return
-            duration = round(float(overlay["end"]) - float(overlay["start"]), 3)
-            metadata = self.artifact_validator(output_path, duration)
+            raw_render_duration = result.get("render_duration_s")
+            if raw_render_duration is None and preview_options["mode"] == "single":
+                raw_render_duration = sample_window["duration_s"]
+            try:
+                numeric_render_duration = float(raw_render_duration)
+            except (OverflowError, TypeError, ValueError):
+                numeric_render_duration = math.nan
+            if (
+                isinstance(raw_render_duration, bool)
+                or not isinstance(raw_render_duration, (int, float))
+                or not math.isfinite(numeric_render_duration)
+                or numeric_render_duration <= 0
+                or numeric_render_duration > float(sample_window["duration_s"]) + 0.05
+            ):
+                raise ValueError("renderer duration is invalid")
+            render_duration = round(numeric_render_duration, 3)
+            time_map = self._normalized_time_map(
+                result.get("time_map"),
+                sample_window,
+                render_duration,
+                mode=preview_options["mode"],
+            )
+            text_layout = _sanitize_text_layout(result.get("text_layout"))
+            metadata = self.artifact_validator(output_path, render_duration)
+            self._assert_storage_safe("working", "root", "runtime")
             if not isinstance(metadata, dict):
                 raise ValueError("artifact validator returned no metadata")
-            size = output_path.stat().st_size
+            digest, output_info = self._sha256_at(
+                self._storage_pins["runtime"].fd,
+                output_path.name,
+            )
+            size = output_info.st_size
             if size <= 0 or size > MAX_PREVIEW_BYTES:
                 raise ValueError("preview size invalid")
-            digest = _file_sha256(output_path)
             receipt = {
                 "schema_version": 1,
                 "cache_key": job["cache_key"],
                 "sha256": digest,
                 "bytes": size,
-                "duration_s": metadata.get("duration_s", duration),
+                "duration_s": metadata.get("duration_s", render_duration),
+                "time_map": time_map,
+                "text_layout": text_layout,
                 "created_at": time.time(),
             }
             self._touch_renderer_cache()
-            os.replace(output_path, cache_media)
-            _atomic_json(cache_receipt, receipt)
+            self._assert_storage_safe("working", "root", "cache", "runtime")
+            os.rename(
+                output_path.name,
+                cache_media.name,
+                src_dir_fd=self._storage_pins["runtime"].fd,
+                dst_dir_fd=self._storage_pins["cache"].fd,
+            )
+            self._atomic_json_in("cache", cache_receipt.name, receipt)
             with self._lock:
                 current = self._jobs.get(job_id)
                 if current is None or current.get("cancel_requested"):
-                    cache_media.unlink(missing_ok=True)
-                    cache_receipt.unlink(missing_ok=True)
+                    self._assert_storage_safe("working", "root", "cache")
+                    for name in (cache_media.name, cache_receipt.name):
+                        try:
+                            os.unlink(name, dir_fd=self._storage_pins["cache"].fd)
+                        except FileNotFoundError:
+                            pass
                     self._finish_cancelled(job_id)
                     return
                 current.update(
@@ -747,6 +1671,8 @@ class FxPreviewJobManager:
                             "sha256": digest,
                             "bytes": size,
                             "duration_s": receipt["duration_s"],
+                            "time_map": time_map,
+                            "text_layout": text_layout,
                         },
                         "error": None,
                     }
@@ -758,9 +1684,28 @@ class FxPreviewJobManager:
             with self._lock:
                 self._finish_failed(job_id, "render_failed", "FX 預覽產生失敗")
         finally:
-            output_path.unlink(missing_ok=True)
-            request_path.unlink(missing_ok=True)
-            result_path.unlink(missing_ok=True)
+            if request_fd >= 0:
+                try:
+                    os.close(request_fd)
+                except OSError:
+                    pass
+            try:
+                self._assert_storage_safe("working", "root", "runtime")
+                for name in (
+                    f"{job_id}.part.mp4",
+                    f"{job_id}.request.json",
+                    f"{job_id}.result.json",
+                ):
+                    try:
+                        os.unlink(name, dir_fd=self._storage_pins["runtime"].fd)
+                    except FileNotFoundError:
+                        pass
+            except (FxPreviewJobError, OSError):
+                pass
+            try:
+                self._cleanup_renderer_scratch()
+            except FxPreviewJobError:
+                pass
 
     @staticmethod
     def _worker_environment() -> dict[str, str]:
@@ -826,9 +1771,11 @@ class FxPreviewJobManager:
             # start_new_session worker, but fail closed if platform policy
             # changes rather than assuming descendants are gone.
             return True
+        except OSError:
+            return True
 
     @classmethod
-    def _terminate_process(cls, process: subprocess.Popen[str]) -> None:
+    def _terminate_process(cls, process: subprocess.Popen[str]) -> bool:
         pgid = process.pid
         try:
             os.killpg(pgid, signal.SIGTERM)
@@ -837,7 +1784,11 @@ class FxPreviewJobManager:
                 process.wait(timeout=0.2)
             except subprocess.TimeoutExpired:
                 pass
-            return
+            return process.poll() is not None
+        except (PermissionError, OSError):
+            # Continue into the verification loop.  Never let a signal race
+            # disconnect the HTTP handler or be mistaken for cancellation.
+            pass
 
         deadline = time.monotonic() + 3.0
         while cls._process_group_exists(pgid) and time.monotonic() < deadline:
@@ -853,7 +1804,7 @@ class FxPreviewJobManager:
         if cls._process_group_exists(pgid):
             try:
                 os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
             kill_deadline = time.monotonic() + 2.0
             while cls._process_group_exists(pgid) and time.monotonic() < kill_deadline:
@@ -862,6 +1813,22 @@ class FxPreviewJobManager:
             process.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
             pass
+        return not cls._process_group_exists(pgid) and process.poll() is not None
+
+    def _mark_termination_unverified(self, job_id: str) -> None:
+        job = self._jobs.get(job_id)
+        if job is None or job.get("state") in TERMINAL_STATES:
+            return
+        message = "無法確認 FX 預覽程序已停止，請重試取消"
+        job.update(
+            {
+                "state": "running",
+                "phase": "cancelling",
+                "message": message,
+                "error": {"code": "termination_unverified", "message": message},
+                "updated_monotonic": time.time(),
+            }
+        )
 
     @staticmethod
     def _validate_mp4(path: Path, expected_duration: float) -> dict[str, Any]:
@@ -947,9 +1914,14 @@ class FxPreviewJobManager:
             job["cancel_requested"] = True
             process = job.get("process")
         if process is not None:
-            self._terminate_process(process)
+            terminated = self._terminate_process(process)
+        else:
+            terminated = True
         with self._lock:
-            self._finish_cancelled(job_id)
+            if terminated:
+                self._finish_cancelled(job_id)
+            else:
+                self._mark_termination_unverified(job_id)
             return self._public_job_locked(self._jobs[job_id])
 
     def public_job(self, job_id: str) -> dict[str, Any]:
@@ -971,10 +1943,15 @@ class FxPreviewJobManager:
             "message": job["message"],
             "status_url": f"/api/fx-previews/{job['id']}",
             "cache_hit": bool(job.get("cache_hit")),
+            "preview_options": deepcopy(job.get("preview_options") or {}),
         }
         media = job.get("media")
         if job.get("state") == "ready" and isinstance(media, dict):
             public["media_url"] = f"/fx-preview-media/{job['id']}/{media['sha256']}.mp4"
+            public["render_duration_s"] = media.get("duration_s")
+            public["time_map"] = deepcopy(media.get("time_map") or [])
+            if media.get("text_layout") is not None:
+                public["text_layout"] = deepcopy(media["text_layout"])
         if isinstance(job.get("error"), dict):
             public["error"] = dict(job["error"])
         return public
@@ -999,15 +1976,44 @@ class FxPreviewJobManager:
                 "overlay": json.loads(json.dumps(job["overlay"], ensure_ascii=False)),
                 "replace_overlay_id": job.get("replace_overlay_id"),
                 "dependency_hash": job["dependency_hash"],
+                "preview_options": dict(job["preview_options"]),
             }
         if expected_revision != self._state_revision(context) or expected_revision != job["state_revision"]:
             raise FxPreviewJobError(409, "preview_stale", "預覽後時間軸已變更，請重新產生再套用")
-        current_deps = self._dependency_snapshot(context, frozen["overlay"])
+        current_frozen_state = None
+        current_frozen_manifest = None
+        if frozen["preview_options"]["mode"] == "timeline":
+            if self.timeline_snapshot_builder is None:
+                raise FxPreviewJobError(
+                    500, "snapshot_invalid", "無法建立完整時間軸預覽快照"
+                )
+            current_timeline_snapshot = self.timeline_snapshot_builder(
+                deepcopy(context.get("state") or {}),
+                deepcopy(context.get("manifest") or {}),
+                deepcopy(frozen["overlay"]),
+                frozen["replace_overlay_id"],
+            )
+            current_frozen_state = current_timeline_snapshot.get("state")
+            current_frozen_manifest = current_timeline_snapshot.get("manifest")
+            if not isinstance(current_frozen_state, dict) or not isinstance(
+                current_frozen_manifest, dict
+            ):
+                raise FxPreviewJobError(
+                    500, "snapshot_invalid", "無法建立完整時間軸預覽快照"
+                )
+        current_deps = self._dependency_snapshot(
+            context,
+            frozen["overlay"],
+            preview_options=frozen["preview_options"],
+            frozen_state=current_frozen_state,
+            frozen_manifest=current_frozen_manifest,
+        )
         if _canonical_sha256(current_deps) != frozen["dependency_hash"]:
             raise FxPreviewJobError(409, "preview_stale", "預覽依賴的來源、主題或字型已變更")
         return frozen
 
     def media_path(self, job_id: str, digest: str) -> Path:
+        self._assert_storage_safe("working", "root", "cache")
         if JOB_ID_RE.fullmatch(job_id) is None or SHA256_RE.fullmatch(digest) is None:
             raise FxPreviewJobError(404, "media_not_found", "找不到這個 FX 預覽檔")
         with self._lock:
@@ -1016,23 +2022,38 @@ class FxPreviewJobManager:
             if not job or job.get("state") != "ready" or not isinstance(media, dict) or media.get("sha256") != digest:
                 raise FxPreviewJobError(404, "media_not_found", "找不到這個 FX 預覽檔")
             path = media.get("path")
-        if not isinstance(path, Path) or not _regular_nonsymlink(path):
+        if not isinstance(path, Path) or path.name != f"{job.get('cache_key')}.mp4":
             raise FxPreviewJobError(404, "media_not_found", "找不到這個 FX 預覽檔")
-        resolved = path.resolve()
-        if self.cache_dir.resolve() not in resolved.parents or _file_sha256(resolved) != digest:
+        cache_fd = self._storage_pins["cache"].fd
+        try:
+            actual, _info = self._sha256_at(cache_fd, path.name)
+        except OSError:
+            raise FxPreviewJobError(404, "media_not_found", "找不到這個 FX 預覽檔") from None
+        if actual != digest:
             raise FxPreviewJobError(404, "media_not_found", "找不到這個 FX 預覽檔")
         try:
             now = time.time()
-            os.utime(resolved, (now, now), follow_symlinks=False)
+            os.utime(path.name, (now, now), dir_fd=cache_fd, follow_symlinks=False)
             cache_key = str(job.get("cache_key") or "")
-            receipt = self.cache_dir / f"{cache_key}.json"
-            if SHA256_RE.fullmatch(cache_key) and _regular_nonsymlink(receipt):
-                os.utime(receipt, (now, now), follow_symlinks=False)
+            if SHA256_RE.fullmatch(cache_key):
+                try:
+                    descriptor, _receipt_info = self._open_regular_at(cache_fd, f"{cache_key}.json")
+                    os.close(descriptor)
+                    os.utime(
+                        f"{cache_key}.json",
+                        (now, now),
+                        dir_fd=cache_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    pass
         except OSError:
             raise FxPreviewJobError(404, "media_not_found", "找不到這個 FX 預覽檔") from None
-        return resolved
+        self._assert_storage_safe("working", "root", "cache")
+        return path
 
     def prune(self) -> None:
+        self._assert_storage_safe()
         now = time.time()
         protected: set[str] = set()
         expired: list[dict[str, Any]] = []
@@ -1045,16 +2066,30 @@ class FxPreviewJobManager:
                     protected.add(str(job["cache_key"]))
         for job in expired:
             for suffix in ("request.json", "result.json", "part.mp4"):
-                (self.runtime_dir / f"{job['id']}.{suffix}").unlink(missing_ok=True)
-        entries: list[tuple[float, int, str, Path]] = []
-        for path in self.cache_dir.iterdir():
-            if path.is_symlink() or not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}\.mp4", path.name):
+                try:
+                    os.unlink(
+                        f"{job['id']}.{suffix}",
+                        dir_fd=self._storage_pins["runtime"].fd,
+                    )
+                except FileNotFoundError:
+                    pass
+        cache_fd = self._storage_pins["cache"].fd
+        entries: list[tuple[float, int, str, str]] = []
+        for entry in list(os.scandir(cache_fd)):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
                 continue
-            info = path.stat()
-            entries.append((info.st_mtime, info.st_size, path.stem, path))
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or not re.fullmatch(r"[0-9a-f]{64}\.mp4", entry.name)
+            ):
+                continue
+            entries.append((info.st_mtime, info.st_size, entry.name[:-4], entry.name))
         total = sum(item[1] for item in entries)
         count = len(entries)
-        for mtime, size, key, media in sorted(entries):
+        for mtime, size, key, media_name in sorted(entries):
             expired_by_ttl = now - mtime > CACHE_IDLE_TTL_S
             if not expired_by_ttl and count <= CACHE_MAX_ITEMS and total <= CACHE_MAX_BYTES:
                 break
@@ -1075,51 +2110,79 @@ class FxPreviewJobManager:
                             "updated_monotonic": now,
                         }
                     )
-            media.unlink(missing_ok=True)
-            (self.cache_dir / f"{key}.json").unlink(missing_ok=True)
+            for name in (media_name, f"{key}.json"):
+                try:
+                    os.unlink(name, dir_fd=cache_fd)
+                except FileNotFoundError:
+                    pass
             count -= 1
             total -= size
 
-        renderer_entries: list[tuple[float, int, Path]] = []
-        for path in self.renderer_cache_dir.rglob("*"):
-            if path.is_symlink() or not path.is_file():
-                continue
-            resolved = path.resolve()
-            if self.renderer_cache_dir.resolve() not in resolved.parents:
-                continue
-            info = path.stat()
-            renderer_entries.append((info.st_mtime, info.st_size, path))
+        renderer_fd = self._storage_pins["renderer"].fd
+        renderer_entries: list[tuple[float, int, tuple[str, ...]]] = []
+
+        def collect_renderer(
+            _parent_fd: int,
+            _name: str,
+            info: os.stat_result,
+            parts: tuple[str, ...],
+        ) -> None:
+            if info.st_nlink == 1:
+                renderer_entries.append((info.st_mtime, info.st_size, parts))
+
+        self._walk_files_at(renderer_fd, collect_renderer)
         renderer_total = sum(item[1] for item in renderer_entries)
         if self.has_active_job():
             return
-        for mtime, size, path in sorted(renderer_entries):
+        for mtime, size, parts in sorted(renderer_entries):
             expired_by_ttl = now - mtime > CACHE_IDLE_TTL_S
             if not expired_by_ttl and total + renderer_total <= CACHE_MAX_BYTES:
                 break
-            path.unlink(missing_ok=True)
-            renderer_total -= size
-        for directory in sorted(
-            (path for path in self.renderer_cache_dir.rglob("*") if path.is_dir() and not path.is_symlink()),
-            key=lambda path: len(path.parts),
-            reverse=True,
-        ):
             try:
-                directory.rmdir()
-            except OSError:
+                self._unlink_relative_at(renderer_fd, parts)
+            except FileNotFoundError:
                 pass
+            renderer_total -= size
+        self._remove_empty_dirs_at(renderer_fd)
 
     def _touch_renderer_cache(self) -> None:
         """Record successful use so the 24-hour idle TTL is meaningful."""
-        now = time.time()
-        for path in self.renderer_cache_dir.rglob("*"):
-            if path.is_symlink() or not path.is_file():
-                continue
-            resolved = path.resolve()
-            if self.renderer_cache_dir.resolve() not in resolved.parents:
+        self._assert_storage_safe("working", "root", "renderer")
+        now_ns = time.time_ns()
+
+        def touch(
+            parent_fd: int,
+            name: str,
+            info: os.stat_result,
+            _parts: tuple[str, ...],
+        ) -> None:
+            try:
+                # A killed renderer from an older build may have left hard
+                # links to live project inputs.  Touching such a cache entry
+                # would mutate the live inode's mtime.
+                if info.st_nlink > 1:
+                    return
+                os.utime(
+                    name,
+                    ns=(now_ns, now_ns),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return
+
+        self._walk_files_at(self._storage_pins["renderer"].fd, touch)
+
+    def _cleanup_renderer_scratch(self) -> None:
+        """Remove renderer-owned shadow projects, including killed jobs."""
+        self._assert_storage_safe("working", "root", "renderer")
+        renderer_fd = self._storage_pins["renderer"].fd
+        for entry in list(os.scandir(renderer_fd)):
+            if not entry.name.startswith("timeline-project-"):
                 continue
             try:
-                os.utime(resolved, (now, now), follow_symlinks=False)
-            except OSError:
+                self._remove_tree_at(renderer_fd, entry.name)
+            except (FileNotFoundError, OSError):
                 continue
 
     def close(self) -> None:
@@ -1130,10 +2193,21 @@ class FxPreviewJobManager:
                 self.cancel(active)
             except FxPreviewJobError:
                 pass
+        for pin in reversed(tuple(self._storage_pins.values())):
+            pin.close()
 
     def _cleanup_orphan_partials(self) -> None:
-        for path in self.runtime_dir.iterdir():
-            if path.is_symlink() or not path.is_file():
+        self._assert_storage_safe("working", "root", "runtime")
+        runtime_fd = self._storage_pins["runtime"].fd
+        for entry in list(os.scandir(runtime_fd)):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
                 continue
-            if re.fullmatch(r"[0-9a-f]{32}\.(?:request\.json|result\.json|part\.mp4)", path.name):
-                path.unlink(missing_ok=True)
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if re.fullmatch(r"[0-9a-f]{32}\.(?:request\.json|result\.json|part\.mp4)", entry.name):
+                try:
+                    os.unlink(entry.name, dir_fd=runtime_fd)
+                except FileNotFoundError:
+                    pass

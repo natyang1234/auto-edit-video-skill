@@ -38,6 +38,11 @@ let fxPreviewDraft = null;
 let fxPreviewReplaceOverlayId = null;
 let fxPreviewTrigger = null;
 let fxPreviewJob = null;
+// The current job may be a standard-quality upgrade while the video element
+// still shows the already-ready draft. Keep the displayed media's job/meta
+// separate from the job that is running (and eventually confirmable).
+let fxPreviewVisibleJob = null;
+let fxPreviewVisibleMeta = null;
 let fxPreviewPollTimer = null;
 let fxPreviewDebounceTimer = null;
 let fxPreviewCancelPromise = null;
@@ -46,6 +51,11 @@ let fxPreviewReadySignature = "";
 let fxPreviewDraftSignature = "";
 let fxPreviewConfirmed = false;
 let activeFxPreviewCategory = "";
+let fxPreviewLibraryFilter = "";
+let fxPreviewStaleDraft = null;
+let fxPreviewSyncing = false;
+let fxPreviewUpgradeStarted = false;
+let fxPreviewUpgradeCancelled = false;
 // Last state both sides agreed on. Diffing against this is what lets a save
 // conflict be replayed: it says which top-level sections *this* window changed,
 // so the background pipeline's writes can be kept and ours re-applied on top.
@@ -148,8 +158,13 @@ function cacheElements() {
     "fx-panel", "fx-panel-note", "fx-cats", "fx-search", "fx-grid", "fx-spec", "fx-vars",
     "fx-preview-dialog", "fx-preview-close", "fx-preview-cats", "fx-preview-search", "fx-preview-grid",
     "fx-preview-selected-name", "fx-preview-spec", "fx-preview-source", "fx-preview-duration",
-    "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-status",
-    "fx-preview-video", "fx-preview-retry", "fx-preview-cancel", "fx-preview-confirm"
+    "fx-preview-apply-source", "fx-preview-apply-duration", "fx-preview-apply-window-label",
+    "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit", "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-status",
+    "fx-preview-video", "fx-preview-source-video", "fx-preview-source-time", "fx-preview-effect-time",
+    "fx-preview-layout-check", "fx-preview-layout-check-heading", "fx-preview-layout-check-toggle",
+    "fx-preview-layout-check-summary", "fx-preview-layout-check-list",
+    "fx-preview-resync", "fx-preview-draft-notice", "fx-preview-draft-copy", "fx-preview-restore-draft",
+    "fx-preview-discard-draft", "fx-preview-retry", "fx-preview-cancel-upgrade", "fx-preview-cancel", "fx-preview-confirm"
   ].forEach((id) => { elements[id] = byId(id); });
 }
 
@@ -1926,12 +1941,140 @@ function fxThumbUrl(effect) {
 }
 
 function fxPreviewIsBlocked(effect) {
-  return String(effect?.code || "").toUpperCase() === "B1";
+  return String(effect?.code || "").toUpperCase() === "B1" && !fxPreviewDraft?.material?.asset_id;
 }
 
 function fxPreviewReplaceOverlay() {
   if (!fxPreviewReplaceOverlayId || !Array.isArray(state?.overlays)) return null;
   return state.overlays.find((overlay) => String(overlay.id) === String(fxPreviewReplaceOverlayId)) || null;
+}
+
+const FX_PREVIEW_PREFERENCES_KEY = "auto-edit:fx-preview-preferences:v1";
+const FX_PREVIEW_DRAFTS_KEY = "auto-edit:fx-preview-drafts:v1";
+
+function fxPreviewStorageRead(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function fxPreviewStorageWrite(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function fxPreviewProjectIdentity() {
+  const projectId = String(projectPayload?.manifest?.project_id || projectPayload?.state?.project_id || "").trim();
+  return projectId || "unknown-project";
+}
+
+function fxPreviewDraftKey() {
+  return `${fxPreviewProjectIdentity()}::${fxPreviewReplaceOverlayId || "new"}`;
+}
+
+function fxPreviewCurrentRevision() {
+  return String(state?.revision || "");
+}
+
+function fxPreviewSavedDraft() {
+  const drafts = fxPreviewStorageRead(FX_PREVIEW_DRAFTS_KEY, {});
+  return drafts[fxPreviewDraftKey()] && typeof drafts[fxPreviewDraftKey()] === "object"
+    ? drafts[fxPreviewDraftKey()]
+    : null;
+}
+
+function fxPreviewPersistDraft() {
+  if (!fxPreviewDraft || fxPreviewIsBlocked(fxEffectByCode(fxPreviewDraft.code))) return;
+  const drafts = fxPreviewStorageRead(FX_PREVIEW_DRAFTS_KEY, {});
+  drafts[fxPreviewDraftKey()] = {
+    revision: fxPreviewCurrentRevision(),
+    draft: deepCopy(fxPreviewDraft),
+    saved_at: new Date().toISOString(),
+  };
+  fxPreviewStorageWrite(FX_PREVIEW_DRAFTS_KEY, drafts);
+}
+
+function fxPreviewDiscardSavedDraft() {
+  const drafts = fxPreviewStorageRead(FX_PREVIEW_DRAFTS_KEY, {});
+  delete drafts[fxPreviewDraftKey()];
+  fxPreviewStorageWrite(FX_PREVIEW_DRAFTS_KEY, drafts);
+  fxPreviewStaleDraft = null;
+  fxPreviewRenderDraftNotice();
+}
+
+function fxPreviewPreferences() {
+  const stored = fxPreviewStorageRead(FX_PREVIEW_PREFERENCES_KEY, {});
+  return {
+    favorites: Array.isArray(stored.favorites) ? stored.favorites.filter((code) => typeof code === "string") : [],
+    recent: Array.isArray(stored.recent) ? stored.recent.filter((code) => typeof code === "string") : [],
+  };
+}
+
+function fxPreviewSavePreferences(preferences) {
+  fxPreviewStorageWrite(FX_PREVIEW_PREFERENCES_KEY, preferences);
+}
+
+function fxPreviewIsFavorite(code) {
+  return fxPreviewPreferences().favorites.includes(code);
+}
+
+function fxPreviewToggleFavorite(code) {
+  const preferences = fxPreviewPreferences();
+  preferences.favorites = preferences.favorites.includes(code)
+    ? preferences.favorites.filter((item) => item !== code)
+    : [...preferences.favorites, code];
+  fxPreviewSavePreferences(preferences);
+  fxPreviewRenderCatalog();
+}
+
+function fxPreviewRememberRecent(code) {
+  if (!code) return;
+  const preferences = fxPreviewPreferences();
+  preferences.recent = [code, ...preferences.recent.filter((item) => item !== code)].slice(0, 12);
+  fxPreviewSavePreferences(preferences);
+}
+
+function fxPreviewRenderDraftNotice() {
+  const notice = elements["fx-preview-draft-notice"];
+  if (!notice) return;
+  const copy = elements["fx-preview-draft-copy"];
+  const restore = elements["fx-preview-restore-draft"];
+  const discard = elements["fx-preview-discard-draft"];
+  const hasCurrentDraft = Boolean(fxPreviewDraft?.__restored);
+  const stale = fxPreviewStaleDraft;
+  notice.hidden = !hasCurrentDraft && !stale;
+  restore.hidden = !stale;
+  discard.hidden = !hasCurrentDraft && !stale;
+  if (stale) {
+    copy.textContent = "偵測到舊版本的未套用候選草稿；專案版本已變更，不會自動還原或套用。可檢視後丟棄。";
+  } else if (hasCurrentDraft) {
+    copy.textContent = "已還原未套用候選草稿；可繼續試看、直接丟棄，確認前不會改動時間軸。";
+  }
+}
+
+function fxPreviewRestoreStaleDraft() {
+  const saved = fxPreviewStaleDraft;
+  if (!saved?.draft) return;
+  const effect = fxEffectByCode(saved.draft.code);
+  if (!effect) {
+    fxPreviewDiscardSavedDraft();
+    return;
+  }
+  fxPreviewDraft = fxPreviewBuildDraft(effect, saved.draft, fxPreviewReplaceOverlay(), fxPreviewSourceStart());
+  fxPreviewDraft.__restored = true;
+  fxPreviewStaleDraft = null;
+  fxPreviewPersistDraft();
+  fxPreviewRenderDialog();
+  fxPreviewInvalidateAndSchedule();
 }
 
 function fxPreviewCaptionText(start) {
@@ -1997,21 +2140,33 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
   });
   const placement = (effect.vars || []).find((item) => item.kind === "placement");
   const priorFonts = seed?.font_ids || overlay?.font_ids || {};
+  const sourceDuration = Math.max(0.1, Number(duration() || 0.1));
+  const priorApply = seed?.apply_window || {};
+  const applyStart = Math.max(0, Math.min(Number.isFinite(Number(priorApply.start_s)) ? Number(priorApply.start_s) : (overlay ? Number(overlay.start) : safeStart), sourceDuration - 0.1));
+  const applyDuration = Math.max(0.1, Math.min(sourceDuration - applyStart, Number.isFinite(Number(priorApply.duration_s)) ? Number(priorApply.duration_s) : (overlay ? Number(overlay.end) - Number(overlay.start) : Math.min(3, sourceDuration - applyStart))));
   return {
     code: effect.code,
     window: {
-      start_s: safeStart,
+      start_s: Math.max(applyStart, Math.min(safeStart, applyStart + applyDuration - 0.1)),
       duration_s: Math.max(0.1, Math.min(maxDuration, Number.isFinite(rawDuration) ? rawDuration : maxDuration)),
     },
+    apply_window: { start_s: applyStart, duration_s: applyDuration },
     values,
     placement: seed?.placement ?? overlay?.placement ?? placement?.default ?? "",
     scheme: seed?.scheme ?? overlay?.scheme ?? "",
     font_ids: { ...priorFonts },
+    subject: seed?.subject ?? null,
+    text_fit: seed?.text_fit !== false,
+    material: seed?.material || null,
+    preview_options: { mode: seed?.preview_options?.mode === "timeline" ? "timeline" : "single", quality: seed?.preview_options?.quality === "standard" ? "standard" : "draft" },
   };
 }
 
 function fxPreviewSignature() {
-  return fxPreviewDraft ? JSON.stringify(fxPreviewDraft) : "";
+  if (!fxPreviewDraft) return "";
+  const stable = deepCopy(fxPreviewDraft);
+  if (stable.preview_options) delete stable.preview_options.quality;
+  return JSON.stringify(stable);
 }
 
 function fxPreviewSetStatus(message, tone = "") {
@@ -2022,6 +2177,100 @@ function fxPreviewSetStatus(message, tone = "") {
   status.classList.toggle("is-success", tone === "success");
 }
 
+const FX_PREVIEW_LAYOUT_CHECK_LABELS = Object.freeze({
+  safe_area: "文字接近安全區邊緣",
+  text_overflow: "文字超出可用範圍",
+  subject_overlap: "文字可能遮住人物或臉",
+  face_overlap: "文字可能遮住人物或臉",
+  subject_measurement_unavailable: "未能可靠檢查，請看畫面確認",
+  face_measurement_unavailable: "未能可靠檢查，請看畫面確認",
+  dom_measurement_unavailable: "未能可靠檢查，請看畫面確認",
+  text_too_small: "文字已大幅縮小，建議縮短",
+});
+const FX_PREVIEW_LAYOUT_CHECK_UNAVAILABLE = "未能可靠檢查，請看畫面確認";
+const FX_PREVIEW_LAYOUT_CHECK_DISABLED = "停用";
+
+function fxPreviewLayoutCheckKey(value) {
+  return String(value || "").trim().toLowerCase().replace(/-/g, "_");
+}
+
+function fxPreviewLayoutCheckMeasurementAvailable(value) {
+  const key = fxPreviewLayoutCheckKey(value);
+  return Boolean(key) && !["unknown", "unavailable", "disabled", "none", "null"].includes(key);
+}
+
+function fxPreviewRenderTextLayout(textLayout = null) {
+  const panel = elements["fx-preview-layout-check"];
+  const summary = elements["fx-preview-layout-check-summary"];
+  const list = elements["fx-preview-layout-check-list"];
+  const toggle = elements["fx-preview-layout-check-toggle"];
+  if (!panel || !summary || !list || !toggle) return;
+  panel.hidden = true;
+  summary.textContent = "";
+  list.replaceChildren();
+  list.hidden = true;
+  toggle.hidden = true;
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.textContent = "查看細節";
+  if (!textLayout || typeof textLayout !== "object" || Array.isArray(textLayout)) return;
+
+  const details = [];
+  const addDetail = (label) => {
+    if (label && !details.includes(label) && details.length < 10) details.push(label);
+  };
+  let unknownFinding = false;
+  const findings = Array.isArray(textLayout.findings) ? textLayout.findings : [];
+  findings.forEach((finding) => {
+    const kind = fxPreviewLayoutCheckKey(finding?.kind);
+    const label = FX_PREVIEW_LAYOUT_CHECK_LABELS[kind];
+    if (label) addDetail(label);
+    else if (kind) unknownFinding = true;
+  });
+
+  const version = Number(textLayout.version);
+  const measurement = fxPreviewLayoutCheckKey(textLayout.measurement);
+  const status = fxPreviewLayoutCheckKey(textLayout.status);
+  const faceMeasurement = fxPreviewLayoutCheckKey(textLayout.face_measurement);
+  const measurementReliable = version === 2
+    && measurement === "composition_dom"
+    && fxPreviewLayoutCheckMeasurementAvailable(faceMeasurement);
+  const statusKnown = ["pass", "warn"].includes(status);
+  const disabled = measurement === "disabled";
+  const unavailable = !measurementReliable || !statusKnown || unknownFinding;
+  if ((!disabled && unavailable) || (!disabled && !details.length && status === "warn")) {
+    addDetail(FX_PREVIEW_LAYOUT_CHECK_UNAVAILABLE);
+  }
+
+  if (disabled) {
+    summary.textContent = `畫面檢查：${FX_PREVIEW_LAYOUT_CHECK_DISABLED}`;
+  } else if (unavailable) {
+    summary.textContent = `畫面檢查：${FX_PREVIEW_LAYOUT_CHECK_UNAVAILABLE}`;
+  } else if (status === "warn" || details.length) {
+    summary.textContent = details.length
+      ? `畫面檢查：有 ${details.length} 項提醒`
+      : "畫面檢查：有提醒，請看畫面確認";
+  } else {
+    summary.textContent = "畫面檢查：通過";
+  }
+  details.forEach((detail) => {
+    const item = document.createElement("li");
+    item.textContent = detail;
+    list.append(item);
+  });
+  toggle.hidden = !details.length;
+  panel.hidden = false;
+}
+
+function fxPreviewToggleTextLayoutDetails() {
+  const toggle = elements["fx-preview-layout-check-toggle"];
+  const list = elements["fx-preview-layout-check-list"];
+  if (!toggle || !list || toggle.hidden) return;
+  const expanded = toggle.getAttribute("aria-expanded") === "true";
+  list.hidden = expanded;
+  toggle.setAttribute("aria-expanded", String(!expanded));
+  toggle.textContent = expanded ? "查看細節" : "收合細節";
+}
+
 function fxPreviewUpdateWindowControls() {
   if (!fxPreviewDraft) return;
   const effect = fxEffectByCode(fxPreviewDraft.code);
@@ -2029,52 +2278,175 @@ function fxPreviewUpdateWindowControls() {
   const maxStart = Math.max(0, sourceDuration - 0.1);
   const start = Math.max(0, Math.min(maxStart, Number(fxPreviewDraft.window.start_s) || 0));
   const maxDuration = fxPreviewMaxDuration(effect, start);
-  const clipDuration = Math.max(0.1, Math.min(maxDuration, Number(fxPreviewDraft.window.duration_s) || maxDuration));
   fxPreviewDraft.window.start_s = start;
+  const apply = fxPreviewDraft.apply_window || (fxPreviewDraft.apply_window = { start_s: start, duration_s: maxDuration });
+  apply.start_s = Math.max(0, Math.min(Number(apply.start_s) || 0, Math.max(0, sourceDuration - 0.1)));
+  apply.duration_s = Math.max(0.1, Math.min(sourceDuration - apply.start_s, Number(apply.duration_s) || maxDuration));
+  if (start < apply.start_s) fxPreviewDraft.window.start_s = apply.start_s;
+  const actualStart = fxPreviewDraft.window.start_s;
+  const clipDuration = Math.max(0.1, Math.min(maxDuration, apply.start_s + apply.duration_s - actualStart, Number(fxPreviewDraft.window.duration_s) || maxDuration));
   fxPreviewDraft.window.duration_s = clipDuration;
-  elements["fx-preview-source"].value = String(start);
+  elements["fx-preview-source"].value = String(actualStart);
   elements["fx-preview-source"].max = String(maxStart);
   elements["fx-preview-duration"].value = String(clipDuration);
   elements["fx-preview-duration"].max = String(maxDuration);
-  elements["fx-preview-window-label"].textContent = `${formatTime(start)} — ${formatTime(start + clipDuration)}`;
+  elements["fx-preview-window-label"].textContent = `${formatTime(actualStart)} — ${formatTime(actualStart + clipDuration)}`;
+  elements["fx-preview-apply-source"].value = String(apply.start_s);
+  elements["fx-preview-apply-duration"].value = String(apply.duration_s);
+  elements["fx-preview-apply-window-label"].textContent = `${formatTime(apply.start_s)} — ${formatTime(apply.start_s + apply.duration_s)}`;
+  elements["fx-preview-mode"].value = fxPreviewDraft.preview_options?.mode || "single";
+  elements["fx-preview-quality"].value = fxPreviewDraft.preview_options?.quality || "draft";
+  elements["fx-preview-text-fit"].checked = fxPreviewDraft.text_fit !== false;
   const overlay = fxPreviewReplaceOverlay();
   const originalDuration = overlay ? Math.max(0, Number(overlay.end) - Number(overlay.start)) : 0;
   const note = elements["fx-preview-replace-note"];
   if (note) {
-    note.hidden = !overlay || originalDuration <= 4.0001;
-    if (!note.hidden) {
-      note.textContent = `原特效長度 ${originalDuration.toFixed(2)} 秒；這次試看 ${formatTime(start)} — ${formatTime(start + clipDuration)}。確認套用後將縮短為此次試看範圍；未確認前原層不變。`;
-    }
+    note.hidden = !overlay;
+    if (!note.hidden) note.textContent = `原特效範圍 ${originalDuration.toFixed(2)} 秒；試看片段不會縮短實際套用範圍。`;
   }
+}
+
+function fxPreviewSetVisibleMedia(job) {
+  fxPreviewVisibleJob = job ? deepCopy(job) : null;
+  if (!job) {
+    fxPreviewVisibleMeta = null;
+    return;
+  }
+  const renderDuration = Number(job.render_duration_s);
+  fxPreviewVisibleMeta = {
+    render_duration_s: Number.isFinite(renderDuration) ? renderDuration : null,
+    time_map: Array.isArray(job.time_map) ? deepCopy(job.time_map) : [],
+    text_layout: job.text_layout && typeof job.text_layout === "object" ? deepCopy(job.text_layout) : null,
+  };
+  fxPreviewRenderTextLayout(fxPreviewVisibleMeta.text_layout);
+}
+
+function fxPreviewClearVisibleMedia() {
+  fxPreviewVisibleJob = null;
+  fxPreviewVisibleMeta = null;
+  fxPreviewRenderTextLayout(null);
+}
+
+function fxPreviewSourceTimeForEffectTime(effectTime) {
+  const map = Array.isArray(fxPreviewVisibleMeta?.time_map) ? fxPreviewVisibleMeta.time_map : [];
+  const point = Math.max(0, Number(effectTime) || 0);
+  const segment = map.find((item) => point >= Number(item.output_start_s) - 0.001 && point <= Number(item.output_end_s) + 0.001);
+  if (segment) {
+    const outputSpan = Math.max(0.001, Number(segment.output_end_s) - Number(segment.output_start_s));
+    const progress = Math.max(0, Math.min(1, (point - Number(segment.output_start_s)) / outputSpan));
+    return Number(segment.source_start_s) + progress * (Number(segment.source_end_s) - Number(segment.source_start_s));
+  }
+  return Math.max(0, Number(fxPreviewDraft?.window?.start_s || 0) + Math.max(0, Number(effectTime) || 0));
+}
+
+function fxPreviewSetSubjectFromSourceClick(event) {
+  if (fxPreviewDraft?.code !== "P5") return;
+  const video = elements["fx-preview-source-video"];
+  const rect = video.getBoundingClientRect();
+  const videoRatio = Number(video.videoWidth) / Math.max(1, Number(video.videoHeight));
+  const boxRatio = rect.width / Math.max(1, rect.height);
+  if (!Number.isFinite(videoRatio) || videoRatio <= 0) return;
+  const contentWidth = videoRatio > boxRatio ? rect.width : rect.height * videoRatio;
+  const contentHeight = videoRatio > boxRatio ? rect.width / videoRatio : rect.height;
+  const left = rect.left + (rect.width - contentWidth) / 2;
+  const top = rect.top + (rect.height - contentHeight) / 2;
+  if (event.clientX < left || event.clientX > left + contentWidth || event.clientY < top || event.clientY > top + contentHeight) {
+    fxPreviewSetStatus("請點選原片畫面範圍，黑邊不會設定主角位置。", "error");
+    return;
+  }
+  fxPreviewDraft.subject = {
+    x: Math.max(0, Math.min(1, (event.clientX - left) / contentWidth)),
+    y: Math.max(0, Math.min(1, (event.clientY - top) / contentHeight)),
+  };
+  fxPreviewSetStatus("已設定主角位置；可重新試看確認。", "success");
+  fxPreviewDraftChanged();
+}
+
+function fxPreviewSyncVideos(origin = "effect") {
+  const source = elements["fx-preview-source-video"];
+  const effect = elements["fx-preview-video"];
+  if (!source || !effect || !fxPreviewDraft || fxPreviewSyncing) return;
+  fxPreviewSyncing = true;
+  const sourceTime = origin === "source"
+    ? Math.max(0, Number(source.currentTime) || 0)
+    : fxPreviewSourceTimeForEffectTime(effect.currentTime);
+  const effectTime = origin === "source"
+    ? Math.max(0, sourceTime - Number(fxPreviewDraft.window.start_s || 0))
+    : Math.max(0, Number(effect.currentTime) || 0);
+  if (Math.abs(Number(source.currentTime || 0) - sourceTime) > 0.08) source.currentTime = sourceTime;
+  if (Math.abs(Number(effect.currentTime || 0) - effectTime) > 0.08) effect.currentTime = effectTime;
+  if (elements["fx-preview-source-time"]) elements["fx-preview-source-time"].textContent = formatTime(sourceTime);
+  if (elements["fx-preview-effect-time"]) elements["fx-preview-effect-time"].textContent = formatTime(effectTime);
+  setTimeout(() => { fxPreviewSyncing = false; }, 0);
+}
+
+function fxPreviewPrepareSourceVideo() {
+  const source = elements["fx-preview-source-video"];
+  if (!source || !sourceMediaUrl) return;
+  if (source.src !== new URL(sourceMediaUrl, location.href).href) {
+    source.src = sourceMediaUrl;
+    source.load();
+  }
+  const setStart = () => fxPreviewSyncVideos("effect");
+  if (source.readyState >= 1) setStart();
+  else source.addEventListener("loadedmetadata", setStart, { once: true });
+}
+
+function fxPreviewPlayBoth(origin = "effect") {
+  const source = elements["fx-preview-source-video"];
+  const effect = elements["fx-preview-video"];
+  fxPreviewSyncVideos(origin);
+  if (origin === "source") effect.play().catch(() => {});
+  else source.play().catch(() => {});
+}
+
+function fxPreviewPauseBoth(origin = "effect") {
+  const source = elements["fx-preview-source-video"];
+  const effect = elements["fx-preview-video"];
+  if (origin === "source") effect.pause();
+  else source.pause();
 }
 
 function fxPreviewRenderCatalog() {
   const catalog = fxCatalog();
   const categories = catalog.categories || {};
-  const tabs = [["", "全部"], ...Object.entries(categories)];
+  const tabs = [["favorites", "我的收藏"], ["recent", "最近試用"], ["", "全部"], ...Object.entries(categories)];
   elements["fx-preview-cats"].replaceChildren(...tabs.map(([key, label]) => {
     const button = document.createElement("button");
     button.type = "button";
     button.setAttribute("role", "tab");
-    button.setAttribute("aria-selected", String(key === activeFxPreviewCategory));
-    button.className = key === activeFxPreviewCategory ? "is-selected" : "";
-    button.textContent = key ? `${key} ${label}` : label;
+    const selected = key === "favorites" || key === "recent"
+      ? key === fxPreviewLibraryFilter
+      : !fxPreviewLibraryFilter && key === activeFxPreviewCategory;
+    button.setAttribute("aria-selected", String(selected));
+    button.className = selected ? "is-selected" : "";
+    button.textContent = key && key !== "favorites" && key !== "recent" ? `${key} ${label}` : label;
     button.addEventListener("click", () => {
-      activeFxPreviewCategory = key;
+      if (key === "favorites" || key === "recent") {
+        fxPreviewLibraryFilter = key;
+        activeFxPreviewCategory = "";
+      } else {
+        fxPreviewLibraryFilter = "";
+        activeFxPreviewCategory = key;
+      }
       fxPreviewRenderCatalog();
     });
     return button;
   }));
   const query = String(elements["fx-preview-search"].value || "").trim().toLowerCase();
+  const preferences = fxPreviewPreferences();
   const list = fxEffects().filter((effect) => (!activeFxPreviewCategory || effect.category === activeFxPreviewCategory)
+    && (!fxPreviewLibraryFilter || (fxPreviewLibraryFilter === "favorites"
+      ? preferences.favorites.includes(effect.code)
+      : preferences.recent.includes(effect.code)))
     && (!query || [effect.code, effect.name, effect.spec].join(" ").toLowerCase().includes(query)));
   elements["fx-preview-grid"].replaceChildren(...list.map((effect) => {
     const selected = effect.code === fxPreviewDraft?.code;
-    const button = document.createElement("button");
-    button.type = "button";
+    const button = document.createElement("div");
     button.className = `fx-card fx-preview-card${selected ? " is-selected" : ""}`;
     button.setAttribute("role", "radio");
     button.setAttribute("aria-checked", String(selected));
+    button.tabIndex = 0;
     button.dataset.fxCode = effect.code;
     button.title = fxPreviewIsBlocked(effect)
       ? `#${effect.num} ${effect.name}\n需要B-roll素材，請先至素材區處理`
@@ -2103,6 +2475,24 @@ function fxPreviewRenderCatalog() {
     name.textContent = effect.name;
     button.append(name);
     button.addEventListener("click", () => fxPreviewSelectEffect(effect.code));
+    button.addEventListener("keydown", (event) => {
+      if (event.target !== button) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        fxPreviewSelectEffect(effect.code);
+      }
+    });
+    const favorite = document.createElement("button");
+    favorite.type = "button";
+    favorite.className = `fx-preview-favorite${fxPreviewIsFavorite(effect.code) ? " is-favorite" : ""}`;
+    favorite.setAttribute("aria-label", `${fxPreviewIsFavorite(effect.code) ? "取消收藏" : "收藏"} ${effect.name}`);
+    favorite.setAttribute("aria-pressed", String(fxPreviewIsFavorite(effect.code)));
+    favorite.textContent = fxPreviewIsFavorite(effect.code) ? "★" : "☆";
+    favorite.addEventListener("click", (event) => {
+      event.stopPropagation();
+      fxPreviewToggleFavorite(effect.code);
+    });
+    button.append(favorite);
     return button;
   }));
 }
@@ -2114,6 +2504,32 @@ function fxPreviewRenderFields() {
     return;
   }
   const rows = [];
+  if (effect.code === "B1") {
+    const label = document.createElement("label");
+    label.className = "field fx-preview-field";
+    const span = document.createElement("span");
+    span.textContent = "已匯入素材";
+    const select = document.createElement("select");
+    select.innerHTML = '<option value="">選擇已匯入素材</option>';
+    label.append(span, select);
+    rows.push(label);
+    request("/api/assets/library").then((payload) => {
+      const assets = Array.isArray(payload.assets) ? payload.assets : [];
+      assets.filter((asset) => asset?.asset_id && asset?.sha256).forEach((asset) => {
+        const option = document.createElement("option");
+        option.value = asset.asset_id;
+        option.textContent = String(asset.path || asset.asset_id).split("/").pop();
+        option.dataset.sha256 = asset.sha256;
+        select.append(option);
+      });
+      select.value = fxPreviewDraft?.material?.asset_id || "";
+    }).catch(() => {});
+    select.addEventListener("change", () => {
+      const option = select.selectedOptions[0];
+      fxPreviewDraft.material = select.value ? { asset_id: select.value, sha256: option?.dataset.sha256 || "" } : null;
+      fxPreviewDraftChanged();
+    });
+  }
   const textVars = (effect.vars || []).filter((item) => item.kind === "text");
   textVars.forEach((item) => {
     const label = document.createElement("label");
@@ -2254,20 +2670,48 @@ function fxPreviewApplyJob(job, generation, signature) {
   const stateName = String(job?.state || "pending").toLowerCase();
   const ready = ["ready", "cache_hit"].includes(stateName) && Boolean(job?.media_url);
   const failed = stateName === "failed";
-  fxPreviewSetStatus(fxPreviewStatusForJob(job), failed ? "error" : ready ? "success" : "");
+  const quality = String(job?.preview_options?.quality || fxPreviewDraft?.preview_options?.quality || "draft");
+  const upgrading = quality === "standard" && !ready && !failed;
+  fxPreviewSetStatus(failed && quality === "standard"
+    ? "清晰版預覽失敗；快速版仍可播放，請手動重試清晰版。"
+    : ready && quality === "draft"
+      ? "快速版預覽可播放；正在背景準備清晰版，完成後才能套用。"
+      : fxPreviewStatusForJob(job), failed ? "error" : ready ? "success" : "");
   elements["fx-preview-retry"].hidden = !failed;
-  fxPreviewReadySignature = ready ? signature : "";
+  elements["fx-preview-cancel-upgrade"].hidden = !upgrading;
+  fxPreviewReadySignature = ready && quality === "standard" ? signature : "";
   elements["fx-preview-confirm"].disabled = !ready || fxPreviewReadySignature !== fxPreviewDraftSignature;
   if (ready) {
+    // A ready job is the only job allowed to become the media currently shown
+    // in the player. A standard upgrade can otherwise replace fxPreviewJob
+    // while the draft media remains on screen, which would make seeking use
+    // the wrong time map.
+    fxPreviewSetVisibleMedia(job);
     const video = elements["fx-preview-video"];
     const nextUrl = String(job.media_url);
     if (video.src !== new URL(nextUrl, location.href).href) {
       video.src = nextUrl;
       video.load();
     }
-    video.play().catch(() => {});
+    fxPreviewPrepareSourceVideo();
+    fxPreviewSyncVideos("effect");
+    fxPreviewPlayBoth("effect");
+    if (quality === "draft" && !fxPreviewUpgradeStarted && !fxPreviewUpgradeCancelled) {
+      fxPreviewUpgradeStarted = true;
+      setTimeout(() => fxPreviewStartStandardUpgrade(generation, signature), 0);
+    }
   }
   return true;
+}
+
+function fxPreviewStartStandardUpgrade(generation, signature) {
+  if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !fxPreviewDraft || !elements["fx-preview-dialog"]?.open || fxPreviewUpgradeCancelled) return;
+  fxPreviewDraft.preview_options.quality = "standard";
+  fxPreviewPersistDraft();
+  elements["fx-preview-confirm"].disabled = true;
+  elements["fx-preview-cancel-upgrade"].hidden = false;
+  fxPreviewSetStatus("快速版預覽可播放；正在背景準備清晰版。");
+  fxPreviewStart(generation, signature, true);
 }
 
 function fxPreviewCancelCurrentJob() {
@@ -2292,21 +2736,26 @@ function fxPreviewChangedMessage() {
   return "候選設定已變更，正在準備新的預覽（待渲染，不是即時完成）";
 }
 
-function fxPreviewInvalidateAndSchedule() {
+function fxPreviewInvalidateAndSchedule(keepVisiblePreview = false) {
   if (!fxPreviewDraft || !elements["fx-preview-dialog"]?.open) return;
   fxPreviewGeneration += 1;
   const generation = fxPreviewGeneration;
   clearTimeout(fxPreviewDebounceTimer);
   fxPreviewDebounceTimer = null;
   fxPreviewReadySignature = "";
+  fxPreviewUpgradeStarted = false;
+  fxPreviewUpgradeCancelled = false;
   fxPreviewDraftSignature = fxPreviewSignature();
   elements["fx-preview-confirm"].disabled = true;
   elements["fx-preview-retry"].hidden = true;
-  const oldVideo = elements["fx-preview-video"];
-  if (oldVideo) {
-    oldVideo.pause();
-    oldVideo.removeAttribute("src");
-    oldVideo.load();
+  if (!keepVisiblePreview) {
+    fxPreviewClearVisibleMedia();
+    const oldVideo = elements["fx-preview-video"];
+    if (oldVideo) {
+      oldVideo.pause();
+      oldVideo.removeAttribute("src");
+      oldVideo.load();
+    }
   }
   fxPreviewSetStatus(fxPreviewChangedMessage());
   const cancellation = fxPreviewCancelCurrentJob();
@@ -2327,7 +2776,7 @@ function fxPreviewInvalidateAndSchedule() {
   }, 350);
 }
 
-async function fxPreviewStart(generation, signature) {
+async function fxPreviewStart(generation, signature, _keepExistingPreview = false) {
   if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !fxPreviewDraft || !elements["fx-preview-dialog"].open) return;
   try {
     if (stateDirty || !lastSaveSucceeded) {
@@ -2346,12 +2795,17 @@ async function fxPreviewStart(generation, signature) {
           start_s: Number(fxPreviewDraft.window.start_s),
           duration_s: Number(fxPreviewDraft.window.duration_s),
         },
+        apply_window: { ...(fxPreviewDraft.apply_window || fxPreviewDraft.window) },
         values: { ...(fxPreviewDraft.values || {}) },
         placement: fxPreviewDraft.placement || "",
         scheme: fxPreviewDraft.scheme || "",
         font_ids: { ...(fxPreviewDraft.font_ids || {}) },
+        text_fit: fxPreviewDraft.text_fit !== false,
       },
+      preview_options: { ...(fxPreviewDraft.preview_options || { mode: "single", quality: "draft" }) },
     };
+    if (fxPreviewDraft.code === "P5") body.candidate.subject = fxPreviewDraft.subject;
+    if (fxPreviewDraft.code === "B1" && fxPreviewDraft.material) body.candidate.material = { ...fxPreviewDraft.material };
     if (fxPreviewReplaceOverlayId) body.replace_overlay_id = fxPreviewReplaceOverlayId;
     fxPreviewSetStatus("預覽排隊中（待渲染，不是即時完成）");
     const payload = await request("/api/fx-previews", {
@@ -2419,6 +2873,7 @@ async function fxPreviewPoll(statusUrl, generation, signature) {
 
 function fxPreviewDraftChanged() {
   fxPreviewUpdateWindowControls();
+  fxPreviewPersistDraft();
   fxPreviewInvalidateAndSchedule();
 }
 
@@ -2427,6 +2882,8 @@ function fxPreviewSelectEffect(code) {
   if (!effect) return;
   const overlay = fxPreviewReplaceOverlay();
   fxPreviewDraft = fxPreviewBuildDraft(effect, fxPreviewDraft, overlay, fxPreviewSourceStart());
+  fxPreviewRememberRecent(effect.code);
+  fxPreviewPersistDraft();
   fxPreviewRenderDialog();
   fxPreviewInvalidateAndSchedule();
 }
@@ -2439,6 +2896,7 @@ function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId 
   fxPreviewTrigger = trigger instanceof HTMLElement ? trigger : document.activeElement;
   fxPreviewReplaceOverlayId = replaceOverlayId || null;
   activeFxPreviewCategory = "";
+  fxPreviewLibraryFilter = "";
   elements["fx-preview-search"].value = "";
   const overlay = fxPreviewReplaceOverlay();
   const first = fxEffectByCode(initialCode)
@@ -2452,13 +2910,24 @@ function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId 
     showToast("找不到效果庫（edit-style-profiles）", "error");
     return;
   }
-  fxPreviewDraft = fxPreviewBuildDraft(first, null, overlay, fxPreviewSourceStart());
+  const saved = fxPreviewSavedDraft();
+  const savedEffect = fxEffectByCode(saved?.draft?.code);
+  fxPreviewStaleDraft = saved && saved.revision !== fxPreviewCurrentRevision() ? saved : null;
+  if (saved?.revision === fxPreviewCurrentRevision() && savedEffect && !fxPreviewIsBlocked(savedEffect)) {
+    fxPreviewDraft = fxPreviewBuildDraft(savedEffect, saved.draft, overlay, fxPreviewSourceStart());
+    fxPreviewDraft.__restored = true;
+  } else {
+    fxPreviewDraft = fxPreviewBuildDraft(first, null, overlay, fxPreviewSourceStart());
+  }
   fxPreviewDraftSignature = fxPreviewSignature();
   fxPreviewJob = null;
+  fxPreviewClearVisibleMedia();
   clearTimeout(fxPreviewDebounceTimer);
   clearTimeout(fxPreviewPollTimer);
   fxPreviewRenderDialog();
   dialog.showModal();
+  fxPreviewPrepareSourceVideo();
+  fxPreviewRenderDraftNotice();
   elements["fx-preview-search"].focus();
   fxPreviewInvalidateAndSchedule();
 }
@@ -2506,6 +2975,7 @@ async function confirmFxPreview() {
     updateScrubberBounds();
     showToast(result.overlay_id && fxPreviewReplaceOverlayId ? "特效已替換到時間軸" : "特效已加入時間軸", "success");
     fxPreviewConfirmed = true;
+    fxPreviewDiscardSavedDraft();
     fxPreviewJob = null;
     clearTimeout(fxPreviewPollTimer);
     elements["fx-preview-video"].pause();
@@ -2541,13 +3011,23 @@ function cleanupFxPreviewDialog() {
     video.removeAttribute("src");
     video.load();
   }
+  const sourceVideo = elements["fx-preview-source-video"];
+  if (sourceVideo) {
+    sourceVideo.pause();
+    sourceVideo.removeAttribute("src");
+    sourceVideo.load();
+  }
   const trigger = fxPreviewTrigger;
   fxPreviewDraft = null;
   fxPreviewReplaceOverlayId = null;
+  fxPreviewClearVisibleMedia();
   fxPreviewReadySignature = "";
   fxPreviewDraftSignature = "";
   fxPreviewTrigger = null;
   fxPreviewConfirmed = false;
+  fxPreviewUpgradeStarted = false;
+  fxPreviewUpgradeCancelled = false;
+  fxPreviewStaleDraft = null;
   if (trigger && typeof trigger.focus === "function" && document.contains(trigger)) trigger.focus();
 }
 
@@ -4060,10 +4540,57 @@ function bindEvents() {
     fxPreviewDraft.window.duration_s = Number(elements["fx-preview-duration"].value) || 0.01;
     fxPreviewDraftChanged();
   });
+  elements["fx-preview-apply-source"].addEventListener("input", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.apply_window.start_s = Number(elements["fx-preview-apply-source"].value) || 0;
+    fxPreviewDraftChanged();
+  });
+  elements["fx-preview-apply-duration"].addEventListener("input", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.apply_window.duration_s = Number(elements["fx-preview-apply-duration"].value) || 0.1;
+    fxPreviewDraftChanged();
+  });
+  elements["fx-preview-mode"].addEventListener("change", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.preview_options.mode = elements["fx-preview-mode"].value;
+    fxPreviewDraftChanged();
+  });
+  elements["fx-preview-quality"].addEventListener("change", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.preview_options.quality = elements["fx-preview-quality"].value;
+    fxPreviewDraftChanged();
+  });
+  elements["fx-preview-text-fit"].addEventListener("change", () => {
+    if (!fxPreviewDraft) return;
+    fxPreviewDraft.text_fit = elements["fx-preview-text-fit"].checked;
+    fxPreviewDraftChanged();
+  });
   elements["fx-preview-retry"].addEventListener("click", () => {
     if (!fxPreviewDraft) return;
-    fxPreviewInvalidateAndSchedule();
+    // Retry the current standard job without discarding the ready draft that
+    // is still visible while the replacement is rendered.
+    fxPreviewInvalidateAndSchedule(true);
   });
+  elements["fx-preview-cancel-upgrade"].addEventListener("click", () => {
+    fxPreviewUpgradeCancelled = true;
+    elements["fx-preview-cancel-upgrade"].hidden = true;
+    elements["fx-preview-confirm"].disabled = true;
+    fxPreviewCancelCurrentJob();
+    fxPreviewSetStatus("已取消清晰版；快速版仍可播放，但必須取得清晰版才能套用。", "error");
+  });
+  elements["fx-preview-layout-check-toggle"].addEventListener("click", fxPreviewToggleTextLayoutDetails);
+  elements["fx-preview-resync"].addEventListener("click", () => fxPreviewSyncVideos("effect"));
+  elements["fx-preview-source-video"].addEventListener("play", () => fxPreviewPlayBoth("source"));
+  elements["fx-preview-video"].addEventListener("play", () => fxPreviewPlayBoth("effect"));
+  elements["fx-preview-source-video"].addEventListener("pause", () => fxPreviewPauseBoth("source"));
+  elements["fx-preview-video"].addEventListener("pause", () => fxPreviewPauseBoth("effect"));
+  elements["fx-preview-source-video"].addEventListener("seeking", () => fxPreviewSyncVideos("source"));
+  elements["fx-preview-video"].addEventListener("seeking", () => fxPreviewSyncVideos("effect"));
+  elements["fx-preview-source-video"].addEventListener("timeupdate", () => fxPreviewSyncVideos("source"));
+  elements["fx-preview-video"].addEventListener("timeupdate", () => fxPreviewSyncVideos("effect"));
+  elements["fx-preview-source-video"].addEventListener("click", fxPreviewSetSubjectFromSourceClick);
+  elements["fx-preview-restore-draft"].addEventListener("click", fxPreviewRestoreStaleDraft);
+  elements["fx-preview-discard-draft"].addEventListener("click", fxPreviewDiscardSavedDraft);
   elements["fx-preview-confirm"].addEventListener("click", confirmFxPreview);
   elements["fx-preview-cancel"].addEventListener("click", closeFxPreviewDialog);
   elements["fx-preview-close"].addEventListener("click", closeFxPreviewDialog);

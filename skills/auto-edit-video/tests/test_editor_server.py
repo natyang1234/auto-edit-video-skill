@@ -1460,15 +1460,25 @@ class EditorServerTests(unittest.TestCase):
         self.assertNotIn("secret query", str(payload))
 
     def test_asset_library_exposes_current_license_and_fails_closed_on_bad_registry(self) -> None:
-        path = self.project / "assets/providers/openverse/candidate.jpg"
+        def png_chunk(kind: bytes, payload: bytes) -> bytes:
+            checksum = binascii.crc32(kind)
+            checksum = binascii.crc32(payload, checksum) & 0xFFFFFFFF
+            return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + png_chunk(
+            b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)
+        ) + png_chunk(
+            b"IDAT", zlib.compress(b"\0" + b"\x33" * 8 + b"\0" + b"\x33" * 8)
+        ) + png_chunk(b"IEND", b"")
+        path = self.project / "assets/providers/openverse/candidate.png"
         path.parent.mkdir(parents=True)
-        path.write_bytes(b"registered-provider-image")
+        path.write_bytes(png_bytes)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         editor_server.asset_registry.upsert_item(
             self.project,
             {
                 "asset_id": "provider-openverse-candidate",
-                "path": "assets/providers/openverse/candidate.jpg",
+                "path": "assets/providers/openverse/candidate.png",
                 "sha256": digest,
                 "origin": "provider",
                 "provider_id": "openverse",
@@ -1487,7 +1497,7 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, body = self.request("GET", "/api/assets/library")
         self.assertEqual(status, 200)
         payload = json.loads(body)
-        item = next(asset for asset in payload["assets"] if asset["path"].endswith("candidate.jpg"))
+        item = next(asset for asset in payload["assets"] if asset["path"].endswith("candidate.png"))
         self.assertEqual(item["provider_id"], "openverse")
         self.assertEqual(item["license_spdx"], "CC-BY-4.0")
         self.assertEqual(item["review_status"], "approved")
@@ -1500,10 +1510,11 @@ class EditorServerTests(unittest.TestCase):
         status, _headers, body = self.request("GET", "/api/assets/library")
         self.assertEqual(status, 200)
         payload = json.loads(body)
-        item = next(asset for asset in payload["assets"] if asset["path"].endswith("candidate.jpg"))
         self.assertTrue(payload["registry_error"])
-        self.assertIsNone(item["provider_id"])
-        self.assertNotEqual(item["review_status"], "approved")
+        self.assertFalse(
+            any(asset["path"].endswith("candidate.png") for asset in payload["assets"]),
+            "a corrupt provenance registry must fail closed instead of downgrading an approved asset",
+        )
 
     def test_cross_origin_gets_cannot_trigger_legacy_registry_migration(self) -> None:
         asset = self.project / "assets/legacy.png"

@@ -1028,3 +1028,34 @@ class DialogueProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DesignedFullTimelineTests(unittest.TestCase):
+    def test_every_designed_highlight_is_a_scoped_base_and_gap_is_preserved(self):
+        import render_editor_timeline as timeline
+        clips = [{"id":"a","start":0,"end":2},{"id":"b","start":3,"end":5}]
+        cards = [{"id":f"{c['id']}-{role}","type":"card","highlight_id":c["id"],"design_role":role,
+                  "start":c["start"],"end":c["end"]} for c in clips for role in timeline.DESIGN_ROLES]
+        caption = {"id":"subtitle","type":"caption","start":0,"end":5,"text":"字幕"}
+        state = {"highlights":clips,"overlays":cards+[caption],"video_template":{"id":"dynamic-craft"}}
+        original = json.loads(json.dumps(state))
+        root = Path("/tmp/project")
+        calls = []
+        def package(project, package_state, manifest, clip):
+            calls.append(clip["id"])
+            self.assertFalse(any(o["type"] == "caption" for o in package_state["overlays"]))
+            return root / "working/graphic_packages" / clip["id"] / "output.mp4"
+        with patch.object(timeline,"ensure_graphic_package",side_effect=package):
+            result=timeline.compose_designed_timeline_state(root,state,{})
+        self.assertEqual(calls,["a","b"])
+        self.assertEqual(state,original)
+        bases=[o for o in result["overlays"] if o.get("source_axis_media")]
+        self.assertEqual([(o["start"],o["end"]) for o in bases],[(0,2),(3,5)])
+        self.assertTrue(all(o["z_index"] < 0 for o in bases))
+        self.assertEqual(sum(o["id"] == "subtitle" for o in result["overlays"]),1)
+
+    def test_media_offset_seeks_original_animation_after_cut(self):
+        import render_editor_timeline as timeline
+        value=timeline.image_filter("base","out","1:v",{"start":5,"end":8,"media_offset_s":3,"style":{"width":100}},1080,1920)
+        self.assertIn("trim=start=3.000000",value)
+        self.assertIn("setpts=PTS-STARTPTS+5.000/TB",value)
