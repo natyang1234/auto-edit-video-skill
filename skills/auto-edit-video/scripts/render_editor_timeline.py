@@ -1848,6 +1848,7 @@ def build_render_command(
                 str(style_pack_for_clip(state, clip).get("id") or ""),
                 quality,
                 canvas=(width, height),
+                fit=fit,
             )
             if rendered is None:
                 if quality == "final":

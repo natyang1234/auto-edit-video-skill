@@ -27,12 +27,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-FX_VERSION = "fx-overlay-v1"
+FX_VERSION = "fx-overlay-v2-strict-source"
 FX_REL = Path("working/fx")
 MATTE_TIMEOUT_S = 30 * 60
 
@@ -330,13 +331,22 @@ def _log(payload: dict[str, Any]) -> None:
     print(json.dumps({"fx_fallback": payload}, ensure_ascii=False), file=sys.stderr)
 
 
-def _person_clip(project_dir: Path, source: Path, start: float, dur: float) -> Path | None:
-    """Transparent person webm for [start, start+dur] of the source (cached)."""
+def _person_assets(project_dir: Path, source: Path, start: float, dur: float, fit: str = "cover") -> tuple[Path, Path] | None:
+    """Transparent person + same-window matte for [start, start+dur] (cached).
+
+    The mask is deliberately retained for P5, while the large ProRes alpha
+    intermediate is removed after VP9 conversion.  A cache entry is useful only
+    if both artifacts are present, so a killed matte run cannot look complete.
+    """
     compose = _compose()
-    key = hashlib.sha256(f"{source}|{source.stat().st_mtime}|{start:.3f}|{dur:.3f}|matte-v1".encode()).hexdigest()[:16]
+    st = source.stat()
+    key = hashlib.sha256(f"{source}|{st.st_dev}|{st.st_ino}|{st.st_size}|{st.st_mtime_ns}|{start:.3f}|{dur:.3f}|{fit}|matte-v3".encode()).hexdigest()[:16]
     out = project_dir / FX_REL / f"person-{key}.webm"
-    if out.is_file() and out.stat().st_size > 0:
-        return out
+    mask = project_dir / FX_REL / f"mask-{key}.mp4"
+    if out.is_file() and out.stat().st_size > 0 and mask.is_file() and mask.stat().st_size > 0:
+        if compose._clip_valid(str(out), dur) and compose._clip_valid(str(mask), dur) and _has_person_mask(compose, mask, dur):
+            return out, mask
+        return None
     matte = skill_dir() / "tools/matte_video.py"
     if not matte.is_file():
         return None
@@ -348,27 +358,72 @@ def _person_clip(project_dir: Path, source: Path, start: float, dur: float) -> P
     if r.returncode or not mov.is_file():
         _log({"stage": "matte", "error": (r.stderr or r.stdout).strip()[-400:]})
         return None
-    vf = f"scale={compose.W}:{compose.H}:force_original_aspect_ratio=increase,crop={compose.W}:{compose.H},setsar=1"
+    vf = compose._canvas_filter(compose.W, compose.H, fit)
     q = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(mov), "-vf", vf, "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
                         "-b:v", "0", "-crf", "24", "-row-mt", "1", "-an", str(out)], capture_output=True, text=True)
     if q.returncode:
         _log({"stage": "matte-webm", "error": q.stderr.strip()[-400:]})
         return None
+    made_mask = workdir / "mask.mp4"
+    if not made_mask.is_file() or made_mask.stat().st_size == 0:
+        _log({"stage": "matte-mask", "error": "matte did not produce a mask"})
+        shutil.rmtree(workdir, ignore_errors=True)
+        return None
+    normalized_mask = workdir / "mask-canvas.mp4"
+    nq = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(made_mask), "-vf", vf, "-an",
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(normalized_mask)],
+                        capture_output=True, text=True)
+    if nq.returncode or not normalized_mask.is_file():
+        shutil.rmtree(workdir, ignore_errors=True)
+        return None
+    os.replace(normalized_mask, made_mask)
+    try:
+        # Values near zero mean there is no identifiable person.  Check the
+        # middle of the requested source window before a person-dependent
+        # block can render with an invisible placeholder.
+        if not _has_person_mask(compose, made_mask, dur):
+            _log({"stage": "matte", "error": "這一段找不到清楚人物，無法套用需要人物的特效"})
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
     try:
         mov.unlink()  # ProRes 4444 is huge; the webm is what the block eats
     except OSError:
         pass
-    return out
+    try:
+        os.replace(made_mask, mask)
+    except OSError:
+        return None
+    return out, mask
+
+
+def _has_person_mask(compose: Any, mask: Path, dur: float) -> bool:
+    """Reject weak matte noise; preview must not claim it has a cutout person."""
+    points = (dur * .2, dur * .5, dur * .8)
+    try:
+        return sum(compose.mask_mean(str(mask), point) for point in points) / len(points) >= 3.0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _person_clip(project_dir: Path, source: Path, start: float, dur: float, fit: str = "cover") -> Path | None:
+    """Compatibility helper for callers that only consume the alpha person."""
+    assets = _person_assets(project_dir, source, start, dur, fit)
+    return assets[0] if assets else None
 
 
 def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path, pack_id: str | None,
-                        quality: str = "draft", canvas: tuple[int, int] | None = None) -> dict[str, Any] | None:
+                        quality: str = "draft", canvas: tuple[int, int] | None = None, fit: str = "cover") -> dict[str, Any] | None:
     """Render one fx overlay to a transparent .mov under working/fx/; None on failure."""
     if not available():
         _log({"layer": overlay.get("id"), "reason": "edit-style-profiles skill unavailable"})
         return None
     if not canvas_ok(canvas):
         _log({"layer": overlay.get("id"), "reason": f"effects need a 9:16 canvas, got {canvas[0]}×{canvas[1]}"})
+        return None
+    if fit not in {"cover", "contain"}:
+        _log({"layer": overlay.get("id"), "reason": f"unsupported canvas fit {fit}"})
         return None
     compose = _compose()
     code = str(overlay.get("code") or "")
@@ -387,25 +442,33 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
         workdir = workdir / f"fonts-{fonts_digest_for({'overlays': [overlay]})[:10]}"
     workdir.mkdir(parents=True, exist_ok=True)
     person = None
+    mask = None
     try:
         eff = next(e for e in catalog()["effects"] if e["code"] == code)
     except StopIteration:
         _log({"layer": overlay.get("id"), "reason": f"unknown code {code}"})
         return None
-    if eff["needs_person"]:
-        person = _person_clip(project_dir, source, start, dur)
-        if person is None:
-            _log({"layer": overlay.get("id"), "code": code, "reason": "person matte unavailable; using placeholder person"})
+    if eff["needs_person"] or code == "P5":
+        assets = _person_assets(project_dir, source, start, dur, fit)
+        if assets is None:
+            _log({"layer": overlay.get("id"), "code": code, "reason": "人物去背不足，無法渲染此特效"})
+            return None
+        person, mask = assets
     try:
         rep = compose.render_clip(str(source), start, dur, code, theme, main, scheme, values, placement, None,
                                   str(person) if person else None, "draft" if quality != "final" else "final",
                                   str(workdir), "mov", log=lambda m: None, fonts=fonts or None,
-                                  font_files=font_files_for(overlay.get("font_ids")) or None)
+                                  font_files=font_files_for(overlay.get("font_ids")) or None,
+                                  spotlight_mask={"path": str(mask), "start": 0.0} if mask else None,
+                                  strict_source=True, strict_fit=fit)
     except SystemExit as exc:
         _log({"layer": overlay.get("id"), "code": code, "error": str(exc)})
         return None
     if not rep.get("ok"):
         _log({"layer": overlay.get("id"), "code": code, "error": rep.get("log", "")[-400:]})
+        return None
+    if code == "P5" and (not isinstance(rep.get("spotlight"), dict) or rep["spotlight"].get("status") != "tracked"):
+        _log({"layer": overlay.get("id"), "code": code, "reason": "人物遮罩無法可靠追蹤"})
         return None
     out = Path(rep["out"])
     return {"source": str(out.relative_to(project_dir)), "cached": rep.get("cached"), "seconds": rep.get("seconds"),
