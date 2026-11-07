@@ -2,9 +2,8 @@
 """Cancellation ownership and timing-retention contracts for FX preview jobs."""
 from __future__ import annotations
 
-import os
-import inspect
 import io
+import os
 import shutil
 import sys
 import tempfile
@@ -142,6 +141,59 @@ class FxPreviewWorkerCleanupTests(unittest.TestCase):
         self.assertEqual(cancelled["state"], "cancelled")
         self.assertEqual(self.manager.public_job(job_id)["state"], "cancelled")
         self._assert_only_owned_artifacts_removed(job_id)
+
+    def test_runtime_unlink_permission_error_keeps_lease_until_retry(self) -> None:
+        job_id = "2" * 32
+        other_owner = "3" * 32
+        other_lease_fd = self.manager._try_acquire_scratch_lease(other_owner, create=True)
+        self.assertIsNotNone(other_lease_fd)
+        self.addCleanup(os.close, other_lease_fd)
+        other_scratch = (
+            self.manager.renderer_cache_dir
+            / f"timeline-project-{other_owner}-0123456789abcdef-live"
+        )
+        other_scratch.mkdir()
+        (other_scratch / "active.part.mp4").write_bytes(b"other")
+        thread = self._start_worker(job_id)
+        self._wait_for_worker_scratch(job_id)
+        original_unlink = os.unlink
+        injected = False
+
+        def fail_one_owned_runtime_unlink(path, *args, **kwargs):
+            nonlocal injected
+            if (
+                not injected
+                and path == f"{job_id}.part.mp4"
+                and kwargs.get("dir_fd") == self.manager._storage_pins["runtime"].fd
+            ):
+                injected = True
+                raise PermissionError("injected runtime cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(jobs.os, "unlink", side_effect=fail_one_owned_runtime_unlink):
+            cancelled = self.manager.cancel(job_id)
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertTrue(injected)
+        lease = self.manager.renderer_cache_dir / f".timeline-owner-{job_id}.lock"
+        partial = self.manager.runtime_dir / f"{job_id}.part.mp4"
+        self.assertTrue(partial.is_file())
+        self.assertTrue(lease.is_file())
+        self.assertFalse((self.manager.runtime_dir / f"{job_id}.request.json").exists())
+        self.assertFalse((self.manager.runtime_dir / f"{job_id}.result.json").exists())
+        self.assertTrue(other_scratch.is_dir())
+
+        self.manager._cleanup_orphan_partials()
+        self.manager._cleanup_renderer_scratch(job_id)
+        self.assertFalse(partial.exists())
+        self.assertFalse(lease.exists())
+        self.assertTrue(other_scratch.is_dir())
+        self.assertEqual(
+            (self.manager.runtime_dir / "foreign.keep").read_text(encoding="utf-8"),
+            "keep",
+        )
 
     def test_cancel_race_never_exposes_or_records_failed_phase(self) -> None:
         job_id = "a" * 32
@@ -328,12 +380,17 @@ class FxPreviewWorkerCleanupTests(unittest.TestCase):
                 cancel_outcome = {}
 
                 class FakeProcess:
-                    stderr = None
+                    pid = 987654
+                    stderr = io.StringIO("")
                     returncode = None
 
-                    @staticmethod
-                    def poll():
-                        return None
+                    def poll(self):
+                        return self.returncode
+
+                    def wait(self, timeout=None):
+                        del timeout
+                        self.returncode = -15
+                        return self.returncode
 
                 fake_process = FakeProcess()
 
@@ -391,11 +448,164 @@ class FxPreviewWorkerCleanupTests(unittest.TestCase):
                         self.manager._active_job_id = None
                         self.manager._jobs[owner]["process"] = None
 
-    def test_post_process_worker_callbacks_never_claim_cancelled(self) -> None:
-        source = inspect.getsource(self.manager._run_job)
-        post_process = source[source.index("progress.join"):source.rindex("self.prune()")]
-        self.assertNotIn("_finish_cancelled", post_process)
-        self.assertGreaterEqual(post_process.count("_worker_cancel_pending"), 3)
+    def test_post_process_cancel_branches_defer_verdict_and_unpublish_cache(self) -> None:
+        worker_source = f"""
+import hashlib, json, sys
+from pathlib import Path
+sys.path.insert(0, {str(SCRIPTS)!r})
+import fx_preview_contract
+request_path = Path(sys.argv[sys.argv.index('--request') + 1])
+result_path = Path(sys.argv[sys.argv.index('--result') + 1])
+request = json.loads(request_path.read_text(encoding='utf-8'))
+out = Path(request['output'])
+out.write_bytes(b'finished-before-cancel')
+result_path.write_text(json.dumps({{
+    'ok': True,
+    'out': str(out),
+    'request_sha256': hashlib.sha256(request_path.read_bytes()).hexdigest(),
+    'render_request_sha256': fx_preview_contract.renderer_request_digest(request),
+    'render_duration_s': 2,
+    'time_map': [{{
+        'output_start_s': 0, 'output_end_s': 2,
+        'source_start_s': 0, 'source_end_s': 2,
+    }}],
+}}), encoding='utf-8')
+"""
+        for index, stage in enumerate(("result", "validation", "cache"), start=10):
+            with self.subTest(stage=stage):
+                root = self.tmp / f"post-process-{stage}"
+                project = root / "project"
+                (project / "working").mkdir(parents=True)
+                (project / "source").mkdir()
+                source = project / "source/source.mp4"
+                source.write_bytes(b"fixture")
+                worker_script = root / "worker.py"
+                worker_script.write_text(worker_source, encoding="utf-8")
+                manager = jobs.FxPreviewJobManager(
+                    project,
+                    context_provider=lambda: {},
+                    renderer_script=worker_script,
+                    render_timeout_s=5,
+                    artifact_validator=lambda _path, duration: {"duration_s": duration},
+                )
+                owner = f"{index:032x}"
+                now = time.monotonic()
+                dependencies = {"pack_id": "", "canvas": {"width": 1080, "height": 1920}}
+                job = {
+                    "id": owner,
+                    "state": "running",
+                    "phase": "queued",
+                    "message": "queued",
+                    "cache_hit": False,
+                    "timing_started": now,
+                    "timing_phase_started": now,
+                    "phase_timings_s": {},
+                    "updated_monotonic": time.time(),
+                    "state_revision": "b" * 64,
+                    "overlay": {"id": "fx", "type": "fx", "code": "T3", "start": 0, "end": 2},
+                    "sample_window": {"start_s": 0, "duration_s": 2},
+                    "preview_options": {"mode": "single", "quality": "draft"},
+                    "state_snapshot": {},
+                    "manifest_snapshot": {},
+                    "timeline_snapshot": None,
+                    "replace_overlay_id": None,
+                    "dependencies": dependencies,
+                    "dependency_hash": jobs._canonical_sha256(dependencies),
+                    "source_identity": {"path": source},
+                    "cache_key": f"{index:064x}",
+                    "process": None,
+                    "cancel_requested": False,
+                    "media": None,
+                    "error": None,
+                }
+                manager._jobs[owner] = job
+                manager._active_job_id = owner
+                cache_media = manager.cache_dir / f"{job['cache_key']}.mp4"
+                cache_receipt = manager.cache_dir / f"{job['cache_key']}.json"
+                (manager.cache_dir / "foreign.keep").write_text("keep", encoding="utf-8")
+                stage_entered = threading.Event()
+                release_stage = threading.Event()
+                terminate_entered = threading.Event()
+                release_terminate = threading.Event()
+                outcome = {}
+                original_read = manager._read_json_at
+                original_atomic = manager._atomic_json_in
+
+                def read_with_barrier(directory_fd, name, max_bytes):
+                    value = original_read(directory_fd, name, max_bytes)
+                    if stage == "result" and name == f"{owner}.result.json":
+                        stage_entered.set()
+                        self.assertTrue(release_stage.wait(timeout=5))
+                    return value
+
+                def dependency_with_barrier(*_args, **_kwargs):
+                    if stage == "validation":
+                        stage_entered.set()
+                        self.assertTrue(release_stage.wait(timeout=5))
+                    return dependencies
+
+                def atomic_with_barrier(directory_name, name, payload):
+                    digest = original_atomic(directory_name, name, payload)
+                    if stage == "cache" and directory_name == "cache":
+                        stage_entered.set()
+                        self.assertTrue(release_stage.wait(timeout=5))
+                    return digest
+
+                def unverified_terminate(_process):
+                    terminate_entered.set()
+                    self.assertTrue(release_terminate.wait(timeout=5))
+                    return False
+
+                def issue_cancel():
+                    outcome["job"] = manager.cancel(owner)
+
+                try:
+                    with (
+                        mock.patch.object(manager, "_read_json_at", side_effect=read_with_barrier),
+                        mock.patch.object(manager, "_source_identity", return_value=job["source_identity"]),
+                        mock.patch.object(manager, "_dependency_snapshot", side_effect=dependency_with_barrier),
+                        mock.patch.object(manager, "_atomic_json_in", side_effect=atomic_with_barrier),
+                        mock.patch.object(manager, "_terminate_process", side_effect=unverified_terminate),
+                    ):
+                        worker = threading.Thread(
+                            target=manager._run_job,
+                            args=(owner, cache_media, cache_receipt),
+                        )
+                        worker.start()
+                        self.assertTrue(stage_entered.wait(timeout=5))
+                        cancel_thread = threading.Thread(target=issue_cancel)
+                        cancel_thread.start()
+                        self.assertTrue(terminate_entered.wait(timeout=5))
+                        release_stage.set()
+                        worker.join(timeout=5)
+                        self.assertFalse(worker.is_alive())
+                        with manager._lock:
+                            pending = manager._jobs[owner]
+                            self.assertEqual(pending["state"], "running")
+                            self.assertNotIn(pending["phase"], jobs.TERMINAL_STATES)
+                        self.assertFalse(cache_media.exists())
+                        self.assertFalse(cache_receipt.exists())
+                        self.assertEqual(
+                            (manager.cache_dir / "foreign.keep").read_text(encoding="utf-8"),
+                            "keep",
+                        )
+                        release_terminate.set()
+                        cancel_thread.join(timeout=5)
+                        self.assertFalse(cancel_thread.is_alive())
+
+                    status = outcome["job"]
+                    self.assertEqual(
+                        (status["state"], status["phase"]),
+                        ("running", "cancelling"),
+                    )
+                    self.assertEqual(status["error"]["code"], "termination_unverified")
+                finally:
+                    release_stage.set()
+                    release_terminate.set()
+                    with manager._lock:
+                        manager._active_job_id = None
+                        manager._jobs[owner]["process"] = None
+                    manager.close()
 
     def test_retry_after_unverified_cancel_reclaims_only_that_job_shadow(self) -> None:
         owner = "b" * 32
@@ -522,6 +732,79 @@ class FxPreviewWorkerCleanupTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in runtime_files))
         self.assertEqual(self.outside_sentinel.read_text(encoding="utf-8"), "keep")
 
+    def test_touch_renderer_cache_retries_short_exclusive_contention(self) -> None:
+        ordinary = self.manager.renderer_cache_dir / "working/fx/recent.mov"
+        ordinary.parent.mkdir(parents=True)
+        ordinary.write_bytes(b"cache")
+        old_time = time.time() - jobs.CACHE_IDLE_TTL_S - 60
+        os.utime(ordinary, (old_time, old_time))
+        old_mtime = ordinary.stat().st_mtime_ns
+        live_owner = "4" * 32
+        live_scratch = (
+            self.manager.renderer_cache_dir
+            / f"timeline-project-{live_owner}-0123456789abcdef-live"
+        )
+        live_scratch.mkdir()
+        live_file = live_scratch / "active.part.mp4"
+        live_file.write_bytes(b"active")
+        os.utime(live_file, (old_time, old_time))
+        live_mtime = live_file.stat().st_mtime_ns
+        second = jobs.FxPreviewJobManager(self.project, context_provider=lambda: {})
+        shared_fd = second._acquire_renderer_maintenance_lock(exclusive=False)
+        self.assertIsNotNone(shared_fd)
+        maintenance = self.manager.renderer_cache_dir / jobs.RENDERER_MAINTENANCE_LOCK
+        maintenance_mtime = maintenance.stat().st_mtime_ns
+        attempted = threading.Event()
+        original_acquire = self.manager._acquire_renderer_maintenance_lock
+
+        def observed_acquire(*, exclusive):
+            result = original_acquire(exclusive=exclusive)
+            if exclusive and result is None:
+                attempted.set()
+            return result
+
+        try:
+            with mock.patch.object(
+                self.manager,
+                "_acquire_renderer_maintenance_lock",
+                side_effect=observed_acquire,
+            ):
+                thread = threading.Thread(target=self.manager._touch_renderer_cache)
+                thread.start()
+                self.assertTrue(attempted.wait(timeout=2))
+                self.assertEqual(ordinary.stat().st_mtime_ns, old_mtime)
+                os.close(shared_fd)
+                shared_fd = None
+                thread.join(timeout=2)
+        finally:
+            if shared_fd is not None:
+                os.close(shared_fd)
+            second.close()
+        self.assertFalse(thread.is_alive())
+        self.assertGreater(ordinary.stat().st_mtime_ns, old_mtime)
+        self.assertEqual(live_file.stat().st_mtime_ns, live_mtime)
+        self.assertEqual(maintenance.stat().st_mtime_ns, maintenance_mtime)
+
+    def test_touch_renderer_cache_returns_within_budget_while_shared_guard_stays_busy(self) -> None:
+        ordinary = self.manager.renderer_cache_dir / "working/fx/busy.mov"
+        ordinary.parent.mkdir(parents=True)
+        ordinary.write_bytes(b"cache")
+        old_time = time.time() - jobs.CACHE_IDLE_TTL_S - 60
+        os.utime(ordinary, (old_time, old_time))
+        old_mtime = ordinary.stat().st_mtime_ns
+        second = jobs.FxPreviewJobManager(self.project, context_provider=lambda: {})
+        shared_fd = second._acquire_renderer_maintenance_lock(exclusive=False)
+        self.assertIsNotNone(shared_fd)
+        started = time.monotonic()
+        try:
+            self.manager._touch_renderer_cache()
+        finally:
+            os.close(shared_fd)
+            second.close()
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(ordinary.stat().st_mtime_ns, old_mtime)
+
     def test_exclusive_maintenance_guard_blocks_new_worker_cache_entry(self) -> None:
         owner = "9" * 32
         maintenance_fd = self.manager._acquire_renderer_maintenance_lock(exclusive=True)
@@ -592,6 +875,22 @@ class FxPreviewWorkerCleanupTests(unittest.TestCase):
         self.manager._cleanup_renderer_scratch(owner)
         self.assertFalse(scratch.exists())
         self.assertFalse(lease.exists())
+
+    def test_nonregular_owned_runtime_entry_keeps_owner_lease(self) -> None:
+        owner = "8" * 32
+        lease_fd = self.manager._try_acquire_scratch_lease(owner, create=True)
+        self.assertIsNotNone(lease_fd)
+        os.close(lease_fd)
+        lease = self.manager.renderer_cache_dir / f".timeline-owner-{owner}.lock"
+        unsafe_runtime = self.manager.runtime_dir / f"{owner}.part.mp4"
+        unsafe_runtime.symlink_to(self.outside_sentinel)
+
+        self.manager._cleanup_orphan_partials()
+        self.manager._cleanup_renderer_scratch(owner)
+
+        self.assertTrue(lease.is_file())
+        self.assertTrue(unsafe_runtime.is_symlink())
+        self.assertEqual(self.outside_sentinel.read_text(encoding="utf-8"), "keep")
 
     def test_old_job_finally_does_not_remove_new_job_shadow(self) -> None:
         old_job_id = "3" * 32
