@@ -1656,6 +1656,19 @@ def write_dialogue_probe(
     return output
 
 
+def _preview_window_map_indices(command: list[str], current: str) -> tuple[int, int, int]:
+    """Reject an unfamiliar output graph before modifying stream mappings."""
+    if command.count("-filter_complex") != 1 or command.count("-map") != 2:
+        raise ValueError("preview output window requires one filter graph and two output maps")
+    graph = command.index("-filter_complex") + 1
+    video = command.index("-map") + 1
+    audio = command.index("-map", video + 1) + 1
+    if (max(graph, video, audio) >= len(command) or command[graph].startswith("-")
+            or command[video] != f"[{current}]" or command[audio] not in {"[aout]", "0:a?"}):
+        raise ValueError("preview output window encountered unexpected output stream labels")
+    return graph, video, audio
+
+
 def build_render_command(
     project_dir: Path,
     state: dict[str, Any],
@@ -2453,9 +2466,7 @@ def build_render_command(
             raise ValueError("preview output window cannot produce motion sidecars")
         # Trim after the complete timeline graph: upstream FX still see their
         # original timestamps, while both output streams start at zero.
-        graph_index = command.index("-filter_complex") + 1
-        video_map = command.index("-map") + 1
-        audio_map = command.index("-map", video_map + 1) + 1
+        graph_index, video_map, audio_map = _preview_window_map_indices(command, current)
         video_label, audio_label = command[video_map], command[audio_map]
         end = start + window_duration
         command[graph_index] += (f";{video_label}trim=start={start:.6f}:end={end:.6f},"

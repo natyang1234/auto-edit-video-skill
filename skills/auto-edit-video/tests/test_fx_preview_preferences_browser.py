@@ -163,7 +163,7 @@ class FxPreviewPreferencesBrowserTests(unittest.TestCase):
             self.assertIsNotNone(favorite_box)
             self.assertGreaterEqual(favorite_box["width"], 44)
             self.assertGreaterEqual(favorite_box["height"], 44)
-            page.get_by_role("tab", name="favorites 我的收藏").click()
+            page.get_by_role("tab", name="我的收藏").click()
             self.assertEqual(page.locator("#fx-preview-grid .fx-preview-card").count(), 1)
             self.assertEqual(
                 page.locator("#fx-preview-grid .fx-preview-card").first.get_attribute("data-fx-code"), first_code
