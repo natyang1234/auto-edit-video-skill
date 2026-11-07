@@ -417,8 +417,10 @@ class StylePresetStore:
             ) from exc
         try:
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STORE_BYTES:
-                raise StylePresetError(409, "store_corrupt", "預設資料格式或大小無效")
+            if not stat.S_ISREG(info.st_mode):
+                raise StylePresetError(409, "store_unsafe", "預設資料檔類型不安全")
+            if info.st_size > MAX_STORE_BYTES:
+                raise StylePresetError(409, "store_corrupt", "預設資料過大")
             raw = b""
             while len(raw) <= MAX_STORE_BYTES:
                 chunk = os.read(descriptor, min(65536, MAX_STORE_BYTES + 1 - len(raw)))
@@ -433,11 +435,15 @@ class StylePresetStore:
                 os.close(directory_fd)
         try:
             document = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise StylePresetError(409, "store_corrupt", "預設資料已毀損，原檔未變更") from exc
         if not isinstance(document, dict) or set(document) != {"schema_version", "presets"}:
             raise StylePresetError(409, "store_corrupt", "預設資料 schema 無效")
-        if document.get("schema_version") != SCHEMA_VERSION or not isinstance(document.get("presets"), list):
+        if (
+            type(document.get("schema_version")) is not int
+            or document.get("schema_version") != SCHEMA_VERSION
+            or not isinstance(document.get("presets"), list)
+        ):
             raise StylePresetError(409, "store_corrupt", "預設資料 schema 無效")
         if len(document["presets"]) > MAX_PRESETS:
             raise StylePresetError(409, "store_corrupt", "預設資料筆數超限")
@@ -449,7 +455,12 @@ class StylePresetStore:
             raise StylePresetError(409, "store_corrupt", "預設識別碼重複")
         if len({item["name"].casefold() for item in presets}) != len(presets):
             raise StylePresetError(409, "store_corrupt", "預設名稱重複")
-        return {"schema_version": SCHEMA_VERSION, "presets": presets}
+        normalized = {"schema_version": SCHEMA_VERSION, "presets": presets}
+        try:
+            _canonical_bytes(normalized)
+        except StylePresetError as exc:
+            raise StylePresetError(409, "store_corrupt", "預設資料已毀損，原檔未變更") from exc
+        return normalized
 
     def collection(self) -> dict[str, Any]:
         try:
