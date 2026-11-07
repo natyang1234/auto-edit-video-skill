@@ -100,7 +100,7 @@ class FxPreviewBrowserTests(unittest.TestCase):
                     "visible": True,
                     "locked": False,
                     "z_index": 25,
-                    "style": {"x": 50, "y": 50, "width": 100, "animation": "none", "opacity": 1},
+                    "style": {"x": 50, "y": 50, "width": 100, "animation": "none", "opacity": posted[-1].get("opacity", 1)},
                     "code": candidate["code"],
                     "values": candidate.get("values", {}),
                     "placement": candidate.get("placement", ""),

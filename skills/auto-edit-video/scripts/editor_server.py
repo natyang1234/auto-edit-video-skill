@@ -3561,12 +3561,13 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
             if key not in style:
                 continue
             value = style[key]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not minimum <= float(value) <= maximum
-            ):
+            try:
+                numeric_value = float(value)
+            except (OverflowError, TypeError, ValueError):
+                numeric_value = math.nan
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(numeric_value)
+                    or not minimum <= numeric_value <= maximum):
                 errors.append(f"overlay {overlay_id or index} style {key} is invalid")
         source = overlay.get("source")
         if source and overlay.get("type") in {"image", "gif", "video"}:

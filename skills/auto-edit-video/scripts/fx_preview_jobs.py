@@ -844,7 +844,7 @@ class FxPreviewJobManager:
             body,
             {
                 "schema_version", "expected_revision", "candidate",
-                "replace_overlay_id", "preview_options",
+                "replace_overlay_id", "preview_options", "opacity",
             },
             {"schema_version", "expected_revision", "candidate"},
             "請求",
@@ -854,6 +854,11 @@ class FxPreviewJobManager:
         try:
             preview_options = fx_preview_contract.normalize_preview_options(
                 body.get("preview_options")
+            )
+            opacity = (
+                fx_preview_contract.normalize_fx_opacity(body["opacity"])
+                if "opacity" in body
+                else None
             )
         except fx_preview_contract.FxPreviewContractError as exc:
             raise FxPreviewJobError(422, exc.code, exc.message) from exc
@@ -1041,6 +1046,15 @@ class FxPreviewJobManager:
             # and metadata while freezing only candidate-owned FX controls.
             overlay = deepcopy(existing)
         overlay.update(candidate_fields)
+        style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
+        overlay["style"] = {
+            **style,
+            "opacity": (
+                fx_preview_contract.normalize_fx_opacity(style.get("opacity", 1.0))
+                if opacity is None
+                else opacity
+            ),
+        }
         errors = fx_overlay.validate(overlay, state)
         if errors:
             raise FxPreviewJobError(422, "candidate_invalid", "FX candidate 未通過伺服器驗證")

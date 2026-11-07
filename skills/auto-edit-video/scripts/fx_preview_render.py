@@ -835,9 +835,12 @@ def _render(data: dict[str, Any]) -> dict[str, Any]:
     vf = ("scale=1080:1920:force_original_aspect_ratio=decrease,"
           "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x171512,setsar=1" if fit == "contain"
           else "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1")
+    composite = single_preview_composite_filter(
+        (overlay.get("style") or {}).get("opacity", 1.0)
+    )
     cmd = [
         "ffmpeg", "-v", "error", "-y", "-ss", f"{sample_start:.3f}", "-i", str(source), "-ss", f"{sample_start - apply_start:.3f}", "-i", str(alpha),
-        "-t", f"{duration:.3f}", "-filter_complex", f"[0:v]{vf}[base];[base][1:v]overlay=0:0:shortest=1[v]",
+        "-t", f"{duration:.3f}", "-filter_complex", f"[0:v]{vf}[base];{composite}",
         "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-shortest", str(tmp),
     ]
@@ -863,6 +866,14 @@ def _render(data: dict[str, Any]) -> dict[str, Any]:
             "time_map": [{"source_start_s": sample_start, "source_end_s": sample_start + duration,
                           "output_start_s": 0.0, "output_end_s": duration}], "text_layout": text_layout,
             "subject_track": rendered.get("spotlight"), "cached": bool(rendered.get("cached")), "effect_seconds": rendered.get("seconds")}
+
+
+def single_preview_composite_filter(opacity: Any) -> str:
+    """Build the single-preview FX composition while preserving the 1.0 graph."""
+    suffix = fx_overlay.opacity_alpha_filter_suffix(opacity)
+    if not suffix:
+        return "[base][1:v]overlay=0:0:shortest=1[v]"
+    return f"[1:v]format=rgba{suffix}[fx];[base][fx]overlay=0:0:shortest=1[v]"
 
 
 def main() -> int:

@@ -716,6 +716,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if path == "/styles.css":
             self.serve_static(EDITOR_DIR / "styles.css")
             return
+        if path == "/fx-preview-panel.css":
+            self.serve_static(EDITOR_DIR / "fx-preview-panel.css")
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:

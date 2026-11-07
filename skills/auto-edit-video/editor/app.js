@@ -159,7 +159,7 @@ function cacheElements() {
     "fx-preview-dialog", "fx-preview-close", "fx-preview-cats", "fx-preview-search", "fx-preview-grid",
     "fx-preview-selected-name", "fx-preview-spec", "fx-preview-source", "fx-preview-duration",
     "fx-preview-apply-source", "fx-preview-apply-duration", "fx-preview-apply-window-label",
-    "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit", "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-status",
+    "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit", "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-advanced-fields", "fx-preview-status",
     "fx-preview-video", "fx-preview-source-video", "fx-preview-source-time", "fx-preview-effect-time",
     "fx-preview-layout-check", "fx-preview-layout-check-heading", "fx-preview-layout-check-toggle",
     "fx-preview-layout-check-summary", "fx-preview-layout-check-list",
@@ -2055,7 +2055,9 @@ function fxPreviewRenderDraftNotice() {
   restore.hidden = !stale;
   discard.hidden = !hasCurrentDraft && !stale;
   if (stale) {
-    copy.textContent = "偵測到舊版本的未套用候選草稿；專案版本已變更，不會自動還原或套用。可檢視後丟棄。";
+    copy.textContent = stale.revision === fxPreviewCurrentRevision()
+      ? "偵測到未套用的替換草稿；目前顯示時間軸上的設定，可選擇還原草稿。"
+      : "偵測到舊版本的未套用候選草稿；專案版本已變更，不會自動還原或套用。可選擇還原或丟棄。";
   } else if (hasCurrentDraft) {
     copy.textContent = "已還原未套用候選草稿；可繼續試看、直接丟棄，確認前不會改動時間軸。";
   }
@@ -2118,6 +2120,10 @@ function fxPreviewMaxDuration(effect, start) {
   return Math.max(0.1, Math.min(4, sourceTail, Number.isFinite(effectMax) && effectMax > 0 ? effectMax : 4));
 }
 
+function fxPreviewValidOpacity(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
 function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart = 0) {
   if (!effect) return null;
   const seedWindow = seed?.window || {};
@@ -2154,6 +2160,7 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
     values,
     placement: seed?.placement ?? overlay?.placement ?? placement?.default ?? "",
     scheme: seed?.scheme ?? overlay?.scheme ?? "",
+    opacity: fxPreviewValidOpacity(seed?.opacity) ? seed.opacity : fxPreviewValidOpacity(overlay?.style?.opacity) ? overlay.style.opacity : 1,
     font_ids: { ...priorFonts },
     subject: seed?.subject ?? null,
     text_fit: seed?.text_fit !== false,
@@ -2274,6 +2281,7 @@ function fxPreviewToggleTextLayoutDetails() {
 function fxPreviewUpdateWindowControls() {
   if (!fxPreviewDraft) return;
   const effect = fxEffectByCode(fxPreviewDraft.code);
+  elements["fx-preview-selected-name"].textContent = effect ? `#${effect.num} ${effect.name}` : "—";
   const sourceDuration = Number(duration() || 0);
   const maxStart = Math.max(0, sourceDuration - 0.1);
   const start = Math.max(0, Math.min(maxStart, Number(fxPreviewDraft.window.start_s) || 0));
@@ -2504,6 +2512,7 @@ function fxPreviewRenderFields() {
     return;
   }
   const rows = [];
+  const advancedRows = [];
   if (effect.code === "B1") {
     const label = document.createElement("label");
     label.className = "field fx-preview-field";
@@ -2566,6 +2575,27 @@ function fxPreviewRenderFields() {
   placement.append(placementLabel, placementSelect);
   rows.push(placement);
 
+  const opacityLabel = document.createElement("label");
+  opacityLabel.className = "field fx-preview-field fx-preview-opacity";
+  const opacityTitle = document.createElement("span");
+  opacityTitle.textContent = "特效透明度";
+  const opacityOutput = document.createElement("output");
+  const opacityInput = document.createElement("input");
+  opacityInput.type = "range";
+  opacityInput.min = "0";
+  opacityInput.max = "100";
+  opacityInput.step = "1";
+  opacityInput.value = String(Math.round(fxPreviewDraft.opacity * 100));
+  opacityInput.setAttribute("aria-label", "特效透明度");
+  opacityOutput.textContent = `${opacityInput.value}%`;
+  opacityInput.addEventListener("input", () => {
+    fxPreviewDraft.opacity = Number(opacityInput.value) / 100;
+    opacityOutput.textContent = `${opacityInput.value}%`;
+    fxPreviewDraftChanged();
+  });
+  opacityLabel.append(opacityTitle, opacityOutput, opacityInput);
+  rows.push(opacityLabel);
+
   const scheme = document.createElement("label");
   scheme.className = "field fx-preview-field";
   const schemeLabel = document.createElement("span");
@@ -2583,7 +2613,7 @@ function fxPreviewRenderFields() {
     fxPreviewDraftChanged();
   });
   scheme.append(schemeLabel, schemeSelect);
-  rows.push(scheme);
+  advancedRows.push(scheme);
 
   const fonts = (fxCatalog().fonts || []).filter((font) => font.verified !== false);
   if (fonts.length) {
@@ -2612,16 +2642,17 @@ function fxPreviewRenderFields() {
         fxPreviewDraftChanged();
       });
       label.append(span, select);
-      rows.push(label);
+      advancedRows.push(label);
     });
   }
   elements["fx-preview-fields"].replaceChildren(...rows);
+  elements["fx-preview-advanced-fields"].replaceChildren(...advancedRows);
 }
 
 function fxPreviewRenderDialog() {
   const effect = fxEffectByCode(fxPreviewDraft?.code);
   if (!effect || !fxPreviewDraft) return;
-  elements["fx-preview-selected-name"].textContent = `#${effect.num} ${effect.name}`;
+
   const notes = [effect.spec || "", effect.matte ? "ⓜ 需要人物去背" : ""].filter(Boolean);
   elements["fx-preview-spec"].textContent = notes.join("｜");
   fxPreviewUpdateWindowControls();
@@ -2823,6 +2854,7 @@ async function fxPreviewStart(generation, signature, _keepExistingPreview = fals
         font_ids: { ...(fxPreviewDraft.font_ids || {}) },
         text_fit: fxPreviewDraft.text_fit !== false,
       },
+      opacity: fxPreviewDraft.opacity,
       preview_options: { ...(fxPreviewDraft.preview_options || { mode: "single", quality: "draft" }) },
     };
     if (fxPreviewDraft.code === "P5") body.candidate.subject = fxPreviewDraft.subject;
@@ -2933,8 +2965,8 @@ function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId 
   }
   const saved = fxPreviewSavedDraft();
   const savedEffect = fxEffectByCode(saved?.draft?.code);
-  fxPreviewStaleDraft = saved && saved.revision !== fxPreviewCurrentRevision() ? saved : null;
-  if (saved?.revision === fxPreviewCurrentRevision() && savedEffect && !fxPreviewIsBlocked(savedEffect)) {
+  fxPreviewStaleDraft = saved && (overlay || saved.revision !== fxPreviewCurrentRevision()) ? saved : null;
+  if (!overlay && saved?.revision === fxPreviewCurrentRevision() && savedEffect && !fxPreviewIsBlocked(savedEffect)) {
     fxPreviewDraft = fxPreviewBuildDraft(savedEffect, saved.draft, overlay, fxPreviewSourceStart());
     fxPreviewDraft.__restored = true;
   } else {
@@ -2946,10 +2978,13 @@ function openFxPreviewDialog(trigger = document.activeElement, replaceOverlayId 
   clearTimeout(fxPreviewDebounceTimer);
   clearTimeout(fxPreviewPollTimer);
   fxPreviewRenderDialog();
+  const catalogDisclosure = document.getElementById("fx-preview-catalog-disclosure");
+  catalogDisclosure.open = !window.matchMedia("(max-width: 760px)").matches;
   dialog.showModal();
+  dialog.querySelector(".fx-preview-editor-scroll").scrollTop = 0;
   fxPreviewPrepareSourceVideo();
   fxPreviewRenderDraftNotice();
-  elements["fx-preview-search"].focus();
+  (catalogDisclosure.open ? elements["fx-preview-search"] : catalogDisclosure.querySelector("summary")).focus();
   fxPreviewInvalidateAndSchedule();
 }
 
@@ -3372,7 +3407,6 @@ function updateOverlayFromForm() {
     overlay.start = Number(elements["overlay-start"].value);
     overlay.end = Math.max(overlay.start + 0.2, Number(elements["overlay-end"].value));
     overlay.visible = elements["overlay-visible"].checked;
-    overlay.style = { x: 50, y: 50, width: 100, animation: "none", opacity: 1 };
     markDirty("圖層變更，儲存中…");
     renderLayoutWarning();
     return;
@@ -4729,7 +4763,7 @@ function bindEvents() {
         undo();
       }
     }
-    if (event.code === "Space" && !["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(document.activeElement.tagName)) {
+    if (event.code === "Space" && !["INPUT", "TEXTAREA", "SELECT", "BUTTON", "SUMMARY"].includes(document.activeElement.tagName)) {
       event.preventDefault();
       if (elements["preview-video"].paused) elements["preview-video"].play(); else elements["preview-video"].pause();
     }

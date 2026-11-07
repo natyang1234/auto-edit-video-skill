@@ -1103,6 +1103,12 @@ def image_filter(
         f"[{asset_label}]trim=start={float(overlay.get('media_offset_s', 0)):.6f},scale={asset_width}:-2,format=rgba,"
         f"setpts=PTS-STARTPTS+{start:.3f}/TB"
     )
+    if isinstance(overlay.get("fx"), dict):
+        import fx_overlay
+
+        asset_filters += fx_overlay.opacity_alpha_filter_suffix(
+            style.get("opacity", 1.0)
+        )
     if animation in MOTION_ANIMATIONS:
         asset_filters += (
             f",fade=t=in:st={start:.3f}:d={fade_duration:.3f}:alpha=1"
