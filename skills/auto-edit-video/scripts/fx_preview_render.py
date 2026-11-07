@@ -475,7 +475,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     verify_inputs(project, dependencies)
     shadow = Path(tempfile.mkdtemp(prefix=f"timeline-project-{key}-", dir=cache))
     path = shadow / "working" / "render_snapshots" / f"fx-preview-{key}.json"
-    full = cache / f"timeline-{key}.mp4"
+    full = output.with_name(f".{output.stem}.{os.getpid()}.partial.mp4")
     layout_reports: dict[str, Any] = {}
     target_material = dependencies.get("material")
     expected_broll = None
@@ -511,6 +511,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
         def audited_fx_render(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
             nonlocal observed_broll
             overlay = args[1] if len(args) > 1 and isinstance(args[1], dict) else {}
+            kwargs["progress"] = lambda phase: progress(phase, "正在準備效果與圖層")
             rendered = original_fx_render(*args, **kwargs)
             if expected_broll is not None and overlay.get("id") == expected_broll.get("id"):
                 if rendered is None:
@@ -531,6 +532,8 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
                 "preview",
                 snapshot_path=path,
                 preview_fx_quality=quality,
+                preview_output_window=(start, end - start),
+                preview_progress=lambda phase: progress(phase, "正在處理時間軸預覽"),
             )
         finally:
             fx_overlay.render_for_timeline = original_fx_render
@@ -550,17 +553,18 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
             report["status"] = "warn"
         atomic_json(cache / f"timeline-{key}-text-layout.json", layout_reports)
     except PreviewError:
+        full.unlink(missing_ok=True)
         raise
     except Exception as exc:
+        full.unlink(missing_ok=True)
         raise PreviewError("timeline_render_failed", "完整時間軸預覽無法渲染") from exc
     finally:
         path.unlink(missing_ok=True)
         shutil.rmtree(shadow, ignore_errors=True)
-    tmp = output.with_name(f".{output.stem}.{os.getpid()}.partial.mp4")
-    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.3f}", "-i", str(full), "-t", f"{end-start:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(tmp)], capture_output=True, text=True, timeout=20 * 60)
-    if r.returncode or not media_ok(tmp, end - start):
-        tmp.unlink(missing_ok=True); raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
-    os.replace(tmp, output)
+    progress("validating", "正在驗證時間軸預覽")
+    if not media_ok(full, end - start):
+        full.unlink(missing_ok=True); raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
+    os.replace(full, output)
     time_map, out_at = [], 0.0
     for seg_start, seg_end in segments:
         left, right = max(sample_start, seg_start), min(sample_start + duration, seg_end)
@@ -640,15 +644,14 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "out": str(output), "code": code, "mode": mode, "quality": requested_quality, "apply_window": {"start_s": apply_start, "duration_s": apply_duration}, "sample_window": {"start_s": sample_start, "duration_s": duration}, **rep}
     progress("preparing", "正在準備原片時窗")
     effect = next((x for x in fx_overlay.catalog().get("effects", []) if x["code"] == code), {})
-    if effect.get("needs_person") or code == "P5":
-        progress("matte", "正在準備人物去背")
-    progress("rendering", f"正在以原片時窗渲染 {code}")
+    progress("composing", f"正在以原片時窗渲染 {code}")
     # Render the whole apply window.  The MP4 below seeks its *absolute* phase;
     # rendering a 2 s replacement for an 8 s layer changes GSAP timing.
     try:
         rendered = fx_overlay.render_for_timeline(cache, overlay, source, str(data.get("pack_id") or ""),
                                                    requested_quality, canvas=(width, height), fit=fit,
-                                                   material=material, asset_project=project)
+                                                   material=material, asset_project=project,
+                                                   progress=lambda phase: progress(phase, "正在準備效果"))
     except fx_overlay.SubjectTrackingError as exc:
         raise PreviewError("subject_tracking_lost", str(exc)) from exc
     if rendered is None:
@@ -658,7 +661,7 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
     alpha = cache / rendered["source"]
     if not alpha.is_file():
         raise PreviewError("render_failed", "特效渲染檔未產生")
-    progress("rendering", "正在合成可播放預覽")
+    progress("encoding", "正在合成可播放預覽")
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_name(f".{output.stem}.{os.getpid()}.partial.mp4")
     vf = ("scale=1080:1920:force_original_aspect_ratio=decrease,"
@@ -671,6 +674,7 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-shortest", str(tmp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=20 * 60, check=False)
+    progress("validating", "正在驗證預覽")
     if r.returncode or not media_ok(tmp, duration):
         tmp.unlink(missing_ok=True)
         raise PreviewError("output_invalid", "預覽 MP4 未完整解碼或格式不相容")

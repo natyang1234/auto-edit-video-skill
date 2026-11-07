@@ -2647,6 +2647,11 @@ function fxPreviewStatusForJob(job) {
     pending: "排隊中",
     running: "處理中",
     matting: "人物去背中",
+    matte: "人物去背中",
+    preparing: "準備中",
+    composing: "準備效果與圖層",
+    encoding: "編碼中",
+    validating: "驗證中",
     rendering: "渲染中",
     ready: "完成",
     cache_hit: "快取完成",
@@ -2655,6 +2660,7 @@ function fxPreviewStatusForJob(job) {
     message += ` · ${phaseLabels[String(job.phase)] || "處理中"}`;
   }
   if (job?.message) message += `：${job.message}`;
+  message += fxPreviewTimingSuffix(job);
   if (job?.error && stateName === "failed") {
     const error = typeof job.error === "string"
       ? job.error
@@ -2662,6 +2668,17 @@ function fxPreviewStatusForJob(job) {
     message += `：${error}`;
   }
   return message;
+}
+
+function fxPreviewTimingSuffix(job) {
+  if (typeof job?.elapsed_s !== "number" || !Number.isFinite(job.elapsed_s)) return "";
+  let suffix = ` · 已用 ${Math.round(job.elapsed_s)} 秒`;
+  if (job.state === "running") {
+    const eta = job.eta_remaining_s;
+    suffix += typeof eta === "number" && Number.isFinite(eta)
+      ? ` · 預估還需 ${Math.ceil(eta)} 秒` : " · 預估時間計算中";
+  }
+  return suffix;
 }
 
 function fxPreviewApplyJob(job, generation, signature) {
@@ -2673,9 +2690,9 @@ function fxPreviewApplyJob(job, generation, signature) {
   const quality = String(job?.preview_options?.quality || fxPreviewDraft?.preview_options?.quality || "draft");
   const upgrading = quality === "standard" && !ready && !failed;
   fxPreviewSetStatus(failed && quality === "standard"
-    ? "清晰版預覽失敗；快速版仍可播放，請手動重試清晰版。"
+    ? `清晰版預覽失敗；快速版仍可播放，請手動重試清晰版。${fxPreviewTimingSuffix(job)}`
     : ready && quality === "draft"
-      ? "快速版預覽可播放；正在背景準備清晰版，完成後才能套用。"
+      ? `快速版預覽可播放；正在背景準備清晰版，完成後才能套用。${fxPreviewTimingSuffix(job)}`
       : fxPreviewStatusForJob(job), failed ? "error" : ready ? "success" : "");
   elements["fx-preview-retry"].hidden = !failed;
   elements["fx-preview-cancel-upgrade"].hidden = !upgrading;

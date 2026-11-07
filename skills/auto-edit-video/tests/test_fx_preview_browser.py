@@ -125,6 +125,35 @@ class FxPreviewBrowserTests(unittest.TestCase):
         page.route("**/api/fx-previews**", route_handler)
         return posted, cancelled, force_failed
 
+    def test_timing_status_text(self) -> None:
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page()
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            running = page.evaluate("() => fxPreviewStatusForJob({state:'running', phase:'encoding', elapsed_s:7, eta_remaining_s:null})")
+            estimated = page.evaluate("() => fxPreviewStatusForJob({state:'running', phase:'encoding', elapsed_s:8, eta_remaining_s:12})")
+            ready = page.evaluate("() => fxPreviewStatusForJob({state:'ready', phase:'ready', elapsed_s:20, eta_remaining_s:null})")
+            self.assertIn("已用 7 秒", running)
+            self.assertIn("預估時間計算中", running)
+            self.assertIn("預估還需 12 秒", estimated)
+            self.assertIn("已用 20 秒", ready)
+            self.assertNotIn("計算中", ready)
+            page.evaluate("""() => { elements['fx-preview-dialog'].showModal();
+                fxPreviewGeneration = 123; fxPreviewDraftSignature = 'test'; fxPreviewUpgradeStarted = true; }""")
+            for job, expected in [
+                ({"state": "running", "phase": "encoding", "elapsed_s": 7, "eta_remaining_s": None,
+                  "preview_options": {"quality": "standard"}}, "預估時間計算中"),
+                ({"state": "ready", "phase": "ready", "elapsed_s": 20, "media_url": "/media/source",
+                  "preview_options": {"quality": "draft"}}, "已用 20 秒"),
+                ({"state": "failed", "phase": "failed", "elapsed_s": 20,
+                  "preview_options": {"quality": "standard"}}, "已用 20 秒"),
+                ({"state": "failed", "phase": "failed", "preview_options": {"quality": "standard"}}, "清晰版預覽失敗"),
+            ]:
+                page.evaluate('(job) => fxPreviewApplyJob(job, 123, "test")', job)
+                self.assertIn(expected, page.locator("#fx-preview-status").inner_text())
+            browser.close()
+
     def test_catalog_blocked_b1_preview_lifecycle_and_confirm(self) -> None:
         host, port = self.server.server_address
         with sync_playwright() as playwright:

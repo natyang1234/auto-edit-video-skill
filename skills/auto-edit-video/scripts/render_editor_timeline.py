@@ -1671,7 +1671,16 @@ def build_render_command(
     visual_authority: FrozenVisualAuthority | None = None,
     motion_base_output: Path | None = None,
     preview_fx_quality: str | None = None,
+    preview_output_window: tuple[float, float] | None = None,
 ) -> list[str]:
+    if preview_output_window is not None and (quality != "preview" or preview_fx_quality not in {"draft", "standard"}):
+        raise ValueError("output window is only available for FX preview")
+    if preview_output_window is not None and (
+        not isinstance(preview_output_window, tuple) or len(preview_output_window) != 2
+        or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in preview_output_window)
+        or preview_output_window[0] < 0 or preview_output_window[1] <= 0
+    ):
+        raise ValueError("invalid preview output window")
     canvas = state.get("canvas") or {}
     target_width = int(canvas.get("width", 1080))
     target_height = int(canvas.get("height", 1920))
@@ -2438,6 +2447,29 @@ def build_render_command(
                 ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"]
             )
         command.extend(["-t", f"{duration:.3f}"])
+    if preview_output_window is not None:
+        start, window_duration = preview_output_window
+        if motion_base_output is not None:
+            raise ValueError("preview output window cannot produce motion sidecars")
+        # Trim after the complete timeline graph: upstream FX still see their
+        # original timestamps, while both output streams start at zero.
+        graph_index = command.index("-filter_complex") + 1
+        video_map = command.index("-map") + 1
+        audio_map = command.index("-map", video_map + 1) + 1
+        video_label, audio_label = command[video_map], command[audio_map]
+        end = start + window_duration
+        command[graph_index] += (f";{video_label}trim=start={start:.6f}:end={end:.6f},"
+                                 "setpts=PTS-STARTPTS[preview_window_video]")
+        command[video_map] = "[preview_window_video]"
+        audio_trim = f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+        if audio_label.startswith("["):
+            command[graph_index] += f";{audio_label}{audio_trim}[preview_window_audio]"
+            command[audio_map] = "[preview_window_audio]"
+        elif "-af" in command:
+            audio_filter = command.index("-af") + 1
+            command[audio_filter] += "," + audio_trim
+        else:
+            command.extend(["-af", audio_trim])
     command.extend(
         [
             "-r",
@@ -2602,7 +2634,16 @@ def render_project(
     *,
     defer_delivery_handoff: bool = False,
     preview_fx_quality: str | None = None,
+    preview_output_window: tuple[float, float] | None = None,
+    preview_progress: Any = None,
 ) -> delivery_envelope.DeferredPublication | None:
+    if preview_output_window is not None:
+        if quality != "preview" or snapshot_path is None or variant_id is not None or preview_fx_quality not in {"draft", "standard"}:
+            raise ValueError("output window requires a frozen FX preview")
+        if (not isinstance(preview_output_window, tuple) or len(preview_output_window) != 2
+                or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in preview_output_window)
+                or preview_output_window[0] < 0 or preview_output_window[1] <= 0):
+            raise ValueError("invalid preview output window")
     direct_final = quality == "final" and snapshot_path is None and variant_id is None
     # Phase 4 sub-slice 3: a variant final is a single, self-contained delivery
     # exactly like the direct route — one output, its own per-variant evidence,
@@ -2777,6 +2818,8 @@ def render_project(
         raw_visual_evidence: dict[str, Any] | None = (
             {} if quality == "final" and render_id is not None else None
         )
+        if preview_progress is not None:
+            preview_progress("composing")
         command = build_render_command(
             project_dir,
             state,
@@ -2789,6 +2832,7 @@ def render_project(
             visual_authority=visual_authority,
             motion_base_output=motion_base_output,
             preview_fx_quality=preview_fx_quality,
+            preview_output_window=preview_output_window,
         )
         if direct_final and state.get("director_style") == "kinetic-explainer":
             if direct_stage is None or render_id is None or raw_visual_evidence is None:
@@ -2825,6 +2869,8 @@ def render_project(
                 motion_base_output=motion_base_output,
                 preview_fx_quality=preview_fx_quality,
             )
+        if preview_progress is not None:
+            preview_progress("encoding")
         try:
             result = subprocess.run(
                 command,
