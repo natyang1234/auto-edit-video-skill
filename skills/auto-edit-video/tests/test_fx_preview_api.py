@@ -1013,66 +1013,92 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(second["state"], "cancelled")
 
     def test_http_timing_lifecycle_and_sample_limits(self) -> None:
+        # The worker is gated by a per-job file; the manager alone uses this
+        # controllable monotonic clock. No ETA assertion relies on CPU speed.
+        import types
         manager = self.server.fx_preview_jobs
-        delayed = self.fast_renderer.parent / "delayed-timing.py"
+        clock = [100.0]
+        clock_proxy = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time, time_ns=time.time_ns, sleep=time.sleep)
+        gated = self.fast_renderer.parent / "gated-timing.py"
         marker = 'out=Path(req["output"]);'
         self.assertIn(marker, FAST_RENDERER)
-        delayed.write_text(FAST_RENDERER.replace(marker, 'import time; time.sleep(1.0)\n' + marker), encoding="utf-8")
-        manager.renderer_script = delayed.resolve()
+        gate_code = ("import time\n"
+                     "gate=Path(req['output']).with_name(Path(req['output']).name.split('.')[0]+'.go')\n"
+                     "while not gate.exists(): time.sleep(0.01)\n")
+        gated.write_text(FAST_RENDERER.replace(marker, gate_code + marker), encoding="utf-8")
+        manager.renderer_script = gated.resolve()
 
         def body(start: float) -> dict:
             candidate = self._candidate()
             candidate["candidate"]["window"]["start_s"] = start
             return candidate
 
-        terminal = None
-        for i in range(3):
-            status, created = self._json_request("POST", "/api/fx-previews", body(1.0 + i * 0.1))
-            self.assertEqual(status, 202, created)
-            self.assertIsNone(created["job"]["eta_remaining_s"])
-            terminal = self._wait_terminal(created["job"]["id"])["job"]
-            self.assertEqual(terminal["state"], "ready")
-            self.assertEqual(terminal["eta_sample_count"], i + 1)
-            self.assertIn("rendering", terminal["phase_timings_s"])
-            self.assertIn("validating", terminal["phase_timings_s"])
-        assert terminal is not None
-        time.sleep(0.03)
-        _, repeated = self._json_request("GET", terminal["status_url"])
-        self.assertEqual(repeated["job"]["elapsed_s"], terminal["elapsed_s"])
+        def start_job(start: float) -> dict:
+            status, response = self._json_request("POST", "/api/fx-previews", body(start))
+            self.assertEqual(status, 202, response)
+            job = response["job"]
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                _, payload = self._json_request("GET", job["status_url"])
+                if payload["job"]["phase"] == "rendering":
+                    return payload["job"]
+                time.sleep(0.01)
+            self.fail("gated renderer did not reach rendering")
 
-        _, created = self._json_request("POST", "/api/fx-previews", body(1.4))
-        _, active = self._json_request("GET", created["job"]["status_url"])
-        self.assertEqual(active["job"]["eta_sample_count"], 3)
-        self.assertIsInstance(active["job"]["eta_remaining_s"], (int, float))
-        done = self._wait_terminal(created["job"]["id"])["job"]
-        self.assertEqual(done["eta_sample_count"], 4)
-        _, cached = self._json_request("POST", "/api/fx-previews", body(1.0))
-        self.assertTrue(cached["job"]["cache_hit"])
-        self.assertEqual(cached["job"]["eta_sample_count"], 4)
+        def release(job: dict) -> None:
+            (manager.runtime_dir / (job["id"] + ".go")).touch()
 
-        failing = self.fast_renderer.parent / "fail-timing.py"
-        failing.write_text("import sys; sys.exit(1)\n", encoding="utf-8")
-        manager.renderer_script = failing.resolve()
-        _, created = self._json_request("POST", "/api/fx-previews", body(1.5))
-        failed = self._wait_terminal(created["job"]["id"])["job"]
-        self.assertEqual(failed["state"], "failed")
-        self.assertEqual(failed["eta_sample_count"], 4)
-        time.sleep(0.03)
-        _, repeated = self._json_request("GET", failed["status_url"])
-        self.assertEqual(repeated["job"]["elapsed_s"], failed["elapsed_s"])
+        def assert_stopped(job: dict) -> None:
+            clock[0] += 500
+            _, response = self._json_request("GET", job["status_url"])
+            self.assertEqual(response["job"]["elapsed_s"], job["elapsed_s"])
 
-        manager.renderer_script = self.slow_renderer.resolve()
-        _, created = self._json_request("POST", "/api/fx-previews", body(1.6))
-        _, response = self._json_request("POST", created["job"]["status_url"] + "/cancel", {})
-        cancelled = response["job"]
-        self.assertEqual(cancelled["state"], "cancelled")
-        self.assertEqual(cancelled["eta_sample_count"], 4)
-        time.sleep(0.03)
-        _, repeated = self._json_request("GET", cancelled["status_url"])
-        self.assertEqual(repeated["job"]["elapsed_s"], cancelled["elapsed_s"])
+        with patch.object(fx_preview_jobs, "time", clock_proxy):
+            for i in range(3):
+                running = start_job(1.0 + i * 0.1)
+                self.assertEqual(running["eta_sample_count"], i)
+                self.assertIsNone(running["eta_remaining_s"])
+                clock[0] += 10
+                release(running)
+                terminal = self._wait_terminal(running["id"])["job"]
+                self.assertEqual(terminal["state"], "ready")
+                self.assertEqual(terminal["eta_sample_count"], i + 1)
+                self.assertIn("rendering", terminal["phase_timings_s"])
+                self.assertIn("validating", terminal["phase_timings_s"])
+            assert_stopped(terminal)
 
-        # Exercise retention through the same manager's recording method without
-        # launching hundreds of renderer processes.
+            active = start_job(1.4)
+            self.assertEqual(active["eta_sample_count"], 3)
+            self.assertEqual(active["eta_remaining_s"], 10)
+            clock[0] += 11
+            _, overdue = self._json_request("GET", active["status_url"])
+            self.assertIsNone(overdue["job"]["eta_remaining_s"])
+            self.assertEqual(overdue["job"]["eta_sample_count"], 3)
+            release(active)
+            done = self._wait_terminal(active["id"])["job"]
+            self.assertEqual(done["eta_sample_count"], 4)
+            _, cached = self._json_request("POST", "/api/fx-previews", body(1.0))
+            self.assertTrue(cached["job"]["cache_hit"])
+            self.assertEqual(cached["job"]["eta_sample_count"], 4)
+
+            failing = self.fast_renderer.parent / "fail-timing.py"
+            failing.write_text("import sys; sys.exit(1)\n", encoding="utf-8")
+            manager.renderer_script = failing.resolve()
+            _, created = self._json_request("POST", "/api/fx-previews", body(1.5))
+            failed = self._wait_terminal(created["job"]["id"])["job"]
+            self.assertEqual(failed["state"], "failed")
+            self.assertEqual(failed["eta_sample_count"], 4)
+            assert_stopped(failed)
+
+            manager.renderer_script = gated.resolve()
+            running = start_job(1.6)
+            _, response = self._json_request("POST", running["status_url"] + "/cancel", {})
+            cancelled = response["job"]
+            self.assertEqual(cancelled["state"], "cancelled")
+            self.assertEqual(cancelled["eta_sample_count"], 4)
+            assert_stopped(cancelled)
+
+        # Retention uses the real manager but does not launch hundreds of jobs.
         with manager._lock:
             for i in range(101):
                 manager._record_timing_sample(("single", "draft", f"test-{i}", 2.0, 2.0), 1.0)

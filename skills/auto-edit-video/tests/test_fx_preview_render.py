@@ -228,8 +228,26 @@ class FxPreviewRequestTests(unittest.TestCase):
         }
         observed = {}
 
-        def render_shadow(shadow, full, *_args, **_kwargs):
+        def render_shadow(
+            shadow,
+            full,
+            quality,
+            *,
+            snapshot_path,
+            preview_fx_quality,
+            preview_output_window,
+            preview_progress,
+        ):
             shadow = Path(shadow)
+            full = Path(full)
+            self.assertEqual(quality, "preview")
+            self.assertEqual(snapshot_path.parent.parent.parent, shadow)
+            self.assertTrue(snapshot_path.name.startswith("fx-preview-"))
+            self.assertEqual(snapshot_path.suffix, ".json")
+            self.assertEqual(preview_fx_quality, "standard")
+            self.assertEqual(preview_output_window, (1.0, 2.0))
+            self.assertEqual(full.relative_to(shadow), Path("working/fx-preview-output.mp4"))
+            preview_progress("encoding")
             observed["files"] = {
                 path.relative_to(shadow).as_posix()
                 for path in shadow.rglob("*")
@@ -255,7 +273,7 @@ class FxPreviewRequestTests(unittest.TestCase):
             (shadow / "working/generated-only-in-shadow.txt").write_text(
                 "generated", encoding="utf-8"
             )
-            Path(full).write_bytes(b"full")
+            full.write_bytes(b"full")
 
         def fake_fx_render(project, overlay, *_args, **_kwargs):
             return {
@@ -266,21 +284,20 @@ class FxPreviewRequestTests(unittest.TestCase):
                 },
             }
 
-        def fake_ffmpeg(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"preview")
-            return __import__("subprocess").CompletedProcess(command, 0, "", "")
-
         with (
             mock.patch.object(timeline, "render_project", side_effect=render_shadow),
             mock.patch.object(worker.fx_overlay, "render_for_timeline", side_effect=fake_fx_render),
             mock.patch.object(worker, "_broll_workspace_media", return_value=referenced),
-            mock.patch.object(worker.subprocess, "run", side_effect=fake_ffmpeg),
             mock.patch.object(worker, "media_ok", return_value=True),
+            mock.patch.object(worker, "progress") as progress_mock,
         ):
             report = worker.timeline_preview(
                 self.project, cache, output, snapshot, 1.0, 2.0, dependencies
             )
         self.assertEqual(report["render_duration_s"], 2.0)
+        self.assertEqual(output.read_bytes(), b"full")
+        progress_mock.assert_any_call("encoding", "正在處理時間軸預覽")
+        progress_mock.assert_any_call("validating", "正在驗證時間軸預覽")
         self.assertIn("source/source.mp4", observed["files"])
         self.assertIn("assets/referenced.png", observed["files"])
         self.assertIn("assets/provenance.json", observed["files"])
@@ -289,8 +306,107 @@ class FxPreviewRequestTests(unittest.TestCase):
         self.assertFalse(any("unrelated-link" in path for path in observed["files"]))
         self.assertFalse((self.project / "working/generated-only-in-shadow.txt").exists())
         self.assertFalse(any(cache.glob("timeline-project-*")))
+        self.assertFalse(any(cache.glob(".timeline-owner-*.lock")))
         for path, identity in before.items():
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), identity)
+
+    def test_timeline_failure_paths_remove_owned_shadow_and_unpublished_output(self):
+        cache = self.project / "working/fx-preview/renderer-cache"
+        output = self.project / "working/fx-preview/runtime/out.mp4"
+        cache.mkdir(parents=True)
+        output.parent.mkdir(parents=True)
+        dependencies = {
+            "source": {
+                "relative": "source/source.mp4",
+                "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            },
+            "timeline_project_inputs": {},
+        }
+        snapshot = {
+            "manifest": {"source": {"duration_s": 10, "path": "source/source.mp4"}},
+            "state": {"segments": [{"source_start": 0, "source_end": 10}], "overlays": []},
+        }
+
+        cases = (
+            ("media_invalid", None, False, "output_invalid"),
+            ("preview_error", worker.PreviewError("fixture_preview", "fixture"), True, "fixture_preview"),
+            ("ordinary_error", RuntimeError("fixture"), True, "timeline_render_failed"),
+        )
+        for label, raised, media_valid, expected_code in cases:
+            with self.subTest(case=label):
+                captured = {}
+
+                def render_shadow(
+                    shadow,
+                    full,
+                    quality,
+                    *,
+                    snapshot_path,
+                    preview_fx_quality,
+                    preview_output_window,
+                    preview_progress,
+                ):
+                    captured["shadow"] = Path(shadow)
+                    captured["full"] = Path(full)
+                    self.assertEqual(quality, "preview")
+                    self.assertEqual(preview_fx_quality, "standard")
+                    self.assertEqual(preview_output_window, (1.0, 2.0))
+                    self.assertTrue(callable(preview_progress))
+                    self.assertEqual(snapshot_path.parent.parent.parent, Path(shadow))
+                    Path(full).write_bytes(b"unpublished")
+                    if raised is not None:
+                        raise raised
+
+                with (
+                    mock.patch.object(timeline, "render_project", side_effect=render_shadow),
+                    mock.patch.object(worker, "media_ok", return_value=media_valid),
+                ):
+                    with self.assertRaises(worker.PreviewError) as got:
+                        worker.timeline_preview(
+                            self.project,
+                            cache,
+                            output,
+                            snapshot,
+                            1.0,
+                            2.0,
+                            dependencies,
+                        )
+                self.assertEqual(got.exception.code, expected_code)
+                self.assertFalse(output.exists())
+                self.assertFalse(captured["full"].exists())
+                self.assertFalse(captured["shadow"].exists())
+                self.assertFalse(any(cache.glob("timeline-project-*")))
+                self.assertFalse(any(cache.glob(".timeline-owner-*.lock")))
+
+    def test_timeline_setup_failure_removes_only_its_locked_direct_lease(self):
+        cache = self.project / "working/fx-preview/renderer-cache"
+        output = self.project / "working/fx-preview/runtime/out.mp4"
+        cache.mkdir(parents=True)
+        output.parent.mkdir(parents=True)
+        dependencies = {
+            "source": {
+                "relative": "source/source.mp4",
+                "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            },
+            "timeline_project_inputs": {},
+        }
+        snapshot = {
+            "manifest": {"source": {"duration_s": 10}},
+            "state": {"segments": [{"source_start": 0, "source_end": 10}]},
+        }
+        with mock.patch.object(worker.tempfile, "mkdtemp", side_effect=OSError("fixture")):
+            with self.assertRaises(OSError):
+                worker.timeline_preview(
+                    self.project,
+                    cache,
+                    output,
+                    snapshot,
+                    1.0,
+                    2.0,
+                    dependencies,
+                )
+        self.assertFalse(any(cache.glob(".timeline-owner-*.lock")))
+        self.assertFalse(any(cache.glob("timeline-project-*")))
 
     def test_timeline_shadow_rejects_missing_or_changed_referenced_input(self):
         cache = self.project / "working/fx-preview/renderer-cache"

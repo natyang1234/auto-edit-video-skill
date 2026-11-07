@@ -8,6 +8,7 @@ The API owns process groups, authorization and path containment.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import text_fit
 
 MAX_SECONDS = 4.0
 MAX_REQUEST_JSON_BYTES = 16 * 1024 * 1024
+RENDERER_MAINTENANCE_LOCK = ".renderer-maintenance.lock"
 
 
 class PreviewError(Exception):
@@ -71,6 +73,62 @@ def _open_parent(path: Path) -> tuple[int, str]:
     if not absolute.name or Path(absolute.name).name != absolute.name:
         raise OSError("unsafe result entry name")
     return _open_directory_no_follow(absolute.parent), absolute.name
+
+
+def _unlink_lease_if_same(directory_fd: int, name: str, descriptor: int) -> bool:
+    """Unlink only the still-named regular inode held and locked by this worker."""
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            return False
+        os.unlink(name, dir_fd=directory_fd)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_renderer_maintenance_shared(cache: Path) -> tuple[int, int]:
+    """Hold the fixed shared guard before any renderer-cache read or write."""
+    cache_fd = _open_directory_no_follow(cache)
+    descriptor = -1
+    try:
+        inherited = os.environ.get("FX_PREVIEW_MAINTENANCE_FD")
+        if inherited:
+            descriptor = os.dup(int(inherited))
+        else:
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(
+                RENDERER_MAINTENANCE_LOCK,
+                flags,
+                0o600,
+                dir_fd=cache_fd,
+            )
+        opened = os.fstat(descriptor)
+        named = os.stat(
+            RENDERER_MAINTENANCE_LOCK,
+            dir_fd=cache_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise OSError("unsafe renderer maintenance lock")
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        return cache_fd, descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(cache_fd)
+        raise
 
 
 def _open_regular_at(directory_fd: int, name: str) -> int:
@@ -454,7 +512,7 @@ def _broll_workspace_media(project: Path, rendered: dict[str, Any]) -> Path:
     return media
 
 
-def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[str, Any], sample_start: float, duration: float, dependencies: dict[str, Any], quality: str = "standard") -> dict[str, Any]:
+def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[str, Any], sample_start: float, duration: float, dependencies: dict[str, Any], quality: str = "standard", scratch_owner: str | None = None) -> dict[str, Any]:
     """Render frozen editor state, then take the post-cut windows for a source sample."""
     import hashlib
     import render_editor_timeline as timeline
@@ -473,9 +531,52 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     # write them into the live project: clone immutable inputs into the preview
     # cache. Copy bytes, not hard links: cache cleanup/utime must not alter live mtimes.
     verify_inputs(project, dependencies)
-    shadow = Path(tempfile.mkdtemp(prefix=f"timeline-project-{key}-", dir=cache))
+    if scratch_owner is None:
+        scratch_owner = secrets.token_hex(16)
+    if re.fullmatch(r"[0-9a-f]{32}", scratch_owner) is None:
+        raise PreviewError("invalid_request", "預覽暫存 ownership 格式無效")
+    cache_fd = _open_directory_no_follow(cache)
+    lease_name = f".timeline-owner-{scratch_owner}.lock"
+    lease_fd = -1
+    owns_lease_path = False
+    lease_locked = False
+    shadow: Path | None = None
+    try:
+        inherited_lease = os.environ.get("FX_PREVIEW_SCRATCH_LEASE_FD")
+        if inherited_lease:
+            lease_fd = os.dup(int(inherited_lease))
+        else:
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            lease_fd = os.open(lease_name, flags, 0o600, dir_fd=cache_fd)
+            owns_lease_path = True
+        lease_info = os.fstat(lease_fd)
+        named_lease = os.stat(lease_name, dir_fd=cache_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(lease_info.st_mode)
+            or lease_info.st_nlink != 1
+            or (lease_info.st_dev, lease_info.st_ino) != (named_lease.st_dev, named_lease.st_ino)
+        ):
+            raise OSError("unsafe renderer scratch lease")
+        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease_locked = True
+        shadow = Path(tempfile.mkdtemp(prefix=f"timeline-project-{scratch_owner}-{key}-", dir=cache))
+    except Exception:
+        if owns_lease_path and lease_locked and lease_fd >= 0:
+            _unlink_lease_if_same(cache_fd, lease_name, lease_fd)
+        if lease_fd >= 0:
+            os.close(lease_fd)
+        os.close(cache_fd)
+        raise
+    assert shadow is not None
     path = shadow / "working" / "render_snapshots" / f"fx-preview-{key}.json"
-    full = output.with_name(f".{output.stem}.{os.getpid()}.partial.mp4")
+    # Keep every unpublished timeline artifact under the renderer-owned shadow.
+    # The manager removes this exact directory prefix through its pinned cache
+    # descriptor after cancellation/timeout, even when SIGKILL prevents this
+    # worker's finally block from running.  Only the validated MP4 crosses into
+    # runtime, under the manager-owned job filename.
+    full = shadow / "working" / "fx-preview-output.mp4"
     layout_reports: dict[str, Any] = {}
     target_material = dependencies.get("material")
     expected_broll = None
@@ -552,19 +653,21 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
             report["findings"].append({"kind": "composite_subject_measurement_unavailable"})
             report["status"] = "warn"
         atomic_json(cache / f"timeline-{key}-text-layout.json", layout_reports)
+        progress("validating", "正在驗證時間軸預覽")
+        if not media_ok(full, end - start):
+            raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
+        os.replace(full, output)
     except PreviewError:
-        full.unlink(missing_ok=True)
         raise
     except Exception as exc:
-        full.unlink(missing_ok=True)
         raise PreviewError("timeline_render_failed", "完整時間軸預覽無法渲染") from exc
     finally:
         path.unlink(missing_ok=True)
         shutil.rmtree(shadow, ignore_errors=True)
-    progress("validating", "正在驗證時間軸預覽")
-    if not media_ok(full, end - start):
-        full.unlink(missing_ok=True); raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
-    os.replace(full, output)
+        if owns_lease_path and lease_locked:
+            _unlink_lease_if_same(cache_fd, lease_name, lease_fd)
+        os.close(lease_fd)
+        os.close(cache_fd)
     time_map, out_at = [], 0.0
     for seg_start, seg_end in segments:
         left, right = max(sample_start, seg_start), min(sample_start + duration, seg_end)
@@ -579,6 +682,19 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
 
 
 def render(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise PreviewError("invalid_request", "預覽請求必須是 JSON 物件")
+    _project, _source, cache, _output = request_paths(data)
+    cache.mkdir(parents=True, exist_ok=True)
+    cache_fd, maintenance_fd = _acquire_renderer_maintenance_shared(cache)
+    try:
+        return _render(data)
+    finally:
+        os.close(maintenance_fd)
+        os.close(cache_fd)
+
+
+def _render(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise PreviewError("invalid_request", "預覽請求必須是 JSON 物件")
     project, source, cache, output = request_paths(data)
@@ -640,7 +756,17 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
             raise PreviewError("invalid_request", "完整時間軸預覽需要凍結快照")
         progress("rendering", "正在以凍結快照渲染完整時間軸")
         output.parent.mkdir(parents=True, exist_ok=True)
-        rep = timeline_preview(project, cache, output, snapshot, sample_start, duration, dependencies, requested_quality)
+        rep = timeline_preview(
+            project,
+            cache,
+            output,
+            snapshot,
+            sample_start,
+            duration,
+            dependencies,
+            requested_quality,
+            scratch_owner=data.get("scratch_owner"),
+        )
         return {"ok": True, "out": str(output), "code": code, "mode": mode, "quality": requested_quality, "apply_window": {"start_s": apply_start, "duration_s": apply_duration}, "sample_window": {"start_s": sample_start, "duration_s": duration}, **rep}
     progress("preparing", "正在準備原片時窗")
     effect = next((x for x in fx_overlay.catalog().get("effects", []) if x["code"] == code), {})
