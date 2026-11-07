@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import hashlib
 import json
@@ -46,6 +47,31 @@ class StylePresetError(ValueError):
         self.status = status
         self.code = code
         self.message = message
+
+
+UNSAFE_PATH_ERRNOS = frozenset({errno.ELOOP, errno.ENOTDIR, errno.EISDIR})
+
+
+def _classified_store_os_error(
+    exc: OSError,
+    *,
+    unsafe_message: str,
+    writing: bool,
+) -> StylePresetError:
+    """Keep no-follow/type failures distinct from operational store I/O."""
+    if exc.errno in UNSAFE_PATH_ERRNOS:
+        return StylePresetError(409, "store_unsafe", unsafe_message)
+    if writing:
+        return StylePresetError(
+            503,
+            "store_io_error",
+            "預設寫入結果未能完整確認；請重新載入清單確認後再試，並檢查磁碟空間與權限",
+        )
+    return StylePresetError(
+        503,
+        "store_io_error",
+        "預設資料暫時無法讀取；原檔未變更，請檢查磁碟或權限後重試",
+    )
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -312,7 +338,14 @@ class StylePresetStore:
     def _open_directory(self, *, create: bool) -> int | None:
         """Open every path component without following symlinks and pin the final fd."""
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(os.sep, flags)
+        try:
+            descriptor = os.open(os.sep, flags)
+        except OSError as exc:
+            raise _classified_store_os_error(
+                exc,
+                unsafe_message="預設資料夾含不安全的路徑元件",
+                writing=create,
+            ) from exc
         try:
             for component in self.directory.parts[1:]:
                 try:
@@ -329,13 +362,25 @@ class StylePresetStore:
                         # the no-follow open below still revalidates its type.
                         pass
                     except OSError as exc:
-                        raise StylePresetError(409, "store_unsafe", "無法安全建立預設資料夾") from exc
+                        raise _classified_store_os_error(
+                            exc,
+                            unsafe_message="無法安全建立預設資料夾",
+                            writing=True,
+                        ) from exc
                     try:
                         child = os.open(component, flags, dir_fd=descriptor)
                     except OSError as exc:
-                        raise StylePresetError(409, "store_unsafe", "無法安全建立預設資料夾") from exc
+                        raise _classified_store_os_error(
+                            exc,
+                            unsafe_message="無法安全建立預設資料夾",
+                            writing=True,
+                        ) from exc
                 except OSError as exc:
-                    raise StylePresetError(409, "store_unsafe", "預設資料夾含不安全的路徑元件") from exc
+                    raise _classified_store_os_error(
+                        exc,
+                        unsafe_message="預設資料夾含不安全的路徑元件",
+                        writing=create,
+                    ) from exc
                 os.close(descriptor)
                 descriptor = child
             return descriptor
@@ -353,7 +398,9 @@ class StylePresetStore:
         try:
             descriptor = os.open(
                 "presets.json",
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=directory_fd,
             )
         except FileNotFoundError:
@@ -363,7 +410,11 @@ class StylePresetStore:
         except OSError as exc:
             if owned_fd:
                 os.close(directory_fd)
-            raise StylePresetError(409, "store_unsafe", "無法安全讀取預設資料") from exc
+            raise _classified_store_os_error(
+                exc,
+                unsafe_message="無法安全讀取預設資料",
+                writing=False,
+            ) from exc
         try:
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STORE_BYTES:
@@ -528,7 +579,12 @@ class StylePresetStore:
                 break
         if lock_fd < 0:
             os.close(directory_fd)
-            raise StylePresetError(409, "store_unsafe", "無法安全讀取預設鎖") from last_error
+            assert last_error is not None
+            raise _classified_store_os_error(
+                last_error,
+                unsafe_message="無法安全讀取預設鎖",
+                writing=False,
+            ) from last_error
         try:
             try:
                 if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
@@ -556,18 +612,29 @@ class StylePresetStore:
         except FileNotFoundError:
             target_info = None
         except OSError as exc:
-            raise StylePresetError(409, "store_unsafe", "預設資料檔不安全") from exc
+            raise _classified_store_os_error(
+                exc,
+                unsafe_message="預設資料檔不安全",
+                writing=True,
+            ) from exc
         if target_info is not None and not stat.S_ISREG(target_info.st_mode):
             raise StylePresetError(409, "store_unsafe", "預設資料檔不安全")
         temporary = f".presets-{os.getpid()}-{secrets.token_hex(8)}.tmp"
         descriptor = -1
         try:
-            descriptor = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=directory_fd,
-            )
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                raise _classified_store_os_error(
+                    exc,
+                    unsafe_message="預設暫存檔不安全",
+                    writing=True,
+                ) from exc
             view = memoryview(raw)
             while view:
                 written = os.write(descriptor, view)
@@ -626,7 +693,12 @@ class StylePresetStore:
                 break
         if lock_fd < 0:
             os.close(directory_fd)
-            raise StylePresetError(409, "store_unsafe", "無法鎖定預設資料") from last_error
+            assert last_error is not None
+            raise _classified_store_os_error(
+                last_error,
+                unsafe_message="無法鎖定預設資料",
+                writing=True,
+            ) from last_error
         try:
             if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                 raise StylePresetError(409, "store_unsafe", "預設鎖檔不安全")
