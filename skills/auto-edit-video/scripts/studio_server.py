@@ -25,6 +25,7 @@ import unicodedata
 import urllib.parse
 import uuid
 import webbrowser
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +48,7 @@ from editor_server import (
     EDITOR_DIR,
     EditorServer,
     atomic_write_json,
+    ensure_caption_preset_mutation_ready,
 )
 from director_resolver import (
     DirectorResolutionError,
@@ -211,6 +213,17 @@ class StudioServer(ThreadingHTTPServer):
         thread.start()
         self.editor_servers.append((server, thread))
         return f"http://127.0.0.1:{server.server_port}/"
+
+    def _editor_server_for_project(self, project_dir: Path) -> EditorServer | None:
+        resolved = project_dir.resolve()
+        matches = [
+            server
+            for server, _thread in self.editor_servers
+            if server.project_dir == resolved
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("project editor server is not uniquely available")
+        return matches[0] if matches else None
 
     @staticmethod
     def terminate_pipeline_process(process: subprocess.Popen[str]) -> None:
@@ -509,48 +522,93 @@ class StudioServer(ThreadingHTTPServer):
         contextual_semantic_calibration: bool = False,
         semantic_model: str = "qwen2.5:7b",
     ) -> None:
-        status_path = project_dir / "working/pipeline_status.json"
+        resolved_project = project_dir.resolve()
+        status_path = resolved_project / "working/pipeline_status.json"
+        editor = self._editor_server_for_project(project_dir)
+        # Product import paths start exactly one EditorServer first. The
+        # no-editor branch preserves the isolated pipeline-worker API; without
+        # an editor there is no caption HTTP mutation endpoint to race.
+        project_guard = editor.project_lock if editor is not None else nullcontext()
         if not self.auto_process:
-            atomic_write_json(
-                status_path,
-                {
-                    "schema_version": 1,
-                    "state": "pending",
-                    "phase": "transcribe",
-                    "message": "等待啟動本機自動處理。",
-                    "updated_at": now_utc(),
-                },
-            )
-            return
-        with self.pipeline_lock:
-            if self.active_pipeline_project is not None:
+            with project_guard:
+                ensure_caption_preset_mutation_ready(resolved_project)
                 atomic_write_json(
                     status_path,
                     {
                         "schema_version": 1,
-                        "state": "needs_attention",
-                        "phase": "queue",
-                        "message": "另一個影片仍在處理；請稍後重新啟動這個專案。",
-                        "error_code": "pipeline_busy",
+                        "state": "pending",
+                        "phase": "transcribe",
+                        "message": "等待啟動本機自動處理。",
                         "updated_at": now_utc(),
                     },
                 )
-                return
-            self.active_pipeline_project = project_dir
-        thread = threading.Thread(
-            target=self.pipeline_worker,
-            args=(
-                project_dir,
-                director_profile,
-                editing_brief,
-                contextual_semantic_calibration,
-                semantic_model,
-            ),
-            daemon=False,
-            name=f"auto-edit-{project_dir.name}",
-        )
-        self.pipeline_threads.append(thread)
-        thread.start()
+            return
+        with project_guard:
+            ensure_caption_preset_mutation_ready(resolved_project)
+            with self.pipeline_lock:
+                if self.active_pipeline_project is not None:
+                    if self.active_pipeline_project == resolved_project:
+                        # Preserve the live reservation for this exact writer.
+                        # Replacing it with needs_attention would let caption
+                        # apply mistake an active external pipeline for idle.
+                        return
+                    atomic_write_json(
+                        status_path,
+                        {
+                            "schema_version": 1,
+                            "state": "needs_attention",
+                            "phase": "queue",
+                            "message": "另一個影片仍在處理；請稍後重新啟動這個專案。",
+                            "error_code": "pipeline_busy",
+                            "updated_at": now_utc(),
+                        },
+                    )
+                    return
+                # Reserve on disk before the thread exists. Caption apply reads
+                # this under the same project RLock, so there is no window in
+                # which an external authority-writing pipeline is alive while
+                # a caption transaction can create its prepared journal.
+                atomic_write_json(
+                    status_path,
+                    {
+                        "schema_version": 1,
+                        "state": "running",
+                        "phase": "reserved",
+                        "message": "本機自動處理已保留，正在啟動。",
+                        "updated_at": now_utc(),
+                    },
+                )
+                self.active_pipeline_project = resolved_project
+                thread = threading.Thread(
+                    target=self.pipeline_worker,
+                    args=(
+                        resolved_project,
+                        director_profile,
+                        editing_brief,
+                        contextual_semantic_calibration,
+                        semantic_model,
+                    ),
+                    daemon=False,
+                    name=f"auto-edit-{resolved_project.name}",
+                )
+                self.pipeline_threads.append(thread)
+                try:
+                    thread.start()
+                except BaseException:
+                    self.pipeline_threads.remove(thread)
+                    self.active_pipeline_project = None
+                    atomic_write_json(
+                        status_path,
+                        {
+                            "schema_version": 1,
+                            "state": "failed",
+                            "phase": "startup",
+                            "message": "本機自動處理無法啟動；尚未執行任何處理步驟。",
+                            "error_code": "pipeline_start_failed",
+                            "updated_at": now_utc(),
+                        },
+                    )
+                    raise
 
     def server_close(self) -> None:
         self.stop_event.set()
