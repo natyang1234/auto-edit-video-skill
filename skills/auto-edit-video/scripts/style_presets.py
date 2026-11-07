@@ -408,8 +408,22 @@ class StylePresetStore:
                 os.close(directory_fd)
             return empty_document()
         except OSError as exc:
+            try:
+                failed_info = os.stat(
+                    "presets.json",
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                failed_info = None
             if owned_fd:
                 os.close(directory_fd)
+            if failed_info is not None and not stat.S_ISREG(failed_info.st_mode):
+                raise StylePresetError(
+                    409,
+                    "store_unsafe",
+                    "預設資料檔類型不安全",
+                ) from exc
             raise _classified_store_os_error(
                 exc,
                 unsafe_message="無法安全讀取預設資料",

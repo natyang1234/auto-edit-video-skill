@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
@@ -28,6 +29,34 @@ from tests import test_fx_preview_api as fx_api_test  # noqa: E402
 
 
 OFL_LICENSE = (Path(__file__).resolve().parents[1] / "contracts/licenses/OFL-1.1.txt").read_bytes()
+
+
+class StylePresetOSProxy:
+    """Track only style_presets' successful open/close pairs without patching global os."""
+
+    def __init__(self) -> None:
+        self._delegate = os
+        self._lock = threading.Lock()
+        self._live: dict[int, object] = {}
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+    def open(self, *args, **kwargs) -> int:
+        with self._lock:
+            descriptor = self._delegate.open(*args, **kwargs)
+            self._live[descriptor] = args[0] if args else kwargs.get("path")
+        return descriptor
+
+    def close(self, descriptor: int) -> None:
+        with self._lock:
+            self._delegate.close(descriptor)
+            self._live.pop(descriptor, None)
+
+    @property
+    def live_fds(self) -> dict[int, object]:
+        with self._lock:
+            return dict(self._live)
 
 
 def publish_verified_font(project: Path, candidate_name: str) -> tuple[dict, dict]:
@@ -150,6 +179,76 @@ class StylePresetStoreTests(unittest.TestCase):
         self.assertEqual(first["presets"], [])
         self.assertFalse(self.directory.exists())
         self.assertEqual(first, style_presets.StylePresetStore(self.directory).collection())
+
+    def test_fd_tracker_serializes_close_with_reused_descriptor_open(self) -> None:
+        class PausedCloseDelegate:
+            def __init__(self) -> None:
+                self.real_close_done = threading.Event()
+                self.allow_close_return = threading.Event()
+
+            def __getattr__(self, name: str):
+                return getattr(os, name)
+
+            def close(self, descriptor: int) -> None:
+                os.close(descriptor)
+                self.real_close_done.set()
+                if not self.allow_close_return.wait(timeout=5):
+                    raise TimeoutError("fd tracker close barrier timed out")
+
+        self.directory.mkdir()
+        tracker = StylePresetOSProxy()
+        delegate = PausedCloseDelegate()
+        tracker._delegate = delegate
+        first_path = self.directory / "first.tmp"
+        second_path = self.directory / "second.tmp"
+        first_fd = tracker.open(
+            first_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        close_errors: list[BaseException] = []
+        open_errors: list[BaseException] = []
+        second: list[int] = []
+        opened = threading.Event()
+
+        def close_first() -> None:
+            try:
+                tracker.close(first_fd)
+            except BaseException as exc:
+                close_errors.append(exc)
+
+        def open_second() -> None:
+            try:
+                second.append(tracker.open(
+                    second_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                ))
+            except BaseException as exc:
+                open_errors.append(exc)
+            finally:
+                opened.set()
+
+        closer = threading.Thread(target=close_first)
+        closer.start()
+        self.assertTrue(delegate.real_close_done.wait(timeout=5))
+        opener = threading.Thread(target=open_second)
+        opener.start()
+        self.assertFalse(opened.wait(timeout=0.1), "open bypassed the tracker close lock")
+        delegate.allow_close_return.set()
+        closer.join(timeout=5)
+        opener.join(timeout=5)
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(opener.is_alive())
+        self.assertEqual(close_errors, [])
+        self.assertEqual(open_errors, [])
+        self.assertEqual(len(second), 1)
+        second_fd = second[0]
+        self.assertEqual(first_fd, second_fd)
+        self.assertIn(second_fd, tracker.live_fds)
+        self.assertTrue(stat.S_ISREG(os.fstat(second_fd).st_mode))
+        tracker.close(second_fd)
+        self.assertEqual(tracker.live_fds, {})
 
     def test_crud_persists_and_uses_revision_cas(self) -> None:
         empty = self.store.collection()
@@ -2016,6 +2115,10 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(current["revision"], created["revision"])
 
     def test_store_operational_errno_is_503_across_http_boundaries(self) -> None:
+        tracker = StylePresetOSProxy()
+        os_proxy = patch.object(style_presets, "os", tracker)
+        os_proxy.start()
+        self.addCleanup(os_proxy.stop)
         state_path = self.harness.project / "working/editor_state.json"
         manifest_path = self.harness.project / "project.json"
         journal_path = self.harness.project / "working/caption-preset-transaction.json"
@@ -2026,17 +2129,6 @@ class StylePresetApiTests(unittest.TestCase):
                 path: path.read_bytes() if path.exists() else None
                 for path in (store_path, state_path, manifest_path, journal_path)
             }
-
-        def open_store_fds() -> list[str]:
-            found: list[str] = []
-            for name in os.listdir("/dev/fd"):
-                try:
-                    target = os.readlink(f"/dev/fd/{name}")
-                except OSError:
-                    continue
-                if str(self.store_dir) in target:
-                    found.append(target)
-            return sorted(found)
 
         status, empty = self.request("GET", "/api/style-presets")
         self.assertEqual(status, 200, empty)
@@ -2060,7 +2152,7 @@ class StylePresetApiTests(unittest.TestCase):
                 self.assertEqual(status, 503, rejected)
                 self.assertEqual(rejected["reason"], "store_io_error")
                 self.assertEqual(authority_snapshot(), before)
-                self.assertEqual(open_store_fds(), [])
+                self.assertEqual(tracker.live_fds, {})
 
         _state, project_revision = self.install_caption()
         created = self.create_caption_preset(empty["revision"])
@@ -2073,6 +2165,13 @@ class StylePresetApiTests(unittest.TestCase):
         }
         status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
         self.assertEqual(status, 200, plan)
+        held_fd = style_presets.os.open(
+            self.store_dir,
+            style_presets.os.O_RDONLY | getattr(style_presets.os, "O_DIRECTORY", 0),
+        )
+        self.assertIn(held_fd, tracker.live_fds)
+        style_presets.os.close(held_fd)
+        self.assertEqual(tracker.live_fds, {})
         real_open = style_presets.os.open
 
         for endpoint, request, component_errno in (
@@ -2092,7 +2191,7 @@ class StylePresetApiTests(unittest.TestCase):
                 self.assertEqual(status, 503, rejected)
                 self.assertEqual(rejected["reason"], "store_io_error")
                 self.assertEqual(authority_snapshot(), before)
-                self.assertEqual(open_store_fds(), [])
+                self.assertEqual(tracker.live_fds, {})
 
         for boundary, errnos in (
             ("caption-apply-lock", (errno.EACCES, errno.ENOSPC, errno.EIO, errno.EROFS)),
@@ -2124,7 +2223,7 @@ class StylePresetApiTests(unittest.TestCase):
                     self.assertEqual(status, 503, rejected)
                     self.assertEqual(rejected["reason"], "store_io_error")
                     self.assertEqual(authority_snapshot(), before)
-                    self.assertEqual(open_store_fds(), [])
+                    self.assertEqual(tracker.live_fds, {})
 
         lock_path = self.harness.server.style_preset_store.lock_path
         lock_path.unlink()
@@ -2149,11 +2248,15 @@ class StylePresetApiTests(unittest.TestCase):
                     self.assertEqual(status, 409, rejected)
                     self.assertEqual(rejected["reason"], "store_unsafe")
                     self.assertEqual(authority_snapshot(), before)
-                    self.assertEqual(open_store_fds(), [])
+                    self.assertEqual(tracker.live_fds, {})
         finally:
             lock_path.rmdir()
 
     def test_store_fifo_is_rejected_without_waiting_for_writer(self) -> None:
+        tracker = StylePresetOSProxy()
+        os_proxy = patch.object(style_presets, "os", tracker)
+        os_proxy.start()
+        self.addCleanup(os_proxy.stop)
         self.store_dir.mkdir(parents=True)
         store_path = self.harness.server.style_preset_store.path
         os.mkfifo(store_path, mode=0o600)
@@ -2165,6 +2268,7 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(rejected["reason"], "store_unsafe")
         self.assertTrue(store_path.exists())
         self.assertTrue(stat.S_ISFIFO(store_path.stat().st_mode))
+        self.assertEqual(tracker.live_fds, {})
 
         store_path.unlink()
         status, empty = self.request("GET", "/api/style-presets")
@@ -2174,8 +2278,65 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(status, 200, current)
         self.assertEqual(current["revision"], created["revision"])
         self.assertEqual(len(current["presets"]), 1)
+        self.assertEqual(tracker.live_fds, {})
+
+    def test_store_socket_is_unsafe_and_fd_tracker_has_positive_control(self) -> None:
+        original_store = self.harness.server.style_preset_store
+        with tempfile.TemporaryDirectory(prefix="p3-store-socket-", dir="/private/tmp") as raw:
+            short_store = Path(raw)
+            self.harness.server.style_preset_store = style_presets.StylePresetStore(short_store)
+            tracker = StylePresetOSProxy()
+            bound = None
+            try:
+                with patch.object(style_presets, "os", tracker):
+                    held_fd = style_presets.os.open(
+                        short_store,
+                        style_presets.os.O_RDONLY
+                        | getattr(style_presets.os, "O_DIRECTORY", 0),
+                    )
+                    self.assertIn(held_fd, tracker.live_fds)
+                    style_presets.os.close(held_fd)
+                    self.assertEqual(tracker.live_fds, {})
+
+                    store_path = self.harness.server.style_preset_store.path
+                    state_path = self.harness.project / "working/editor_state.json"
+                    manifest_path = self.harness.project / "project.json"
+                    before = (state_path.read_bytes(), manifest_path.read_bytes())
+                    bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    bound.bind(str(store_path))
+                    status, rejected = self.request("GET", "/api/style-presets")
+                    self.assertEqual(status, 409, rejected)
+                    self.assertEqual(rejected["reason"], "store_unsafe")
+                    self.assertTrue(stat.S_ISSOCK(store_path.lstat().st_mode))
+                    self.assertEqual(
+                        (state_path.read_bytes(), manifest_path.read_bytes()),
+                        before,
+                    )
+                    self.assertEqual(tracker.live_fds, {})
+
+                    bound.close()
+                    bound = None
+                    store_path.unlink()
+                    status, empty = self.request("GET", "/api/style-presets")
+                    self.assertEqual(status, 200, empty)
+                    created = self.create_caption_preset(empty["revision"])
+                    status, current = self.request("GET", "/api/style-presets")
+                    self.assertEqual(status, 200, current)
+                    self.assertEqual(current["revision"], created["revision"])
+                    self.assertEqual(tracker.live_fds, {})
+            finally:
+                if bound is not None:
+                    bound.close()
+                socket_path = self.harness.server.style_preset_store.path
+                if socket_path.exists() or socket_path.is_socket():
+                    socket_path.unlink()
+                self.harness.server.style_preset_store = original_store
 
     def test_extreme_corrupt_json_is_409_and_preserved_across_http_boundaries(self) -> None:
+        tracker = StylePresetOSProxy()
+        os_proxy = patch.object(style_presets, "os", tracker)
+        os_proxy.start()
+        self.addCleanup(os_proxy.stop)
         _state, project_revision = self.install_caption()
         status, empty = self.request("GET", "/api/style-presets")
         self.assertEqual(status, 200, empty)
@@ -2230,17 +2391,6 @@ class StylePresetApiTests(unittest.TestCase):
             "bool-schema": b'{"schema_version":true,"presets":[]}',
         }
 
-        def store_fds() -> list[str]:
-            found: list[str] = []
-            for descriptor in os.listdir("/dev/fd"):
-                try:
-                    target = os.readlink(f"/dev/fd/{descriptor}")
-                except OSError:
-                    continue
-                if str(self.store_dir) in target:
-                    found.append(target)
-            return sorted(found)
-
         requests = (
             ("GET", "/api/style-presets", None),
             ("POST", "/api/style-presets/caption-plan", base),
@@ -2280,7 +2430,7 @@ class StylePresetApiTests(unittest.TestCase):
                         journal_path.read_bytes() if journal_path.exists() else None,
                         before["journal"],
                     )
-                    self.assertEqual(store_fds(), [])
+                    self.assertEqual(tracker.live_fds, {})
 
         oversized = b"x" * (style_presets.MAX_STORE_BYTES + 1)
         store_path.write_bytes(oversized)
@@ -2288,12 +2438,13 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(status, 409, rejected)
         self.assertEqual(rejected["reason"], "store_corrupt")
         self.assertEqual(store_path.read_bytes(), oversized)
-        self.assertEqual(store_fds(), [])
+        self.assertEqual(tracker.live_fds, {})
 
         store_path.write_bytes(valid_raw)
         status, current = self.request("GET", "/api/style-presets")
         self.assertEqual(status, 200, current)
         self.assertEqual(current["revision"], created["revision"])
+        self.assertEqual(tracker.live_fds, {})
 
     def test_preview_failure_after_replace_reports_publication_truthfully(self) -> None:
         from tests.test_editor_server import EditorServerTests
