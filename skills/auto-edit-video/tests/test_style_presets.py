@@ -2162,7 +2162,7 @@ class StylePresetApiTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 1.0)
         self.assertEqual(status, 409, rejected)
-        self.assertEqual(rejected["reason"], "store_corrupt")
+        self.assertEqual(rejected["reason"], "store_unsafe")
         self.assertTrue(store_path.exists())
         self.assertTrue(stat.S_ISFIFO(store_path.stat().st_mode))
 
@@ -2174,6 +2174,126 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(status, 200, current)
         self.assertEqual(current["revision"], created["revision"])
         self.assertEqual(len(current["presets"]), 1)
+
+    def test_extreme_corrupt_json_is_409_and_preserved_across_http_boundaries(self) -> None:
+        _state, project_revision = self.install_caption()
+        status, empty = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, empty)
+        created = self.create_caption_preset(empty["revision"])
+        base = {
+            "preset_id": created["preset"]["id"],
+            "expected_library_revision": created["revision"],
+            "expected_revision": project_revision,
+            "overlay_id": "caption-preset-target",
+            "scope": "single",
+        }
+        status, plan = self.request("POST", "/api/style-presets/caption-plan", base)
+        self.assertEqual(status, 200, plan)
+        store_path = self.harness.server.style_preset_store.path
+        valid_raw = store_path.read_bytes()
+        state_path = self.harness.project / "working/editor_state.json"
+        manifest_path = self.harness.project / "project.json"
+        journal_path = self.harness.project / "working/caption-preset-transaction.json"
+        timestamp = "2026-11-08T00:00:00Z"
+        surrogate_document = {
+            "schema_version": 1,
+            "presets": [{
+                "id": "preset_" + "1" * 32,
+                "name": "\ud800",
+                "kind": "caption",
+                "settings": {"style": {"color": "#123456"}, "font": None},
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }],
+        }
+        deep_record_document = {
+            "schema_version": 1,
+            "presets": [{
+                "id": "preset_" + "2" * 32,
+                "name": "deep-record",
+                "kind": "caption",
+                "settings": {
+                    "style": {"color": [[[[[[[[[["bad"]]]]]]]]]]},
+                    "font": None,
+                },
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }],
+        }
+        corrupt_cases = {
+            "big-integer": b'{"schema_version":1,"presets":[' + b"9" * 4301 + b"]}",
+            "deep-json": ("[" * 200000 + "0" + "]" * 200000).encode("ascii"),
+            "lone-surrogate": json.dumps(
+                surrogate_document, ensure_ascii=True
+            ).encode("ascii"),
+            "deep-record": json.dumps(deep_record_document).encode("utf-8"),
+            "bool-schema": b'{"schema_version":true,"presets":[]}',
+        }
+
+        def store_fds() -> list[str]:
+            found: list[str] = []
+            for descriptor in os.listdir("/dev/fd"):
+                try:
+                    target = os.readlink(f"/dev/fd/{descriptor}")
+                except OSError:
+                    continue
+                if str(self.store_dir) in target:
+                    found.append(target)
+            return sorted(found)
+
+        requests = (
+            ("GET", "/api/style-presets", None),
+            ("POST", "/api/style-presets/caption-plan", base),
+            (
+                "POST",
+                "/api/style-presets/caption-apply",
+                {**base, "plan_digest": plan["plan_digest"]},
+            ),
+            (
+                "POST",
+                "/api/style-presets",
+                {
+                    "expected_library_revision": created["revision"],
+                    "name": "corrupt-mutation",
+                    "kind": "caption",
+                    "settings": {"style": {"color": "#123456"}},
+                },
+            ),
+        )
+        for label, raw in corrupt_cases.items():
+            store_path.write_bytes(raw)
+            before = {
+                "store": store_path.read_bytes(),
+                "state": state_path.read_bytes(),
+                "manifest": manifest_path.read_bytes(),
+                "journal": journal_path.read_bytes() if journal_path.exists() else None,
+            }
+            for method, path, body in requests:
+                with self.subTest(case=label, endpoint=path):
+                    status, rejected = self.request(method, path, body)
+                    self.assertEqual(status, 409, rejected)
+                    self.assertEqual(rejected["reason"], "store_corrupt")
+                    self.assertEqual(store_path.read_bytes(), before["store"])
+                    self.assertEqual(state_path.read_bytes(), before["state"])
+                    self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+                    self.assertEqual(
+                        journal_path.read_bytes() if journal_path.exists() else None,
+                        before["journal"],
+                    )
+                    self.assertEqual(store_fds(), [])
+
+        oversized = b"x" * (style_presets.MAX_STORE_BYTES + 1)
+        store_path.write_bytes(oversized)
+        status, rejected = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 409, rejected)
+        self.assertEqual(rejected["reason"], "store_corrupt")
+        self.assertEqual(store_path.read_bytes(), oversized)
+        self.assertEqual(store_fds(), [])
+
+        store_path.write_bytes(valid_raw)
+        status, current = self.request("GET", "/api/style-presets")
+        self.assertEqual(status, 200, current)
+        self.assertEqual(current["revision"], created["revision"])
 
     def test_preview_failure_after_replace_reports_publication_truthfully(self) -> None:
         from tests.test_editor_server import EditorServerTests
