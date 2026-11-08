@@ -924,6 +924,123 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
             page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
             browser.close()
 
+    def test_portable_fx_preset_preserves_project_manual_path_and_whitelist(self):
+        host, port = self.server.server_address
+        preset = {
+            "id": "portable-p5-r7",
+            "name": "可攜 P5",
+            "kind": "fx",
+            "settings": {
+                "code": "P5", "values": {}, "placement": "", "scheme": "",
+                "font_ids": {}, "opacity": 0.37, "text_fit": False,
+                # These fields simulate an untrusted cross-project preset;
+                # only the documented styling whitelist may be copied.
+                "spotlight_mode": "manual",
+                "spotlight_path": {"version": 1, "interpolation": "smoothstep", "keyframes": [
+                    {"source_at": 0, "x": 0.1, "y": 0.1},
+                    {"source_at": 2, "x": 0.9, "y": 0.9},
+                ]},
+            },
+        }
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            posted, _cancelled, _failed = self.mock_preview_api(page)
+
+            def style_preset_route(route):
+                if route.request.method == "GET":
+                    route.fulfill(json={"ok": True, "revision": "preset-r7", "presets": [preset]})
+                else:
+                    route.fallback()
+
+            page.route("**/api/style-presets", style_preset_route)
+            page.evaluate("""(preset) => {
+                const overlay = {
+                    id: 'portable-manual-r7', type: 'fx', start: 0, end: 2,
+                    text: '', emphasis: [], visible: true, locked: false, z_index: 25,
+                    style: {x: 50, y: 50, width: 100, animation: 'none', opacity: 0.91},
+                    code: 'P5', values: {}, placement: '', scheme: '', font_ids: {},
+                    text_fit: true, spotlight_mode: 'manual',
+                    spotlight_path: {version: 1, interpolation: 'smoothstep', keyframes: [
+                        {source_at: 0, x: 0.25, y: 0.35},
+                        {source_at: 2, x: 0.75, y: 0.65},
+                    ]}, provenance: 'browser test', highlight_id: null,
+                };
+                state.overlays.push(overlay);
+                state.review = state.review || {};
+                selectedOverlayId = overlay.id;
+                state.review.selected_overlay_id = overlay.id;
+                renderAll();
+            }""", preset)
+
+            page.locator("#style-presets summary").click()
+            page.wait_for_function("() => document.querySelector('#preset-list option[value=portable-p5-r7]')")
+            page.locator("#preset-list").select_option("portable-p5-r7")
+            page.locator("#preset-apply").click()
+            page.locator("#preset-review[open]").wait_for()
+            page.locator("#preset-review-confirm").click()
+            page.locator("#fx-preview-dialog[open]").wait_for()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'P5'")
+            existing = page.evaluate("""() => ({
+                mode: fxPreviewDraft.spotlight_mode,
+                path: structuredClone(fxPreviewDraft.spotlight_path),
+                opacity: fxPreviewDraft.opacity,
+                textFit: fxPreviewDraft.text_fit,
+            })""")
+            self.assertEqual(existing["mode"], "manual")
+            self.assertEqual(existing["path"]["keyframes"][0], {"source_at": 0, "x": 0.25, "y": 0.35})
+            self.assertEqual(existing["path"]["keyframes"][-1], {"source_at": 2, "x": 0.75, "y": 0.65})
+            self.assertEqual(existing["opacity"], 0.37)
+            self.assertFalse(existing["textFit"])
+            page.wait_for_timeout(800)
+            self._wait_for_post(posted, lambda body: body.get("candidate", {}).get("code") == "P5")
+            self.assertEqual(posted[-1]["candidate"]["spotlight_path"]["keyframes"][0]["x"], 0.25)
+            page.locator("#fx-preview-cancel").click()
+            page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
+
+            # With no project overlay, the same incoming path/mode fields must
+            # not cross the whitelist; new P5 starts in its normal automatic mode.
+            page.evaluate("""() => {
+                state.overlays = [];
+                selectedOverlayId = null;
+                state.review = state.review || {};
+                state.review.selected_overlay_id = null;
+                renderAll();
+            }""")
+            page.locator("#preset-apply").click()
+            page.locator("#preset-review[open]").wait_for()
+            page.locator("#preset-review-confirm").click()
+            page.locator("#fx-preview-dialog[open]").wait_for()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'P5'")
+            fresh = page.evaluate("""() => ({
+                mode: fxPreviewDraft.spotlight_mode,
+                hasPath: Object.prototype.hasOwnProperty.call(fxPreviewDraft, 'spotlight_path')
+                    && Boolean(fxPreviewDraft.spotlight_path),
+            })""")
+            self.assertEqual(fresh, {"mode": "automatic", "hasPath": False})
+
+            # BuildDraft's normal non-P5 transition remains free of spotlight
+            # metadata even when its seed contains a manual P5 path.
+            switched = page.evaluate("""() => {
+                const seed = {
+                    spotlight_mode: 'manual',
+                    spotlight_path: {version: 1, interpolation: 'smoothstep', keyframes: []},
+                };
+                const draft = fxPreviewBuildDraft(fxEffectByCode('H1'), seed, null, 0);
+                return {
+                    hasMode: Object.prototype.hasOwnProperty.call(draft, 'spotlight_mode'),
+                    hasPath: Object.prototype.hasOwnProperty.call(draft, 'spotlight_path'),
+                };
+            }""")
+            self.assertEqual(switched, {"hasMode": False, "hasPath": False})
+            page.locator("#fx-preview-cancel").click()
+            page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
+            browser.close()
+
     def test_mode_seed_fixed_label_and_output_crop_contract(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:
