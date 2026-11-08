@@ -72,7 +72,7 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 "version": 1,
                 "scope": "full-timeline",
                 "measurement": "sampled-local-frames",
-                "status": "warn",
+                "status": "unmeasured",
                 "source_sha256": "a" * 64,
                 "media_sha256": "b" * 64,
                 "frame_size": {"width": 360, "height": 640},
@@ -95,8 +95,9 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             }
             self.install_job(page, receipt)
             panel = page.locator("#fx-preview-composition-check")
-            self.assertEqual(panel.get_attribute("data-status"), "warn")
-            self.assertIn("抽樣 1 個時間點", panel.locator("#fx-preview-composition-check-summary").inner_text())
+            self.assertEqual(panel.get_attribute("data-status"), "unmeasured")
+            self.assertIn("目前無法可靠量測", panel.locator("#fx-preview-composition-check-summary").inner_text())
+            self.assertIn("抽樣 1 個時間點", panel.locator("#fx-preview-composition-check-samples").inner_text())
             jump = panel.locator(".fx-preview-composition-check-list button")
             self.assertEqual(jump.count(), 1)
             self.assertIn("查看原片時間 00:01.300", jump.inner_text())
@@ -155,7 +156,11 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                         samples: [{output_at: 0.9, source_at: 1.3, measured: true,
                             source_face_count: 1, reference_face_count: 1,
                             visible_face_count: 1, text_box_count: 1}],
-                        findings: [{kind: 'visibility_uncertain', output_at: 0.9, source_at: 1.3}],
+                        findings: [{
+                            kind: 'text_subject_overlap', output_at: 0.9, source_at: 1.3,
+                            subject_box: {x: 20, y: 30, width: 80, height: 90},
+                            text_box: {x: 24, y: 36, width: 70, height: 20},
+                        }],
                     };
                     const job = {
                         id: 'composition-clear-regression', state: 'ready', media_url: '/media/source',
@@ -236,6 +241,97 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             self.assertFalse(result["restored"]["layoutHidden"])
             self.assertEqual(result["visibleJob"], "composition-clear-regression")
             self.assertTrue(result["visibleMeta"])
+            browser.close()
+
+    def test_receipt_contract_rejects_coercion_and_semantic_warns(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            result = page.evaluate(
+                """() => {
+                    const job = {
+                        render_duration_s: 1.6,
+                        preview_options: {mode: 'timeline', quality: 'standard'},
+                        time_map: [
+                            {output_start_s: 0, output_end_s: .8, source_start_s: 0, source_end_s: .8},
+                            {output_start_s: .8, output_end_s: 1.6, source_start_s: 1.2, source_end_s: 2},
+                        ],
+                    };
+                    const sample = {
+                        output_at: .9, source_at: 1.3, measured: true,
+                        source_face_count: 1, reference_face_count: 1,
+                        visible_face_count: 1, text_box_count: 1,
+                    };
+                    const overlap = {
+                        kind: 'text_subject_overlap', output_at: .9, source_at: 1.3,
+                        subject_box: {x: 20, y: 30, width: 80, height: 90},
+                        text_box: {x: 24, y: 36, width: 70, height: 20},
+                    };
+                    const baseWarn = {
+                        version: 1, scope: 'full-timeline', measurement: 'sampled-local-frames', status: 'warn',
+                        source_sha256: 'a'.repeat(64), media_sha256: 'b'.repeat(64),
+                        frame_size: {width: 360, height: 640}, sample_count: 1, measured_count: 1,
+                        elapsed_s: .4, engines: {faces: 'opencv-yunet', ocr: 'macos-vision'},
+                        samples: [sample], findings: [overlap],
+                    };
+                    const basePass = structuredClone(baseWarn);
+                    basePass.status = 'pass';
+                    basePass.findings = [];
+                    const baseUnmeasured = structuredClone(baseWarn);
+                    baseUnmeasured.status = 'unmeasured';
+                    baseUnmeasured.samples[0].measured = false;
+                    baseUnmeasured.samples[0].source_face_count = 0;
+                    baseUnmeasured.samples[0].reference_face_count = 0;
+                    baseUnmeasured.samples[0].visible_face_count = 0;
+                    baseUnmeasured.samples[0].text_box_count = 0;
+                    baseUnmeasured.measured_count = 0;
+                    baseUnmeasured.findings = [{kind: 'visibility_uncertain', output_at: .9, source_at: 1.3}];
+                    const cases = {
+                        valid_warn: baseWarn,
+                        valid_pass: basePass,
+                        valid_unmeasured: baseUnmeasured,
+                        raw_measured_null: (() => { const r = structuredClone(baseWarn); r.samples[0].measured = null; r.measured_count = 0; return r; })(),
+                        raw_measured_string: (() => { const r = structuredClone(baseWarn); r.samples[0].measured = 'true'; r.measured_count = 0; return r; })(),
+                        raw_measured_number: (() => { const r = structuredClone(baseWarn); r.samples[0].measured = 1; return r; })(),
+                        count_mismatch: (() => { const r = structuredClone(baseWarn); r.measured_count = 0; return r; })(),
+                        capability_warn: (() => { const r = structuredClone(baseWarn); r.findings = [{kind: 'visibility_uncertain', output_at: .9, source_at: 1.3}]; return r; })(),
+                        zero_face_pass: (() => { const r = structuredClone(basePass); Object.assign(r.samples[0], {source_face_count: 0, reference_face_count: 0, visible_face_count: 0}); return r; })(),
+                        zero_face_warn: (() => { const r = structuredClone(baseWarn); Object.assign(r.samples[0], {source_face_count: 0, reference_face_count: 0, visible_face_count: 0}); return r; })(),
+                        missing_findings: (() => { const r = structuredClone(baseWarn); delete r.findings; return r; })(),
+                        null_finding: (() => { const r = structuredClone(baseWarn); r.findings = [null]; return r; })(),
+                        primitive_finding: (() => { const r = structuredClone(baseWarn); r.findings = [1]; return r; })(),
+                        overlap_missing_source: (() => { const r = structuredClone(baseWarn); delete r.findings[0].source_at; return r; })(),
+                        elapsed_over_60: (() => { const r = structuredClone(baseWarn); r.elapsed_s = 61; return r; })(),
+                        raw_sha_number: (() => { const r = structuredClone(baseWarn); r.source_sha256 = 7; return r; })(),
+                        unknown_status: (() => { const r = structuredClone(baseWarn); r.status = 'future'; return r; })(),
+                    };
+                    const inspect = receipt => {
+                        const check = fxPreviewCompositionReceipt(receipt, job);
+                        fxPreviewRenderCompositionCheck(receipt, job);
+                        return {
+                            status: check.status,
+                            reason: check.reason,
+                            buttons: document.querySelectorAll(
+                                '#fx-preview-composition-check-list button[data-source-at]'
+                            ).length,
+                        };
+                    };
+                    return Object.fromEntries(Object.entries(cases).map(([name, receipt]) => [name, inspect(receipt)]));
+                }"""
+            )
+            self.assertEqual(result["valid_warn"], {"status": "warn", "reason": "", "buttons": 1})
+            self.assertEqual(result["valid_pass"], {"status": "pass", "reason": "", "buttons": 0})
+            self.assertEqual(result["valid_unmeasured"], {"status": "unmeasured", "reason": "", "buttons": 1})
+            fixed_reason = "完整畫面檢查結果不完整，無法可靠判定"
+            for name in (
+                "raw_measured_null", "raw_measured_string", "raw_measured_number", "count_mismatch",
+                "capability_warn", "zero_face_pass", "zero_face_warn", "missing_findings",
+                "null_finding", "primitive_finding", "overlap_missing_source", "elapsed_over_60",
+                "raw_sha_number", "unknown_status",
+            ):
+                self.assertEqual(result[name], {"status": "unmeasured", "reason": fixed_reason, "buttons": 0}, name)
             browser.close()
 
     def test_unknown_receipt_cannot_render_pass_and_single_action_is_hidden_in_comparison(self):
@@ -387,7 +483,7 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 "version": 1,
                 "scope": "full-timeline",
                 "measurement": "sampled-local-frames",
-                "status": "warn",
+                "status": "unmeasured",
                 "source_sha256": "a" * 64,
                 "media_sha256": "b" * 64,
                 "frame_size": {"width": 360, "height": 640},
@@ -605,7 +701,7 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 "version": 1,
                 "scope": "full-timeline",
                 "measurement": "sampled-local-frames",
-                "status": "warn",
+                "status": "unmeasured",
                 "source_sha256": "a" * 64,
                 "media_sha256": "b" * 64,
                 "frame_size": {"width": 360, "height": 640},
