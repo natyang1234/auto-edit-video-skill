@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ sys.path.insert(0, str(TESTS))
 
 import test_editor_browser as _editor_browser  # noqa: E402
 import test_fx_preview_browser as _fx_preview_browser  # noqa: E402
+from fx_preview_render import _composition_unmeasured  # noqa: E402
 
 
 CHROME = _editor_browser.CHROME
@@ -342,21 +344,14 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             page.goto(f"http://{host}:{port}/", wait_until="networkidle")
             _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
             self.open_ready_preview(page)
-            receipt = {
-                "version": 1,
-                "scope": "single-effect",
-                "measurement": "sampled-local-frames",
-                "status": "unmeasured",
-                "source_sha256": "a" * 64,
-                "media_sha256": "b" * 64,
-                "frame_size": {"width": 360, "height": 640},
-                "sample_count": 0,
-                "measured_count": 0,
-                "elapsed_s": 0.1,
-                "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
-                "samples": [],
-                "findings": [{"kind": "full_timeline_required"}],
-            }
+            receipt = _composition_unmeasured(
+                scope="single-effect",
+                source_sha256="a" * 64,
+                media_sha256="b" * 64,
+                frame_size={"width": 360, "height": 640},
+                finding="full_timeline_required",
+                elapsed_s=0.1,
+            )
             self.install_job(page, receipt, mode="single")
             panel = page.locator("#fx-preview-composition-check")
             self.assertEqual(panel.get_attribute("data-status"), "unmeasured")
@@ -609,6 +604,106 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             self.assertTrue(result["panelHidden"])
             browser.close()
 
+    def test_unavailable_engines_preserve_unmeasured_contract_and_block_pass_warn(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
+            self.open_ready_preview(page)
+            single_fallback = _composition_unmeasured(
+                scope="single-effect",
+                source_sha256="a" * 64,
+                media_sha256="b" * 64,
+                frame_size={"width": 360, "height": 640},
+                finding="full_timeline_required",
+                elapsed_s=0.4,
+            )
+            timed_unavailable_ocr = _composition_unmeasured(
+                scope="full-timeline",
+                source_sha256="a" * 64,
+                media_sha256="b" * 64,
+                frame_size={"width": 360, "height": 640},
+                finding="ocr_unavailable",
+                elapsed_s=0.4,
+            )
+            timed_unavailable_ocr.update(
+                sample_count=1,
+                measured_count=0,
+                samples=[{
+                    "output_at": 0.9,
+                    "source_at": 1.3,
+                    "measured": False,
+                    "source_face_count": 1,
+                    "reference_face_count": 1,
+                    "visible_face_count": 1,
+                    "text_box_count": 0,
+                }],
+                findings=[{"kind": "ocr_unavailable", "output_at": 0.9, "source_at": 1.3}],
+            )
+            invalid_engine = copy.deepcopy(timed_unavailable_ocr)
+            invalid_engine["engines"] = {"faces": "other", "ocr": "unavailable"}
+            pass_unavailable = copy.deepcopy(timed_unavailable_ocr)
+            pass_unavailable.update(status="pass", measured_count=1, findings=[])
+            pass_unavailable["samples"][0]["measured"] = True
+            warn_unavailable = copy.deepcopy(pass_unavailable)
+            warn_unavailable.update(status="warn", findings=[{
+                "kind": "text_subject_overlap",
+                "output_at": 0.9,
+                "source_at": 1.3,
+                "subject_box": {"x": 20, "y": 30, "width": 80, "height": 90},
+                "text_box": {"x": 24, "y": 36, "width": 70, "height": 20},
+            }])
+
+            def snapshot(receipt, *, mode="timeline", job_id):
+                self.install_job(page, receipt, mode=mode, job_id=job_id)
+                return page.evaluate(
+                    """() => {
+                        const job = fxPreviewVisibleJob;
+                        const check = fxPreviewCompositionReceipt(job.composition_check, job);
+                        const panel = document.querySelector('#fx-preview-composition-check');
+                        return {
+                            status: check.status,
+                            reason: check.reason,
+                            engines: check.engines,
+                            findings: check.findings,
+                            summary: document.querySelector('#fx-preview-composition-check-summary').textContent,
+                            samples: document.querySelector('#fx-preview-composition-check-samples').textContent,
+                            buttons: panel.querySelectorAll('button[data-source-at]').length,
+                            switchHidden: document.querySelector('#fx-preview-composition-switch-timeline').hidden,
+                        };
+                    }"""
+                )
+
+            single = snapshot(single_fallback, mode="single", job_id="composition-single-fallback")
+            timed = snapshot(timed_unavailable_ocr, job_id="composition-timed-unavailable-ocr")
+            invalid = snapshot(invalid_engine, job_id="composition-invalid-engine")
+            passed = snapshot(pass_unavailable, job_id="composition-pass-unavailable")
+            warned = snapshot(warn_unavailable, job_id="composition-warn-unavailable")
+
+            self.assertEqual(single["status"], "unmeasured")
+            self.assertEqual(single["reason"], "")
+            self.assertEqual(single["engines"], {"faces": "unavailable", "ocr": "unavailable"})
+            self.assertEqual(single["findings"], [{"kind": "full_timeline_required"}])
+            self.assertIn("單一效果預覽不是完整時間軸", single["summary"])
+            self.assertFalse(single["switchHidden"])
+            self.assertEqual(single["buttons"], 0)
+
+            self.assertEqual(timed["status"], "unmeasured")
+            self.assertEqual(timed["reason"], "")
+            self.assertEqual(timed["findings"], [{"kind": "ocr_unavailable", "output_at": 0.9, "source_at": 1.3}])
+            self.assertEqual(timed["buttons"], 1)
+            self.assertIn("辨識耗時 0.4 秒（不含預覽合成時間）", timed["samples"])
+
+            fixed_reason = "完整畫面檢查結果不完整，無法可靠判定"
+            for result in (invalid, passed, warned):
+                self.assertEqual(result["status"], "unmeasured")
+                self.assertEqual(result["reason"], fixed_reason)
+                self.assertEqual(result["buttons"], 0)
+                self.assertEqual(result["findings"], [])
+            browser.close()
+
     def test_invalid_receipt_has_no_actions_but_valid_unmeasured_findings_can_seek(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:
@@ -628,7 +723,7 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 "sample_count": 1,
                 "measured_count": 0,
                 "elapsed_s": 0.4,
-                "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+                "engines": {"faces": "opencv-yunet", "ocr": "unavailable"},
                 "samples": [{
                     "output_at": 0.9, "source_at": 1.3, "measured": False,
                     "source_face_count": 1, "reference_face_count": 1,
