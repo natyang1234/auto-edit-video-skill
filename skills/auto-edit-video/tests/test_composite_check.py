@@ -219,7 +219,10 @@ def test_reference_text_overlap_is_reported_even_when_final_face_is_covered(tmp_
     monkeypatch.setattr(
         composite_check,
         "_vision_ocr_boxes",
-        lambda _path, _width, _height: ("ok", [{"x": 25, "y": 25, "width": 20, "height": 20}]),
+        lambda _path, _width, _height, *, timeout_s=None: (
+            "ok",
+            [{"x": 25, "y": 25, "width": 20, "height": 20}],
+        ),
     )
     import hashlib
 
@@ -323,7 +326,7 @@ def _fake_overlap_receipt(tmp_path, monkeypatch, mode):
     monkeypatch.setattr(
         composite_check,
         "_vision_ocr_boxes",
-        lambda _path, _width, _height: ("ok", text_boxes),
+        lambda _path, _width, _height, *, timeout_s=None: ("ok", text_boxes),
     )
     return composite_check.analyze(
         {
@@ -457,7 +460,7 @@ def _fake_capability_receipt(
     sequence = list(ocr_results)
     calls = []
 
-    def fake_ocr(_path, _width, _height):
+    def fake_ocr(_path, _width, _height, *, timeout_s=None):
         index = min(len(calls), len(sequence) - 1)
         calls.append(index)
         return sequence[index]
@@ -481,6 +484,107 @@ def _fake_capability_receipt(
             "scope": "full-timeline",
         }
     )
+
+
+def _fake_timeout_receipt(tmp_path, monkeypatch, timeout_calls, *, missing_first=False):
+    class _Frame:
+        shape = (100, 100, 3)
+
+    class _Reader:
+        width = 100
+        height = 100
+
+        def __init__(self, path, _cv2):
+            self.kind = Path(path).stem
+            self.read_count = 0
+
+        def read(self, _timestamp):
+            if missing_first and self.kind == "composite" and self.read_count == 0:
+                self.read_count += 1
+                return None
+            self.read_count += 1
+            return _Frame()
+
+        def close(self):
+            pass
+
+    class _Detector:
+        failed = False
+
+        def __init__(self, _model, _cv2):
+            pass
+
+        def detect(self, _frame):
+            return True, [{"x": 20, "y": 20, "width": 40, "height": 40}]
+
+    class _CV2:
+        @staticmethod
+        def imwrite(_path, _frame):
+            return True
+
+    source = tmp_path / "source.mp4"
+    composite = tmp_path / "composite.mp4"
+    reference = tmp_path / "reference.mp4"
+    for path in (source, composite, reference):
+        path.write_bytes(b"fixture")
+
+    def fake_ocr(_path, _width, _height, *, timeout_s=None):
+        timeout_calls.append(timeout_s)
+        return "empty", []
+
+    monkeypatch.setattr(composite_check, "_load_cv2", lambda: _CV2())
+    monkeypatch.setattr(composite_check, "_VideoReader", _Reader)
+    monkeypatch.setattr(composite_check, "_YuNetProbe", _Detector)
+    monkeypatch.setattr(composite_check, "_vision_ocr_boxes", fake_ocr)
+    return composite_check.analyze(
+        {
+            "composite": composite,
+            "reference": reference,
+            "source": source,
+            "time_map": [{
+                "source_start_s": 0.0,
+                "source_end_s": 1.0,
+                "output_start_s": 0.0,
+                "output_end_s": 1.0,
+            }],
+            "face_model": tmp_path / "face.onnx",
+            "scratch": tmp_path / "scratch",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "expected_text": False,
+            "scope": "full-timeline",
+        }
+    )
+
+
+def test_first_actual_ocr_attempt_uses_extended_timeout_then_default_after_missing_frame(
+    tmp_path, monkeypatch
+):
+    timeout_calls = []
+    receipt = _fake_timeout_receipt(
+        tmp_path,
+        monkeypatch,
+        timeout_calls,
+        missing_first=True,
+    )
+
+    assert timeout_calls == [composite_check.OCR_FIRST_TIMEOUT_S, *([composite_check.OCR_TIMEOUT_S] * 3)]
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "macos-vision"}
+    assert all(
+        sample["source_face_count"] == sample["reference_face_count"] == sample["visible_face_count"] == 1
+        for sample in receipt["samples"][1:]
+    )
+
+
+def test_each_analyze_invocation_gets_a_fresh_first_ocr_timeout(tmp_path, monkeypatch):
+    first_calls = []
+    _fake_timeout_receipt(tmp_path, monkeypatch, first_calls)
+    second_calls = []
+    _fake_timeout_receipt(tmp_path, monkeypatch, second_calls)
+
+    assert first_calls[0] == composite_check.OCR_FIRST_TIMEOUT_S
+    assert second_calls[0] == composite_check.OCR_FIRST_TIMEOUT_S
+    assert all(timeout == composite_check.OCR_TIMEOUT_S for timeout in first_calls[1:])
+    assert all(timeout == composite_check.OCR_TIMEOUT_S for timeout in second_calls[1:])
 
 
 def test_engine_receipt_reports_unavailable_capabilities_without_cv2(tmp_path, monkeypatch):
@@ -663,8 +767,11 @@ def test_failed_ocr_is_attempted_once_but_face_measurements_continue(tmp_path, m
         path.write_bytes(b"fixture")
     calls = []
 
-    def failed_ocr(_path, _width, _height):
+    timeout_calls = []
+
+    def failed_ocr(_path, _width, _height, *, timeout_s=None):
         calls.append(1)
+        timeout_calls.append(timeout_s)
         return "failed", []
 
     monkeypatch.setattr(composite_check, "_load_cv2", lambda: _CV2())
@@ -685,6 +792,7 @@ def test_failed_ocr_is_attempted_once_but_face_measurements_continue(tmp_path, m
         }
     )
     assert calls == [1]
+    assert timeout_calls == [composite_check.OCR_FIRST_TIMEOUT_S]
     assert receipt["status"] == "unmeasured"
     assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "unavailable"}
     assert receipt["measured_count"] == 0
