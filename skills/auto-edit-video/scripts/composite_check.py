@@ -24,6 +24,7 @@ SMALL_PREVIEW_SECONDS = 2.5
 TEXT_OVERLAP_FRACTION = 0.15
 OCR_MIN_CONFIDENCE = 0.5
 OCR_TIMEOUT_S = 1.5
+OCR_FIRST_TIMEOUT_S = 3.0
 VISIBLE_FACE_IOU = 0.25
 _TIME_EPSILON = 1e-6
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -425,7 +426,11 @@ class _YuNetProbe:
             return False, []
 
 
-def _vision_ocr_lines_bounded(frame_path: Path) -> list[dict[str, Any]] | None:
+def _vision_ocr_lines_bounded(
+    frame_path: Path,
+    *,
+    timeout_s: float | None = None,
+) -> list[dict[str, Any]] | None:
     """Return Vision OCR lines, or ``None`` if its native call misses the deadline.
 
     This bridge deliberately calls vision_ocr's private synchronous entry point
@@ -436,6 +441,7 @@ def _vision_ocr_lines_bounded(frame_path: Path) -> list[dict[str, Any]] | None:
     one analysis owns at most one lingering daemon.
     """
     result: queue.Queue[tuple[bool, list[dict[str, Any]] | None]] = queue.Queue(maxsize=1)
+    effective_timeout_s = OCR_TIMEOUT_S if timeout_s is None else timeout_s
 
     def run() -> None:
         try:
@@ -451,16 +457,22 @@ def _vision_ocr_lines_bounded(frame_path: Path) -> list[dict[str, Any]] | None:
     worker = threading.Thread(target=run, name="composite-vision-ocr", daemon=True)
     worker.start()
     try:
-        succeeded, lines = result.get(timeout=OCR_TIMEOUT_S)
+        succeeded, lines = result.get(timeout=effective_timeout_s)
     except queue.Empty:
         return None
     return lines if succeeded and isinstance(lines, list) else None
 
 
-def _vision_ocr_boxes(frame_path: Path, width: int, height: int) -> tuple[str, list[dict[str, float]]]:
+def _vision_ocr_boxes(
+    frame_path: Path,
+    width: int,
+    height: int,
+    *,
+    timeout_s: float | None = None,
+) -> tuple[str, list[dict[str, float]]]:
     """Return ``ok``, ``empty`` or ``failed`` without exposing recognized text."""
     try:
-        lines = _vision_ocr_lines_bounded(frame_path)
+        lines = _vision_ocr_lines_bounded(frame_path, timeout_s=timeout_s)
     except Exception:
         return "failed", []
     if lines is None:
@@ -677,6 +689,7 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
     face_probe_succeeded = False
     ocr_probe_succeeded = False
     ocr_disabled = False
+    ocr_attempted = False
     try:
         if scratch_path is None:
             findings.add({"kind": "analysis_incomplete"})
@@ -784,7 +797,16 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
                     frame_file = scratch / f"composite-check-{index:02d}.png"
                     try:
                         if bool(cv2_module.imwrite(str(frame_file), composite_frame)):
-                            ocr_status, text_boxes = _vision_ocr_boxes(frame_file, frame_size[0], frame_size[1])
+                            # Count only an actual OCR call; an earlier missing
+                            # frame must not consume this invocation's first-call budget.
+                            timeout_s = OCR_FIRST_TIMEOUT_S if not ocr_attempted else OCR_TIMEOUT_S
+                            ocr_attempted = True
+                            ocr_status, text_boxes = _vision_ocr_boxes(
+                                frame_file,
+                                frame_size[0],
+                                frame_size[1],
+                                timeout_s=timeout_s,
+                            )
                             ocr_probe_succeeded = ocr_probe_succeeded or ocr_status in {"ok", "empty"}
                         else:
                             ocr_status = "failed"
