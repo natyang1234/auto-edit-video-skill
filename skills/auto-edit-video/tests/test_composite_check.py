@@ -94,6 +94,77 @@ def test_invalid_request_returns_bounded_unknown_receipt():
     assert receipt["findings"] == [{"kind": "analysis_incomplete"}]
 
 
+def test_parent_verified_source_hash_is_echoed_without_rehashing_source(tmp_path, monkeypatch):
+    source = tmp_path / "source.mp4"
+    composite = tmp_path / "composite.mp4"
+    source.write_bytes(b"ordinary source fixture")
+    composite.write_bytes(b"ordinary composite fixture")
+    verified_source_sha = "a" * 64
+    hash_calls = []
+    original_hash_file = composite_check._hash_file
+
+    def spy_hash_file(path):
+        hash_calls.append(path)
+        return original_hash_file(path)
+
+    monkeypatch.setattr(composite_check, "_hash_file", spy_hash_file)
+    receipt = composite_check.analyze(
+        {
+            "composite": composite,
+            "reference": None,
+            "source": source,
+            "time_map": _time_map(),
+            "face_model": tmp_path / "face.onnx",
+            "scratch": tmp_path,
+            "source_sha256": verified_source_sha,
+            "expected_text": True,
+            "scope": "single-effect",
+        }
+    )
+
+    assert hash_calls == [composite]
+    assert receipt["source_sha256"] == verified_source_sha
+    assert receipt["media_sha256"] == original_hash_file(composite)
+    assert "source.mp4" not in str(receipt)
+
+
+@pytest.mark.parametrize("source_sha256", [None, "A" * 64, "not-a-sha256"])
+def test_invalid_parent_source_hash_cannot_become_a_valid_binding(
+    tmp_path, monkeypatch, source_sha256
+):
+    composite = tmp_path / "composite.mp4"
+    composite.write_bytes(b"ordinary composite fixture")
+    hash_calls = []
+    original_hash_file = composite_check._hash_file
+
+    def spy_hash_file(path):
+        hash_calls.append(path)
+        return original_hash_file(path)
+
+    monkeypatch.setattr(composite_check, "_hash_file", spy_hash_file)
+    receipt = composite_check.analyze(
+        {
+            "composite": composite,
+            "reference": None,
+            "source": tmp_path / "source.mp4",
+            "time_map": _time_map(),
+            "face_model": tmp_path / "face.onnx",
+            "scratch": tmp_path,
+            "source_sha256": source_sha256,
+            "expected_text": True,
+            "scope": "single-effect",
+        }
+    )
+
+    assert hash_calls == [composite]
+    assert receipt["source_sha256"] == "0" * 64
+    assert receipt["status"] == "unmeasured"
+    assert {item["kind"] for item in receipt["findings"]} >= {
+        "analysis_incomplete",
+        "full_timeline_required",
+    }
+
+
 def test_expected_text_is_conservative_unless_explicitly_false():
     assert composite_check._expected_text_at(True, 0) is True
     assert composite_check._expected_text_at([False, True], 0) is False

@@ -11,12 +11,15 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import fx_preview_render as render  # noqa: E402
+import fx_preview_jobs as jobs  # noqa: E402
 import render_editor_timeline as timeline  # noqa: E402
 
 
@@ -108,7 +111,7 @@ def test_timeline_reference_uses_same_shadow_and_preserves_full_layout(
         "state": {
             "canvas": {"width": 1080, "height": 1920, "fit": "contain"},
             "segments": [
-                {"source_start": 0.0, "source_end": 2.0},
+                {"source_start": 0.0, "source_end": 2.3454},
                 {"source_start": 4.0, "source_end": 6.0},
             ],
             "asset_digests": {},
@@ -215,18 +218,68 @@ def test_timeline_reference_uses_same_shadow_and_preserves_full_layout(
     assert result["time_map"] == [
         {
             "source_start_s": 1.0,
-            "source_end_s": 2.0,
+            "source_end_s": 2.3454,
             "output_start_s": 0.0,
-            "output_end_s": 1.0,
+            "output_end_s": 1.3454,
         },
         {
             "source_start_s": 4.0,
             "source_end_s": 5.0,
-            "output_start_s": 1.0,
-            "output_end_s": 2.0,
+            "output_start_s": 1.3454,
+            "output_end_s": 2.3454,
         },
     ]
+    assert result["render_duration_s"] == 2.3454
+    assert jobs.FxPreviewJobManager._normalized_time_map(
+        result["time_map"],
+        {"start_s": 1.0, "duration_s": 4.0},
+        result["render_duration_s"],
+        mode="timeline",
+    ) == result["time_map"]
     assert "fx-preview-candidate" in result["text_layout"]["layers"]
     assert result["composition_check"]["status"] == "unmeasured"
     assert output.read_bytes() == b"full-composite"
     assert not any(cache.glob("timeline-project-*"))
+
+
+def test_invalid_canvas_after_shadow_creation_still_cleans_owned_scratch(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / "source/source.mp4"
+    cache = project / "working/fx-preview/renderer-cache"
+    output = project / "working/fx-preview/runtime/out.mp4"
+    source.parent.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    output.parent.mkdir(parents=True)
+    source.write_bytes(b"ordinary-source")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    snapshot = {
+        "manifest": {"source": {"duration_s": 2.0}},
+        "state": {
+            "canvas": {"width": None, "height": 1920, "fit": "contain"},
+            "segments": [{"source_start": 0.0, "source_end": 2.0}],
+            "asset_digests": {},
+            "overlays": [],
+        },
+    }
+    dependencies = {
+        "source": {"relative": "source/source.mp4", "sha256": source_sha},
+        "timeline_project_inputs": {},
+    }
+
+    with pytest.raises(render.PreviewError, match="完整時間軸預覽無法渲染") as error:
+        render.timeline_preview(
+            project,
+            cache,
+            output,
+            snapshot,
+            0.0,
+            1.0,
+            dependencies,
+            scratch_owner="e" * 32,
+        )
+
+    assert error.value.code == "timeline_render_failed"
+    assert not any(cache.glob("timeline-project-*"))
+    assert not any(cache.glob(".timeline-owner-*.lock"))

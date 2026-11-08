@@ -278,6 +278,40 @@ def test_missing_worker_diagnostic_is_public_unmeasured_and_cache_safe(
     assert cached["job"]["composition_check"]["media_sha256"] != "f" * 64
 
 
+def test_cache_uses_canonical_render_duration_and_rejects_byte_forgery(
+    api: _api_fixture.FxPreviewApiTests,
+) -> None:
+    api.server.fx_preview_jobs.artifact_validator = lambda _path, duration: {
+        "duration_s": round(duration - 0.01, 3),
+        "width": 1080,
+        "height": 1920,
+    }
+    request = api._candidate("T3")
+    status, created = api._json_request("POST", "/api/fx-previews", request)
+    assert status == 202, created
+    ready = api._wait_terminal(created["job"]["id"])
+    assert ready["job"]["state"] == "ready"
+    with api.server.fx_preview_jobs._lock:
+        record = api.server.fx_preview_jobs._jobs[created["job"]["id"]]
+        receipt_path = (
+            api.server.fx_preview_jobs.cache_dir / f"{record['cache_key']}.json"
+        )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["duration_s"] == receipt["time_map"][-1]["output_end_s"]
+
+    status, cached = api._json_request("POST", "/api/fx-previews", request)
+    assert status == 200, cached
+    assert cached["job"]["cache_hit"] is True
+
+    receipt["bytes"] += 1
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    status, rerendered = api._json_request("POST", "/api/fx-previews", request)
+    assert status == 202, rerendered
+    terminal = api._wait_terminal(rerendered["job"]["id"])
+    assert terminal["job"]["state"] == "ready"
+    assert terminal["job"]["cache_hit"] is False
+
+
 def test_composition_dependency_identity_includes_optional_code_and_native_versions(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:

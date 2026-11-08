@@ -556,12 +556,15 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
     model_path = _as_path(request.get("face_model"))
     scratch_path = _as_path(request.get("scratch"))
     requested_source_sha = request.get("source_sha256")
-    source_sha = _hash_file(source_path) or (requested_source_sha if _valid_sha(requested_source_sha) else _zero_sha())
+    # The renderer has already hashed the project source, verified that digest
+    # while copying the bytes into its owned shadow, and bound both values into
+    # this internal request.  Re-reading the complete source here would spend
+    # the optional probe's hard deadline without strengthening publication:
+    # the manager independently rebinds this field before exposing a receipt.
+    source_sha = requested_source_sha if _valid_sha(requested_source_sha) else _zero_sha()
     media_sha = _hash_file(composite_path) or _zero_sha()
     findings = _FindingCollector()
-    if _valid_sha(requested_source_sha) and source_sha != requested_source_sha:
-        findings.add({"kind": "analysis_incomplete"})
-    elif not _valid_sha(requested_source_sha):
+    if not _valid_sha(requested_source_sha):
         findings.add({"kind": "analysis_incomplete"})
 
     if scope != "full-timeline":
