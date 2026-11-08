@@ -10,6 +10,7 @@
     <link rel="stylesheet" href="/style-presets.css">
     <link rel="stylesheet" href="/fx-comparison.css">
     <link rel="stylesheet" href="/fx-composite-check.css">
+    <link rel="stylesheet" href="/spotlight-keyframes.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
@@ -702,7 +703,14 @@
             <div class="fx-preview-compare" aria-label="原片與效果預覽比較">
               <figure>
                 <figcaption>原片 <output id="fx-preview-source-time">00:00.000</output></figcaption>
-                <video id="fx-preview-source-video" class="fx-preview-video" controls playsinline muted preload="metadata" aria-label="原片試看片段"></video>
+                <div class="spotlight-source-stage" id="spotlight-source-stage">
+                  <video id="fx-preview-source-video" class="fx-preview-video" controls playsinline muted preload="metadata" aria-label="原片試看片段"></video>
+                  <button id="spotlight-source-click-target" class="spotlight-source-click-target" type="button" hidden aria-label="在原片目前時間設定聚光燈位置"></button>
+                  <svg id="spotlight-path-overlay" class="spotlight-path-overlay" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+                    <path id="spotlight-path-line" class="spotlight-path-line" d=""></path>
+                    <g id="spotlight-path-markers"></g>
+                  </svg>
+                </div>
               </figure>
               <figure>
                 <figcaption>效果預覽 <output id="fx-preview-effect-time">00:00.000</output></figcaption>
@@ -736,6 +744,52 @@
 
           <div class="fx-preview-settings">
             <div class="fx-preview-fields" id="fx-preview-fields"></div>
+            <section class="spotlight-keyframes-panel" id="spotlight-keyframes-panel" hidden aria-labelledby="spotlight-keyframes-title">
+              <div class="spotlight-panel-heading">
+                <div>
+                  <h3 id="spotlight-keyframes-title">聚光燈主角位置</h3>
+                  <p class="spotlight-panel-kicker">P5 專用 · 時間軸以原始來源影片為準</p>
+                </div>
+                <span class="spotlight-interpolation-badge">平滑移動</span>
+              </div>
+              <div class="spotlight-mode-choice" role="radiogroup" aria-label="聚光燈追蹤模式">
+                <label class="spotlight-mode-option">
+                  <input id="spotlight-mode-automatic" name="spotlight-mode" type="radio" value="automatic">
+                  <span><strong>自動跟隨</strong><small>沿用自動辨識；自動失去主角仍會如實顯示失敗。</small></span>
+                </label>
+                <label class="spotlight-mode-option">
+                  <input id="spotlight-mode-manual" name="spotlight-mode" type="radio" value="manual">
+                  <span><strong>手動路徑</strong><small>人工修正，不代表自動辨識成功。</small></span>
+                </label>
+              </div>
+              <p class="spotlight-mode-note" id="spotlight-mode-note" role="status"></p>
+              <div class="spotlight-manual-editor" id="spotlight-manual-editor" hidden>
+                <div class="spotlight-time-toolbar" aria-label="原始來源時間控制">
+                  <button class="button button-secondary compact-button" id="spotlight-seek-start" type="button">跳到套用起點</button>
+                  <output id="spotlight-current-time" aria-live="polite">原片 00:00.000</output>
+                  <button class="button button-secondary compact-button" id="spotlight-seek-end" type="button">跳到套用終點</button>
+                </div>
+                <div class="spotlight-point-editor" aria-label="編輯目前關鍵點">
+                  <label class="field"><span>原片時間（秒）</span><input id="spotlight-point-time" type="number" min="0" step="0.001" inputmode="decimal"></label>
+                  <label class="field"><span>X（0–1）</span><input id="spotlight-point-x" type="number" min="0" max="1" step="0.000001" inputmode="decimal"></label>
+                  <label class="field"><span>Y（0–1）</span><input id="spotlight-point-y" type="number" min="0" max="1" step="0.000001" inputmode="decimal"></label>
+                  <div class="spotlight-point-actions">
+                    <button class="button button-primary compact-button" id="spotlight-add-point" type="button">新增目前點</button>
+                    <button class="button button-secondary compact-button" id="spotlight-update-point" type="button">更新選取點</button>
+                    <button class="button button-secondary compact-button" id="spotlight-delete-point" type="button">刪除選取點</button>
+                  </div>
+                </div>
+                <div class="spotlight-reconcile" id="spotlight-reconcile" hidden>
+                  <p>套用範圍已變更；端點時間保留原值，請明確選擇是否對齊。</p>
+                  <div>
+                    <button class="button button-secondary compact-button" id="spotlight-reconcile-start" type="button">將首點對齊新起點</button>
+                    <button class="button button-secondary compact-button" id="spotlight-reconcile-end" type="button">將末點對齊新終點</button>
+                  </div>
+                </div>
+                <ol class="spotlight-keyframe-list" id="spotlight-keyframe-list" aria-label="手動路徑關鍵點"></ol>
+                <p class="spotlight-validation" id="spotlight-validation" role="status" aria-live="polite"></p>
+              </div>
+            </section>
             <div class="fx-preview-draft-notice" id="fx-preview-draft-notice" hidden role="status">
               <p id="fx-preview-draft-copy"></p>
               <div>

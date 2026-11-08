@@ -24,6 +24,7 @@ printed to stderr as ``{"fx_fallback": …}``.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -325,6 +326,20 @@ def validate(overlay: dict[str, Any], state: dict[str, Any] | None = None) -> li
             fx_preview_contract.normalize_fx_opacity(style.get("opacity", 1.0))
         except fx_preview_contract.FxPreviewContractError:
             errors.append(f"fx overlay {oid}: opacity must be a finite number from 0 to 1")
+    if "spotlight_path" in overlay:
+        if code != "P5":
+            errors.append(f"fx overlay {oid}: only P5 can use spotlight_path")
+        elif overlay.get("subject") is not None:
+            errors.append(f"fx overlay {oid}: manual spotlight_path cannot also select an automatic subject")
+        else:
+            try:
+                overlay["spotlight_path"] = fx_preview_contract.normalize_spotlight_path(
+                    overlay.get("spotlight_path"),
+                    start=overlay.get("start"),
+                    end=overlay.get("end"),
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                errors.append(f"fx overlay {oid}: {exc.message}")
     try:
         span = float(overlay.get("end", 0)) - float(overlay.get("start", 0))
     except (TypeError, ValueError):
@@ -441,6 +456,10 @@ class SubjectTrackingError(ValueError):
     """The requested subject could not be followed without changing identity."""
 
 
+class ManualSpotlightUnsupportedError(ValueError):
+    """The pinned shared renderer cannot consume a manual spotlight path."""
+
+
 def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path, pack_id: str | None,
                         quality: str = "draft", canvas: tuple[int, int] | None = None, fit: str = "cover",
                         material: dict[str, Any] | None = None, asset_project: Path | None = None,
@@ -456,12 +475,34 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
         _log({"layer": overlay.get("id"), "reason": f"unsupported canvas fit {fit}"})
         return None
     compose = _compose()
+    overlay = dict(overlay)
     code = str(overlay.get("code") or "")
     start = max(0.0, float(overlay.get("start", 0.0)))
     end = float(overlay.get("end", start))
     dur = round(end - start, 3)
     if dur <= 0.05:
         return None
+    if "spotlight_path" in overlay:
+        if code != "P5" or overlay.get("subject") is not None:
+            _log({"layer": overlay.get("id"), "code": code, "reason": "invalid manual spotlight mode"})
+            return None
+        try:
+            overlay["spotlight_path"] = fx_preview_contract.normalize_spotlight_path(
+                overlay.get("spotlight_path"), start=start, end=end
+            )
+        except fx_preview_contract.FxPreviewContractError as exc:
+            _log({"layer": overlay.get("id"), "code": code, "reason": exc.code})
+            return None
+        try:
+            supports_manual_path = "spotlight_path" in inspect.signature(
+                compose.render_clip
+            ).parameters
+        except (TypeError, ValueError):
+            supports_manual_path = False
+        if not supports_manual_path:
+            raise ManualSpotlightUnsupportedError(
+                "目前固定的聚光燈 renderer 不支援手動路徑，請重新載入相容版本"
+            )
     theme, main = theme_for_pack(pack_id)
     scheme = str(overlay.get("scheme") or "")
     values = {k: str(v) for k, v in (overlay.get("values") or {}).items()}
@@ -514,14 +555,26 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
         progress("composing")
     try:
         compose_quality = quality if quality in {"draft", "standard"} else "final"
-        rep = compose.render_clip(str(source), start, dur, code, theme, main, scheme, values, placement, None,
-                                  str(person) if person else None, compose_quality,
-                                  str(workdir), "mov", log=lambda m: None, fonts=fonts or None,
-                                  font_files=font_files_for(overlay.get("font_ids")) or None,
-                                  spotlight_mask={"path": str(mask), "start": 0.0} if mask else None,
-                                  strict_source=True, strict_fit=fit, material=material, subject=overlay.get("subject"),
-                                  text_fit=bool(overlay.get("text_fit", True)),
-                                  face_model=Path(__file__).resolve().parent.parent / "assets/models/yunet/face_detection_yunet_2026may.onnx")
+        render_kwargs = {
+            "log": lambda m: None,
+            "fonts": fonts or None,
+            "font_files": font_files_for(overlay.get("font_ids")) or None,
+            "spotlight_mask": {"path": str(mask), "start": 0.0} if mask else None,
+            "strict_source": True,
+            "strict_fit": fit,
+            "material": material,
+            "subject": overlay.get("subject"),
+            "text_fit": bool(overlay.get("text_fit", True)),
+            "face_model": Path(__file__).resolve().parent.parent
+            / "assets/models/yunet/face_detection_yunet_2026may.onnx",
+        }
+        if "spotlight_path" in overlay:
+            render_kwargs["spotlight_path"] = overlay["spotlight_path"]
+        rep = compose.render_clip(
+            str(source), start, dur, code, theme, main, scheme, values,
+            placement, None, str(person) if person else None, compose_quality,
+            str(workdir), "mov", **render_kwargs,
+        )
     except SystemExit as exc:
         _log({"layer": overlay.get("id"), "code": code, "error": str(exc)})
         return None
@@ -530,7 +583,11 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
     if not rep.get("ok"):
         _log({"layer": overlay.get("id"), "code": code, "error": rep.get("log", "")[-400:]})
         return None
-    if code == "P5" and (not isinstance(rep.get("spotlight"), dict) or rep["spotlight"].get("status") != "tracked"):
+    expected_spotlight_status = "manual" if "spotlight_path" in overlay else "tracked"
+    if code == "P5" and (
+        not isinstance(rep.get("spotlight"), dict)
+        or rep["spotlight"].get("status") != expected_spotlight_status
+    ):
         _log({"layer": overlay.get("id"), "code": code, "reason": "人物遮罩無法可靠追蹤"})
         return None
     out = Path(rep["out"])

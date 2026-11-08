@@ -85,6 +85,12 @@ const fxPreviewLifecycles = new Set();
 let fxPreviewUnverifiedJob = null;
 let fxPreviewRecoveryPromise = null;
 let fxPreviewOpenIntent = 0;
+// P6 manual spotlight editing is deliberately kept in the FX draft.  The
+// server only receives the canonical spotlight_path when the explicit manual
+// choice is active; automatic P5 keeps its legacy subject={x,y} contract.
+let fxPreviewSpotlightSelectedIndex = -1;
+let fxPreviewManualSourceHold = false;
+let fxPreviewManualInteractionToken = 0;
 // Last state both sides agreed on. Diffing against this is what lets a save
 // conflict be replayed: it says which top-level sections *this* window changed,
 // so the background pipeline's writes can be kept and ours re-applied on top.
@@ -191,6 +197,12 @@ function cacheElements() {
     "fx-preview-apply-source", "fx-preview-apply-duration", "fx-preview-apply-window-label",
     "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit", "fx-preview-window-label", "fx-preview-replace-note", "fx-preview-fields", "fx-preview-advanced-fields", "fx-preview-status",
     "fx-preview-video", "fx-preview-source-video", "fx-preview-source-time", "fx-preview-effect-time",
+    "spotlight-source-stage", "spotlight-source-click-target", "spotlight-path-overlay", "spotlight-path-line", "spotlight-path-markers",
+    "spotlight-keyframes-panel", "spotlight-mode-automatic", "spotlight-mode-manual", "spotlight-mode-note",
+    "spotlight-manual-editor", "spotlight-seek-start", "spotlight-seek-end", "spotlight-current-time",
+    "spotlight-point-time", "spotlight-point-x", "spotlight-point-y", "spotlight-add-point",
+    "spotlight-update-point", "spotlight-delete-point", "spotlight-reconcile", "spotlight-reconcile-start",
+    "spotlight-reconcile-end", "spotlight-keyframe-list", "spotlight-validation",
     "fx-preview-layout-check", "fx-preview-layout-check-heading", "fx-preview-layout-check-toggle",
     "fx-preview-layout-check-summary", "fx-preview-layout-check-list",
     "fx-preview-composition-check", "fx-preview-composition-check-heading", "fx-preview-composition-check-status",
@@ -985,12 +997,13 @@ function renderDirectorCards() {
 
 function templateStateDefaults(templateId) {
   const preset = projectPayload.video_templates[templateId];
-  return {
+  const draft = {
     id: templateId,
     frame: deepCopy(preset.frame_defaults),
     subject: { x: 50, y: 54, scale: 1, feather: 2, mask_stride: 3 },
     background: { color: "#17251d", source: null, fit: "cover", blur: 0 },
   };
+  return draft;
 }
 
 function selectVideoTemplate(templateId) {
@@ -2185,6 +2198,132 @@ function fxPreviewValidOpacity(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
+const FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES = 64;
+
+function fxPreviewCanonicalNumber(value, decimals, label = "數值") {
+  if (typeof value !== "number" || typeof value === "boolean" || !Number.isFinite(value)
+    || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`${label}必須是有限數字`);
+  }
+  const factor = 10 ** decimals;
+  const rounded = Math.round(value * factor) / factor;
+  if (!Number.isFinite(rounded)) throw new Error(`${label}超出可安全處理範圍`);
+  return Object.is(rounded, -0) || rounded === 0 ? 0 : rounded;
+}
+
+function fxPreviewSpotlightPathError(message, incomplete = false) {
+  return { ok: false, incomplete, error: message, value: null };
+}
+
+function fxPreviewValidateSpotlightPath(path, start, end, { allowIncomplete = false } = {}) {
+  if (!path || typeof path !== "object" || Array.isArray(path)) {
+    return fxPreviewSpotlightPathError("手動路徑尚未建立。", true);
+  }
+  if (Object.keys(path).sort().join(",") !== "interpolation,keyframes,version") {
+    return fxPreviewSpotlightPathError("手動路徑欄位不完整或含有未知欄位。", false);
+  }
+  if (path.version !== 1 || typeof path.version !== "number" || !Number.isInteger(path.version)) {
+    return fxPreviewSpotlightPathError("手動路徑版本必須是整數 1。", false);
+  }
+  if (path.interpolation !== "smoothstep") {
+    return fxPreviewSpotlightPathError("手動路徑的移動方式必須保持平滑移動。", false);
+  }
+  if (!Array.isArray(path.keyframes)) return fxPreviewSpotlightPathError("關鍵點清單格式無效。", false);
+  if (path.keyframes.length > FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES) {
+    return fxPreviewSpotlightPathError(`關鍵點最多 ${FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES} 個。`, false);
+  }
+  if (path.keyframes.length < 2) {
+    return fxPreviewSpotlightPathError(
+      allowIncomplete ? "至少需要 2 個關鍵點；請新增首尾位置。" : "手動路徑至少需要 2 個關鍵點。",
+      true,
+    );
+  }
+  let canonicalStart;
+  let canonicalEnd;
+  try {
+    canonicalStart = fxPreviewCanonicalNumber(start, 3, "套用起點");
+    canonicalEnd = fxPreviewCanonicalNumber(end, 3, "套用終點");
+  } catch (error) {
+    return fxPreviewSpotlightPathError(error.message, false);
+  }
+  if (!(canonicalEnd > canonicalStart)) return fxPreviewSpotlightPathError("套用時間範圍必須大於 0。", false);
+  const keyframes = [];
+  for (let index = 0; index < path.keyframes.length; index += 1) {
+    const point = path.keyframes[index];
+    if (!point || typeof point !== "object" || Array.isArray(point)
+      || Object.keys(point).sort().join(",") !== "source_at,x,y") {
+      return fxPreviewSpotlightPathError(`第 ${index + 1} 個關鍵點欄位無效。`, false);
+    }
+    try {
+      const sourceAt = fxPreviewCanonicalNumber(point.source_at, 3, "關鍵點時間");
+      const x = fxPreviewCanonicalNumber(point.x, 6, "關鍵點 X");
+      const y = fxPreviewCanonicalNumber(point.y, 6, "關鍵點 Y");
+      if (x < 0 || x > 1 || y < 0 || y > 1) return fxPreviewSpotlightPathError(`第 ${index + 1} 個關鍵點座標必須介於 0 與 1。`, false);
+      if (index && sourceAt <= keyframes[index - 1].source_at) {
+        return fxPreviewSpotlightPathError("關鍵點時間在正規化後必須嚴格遞增，不能重複。", false);
+      }
+      if (sourceAt < canonicalStart || sourceAt > canonicalEnd) {
+        return fxPreviewSpotlightPathError("所有關鍵點時間都必須位於套用範圍內。", false);
+      }
+      keyframes.push({ source_at: sourceAt, x, y });
+    } catch (error) {
+      return fxPreviewSpotlightPathError(`第 ${index + 1} 個關鍵點無效：${error.message}`, false);
+    }
+  }
+  if (keyframes[0].source_at !== canonicalStart || keyframes[keyframes.length - 1].source_at !== canonicalEnd) {
+    return fxPreviewSpotlightPathError("首點與末點必須分別等於套用起點與終點；請明確對齊端點。", false);
+  }
+  return {
+    ok: true,
+    incomplete: false,
+    error: "",
+    value: { version: 1, interpolation: "smoothstep", keyframes },
+  };
+}
+
+function fxPreviewSpotlightPathForDraft(draft = fxPreviewDraft, { allowIncomplete = true } = {}) {
+  if (!draft || draft.code !== "P5" || draft.spotlight_mode !== "manual") return { ok: true, value: null, error: "" };
+  const apply = draft.apply_window || {};
+  return fxPreviewValidateSpotlightPath(draft.spotlight_path, apply.start_s, Number(apply.start_s) + Number(apply.duration_s), { allowIncomplete });
+}
+
+function fxPreviewSpotlightInterpolation(path, sourceAt) {
+  const points = Array.isArray(path?.keyframes) ? path.keyframes : [];
+  if (!points.length) return null;
+  if (sourceAt <= points[0].source_at) return { x: points[0].x, y: points[0].y };
+  const last = points[points.length - 1];
+  if (sourceAt >= last.source_at) return { x: last.x, y: last.y };
+  const index = points.findIndex((point, position) => sourceAt <= point.source_at && position > 0);
+  const right = points[index < 0 ? points.length - 1 : index];
+  const left = points[Math.max(0, (index < 0 ? points.length - 1 : index) - 1)];
+  const span = Math.max(1e-9, right.source_at - left.source_at);
+  const raw = Math.max(0, Math.min(1, (sourceAt - left.source_at) / span));
+  const eased = raw * raw * (3 - 2 * raw);
+  return { x: left.x + (right.x - left.x) * eased, y: left.y + (right.y - left.y) * eased };
+}
+
+function fxPreviewEnsureManualPath(draft = fxPreviewDraft) {
+  if (!draft || draft.code !== "P5") return null;
+  const apply = draft.apply_window || {};
+  const start = fxPreviewCanonicalNumber(Number(apply.start_s) || 0, 3, "套用起點");
+  const end = fxPreviewCanonicalNumber(start + (Number(apply.duration_s) || 0.1), 3, "套用終點");
+  const subject = draft.subject && typeof draft.subject === "object"
+    && Number.isFinite(Number(draft.subject.x)) && Number.isFinite(Number(draft.subject.y))
+    ? { x: Math.max(0, Math.min(1, Number(draft.subject.x))), y: Math.max(0, Math.min(1, Number(draft.subject.y))) }
+    : { x: 0.5, y: 0.5 };
+  if (!draft.spotlight_path || !Array.isArray(draft.spotlight_path.keyframes)) {
+    draft.spotlight_path = {
+      version: 1,
+      interpolation: "smoothstep",
+      keyframes: [
+        { source_at: start, x: fxPreviewCanonicalNumber(subject.x, 6, "X"), y: fxPreviewCanonicalNumber(subject.y, 6, "Y") },
+        { source_at: end, x: fxPreviewCanonicalNumber(subject.x, 6, "X"), y: fxPreviewCanonicalNumber(subject.y, 6, "Y") },
+      ],
+    };
+  }
+  return draft.spotlight_path;
+}
+
 function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart = 0) {
   if (!effect) return null;
   const seedWindow = seed?.window || {};
@@ -2211,7 +2350,7 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
   const priorApply = seed?.apply_window || {};
   const applyStart = Math.max(0, Math.min(Number.isFinite(Number(priorApply.start_s)) ? Number(priorApply.start_s) : (overlay ? Number(overlay.start) : safeStart), sourceDuration - 0.1));
   const applyDuration = Math.max(0.1, Math.min(sourceDuration - applyStart, Number.isFinite(Number(priorApply.duration_s)) ? Number(priorApply.duration_s) : (overlay ? Number(overlay.end) - Number(overlay.start) : Math.min(3, sourceDuration - applyStart))));
-  return {
+  const draft = {
     code: effect.code,
     window: {
       start_s: Math.max(applyStart, Math.min(safeStart, applyStart + applyDuration - 0.1)),
@@ -2223,11 +2362,21 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
     scheme: seed?.scheme ?? overlay?.scheme ?? "",
     opacity: fxPreviewValidOpacity(seed?.opacity) ? seed.opacity : fxPreviewValidOpacity(overlay?.style?.opacity) ? overlay.style.opacity : 1,
     font_ids: { ...priorFonts },
-    subject: seed?.subject ?? null,
+    subject: seed?.subject ?? overlay?.subject ?? null,
+    spotlight_mode: effect.code === "P5"
+      && (seed?.spotlight_mode === "manual" || seed?.spotlight_path || overlay?.spotlight_path) ? "manual" : "automatic",
+    spotlight_path: effect.code === "P5"
+      ? (seed?.spotlight_path ? deepCopy(seed.spotlight_path) : overlay?.spotlight_path ? deepCopy(overlay.spotlight_path) : null)
+      : null,
     text_fit: seed?.text_fit !== false,
     material: seed?.material || null,
     preview_options: { mode: seed?.preview_options?.mode === "timeline" ? "timeline" : "single", quality: seed?.preview_options?.quality === "standard" ? "standard" : "draft" },
   };
+  if (effect.code !== "P5") {
+    delete draft.spotlight_mode;
+    delete draft.spotlight_path;
+  }
+  return draft;
 }
 
 function fxPreviewSignature() {
@@ -2873,9 +3022,377 @@ function fxPreviewSourceTimeForEffectTime(effectTime) {
   return Math.max(0, Number(fxPreviewDraft?.window?.start_s || 0) + Math.max(0, Number(effectTime) || 0));
 }
 
+function fxPreviewSpotlightBounds(draft = fxPreviewDraft) {
+  const apply = draft?.apply_window || {};
+  const start = Number(apply.start_s);
+  const durationValue = Number(apply.duration_s);
+  if (!Number.isFinite(start) || !Number.isFinite(durationValue)) return null;
+  return { start, end: start + durationValue };
+}
+
+function fxPreviewSpotlightSetValidation(message, tone = "") {
+  const node = elements["spotlight-validation"];
+  if (!node) return;
+  node.textContent = message || "";
+  node.classList.toggle("is-error", tone === "error");
+  node.classList.toggle("is-success", tone === "success");
+}
+
+function fxPreviewSpotlightContentRect() {
+  const video = elements["fx-preview-source-video"];
+  const stage = elements["spotlight-source-stage"];
+  if (!video || !stage) return null;
+  const stageRect = stage.getBoundingClientRect();
+  const videoRect = video.getBoundingClientRect();
+  const width = Number(video.videoWidth) || Number(projectPayload?.manifest?.source?.width) || 0;
+  const height = Number(video.videoHeight) || Number(projectPayload?.manifest?.source?.height) || 0;
+  if (!(videoRect.width > 0 && videoRect.height > 0 && width > 0 && height > 0)) return null;
+  const videoRatio = width / height;
+  const boxRatio = videoRect.width / videoRect.height;
+  const contentWidth = videoRatio > boxRatio ? videoRect.width : videoRect.height * videoRatio;
+  const contentHeight = videoRatio > boxRatio ? videoRect.width / videoRatio : videoRect.height;
+  return {
+    stageRect,
+    videoRect,
+    left: videoRect.left - stageRect.left + (videoRect.width - contentWidth) / 2,
+    top: videoRect.top - stageRect.top + (videoRect.height - contentHeight) / 2,
+    width: contentWidth,
+    height: contentHeight,
+  };
+}
+
+function fxPreviewSpotlightRenderOverlay() {
+  const svg = elements["spotlight-path-overlay"];
+  const line = elements["spotlight-path-line"];
+  const markers = elements["spotlight-path-markers"];
+  const clickTarget = elements["spotlight-source-click-target"];
+  if (!svg || !line || !markers) return;
+  const draft = fxPreviewDraft;
+  const activeP5 = draft?.code === "P5";
+  const manual = draft?.code === "P5" && draft.spotlight_mode === "manual";
+  const points = manual && Array.isArray(draft?.spotlight_path?.keyframes) ? draft.spotlight_path.keyframes : [];
+  const content = fxPreviewSpotlightContentRect();
+  if (clickTarget) {
+    clickTarget.hidden = !activeP5 || !content;
+    if (content) {
+      clickTarget.style.left = `${content.left}px`;
+      clickTarget.style.top = `${content.top}px`;
+      clickTarget.style.width = `${content.width}px`;
+      // Keep the native control strip clickable; content clicks are handled by
+      // this dedicated target rather than by the native video hit region.
+      clickTarget.style.height = `${Math.max(0, content.height - 56)}px`;
+    }
+  }
+  if (!manual || !points.length || !content) {
+    svg.hidden = true;
+    line.setAttribute("d", "");
+    markers.replaceChildren();
+    return;
+  }
+  svg.hidden = false;
+  svg.style.left = `${content.left}px`;
+  svg.style.top = `${content.top}px`;
+  svg.style.width = `${content.width}px`;
+  svg.style.height = `${content.height}px`;
+  const safePoints = points.filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
+  line.setAttribute("d", safePoints.map((point, index) => `${index ? "L" : "M"} ${Math.max(0, Math.min(1, Number(point.x))).toFixed(6)} ${Math.max(0, Math.min(1, Number(point.y))).toFixed(6)}`).join(" "));
+  markers.replaceChildren(...safePoints.map((point, index) => {
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    marker.classList.add("spotlight-path-marker");
+    if (index === fxPreviewSpotlightSelectedIndex) marker.classList.add("is-selected");
+    marker.setAttribute("cx", String(Math.max(0, Math.min(1, Number(point.x)))));
+    marker.setAttribute("cy", String(Math.max(0, Math.min(1, Number(point.y)))));
+    marker.setAttribute("r", index === fxPreviewSpotlightSelectedIndex ? ".028" : ".021");
+    marker.setAttribute("aria-hidden", "true");
+    return marker;
+  }));
+}
+
+function fxPreviewSpotlightCurrentSourceTime() {
+  return Math.max(0, Number(elements["fx-preview-source-video"]?.currentTime) || 0);
+}
+
+function fxPreviewSpotlightHoldMedia() {
+  fxPreviewManualSourceHold = true;
+  fxPreviewManualInteractionToken += 1;
+  elements["fx-preview-source-video"]?.pause();
+  elements["fx-preview-video"]?.pause();
+}
+
+function fxPreviewSpotlightRenderCurrentTime() {
+  const current = fxPreviewSpotlightCurrentSourceTime();
+  if (elements["spotlight-current-time"]) elements["spotlight-current-time"].textContent = `原片 ${formatTime(current)}`;
+  fxPreviewSpotlightRenderOverlay();
+}
+
+function fxPreviewSpotlightSelect(index) {
+  const points = Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
+  fxPreviewSpotlightSelectedIndex = Number.isInteger(index) && index >= 0 && index < points.length ? index : -1;
+  const point = fxPreviewSpotlightSelectedIndex >= 0 ? points[fxPreviewSpotlightSelectedIndex] : null;
+  if (point) {
+    elements["spotlight-point-time"].value = Number.isFinite(Number(point.source_at)) ? String(point.source_at) : "";
+    elements["spotlight-point-x"].value = Number.isFinite(Number(point.x)) ? String(point.x) : "";
+    elements["spotlight-point-y"].value = Number.isFinite(Number(point.y)) ? String(point.y) : "";
+  } else {
+    elements["spotlight-point-time"].value = "";
+    elements["spotlight-point-x"].value = "";
+    elements["spotlight-point-y"].value = "";
+  }
+  fxPreviewSpotlightRenderList();
+  fxPreviewSpotlightRenderOverlay();
+}
+
+function fxPreviewSpotlightRenderList() {
+  const list = elements["spotlight-keyframe-list"];
+  if (!list) return;
+  const points = Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
+  list.replaceChildren(...points.map((point, index) => {
+    const row = document.createElement("li");
+    row.className = `spotlight-keyframe-row${index === fxPreviewSpotlightSelectedIndex ? " is-selected" : ""}`;
+    row.dataset.index = String(index);
+    const time = document.createElement("input");
+    time.type = "number"; time.min = "0"; time.step = "0.001"; time.inputMode = "decimal";
+    time.value = Number.isFinite(Number(point?.source_at)) ? String(point.source_at) : "";
+    time.setAttribute("aria-label", `第 ${index + 1} 點原片時間（秒）`);
+    const x = document.createElement("input");
+    x.type = "number"; x.min = "0"; x.max = "1"; x.step = "0.000001"; x.inputMode = "decimal";
+    x.value = Number.isFinite(Number(point?.x)) ? String(point.x) : "";
+    x.setAttribute("aria-label", `第 ${index + 1} 點 X 座標`);
+    const y = document.createElement("input");
+    y.type = "number"; y.min = "0"; y.max = "1"; y.step = "0.000001"; y.inputMode = "decimal";
+    y.value = Number.isFinite(Number(point?.y)) ? String(point.y) : "";
+    y.setAttribute("aria-label", `第 ${index + 1} 點 Y 座標`);
+    const select = document.createElement("button");
+    select.type = "button"; select.className = "button button-secondary compact-button spotlight-keyframe-select";
+    select.textContent = index === fxPreviewSpotlightSelectedIndex ? "已選取" : "選取";
+    select.setAttribute("aria-label", `選取第 ${index + 1} 個手動關鍵點`);
+    select.addEventListener("click", () => fxPreviewSpotlightSelect(index));
+    const goto = document.createElement("button");
+    goto.type = "button"; goto.className = "button button-secondary compact-button spotlight-keyframe-goto";
+    goto.textContent = "跳到";
+    goto.setAttribute("aria-label", `跳到第 ${index + 1} 個關鍵點`);
+    goto.addEventListener("click", () => {
+      fxPreviewSpotlightSelect(index);
+      fxPreviewSpotlightSeek(Number(point.source_at));
+    });
+    const onInput = (field, input) => {
+      const value = Number(input.value);
+      fxPreviewSpotlightHoldMedia();
+      fxPreviewSpotlightSelect(index);
+      if (!Number.isFinite(value)) fxPreviewDraft.spotlight_path.keyframes[index][field] = NaN;
+      else fxPreviewDraft.spotlight_path.keyframes[index][field] = value;
+      fxPreviewDraftChanged();
+    };
+    time.addEventListener("input", () => onInput("source_at", time));
+    x.addEventListener("input", () => onInput("x", x));
+    y.addEventListener("input", () => onInput("y", y));
+    row.append(time, x, y, goto, select);
+    return row;
+  }));
+}
+
+function fxPreviewSpotlightRenderPanel() {
+  const panel = elements["spotlight-keyframes-panel"];
+  if (!panel) return;
+  const isP5 = fxPreviewDraft?.code === "P5";
+  panel.hidden = !isP5;
+  if (!isP5) {
+    fxPreviewSpotlightRenderOverlay();
+    return;
+  }
+  const manual = fxPreviewDraft.spotlight_mode === "manual";
+  elements["spotlight-mode-automatic"].checked = !manual;
+  elements["spotlight-mode-manual"].checked = manual;
+  elements["spotlight-manual-editor"].hidden = !manual;
+  elements["spotlight-mode-note"].textContent = manual
+    ? "目前是手動模式：人工路徑只描述光點位置，不代表自動辨識成功；預覽與套用都會使用原始來源時間。"
+    : "目前是自動模式：沿用既有主角選取與自動追蹤；切換成手動後才會建立 spotlight_path。";
+  if (manual) {
+    const result = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: true });
+    const bounds = fxPreviewSpotlightBounds();
+    const points = Array.isArray(fxPreviewDraft.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
+    const reconcile = elements["spotlight-reconcile"];
+    const endpointMismatch = points.length >= 2 && bounds
+      && (Number(points[0].source_at) !== fxPreviewCanonicalNumber(bounds.start, 3, "套用起點")
+        || Number(points[points.length - 1].source_at) !== fxPreviewCanonicalNumber(bounds.end, 3, "套用終點"));
+    reconcile.hidden = !endpointMismatch;
+    if (result.ok) fxPreviewSpotlightSetValidation(`有效路徑：${points.length} 點；位置會在相鄰點間平滑移動，不會超出座標範圍。`, "success");
+    else fxPreviewSpotlightSetValidation(result.error, "error");
+    fxPreviewSpotlightRenderList();
+    fxPreviewSpotlightRenderCurrentTime();
+  } else {
+    fxPreviewSpotlightSetValidation("自動模式不攜帶手動路徑。", "");
+  }
+  fxPreviewSpotlightRenderOverlay();
+}
+
+function fxPreviewSpotlightSeek(sourceAt) {
+  const source = elements["fx-preview-source-video"];
+  if (!source || !Number.isFinite(Number(sourceAt))) return;
+  fxPreviewSpotlightHoldMedia();
+  const sourceDuration = Number(source.duration) || Number(duration()) || Number.MAX_SAFE_INTEGER;
+  source.currentTime = Math.max(0, Math.min(sourceDuration, Number(sourceAt)));
+  fxPreviewSpotlightRenderCurrentTime();
+}
+
+function fxPreviewSpotlightAddPoint(sourceAt, x, y) {
+  fxPreviewSpotlightHoldMedia();
+  if (!fxPreviewDraft?.spotlight_path) fxPreviewEnsureManualPath(fxPreviewDraft);
+  const points = fxPreviewDraft.spotlight_path.keyframes;
+  if (!Array.isArray(points) || points.length >= FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES) {
+    fxPreviewSpotlightSetValidation(`關鍵點最多 ${FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES} 個。`, "error");
+    return false;
+  }
+  let canonical;
+  try {
+    canonical = {
+      source_at: fxPreviewCanonicalNumber(Number(sourceAt), 3, "關鍵點時間"),
+      x: fxPreviewCanonicalNumber(Number(x), 6, "關鍵點 X"),
+      y: fxPreviewCanonicalNumber(Number(y), 6, "關鍵點 Y"),
+    };
+  } catch (error) {
+    fxPreviewSpotlightSetValidation(error.message, "error");
+    return false;
+  }
+  if (canonical.x < 0 || canonical.x > 1 || canonical.y < 0 || canonical.y > 1) {
+    fxPreviewSpotlightSetValidation("X 與 Y 必須介於 0 與 1。", "error");
+    return false;
+  }
+  const existing = points.findIndex((point) => Number(point.source_at) === canonical.source_at);
+  if (existing >= 0) {
+    points[existing] = canonical;
+    fxPreviewSpotlightSelectedIndex = existing;
+  } else {
+    points.push(canonical);
+    points.sort((left, right) => Number(left.source_at) - Number(right.source_at));
+    fxPreviewSpotlightSelectedIndex = points.indexOf(canonical);
+  }
+  fxPreviewSpotlightSelect(fxPreviewSpotlightSelectedIndex);
+  fxPreviewDraftChanged();
+  return true;
+}
+
+function fxPreviewSpotlightAddEditorPoint() {
+  if (!fxPreviewDraft?.spotlight_path) fxPreviewEnsureManualPath(fxPreviewDraft);
+  const time = Number(elements["spotlight-point-time"]?.value);
+  const x = Number(elements["spotlight-point-x"]?.value);
+  const y = Number(elements["spotlight-point-y"]?.value);
+  fxPreviewSpotlightAddPoint(Number.isFinite(time) ? time : fxPreviewSpotlightCurrentSourceTime(), Number.isFinite(x) ? x : 0.5, Number.isFinite(y) ? y : 0.5);
+}
+
+function fxPreviewSpotlightUpdateEditorPoint() {
+  fxPreviewSpotlightHoldMedia();
+  const index = fxPreviewSpotlightSelectedIndex;
+  const points = Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
+  if (index < 0 || index >= points.length) {
+    fxPreviewSpotlightSetValidation("請先選取一個關鍵點。", "error");
+    return;
+  }
+  const sourceAt = Number(elements["spotlight-point-time"].value);
+  const x = Number(elements["spotlight-point-x"].value);
+  const y = Number(elements["spotlight-point-y"].value);
+  if (![sourceAt, x, y].every(Number.isFinite)) {
+    fxPreviewSpotlightSetValidation("時間、X、Y 都必須是有限數字。", "error");
+    return;
+  }
+  try {
+    points[index] = {
+      source_at: fxPreviewCanonicalNumber(sourceAt, 3, "關鍵點時間"),
+      x: fxPreviewCanonicalNumber(x, 6, "關鍵點 X"),
+      y: fxPreviewCanonicalNumber(y, 6, "關鍵點 Y"),
+    };
+  } catch (error) {
+    fxPreviewSpotlightSetValidation(error.message, "error");
+    return;
+  }
+  fxPreviewSpotlightSelect(index);
+  fxPreviewDraftChanged();
+}
+
+function fxPreviewSpotlightDeletePoint() {
+  fxPreviewSpotlightHoldMedia();
+  const points = Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
+  if (fxPreviewSpotlightSelectedIndex < 0 || fxPreviewSpotlightSelectedIndex >= points.length) {
+    fxPreviewSpotlightSetValidation("請先選取要刪除的關鍵點。", "error");
+    return;
+  }
+  points.splice(fxPreviewSpotlightSelectedIndex, 1);
+  fxPreviewSpotlightSelectedIndex = Math.min(fxPreviewSpotlightSelectedIndex, points.length - 1);
+  fxPreviewSpotlightSelect(fxPreviewSpotlightSelectedIndex);
+  fxPreviewDraftChanged();
+}
+
+function fxPreviewSpotlightReconcileEndpoint(which) {
+  fxPreviewSpotlightHoldMedia();
+  const points = Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
+  const bounds = fxPreviewSpotlightBounds();
+  if (!bounds || points.length < 2) return;
+  const index = which === "end" ? points.length - 1 : 0;
+  try {
+    points[index].source_at = fxPreviewCanonicalNumber(which === "end" ? bounds.end : bounds.start, 3, "套用端點");
+  } catch (error) {
+    fxPreviewSpotlightSetValidation(error.message, "error");
+    return;
+  }
+  fxPreviewSpotlightSelect(index);
+  fxPreviewDraftChanged();
+}
+
+function fxPreviewSetSpotlightMode(mode) {
+  if (!fxPreviewDraft || fxPreviewDraft.code !== "P5") return;
+  if (mode === "manual") {
+    fxPreviewDraft.spotlight_mode = "manual";
+    const manualPath = fxPreviewEnsureManualPath(fxPreviewDraft);
+    // Keep the legacy auto seed in the draft so switching back to automatic
+    // remains a valid P5 request.  Manual POSTs omit subject explicitly.
+    if (!fxPreviewDraft.subject && manualPath?.keyframes?.[0]) {
+      fxPreviewDraft.subject = {
+        x: manualPath.keyframes[0].x,
+        y: manualPath.keyframes[0].y,
+      };
+    }
+    fxPreviewSpotlightSelectedIndex = Array.isArray(fxPreviewDraft.spotlight_path?.keyframes) ? 0 : -1;
+    fxPreviewSpotlightHoldMedia();
+  } else {
+    fxPreviewDraft.spotlight_mode = "automatic";
+    // Automatic mode deliberately carries no temporal path.  Keep the legacy
+    // subject selection only; the backend infers manual mode from path presence.
+    delete fxPreviewDraft.spotlight_path;
+    fxPreviewSpotlightSelectedIndex = -1;
+    fxPreviewManualSourceHold = false;
+  }
+  fxPreviewSpotlightRenderPanel();
+  fxPreviewDraftChanged();
+}
+
 function fxPreviewSetSubjectFromSourceClick(event) {
   if (fxPreviewDraft?.code !== "P5") return;
   const video = elements["fx-preview-source-video"];
+  const videoRect = video.getBoundingClientRect();
+  // Native controls are part of the video element's hit target in some
+  // browsers.  Keep their lower strip reserved so play/seek/volume clicks can
+  // never become a subject or manual-path point.
+  if (video.controls && event.clientY >= videoRect.bottom - 56) return;
+  if (fxPreviewDraft.spotlight_mode === "manual") {
+    const content = fxPreviewSpotlightContentRect();
+    if (!content || event.clientX < content.videoRect.left + (content.videoRect.width - content.width) / 2
+      || event.clientX > content.videoRect.left + (content.videoRect.width - content.width) / 2 + content.width
+      || event.clientY < content.videoRect.top + (content.videoRect.height - content.height) / 2
+      || event.clientY > content.videoRect.top + (content.videoRect.height - content.height) / 2 + content.height) {
+      fxPreviewSpotlightSetValidation("請點選原片畫面範圍，黑邊不會新增關鍵點。", "error");
+      return;
+    }
+    event.preventDefault();
+    fxPreviewSpotlightHoldMedia();
+    const x = Math.max(0, Math.min(1, (event.clientX - (content.videoRect.left + (content.videoRect.width - content.width) / 2)) / content.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - (content.videoRect.top + (content.videoRect.height - content.height) / 2)) / content.height));
+    fxPreviewSpotlightAddPoint(fxPreviewSpotlightCurrentSourceTime(), x, y);
+    const validation = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: true });
+    fxPreviewSpotlightSetValidation(validation.ok
+      ? `已在原片目前時間新增／替換手動關鍵點；有效路徑：${fxPreviewDraft.spotlight_path.keyframes.length} 點；媒體已暫停。`
+      : `已在原片目前時間新增／替換手動關鍵點；${validation.error}；媒體已暫停。`, validation.ok ? "success" : "error");
+    return;
+  }
   const rect = video.getBoundingClientRect();
   const videoRatio = Number(video.videoWidth) / Math.max(1, Number(video.videoHeight));
   const boxRatio = rect.width / Math.max(1, rect.height);
@@ -2933,7 +3450,8 @@ function fxPreviewPrepareSourceVideo() {
   const setStart = () => {
     if (mediaToken !== fxPreviewVisibleMediaToken || visibleJobId !== String(fxPreviewVisibleJob?.id || "")
       || source.src !== expectedSourceUrl) return;
-    fxPreviewSyncVideos("effect");
+    fxPreviewSpotlightRenderCurrentTime();
+    if (!fxPreviewManualSourceHold) fxPreviewSyncVideos("effect");
   };
   if (source.readyState >= 1) setStart();
   else source.addEventListener("loadedmetadata", setStart, { once: true });
@@ -3197,6 +3715,7 @@ function fxPreviewRenderDialog() {
   fxPreviewUpdateWindowControls();
   fxPreviewRenderFields();
   fxPreviewRenderCatalog();
+  fxPreviewSpotlightRenderPanel();
 }
 
 function fxPreviewStatusForJob(job) {
@@ -3232,6 +3751,8 @@ function fxPreviewStatusForJob(job) {
     message += ` · ${phaseLabels[String(job.phase)] || "處理中"}`;
   }
   if (job?.message) message += `：${job.message}`;
+  const trackSummary = fxPreviewSubjectTrackSummary(job?.subject_track);
+  if (trackSummary) message += ` · ${trackSummary}`;
   message += fxPreviewTimingSuffix(job);
   if (job?.error && stateName === "failed") {
     const error = typeof job.error === "string"
@@ -3255,6 +3776,44 @@ function fxPreviewTimingSuffix(job, label = "已用") {
   return suffix;
 }
 
+function fxPreviewManualPathForRequest(draft = fxPreviewDraft) {
+  if (!draft || draft.code !== "P5" || draft.spotlight_mode !== "manual") return null;
+  const result = fxPreviewSpotlightPathForDraft(draft, { allowIncomplete: false });
+  if (!result.ok) {
+    const error = new Error(result.error || "手動路徑無效");
+    error.code = "spotlight_path_invalid";
+    throw error;
+  }
+  return deepCopy(result.value);
+}
+
+function fxPreviewSubjectTrackSummary(track) {
+  if (!track || typeof track !== "object" || Array.isArray(track)) return "";
+  const mode = track.mode === "manual" ? "manual" : track.mode === "automatic" ? "automatic" : "";
+  const status = typeof track.status === "string" && track.status.length <= 40 ? track.status : "";
+  const interpolation = track.interpolation === "smoothstep" ? "smoothstep" : "";
+  const count = Number.isInteger(track.keyframe_count) && track.keyframe_count >= 0 && track.keyframe_count <= FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES
+    ? track.keyframe_count : null;
+  const digest = typeof track.path_sha256 === "string" && /^[0-9a-f]{64}$/i.test(track.path_sha256)
+    ? track.path_sha256.slice(0, 12) : "";
+  if (!mode || !status) return "";
+  if (mode === "manual") return `手動路徑（人工，不代表自動辨識成功）${interpolation ? " · 平滑移動" : ""}${count === null ? "" : ` · ${count} 點`}${digest ? ` · SHA ${digest}…` : ""}`;
+  return `自動追蹤 · ${status}`;
+}
+
+function fxPreviewUpdateConfirmState(job = fxPreviewJob, signature = fxPreviewDraftSignature) {
+  const stateName = String(job?.state || "").toLowerCase();
+  const ready = ["ready", "cache_hit"].includes(stateName) && Boolean(job?.media_url);
+  let pathValid = true;
+  if (fxPreviewDraft?.code === "P5" && fxPreviewDraft.spotlight_mode === "manual") {
+    pathValid = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: false }).ok;
+  }
+  if (elements["fx-preview-confirm"]) {
+    elements["fx-preview-confirm"].disabled = !ready || fxPreviewReadySignature !== signature || !pathValid;
+  }
+  return pathValid;
+}
+
 function fxPreviewApplyJob(job, generation, signature) {
   if (generation !== fxPreviewGeneration || signature !== fxPreviewDraftSignature || !elements["fx-preview-dialog"].open) return false;
   fxPreviewJob = job || null;
@@ -3271,7 +3830,12 @@ function fxPreviewApplyJob(job, generation, signature) {
   elements["fx-preview-retry"].hidden = !failed;
   elements["fx-preview-cancel-upgrade"].hidden = !upgrading;
   fxPreviewReadySignature = ready && quality === "standard" ? signature : "";
-  elements["fx-preview-confirm"].disabled = !ready || fxPreviewReadySignature !== fxPreviewDraftSignature;
+  fxPreviewUpdateConfirmState(job, signature);
+  if (ready && fxPreviewDraft?.code === "P5" && fxPreviewDraft.spotlight_mode === "manual"
+    && !fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: false }).ok) {
+    const pathError = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: false });
+    fxPreviewSetStatus(`預覽已完成，但手動路徑仍無效：${pathError.error}`, "error");
+  }
   if (ready) {
     // A ready job is the only job allowed to become the media currently shown
     // in the player. A standard upgrade can otherwise replace fxPreviewJob
@@ -3285,8 +3849,11 @@ function fxPreviewApplyJob(job, generation, signature) {
       video.load();
     }
     fxPreviewPrepareSourceVideo();
-    fxPreviewSyncVideos("effect");
-    fxPreviewPlayBoth("effect");
+    if (fxPreviewManualSourceHold) fxPreviewSpotlightRenderCurrentTime();
+    else {
+      fxPreviewSyncVideos("effect");
+      fxPreviewPlayBoth("effect");
+    }
     if (quality === "draft" && !fxPreviewUpgradeStarted && !fxPreviewUpgradeCancelled) {
       fxPreviewUpgradeStarted = true;
       setTimeout(() => fxPreviewStartStandardUpgrade(generation, signature), 0);
@@ -3456,7 +4023,12 @@ function fxCompareCandidateUsable(draft) {
   const effect = fxEffectByCode(draft?.code);
   if (!effect || effect.available === false) return "此效果目前不可用。";
   if (fxPreviewIsBlocked(effect)) return "B1 需要B-roll素材，不能加入比較。";
-  if (effect.code === "P5" && !draft?.subject) return "P5 需要先在原片點選主角位置，不能加入比較。";
+  if (effect.code === "P5") {
+    if (draft?.spotlight_mode === "manual") {
+      const path = fxPreviewSpotlightPathForDraft(draft, { allowIncomplete: false });
+      if (!path.ok) return `手動路徑不能加入比較：${path.error}`;
+    } else if (!draft?.subject) return "P5 自動模式需要先在原片點選主角位置，不能加入比較。";
+  }
   const limit = Number(effect.media_max);
   if (Number.isFinite(limit) && limit > 0 && Number(draft?.window?.duration_s) > limit + 0.001) {
     return `此效果最多試看 ${limit} 秒；比較不會暗中縮短片段。`;
@@ -3514,10 +4086,15 @@ function fxCompareSetInteractionLocks() {
   const confirmationLocked = fxCompareConfirming;
   ["fx-preview-search", "fx-preview-source", "fx-preview-duration", "fx-preview-apply-source",
     "fx-preview-apply-duration", "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit",
-    "fx-preview-restore-draft", "fx-preview-discard-draft", "fx-preview-composition-switch-timeline"].forEach((id) => {
+    "fx-preview-restore-draft", "fx-preview-discard-draft", "fx-preview-composition-switch-timeline",
+    "spotlight-mode-automatic", "spotlight-mode-manual", "spotlight-seek-start", "spotlight-seek-end",
+    "spotlight-point-time", "spotlight-point-x", "spotlight-point-y", "spotlight-add-point",
+    "spotlight-update-point", "spotlight-delete-point", "spotlight-reconcile-start", "spotlight-reconcile-end"].forEach((id) => {
     if (elements[id]) elements[id].disabled = roundLocked;
   });
   document.querySelectorAll("#fx-preview-fields input, #fx-preview-fields select, #fx-preview-advanced-fields input, #fx-preview-advanced-fields select")
+    .forEach((node) => { node.disabled = roundLocked; });
+  document.querySelectorAll("#spotlight-keyframe-list input, #spotlight-keyframe-list button")
     .forEach((node) => { node.disabled = roundLocked; });
   document.querySelectorAll("#fx-preview-grid .fx-preview-card, #fx-preview-cats button, #fx-preview-grid .fx-preview-favorite")
     .forEach((node) => {
@@ -3633,7 +4210,10 @@ function fxCompareRequestBody(candidate, anchorId, frozen) {
     candidate: { code: draft.code, window: deepCopy(draft.window), apply_window: deepCopy(draft.apply_window), values: deepCopy(draft.values || {}), placement: draft.placement || "", scheme: draft.scheme || "", font_ids: deepCopy(draft.font_ids || {}), text_fit: draft.text_fit !== false },
     opacity: draft.opacity, preview_options: { ...(draft.preview_options || {}), mode: frozen.mode, quality: "standard" },
   };
-  if (draft.code === "P5") body.candidate.subject = deepCopy(draft.subject);
+  if (draft.code === "P5") {
+    if (draft.spotlight_mode === "manual") body.candidate.spotlight_path = fxPreviewManualPathForRequest(draft);
+    else if (draft.subject) body.candidate.subject = deepCopy(draft.subject);
+  }
   if (draft.code === "B1") body.candidate.material = deepCopy(draft.material);
   if (frozen.replace_overlay_id) body.replace_overlay_id = frozen.replace_overlay_id;
   if (anchorId) body.comparison_anchor_job_id = anchorId;
@@ -3866,13 +4446,19 @@ function fxCompareSelect(id) {
     if (!fxCompareSelectionCurrent(session, selectionToken, id, jobId)) return;
     if (sourceVideo) sourceVideo.currentTime = sourceTime;
     if (effectTime !== null) video.currentTime = effectTime;
-    fxPreviewSyncVideos("effect");
-    if (wasPlaying) {
-      video.play().catch(() => {});
-      sourceVideo?.play().catch(() => {});
-    } else {
+    if (fxPreviewManualSourceHold) {
+      fxPreviewSpotlightRenderCurrentTime();
       video.pause();
       sourceVideo?.pause();
+    } else {
+      fxPreviewSyncVideos("effect");
+      if (wasPlaying) {
+        video.play().catch(() => {});
+        sourceVideo?.play().catch(() => {});
+      } else {
+        video.pause();
+        sourceVideo?.pause();
+      }
     }
   };
   if (video.src !== new URL(candidate.job.media_url, location.href).href) {
@@ -3881,7 +4467,7 @@ function fxCompareSelect(id) {
     video.load();
   } else applyMedia();
   fxPreviewPrepareSourceVideo();
-  elements["fx-preview-confirm"].disabled = false;
+  fxPreviewUpdateConfirmState(candidate.job, candidate.signature);
   fxPreviewSetStatus("已選擇比較候選；尚未套用到時間軸。", "success");
   fxCompareRender();
 }
@@ -3997,6 +4583,14 @@ async function fxPreviewStart(generation, signature, _keepExistingPreview = fals
     if (!/^[0-9a-f]{64}$/i.test(String(state?.revision || ""))) {
       throw new Error("目前專案版本無法確認，請先重新載入專案");
     }
+    if (fxPreviewDraft.code === "P5" && fxPreviewDraft.spotlight_mode === "manual") {
+      const pathCheck = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: false });
+      if (!pathCheck.ok) {
+        fxPreviewSetStatus(`手動路徑尚未送出：${pathCheck.error}`, "error");
+        elements["fx-preview-retry"].hidden = true;
+        return;
+      }
+    }
     const body = {
       schema_version: 1,
       expected_revision: state.revision,
@@ -4016,7 +4610,10 @@ async function fxPreviewStart(generation, signature, _keepExistingPreview = fals
       opacity: fxPreviewDraft.opacity,
       preview_options: { ...(fxPreviewDraft.preview_options || { mode: "single", quality: "draft" }) },
     };
-    if (fxPreviewDraft.code === "P5") body.candidate.subject = fxPreviewDraft.subject;
+    if (fxPreviewDraft.code === "P5") {
+      if (fxPreviewDraft.spotlight_mode === "manual") body.candidate.spotlight_path = fxPreviewManualPathForRequest(fxPreviewDraft);
+      else if (fxPreviewDraft.subject) body.candidate.subject = deepCopy(fxPreviewDraft.subject);
+    }
     if (fxPreviewDraft.code === "B1" && fxPreviewDraft.material) body.candidate.material = { ...fxPreviewDraft.material };
     if (fxPreviewReplaceOverlayId) body.replace_overlay_id = fxPreviewReplaceOverlayId;
     fxPreviewSetStatus("預覽排隊中（待渲染，不是即時完成）");
@@ -4101,6 +4698,7 @@ function fxPreviewDraftChanged() {
     return;
   }
   fxPreviewUpdateWindowControls();
+  fxPreviewSpotlightRenderPanel();
   fxPreviewPersistDraft();
   fxPreviewInvalidateAndSchedule();
 }
@@ -4172,6 +4770,9 @@ async function openFxPreviewDialog(trigger = document.activeElement, replaceOver
   fxPreviewConfirmed = false;
   fxPreviewTrigger = trigger instanceof HTMLElement ? trigger : document.activeElement;
   fxPreviewReplaceOverlayId = replaceOverlayId || null;
+  fxPreviewSpotlightSelectedIndex = -1;
+  fxPreviewManualSourceHold = false;
+  fxPreviewManualInteractionToken += 1;
   activeFxPreviewCategory = "";
   fxPreviewLibraryFilter = "";
   elements["fx-preview-search"].value = "";
@@ -4202,6 +4803,10 @@ async function openFxPreviewDialog(trigger = document.activeElement, replaceOver
       // Material and subject belong to this project, never to the portable preset.
       if (overlay?.code === first.code && first.code === "B1") fxPreviewDraft.material = overlay.material ? deepCopy(overlay.material) : null;
       if (overlay?.code === first.code && first.code === "P5") fxPreviewDraft.subject = overlay.subject ? deepCopy(overlay.subject) : null;
+      // A manual path is also project-specific (source time and coordinates);
+      // never let a portable/brand preset transfer it across projects.
+      delete fxPreviewDraft.spotlight_path;
+      fxPreviewDraft.spotlight_mode = "automatic";
     }
   }
   fxPreviewDraftSignature = fxPreviewSignature();
@@ -4224,6 +4829,14 @@ async function confirmFxPreview() {
   const dialog = elements["fx-preview-dialog"];
   const effect = fxEffectByCode(fxPreviewDraft?.code);
   if (!dialog?.open || !fxPreviewJob?.id || !effect || fxPreviewReadySignature !== fxPreviewDraftSignature) return;
+  if (fxPreviewDraft?.code === "P5" && fxPreviewDraft.spotlight_mode === "manual") {
+    const pathCheck = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: false });
+    if (!pathCheck.ok) {
+      fxPreviewSetStatus(`尚不能套用：${pathCheck.error}`, "error");
+      fxPreviewUpdateConfirmState();
+      return;
+    }
+  }
   const selected = fxCompareActive
     ? fxCompareCandidates.find((item) => item.id === fxCompareSelectedId && item.state === "ready" && item.job?.id === fxPreviewJob.id)
     : null;
@@ -4353,6 +4966,9 @@ function cleanupFxPreviewDialog() {
   const trigger = fxPreviewTrigger;
   fxPreviewDraft = null;
   fxPreviewReplaceOverlayId = null;
+  fxPreviewSpotlightSelectedIndex = -1;
+  fxPreviewManualSourceHold = false;
+  fxPreviewManualInteractionToken += 1;
   fxPreviewClearVisibleMedia();
   fxPreviewReadySignature = "";
   fxPreviewDraftSignature = "";
@@ -5879,14 +6495,29 @@ function bindEvents() {
   });
   elements["fx-preview-apply-source"].addEventListener("input", () => {
     if (!fxPreviewDraft) return;
+    if (fxPreviewDraft.code === "P5" && fxPreviewDraft.spotlight_mode === "manual") fxPreviewSpotlightHoldMedia();
     fxPreviewDraft.apply_window.start_s = Number(elements["fx-preview-apply-source"].value) || 0;
     fxPreviewDraftChanged();
   });
   elements["fx-preview-apply-duration"].addEventListener("input", () => {
     if (!fxPreviewDraft) return;
+    if (fxPreviewDraft.code === "P5" && fxPreviewDraft.spotlight_mode === "manual") fxPreviewSpotlightHoldMedia();
     fxPreviewDraft.apply_window.duration_s = Number(elements["fx-preview-apply-duration"].value) || 0.1;
     fxPreviewDraftChanged();
   });
+  elements["spotlight-mode-automatic"].addEventListener("change", () => {
+    if (elements["spotlight-mode-automatic"].checked) fxPreviewSetSpotlightMode("automatic");
+  });
+  elements["spotlight-mode-manual"].addEventListener("change", () => {
+    if (elements["spotlight-mode-manual"].checked) fxPreviewSetSpotlightMode("manual");
+  });
+  elements["spotlight-seek-start"].addEventListener("click", () => fxPreviewSpotlightSeek(fxPreviewSpotlightBounds()?.start));
+  elements["spotlight-seek-end"].addEventListener("click", () => fxPreviewSpotlightSeek(fxPreviewSpotlightBounds()?.end));
+  elements["spotlight-add-point"].addEventListener("click", fxPreviewSpotlightAddEditorPoint);
+  elements["spotlight-update-point"].addEventListener("click", fxPreviewSpotlightUpdateEditorPoint);
+  elements["spotlight-delete-point"].addEventListener("click", fxPreviewSpotlightDeletePoint);
+  elements["spotlight-reconcile-start"].addEventListener("click", () => fxPreviewSpotlightReconcileEndpoint("start"));
+  elements["spotlight-reconcile-end"].addEventListener("click", () => fxPreviewSpotlightReconcileEndpoint("end"));
   elements["fx-preview-mode"].addEventListener("change", () => {
     if (!fxPreviewDraft) return;
     fxPreviewDraft.preview_options.mode = elements["fx-preview-mode"].value;
@@ -5917,15 +6548,38 @@ function bindEvents() {
   });
   elements["fx-preview-layout-check-toggle"].addEventListener("click", fxPreviewToggleTextLayoutDetails);
   elements["fx-preview-composition-switch-timeline"].addEventListener("click", fxPreviewSwitchToTimeline);
-  elements["fx-preview-resync"].addEventListener("click", () => fxPreviewSyncVideos("effect"));
-  elements["fx-preview-source-video"].addEventListener("play", () => fxPreviewPlayBoth("source"));
-  elements["fx-preview-video"].addEventListener("play", () => fxPreviewPlayBoth("effect"));
-  elements["fx-preview-source-video"].addEventListener("pause", () => fxPreviewPauseBoth("source"));
-  elements["fx-preview-video"].addEventListener("pause", () => fxPreviewPauseBoth("effect"));
-  elements["fx-preview-source-video"].addEventListener("seeking", () => fxPreviewSyncVideos("source"));
-  elements["fx-preview-video"].addEventListener("seeking", () => fxPreviewSyncVideos("effect"));
-  elements["fx-preview-source-video"].addEventListener("timeupdate", () => fxPreviewSyncVideos("source"));
-  elements["fx-preview-video"].addEventListener("timeupdate", () => fxPreviewSyncVideos("effect"));
+  elements["fx-preview-resync"].addEventListener("click", () => {
+    fxPreviewManualSourceHold = false;
+    fxPreviewSyncVideos("effect");
+    fxPreviewSpotlightRenderCurrentTime();
+  });
+  elements["fx-preview-source-video"].addEventListener("play", () => {
+    if (fxPreviewManualSourceHold) {
+      elements["fx-preview-source-video"].pause();
+      return;
+    }
+    fxPreviewPlayBoth("source");
+  });
+  elements["fx-preview-video"].addEventListener("play", () => {
+    if (fxPreviewManualSourceHold) {
+      elements["fx-preview-video"].pause();
+      return;
+    }
+    fxPreviewPlayBoth("effect");
+  });
+  elements["fx-preview-source-video"].addEventListener("pause", () => { if (!fxPreviewManualSourceHold) fxPreviewPauseBoth("source"); });
+  elements["fx-preview-video"].addEventListener("pause", () => { if (!fxPreviewManualSourceHold) fxPreviewPauseBoth("effect"); });
+  elements["fx-preview-source-video"].addEventListener("seeking", () => {
+    if (fxPreviewManualSourceHold) fxPreviewSpotlightRenderCurrentTime();
+    else fxPreviewSyncVideos("source");
+  });
+  elements["fx-preview-video"].addEventListener("seeking", () => { if (!fxPreviewManualSourceHold) fxPreviewSyncVideos("effect"); });
+  elements["fx-preview-source-video"].addEventListener("timeupdate", () => {
+    if (fxPreviewManualSourceHold) fxPreviewSpotlightRenderCurrentTime();
+    else fxPreviewSyncVideos("source");
+  });
+  elements["fx-preview-video"].addEventListener("timeupdate", () => { if (!fxPreviewManualSourceHold) fxPreviewSyncVideos("effect"); });
+  elements["spotlight-source-click-target"].addEventListener("click", fxPreviewSetSubjectFromSourceClick);
   elements["fx-preview-source-video"].addEventListener("click", fxPreviewSetSubjectFromSourceClick);
   elements["fx-preview-restore-draft"].addEventListener("click", fxPreviewRestoreStaleDraft);
   elements["fx-preview-discard-draft"].addEventListener("click", fxPreviewDiscardSavedDraft);
@@ -6042,7 +6696,7 @@ function bindEvents() {
     state.editing_brief = elements["editing-brief"].value;
     markDirty("剪輯意圖變更，儲存中…");
   });
-  window.addEventListener("resize", () => { renderPreviewOverlays(true); renderTimeline(); });
+  window.addEventListener("resize", () => { renderPreviewOverlays(true); renderTimeline(); fxPreviewSpotlightRenderOverlay(); });
   window.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
       event.preventDefault();
