@@ -23,6 +23,20 @@ import fx_preview_jobs as jobs  # noqa: E402
 import render_editor_timeline as timeline  # noqa: E402
 
 
+def _validated_media_at(width: int, height: int):
+    def validate(
+        _path: Path,
+        _expected: float,
+        *,
+        metadata: dict[str, int] | None = None,
+    ) -> bool:
+        if metadata is not None:
+            metadata.update({"width": width, "height": height})
+        return True
+
+    return validate
+
+
 def test_reference_snapshot_is_derived_without_mutating_frozen_state(tmp_path: Path) -> None:
     snapshot = {
         "render_id": "fx-preview",
@@ -81,10 +95,11 @@ def test_composite_child_timeout_is_hard_and_advisory(tmp_path: Path) -> None:
             source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
             expected_text=True,
             scope="full-timeline",
-            frame_size={"width": 1080, "height": 1920},
+            frame_size={"width": 540, "height": 960},
         )
 
     assert receipt["status"] == "unmeasured"
+    assert receipt["frame_size"] == {"width": 540, "height": 960}
     assert receipt["findings"] == [{"kind": "analysis_incomplete"}]
     assert receipt["media_sha256"] == hashlib.sha256(
         composite.read_bytes()
@@ -92,6 +107,23 @@ def test_composite_child_timeout_is_hard_and_advisory(tmp_path: Path) -> None:
     assert run.call_args.kwargs["timeout"] == 15.0
     assert "start_new_session" not in run.call_args.kwargs
     assert scratch.is_dir()
+    sanitized = jobs._sanitize_composition_check(
+        receipt,
+        scope="full-timeline",
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        media_sha256=hashlib.sha256(composite.read_bytes()).hexdigest(),
+        frame_size={"width": 540, "height": 960},
+        render_duration_s=1.0,
+        time_map=[
+            {
+                "source_start_s": 0.0,
+                "source_end_s": 1.0,
+                "output_start_s": 0.0,
+                "output_end_s": 1.0,
+            }
+        ],
+    )
+    assert sanitized == receipt
 
 
 @pytest.mark.parametrize(
@@ -272,7 +304,7 @@ def test_timeline_reference_uses_same_shadow_and_preserves_full_layout(
             "status": "unmeasured",
             "source_sha256": source_sha,
             "media_sha256": hashlib.sha256(b"full-composite").hexdigest(),
-            "frame_size": {"width": 1080, "height": 1920},
+            "frame_size": {"width": 540, "height": 960},
             "sample_count": 0,
             "measured_count": 0,
             "elapsed_s": 0.1,
@@ -285,7 +317,7 @@ def test_timeline_reference_uses_same_shadow_and_preserves_full_layout(
         mock.patch.object(timeline, "render_project", side_effect=fake_render),
         mock.patch.object(timeline, "referenced_asset_digests", return_value={}),
         mock.patch.object(timeline, "editor_state_revision", return_value="c" * 64),
-        mock.patch.object(render, "media_ok", return_value=True),
+        mock.patch.object(render, "media_ok", side_effect=_validated_media_at(540, 960)),
         mock.patch.object(render, "_run_composition_check", side_effect=fake_check),
     ):
         result = render.timeline_preview(
@@ -306,6 +338,7 @@ def test_timeline_reference_uses_same_shadow_and_preserves_full_layout(
     assert captured["composite_bytes"] == b"full-composite"
     assert captured["reference_bytes"] == b"source-reference"
     assert captured["source_bytes"] == b"source"
+    assert captured["frame_size"] == {"width": 540, "height": 960}
     assert result["time_map"] == [
         {
             "source_start_s": 1.0,
@@ -415,7 +448,7 @@ def test_reference_system_exit_is_advisory_and_preserves_valid_full_video(
         mock.patch.object(timeline, "render_project", side_effect=render_then_exit),
         mock.patch.object(timeline, "referenced_asset_digests", return_value={}),
         mock.patch.object(timeline, "editor_state_revision", return_value="c" * 64),
-        mock.patch.object(render, "media_ok", return_value=True),
+        mock.patch.object(render, "media_ok", side_effect=_validated_media_at(540, 960)),
     ):
         result = render.timeline_preview(
             project,
@@ -432,11 +465,110 @@ def test_reference_system_exit_is_advisory_and_preserves_valid_full_video(
     assert output.read_bytes() == b"valid-full-video"
     assert result["composition_check"]["status"] == "unmeasured"
     assert result["composition_check"]["elapsed_s"] == 0.0
+    assert result["composition_check"]["frame_size"] == {
+        "width": 540,
+        "height": 960,
+    }
     assert result["composition_check"]["findings"] == [
         {"kind": "reference_unavailable"}
     ]
+    sanitized = jobs._sanitize_composition_check(
+        result["composition_check"],
+        scope="full-timeline",
+        source_sha256=source_sha,
+        media_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+        frame_size={"width": 540, "height": 960},
+        render_duration_s=1.0,
+        time_map=result["time_map"],
+    )
+    assert sanitized["findings"] == [{"kind": "reference_unavailable"}]
     assert not any(cache.glob("timeline-project-*"))
     assert not any(cache.glob(".timeline-owner-*.lock"))
+
+
+def test_unknown_encoded_frame_size_keeps_valid_video_without_guessing(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / "source/source.mp4"
+    cache = project / "working/fx-preview/renderer-cache"
+    output = project / "working/fx-preview/runtime/out.mp4"
+    source.parent.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    output.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    snapshot = {
+        "manifest": {"source": {"duration_s": 2.0}},
+        "state": {
+            "canvas": {"width": 1080, "height": 1920, "fit": "contain"},
+            "segments": [{"source_start": 0.0, "source_end": 2.0}],
+            "asset_digests": {},
+            "overlays": [],
+        },
+    }
+    dependencies = {
+        "source": {"relative": "source/source.mp4", "sha256": source_sha},
+        "timeline_project_inputs": {},
+    }
+    calls = 0
+
+    def render_once(_shadow, destination, _quality, **_kwargs):
+        nonlocal calls
+        calls += 1
+        Path(destination).write_bytes(b"valid-full-video")
+
+    with (
+        mock.patch.object(timeline, "render_project", side_effect=render_once),
+        mock.patch.object(render, "media_ok", return_value=True),
+    ):
+        result = render.timeline_preview(
+            project,
+            cache,
+            output,
+            snapshot,
+            0.0,
+            1.0,
+            dependencies,
+            scratch_owner="a" * 32,
+        )
+
+    assert calls == 1
+    assert output.read_bytes() == b"valid-full-video"
+    assert result["composition_check"] is None
+    assert not any(cache.glob("timeline-project-*"))
+
+
+def test_wrong_frame_binding_still_loses_advisory_reason() -> None:
+    source_sha = "a" * 64
+    media_sha = "b" * 64
+    receipt = render._composition_unmeasured(
+        scope="full-timeline",
+        source_sha256=source_sha,
+        media_sha256=media_sha,
+        frame_size={"width": 1080, "height": 1920},
+        finding="reference_unavailable",
+    )
+
+    sanitized = jobs._sanitize_composition_check(
+        receipt,
+        scope="full-timeline",
+        source_sha256=source_sha,
+        media_sha256=media_sha,
+        frame_size={"width": 540, "height": 960},
+        render_duration_s=1.0,
+        time_map=[
+            {
+                "source_start_s": 0.0,
+                "source_end_s": 1.0,
+                "output_start_s": 0.0,
+                "output_end_s": 1.0,
+            }
+        ],
+    )
+
+    assert sanitized["frame_size"] == {"width": 540, "height": 960}
+    assert sanitized["findings"] == [{"kind": "analysis_incomplete"}]
 
 
 def test_analysis_elapsed_is_zero_before_analysis_and_capped_without_sleep() -> None:

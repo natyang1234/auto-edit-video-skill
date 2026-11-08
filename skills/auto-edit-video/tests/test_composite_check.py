@@ -1,8 +1,8 @@
 import sys
 import hashlib
 import subprocess
+import threading
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -578,20 +578,28 @@ def test_vision_ocr_low_confidence_only_is_successful_empty(monkeypatch, tmp_pat
 
 
 def test_vision_ocr_timeout_returns_without_waiting_for_mocked_native_call(monkeypatch, tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
     class _Vision:
         @staticmethod
         def _recognize_sync(_path, _languages):
-            time.sleep(0.05)
+            entered.set()
+            release.wait(5)
+            completed.set()
             return []
 
     monkeypatch.setitem(sys.modules, "vision_ocr", _Vision)
-    monkeypatch.setattr(composite_check, "OCR_TIMEOUT_S", 0.01)
-    started = time.perf_counter()
-    status, boxes = composite_check._vision_ocr_boxes(tmp_path / "frame.png", 100, 100)
-    elapsed = time.perf_counter() - started
-    assert (status, boxes) == ("failed", [])
-    assert elapsed < 0.04
-    time.sleep(0.06)  # Let the test daemon finish before pytest moves on.
+    monkeypatch.setattr(composite_check, "OCR_TIMEOUT_S", 0.05)
+    try:
+        status, boxes = composite_check._vision_ocr_boxes(tmp_path / "frame.png", 100, 100)
+        assert (status, boxes) == ("failed", [])
+        assert entered.wait(1)
+        assert not completed.is_set()
+    finally:
+        release.set()
+        assert completed.wait(1)
 
 
 def test_blocked_ocr_daemon_does_not_keep_isolated_python_child_alive():
@@ -612,11 +620,9 @@ def test_blocked_ocr_daemon_does_not_keep_isolated_python_child_alive():
         print('child-exited')
         """
     )
-    started = time.perf_counter()
     run = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=3)
     assert run.returncode == 0, run.stderr
     assert run.stdout.strip() == "child-exited"
-    assert time.perf_counter() - started < 1.0
 
 
 def test_failed_ocr_is_attempted_once_but_face_measurements_continue(tmp_path, monkeypatch):
