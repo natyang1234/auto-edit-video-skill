@@ -999,13 +999,12 @@ function renderDirectorCards() {
 
 function templateStateDefaults(templateId) {
   const preset = projectPayload.video_templates[templateId];
-  const draft = {
+  return {
     id: templateId,
     frame: deepCopy(preset.frame_defaults),
     subject: { x: 50, y: 54, scale: 1, feather: 2, mask_stride: 3 },
     background: { color: "#17251d", source: null, fit: "cover", blur: 0 },
   };
-  return draft;
 }
 
 function selectVideoTemplate(templateId) {
@@ -3196,29 +3195,31 @@ function fxPreviewSpotlightRenderOverlay() {
   const clickTarget = elements["spotlight-source-click-target"];
   if (!svg || !line || !markers) return;
   const draft = fxPreviewDraft;
-  const activeP5 = draft?.code === "P5";
   const manual = draft?.code === "P5" && draft.spotlight_mode === "manual";
   const points = manual && Array.isArray(draft?.spotlight_path?.keyframes) ? draft.spotlight_path.keyframes : [];
   const content = fxPreviewSpotlightContentRect();
   fxPreviewSpotlightRenderCropNote(points);
   if (clickTarget) {
-    clickTarget.hidden = !activeP5 || !content;
+    clickTarget.hidden = !manual || !content;
     if (content) {
       clickTarget.style.left = `${content.left}px`;
       clickTarget.style.top = `${content.top}px`;
       clickTarget.style.width = `${content.width}px`;
-      // Keep the native control strip clickable; content clicks are handled by
-      // this dedicated target rather than by the native video hit region.
-      clickTarget.style.height = `${Math.max(0, content.height - 56)}px`;
+      const controlsReserve = manual && elements["fx-preview-source-video"]?.controls ? 56 : 0;
+      const bottom = controlsReserve
+        ? Math.max(content.top, Math.min(content.top + content.height,
+          content.videoRect.bottom - content.stageRect.top - controlsReserve))
+        : content.top + content.height;
+      clickTarget.style.height = `${Math.max(0, bottom - content.top)}px`;
     }
   }
   if (!manual || !points.length || !content) {
-    svg.hidden = true;
+    svg.style.display = "none";
     line.setAttribute("d", "");
     markers.replaceChildren();
     return;
   }
-  svg.hidden = false;
+  svg.style.display = "";
   svg.style.left = `${content.left}px`;
   svg.style.top = `${content.top}px`;
   svg.style.width = `${content.width}px`;
@@ -3429,7 +3430,15 @@ function fxPreviewSpotlightAddPoint(sourceAt, x, y) {
     fxPreviewSpotlightSetValidation("X 與 Y 必須介於 0 與 1。", "error");
     return false;
   }
-  const existing = points.findIndex((point) => Number(point.source_at) === canonical.source_at);
+  const existing = points.findIndex((point) => {
+    const sourceAt = point?.source_at;
+    if (typeof sourceAt !== "number" || !Number.isFinite(sourceAt)) return false;
+    try {
+      return fxPreviewCanonicalNumber(sourceAt, 3, "關鍵點時間") === canonical.source_at;
+    } catch (_error) {
+      return false;
+    }
+  });
   if (existing < 0 && points.length >= FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES) {
     fxPreviewSpotlightSetValidation(`關鍵點最多 ${FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES} 個。`, "error");
     return false;
@@ -3549,11 +3558,11 @@ function fxPreviewSetSubjectFromSourceClick(event) {
   if (fxPreviewDraft?.code !== "P5") return;
   const video = elements["fx-preview-source-video"];
   const videoRect = video.getBoundingClientRect();
-  // Native controls are part of the video element's hit target in some
-  // browsers.  Keep their lower strip reserved so play/seek/volume clicks can
-  // never become a subject or manual-path point.
-  if (video.controls && event.clientY >= videoRect.bottom - 56) return;
   if (fxPreviewDraft.spotlight_mode === "manual") {
+    // Native controls are part of the video element's hit target in some
+    // browsers.  Keep their lower strip reserved so play/seek/volume clicks can
+    // never become a manual-path point.
+    if (video.controls && event.clientY >= videoRect.bottom - 56) return;
     const content = fxPreviewSpotlightContentRect();
     if (!content || event.clientX < content.videoRect.left + (content.videoRect.width - content.width) / 2
       || event.clientX > content.videoRect.left + (content.videoRect.width - content.width) / 2 + content.width
@@ -3566,7 +3575,8 @@ function fxPreviewSetSubjectFromSourceClick(event) {
     fxPreviewSpotlightHoldMedia();
     const x = Math.max(0, Math.min(1, (event.clientX - (content.videoRect.left + (content.videoRect.width - content.width) / 2)) / content.width));
     const y = Math.max(0, Math.min(1, (event.clientY - (content.videoRect.top + (content.videoRect.height - content.height) / 2)) / content.height));
-    fxPreviewSpotlightAddPoint(fxPreviewSpotlightCurrentSourceTime(), x, y);
+    const added = fxPreviewSpotlightAddPoint(fxPreviewSpotlightCurrentSourceTime(), x, y);
+    if (!added) return;
     const validation = fxPreviewSpotlightPathForDraft(fxPreviewDraft, { allowIncomplete: true });
     fxPreviewSpotlightSetValidation(validation.ok
       ? `已在原片目前時間新增／替換手動關鍵點；有效路徑：${fxPreviewDraft.spotlight_path.keyframes.length} 點；媒體已暫停。`

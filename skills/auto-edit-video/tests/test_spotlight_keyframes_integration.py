@@ -130,6 +130,12 @@ def test_legacy_renderer_still_accepts_nonmanual_effects(
     person.write_bytes(b"person")
     mask.write_bytes(b"mask")
     seen_kwargs: dict[str, object] = {}
+    preflight_probe_called = False
+
+    def forbidden_preflight_probe(*args, **kwargs):
+        nonlocal preflight_probe_called
+        preflight_probe_called = True
+        raise AssertionError("nonmanual effects must not gain a main preflight probe")
 
     def legacy_render_clip(
         *args,
@@ -163,7 +169,10 @@ def test_legacy_renderer_still_accepts_nonmanual_effects(
             "text_layout": {},
         }
 
-    compose = SimpleNamespace(render_clip=legacy_render_clip)
+    compose = SimpleNamespace(
+        render_clip=legacy_render_clip,
+        probe=forbidden_preflight_probe,
+    )
     overlay = {
         "id": "legacy",
         "type": "fx",
@@ -199,6 +208,7 @@ def test_legacy_renderer_still_accepts_nonmanual_effects(
         )
     assert rendered is not None
     assert seen_kwargs["strict_fit"] == "cover"
+    assert preflight_probe_called is False
 
 
 def test_manual_path_fails_clearly_before_calling_legacy_renderer(
@@ -293,6 +303,15 @@ def assert_manual_source_clipping_fails_closed(
     expected_error: str,
 ) -> None:
     compose = isolated_compose()
+    progress: list[str] = []
+    render_called = False
+    real_render_clip = compose.render_clip
+
+    def forbidden_render_clip(*args, spotlight_path=None, **kwargs):
+        nonlocal render_called
+        render_called = True
+        return real_render_clip(*args, spotlight_path=spotlight_path, **kwargs)
+
     project = tmp_path / "project"
     work = project / "working/fx"
     work.mkdir(parents=True)
@@ -334,7 +353,7 @@ def assert_manual_source_clipping_fails_closed(
         fx_overlay, "catalog", return_value=catalog
     ), patch.object(
         fx_overlay, "_person_assets", return_value=(person, mask)
-    ), patch.object(
+    ) as person_assets_spy, patch.object(
         fx_overlay, "families_for", return_value=[]
     ), patch.object(
         fx_overlay, "font_files_for", return_value={}
@@ -348,6 +367,8 @@ def assert_manual_source_clipping_fails_closed(
         compose.cs,
         "load_theme",
         side_effect=AssertionError("source clipping must fail before theme/render work"),
+    ), patch.object(
+        compose, "render_clip", new=forbidden_render_clip
     ):
         rendered = fx_overlay.render_for_timeline(
             project,
@@ -356,10 +377,14 @@ def assert_manual_source_clipping_fails_closed(
             None,
             canvas=(1080, 1920),
             fit="cover",
+            progress=progress.append,
         )
 
     assert rendered is None
     assert probe_spy.call_count == 1
+    person_assets_spy.assert_not_called()
+    assert progress == []
+    assert render_called is False
     logged = json.loads(capsys.readouterr().err)
     assert logged["fx_fallback"]["layer"] == "manual-source-clipping"
     assert logged["fx_fallback"]["code"] == "P5"
@@ -470,6 +495,7 @@ def test_preview_and_final_forward_identical_full_apply_source_path(
         assert args[1] == 4.0
         assert args[2] == 2.0
         assert spotlight_path == manual_path()
+        compose.probe(args[0])  # the real shared renderer probes after main preflight
         calls.append(json.loads(json.dumps(spotlight_path)))
         output = Path(args[12]) / f"manual-{quality}.mov"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -513,7 +539,9 @@ def test_preview_and_final_forward_identical_full_apply_source_path(
         fx_overlay, "font_files_for", return_value={}
     ), patch.object(
         compose, "render_clip", new=fake_render_clip
-    ):
+    ), patch.object(
+        compose, "probe", return_value={"duration": 10.0}
+    ) as probe_spy:
         rendered = fx_overlay.render_for_timeline(
             project,
             overlay,
@@ -525,6 +553,7 @@ def test_preview_and_final_forward_identical_full_apply_source_path(
         )
 
     assert calls == [manual_path()]
+    assert probe_spy.call_count == 2
     assert rendered is not None
     assert rendered["spotlight"]["status"] == "manual"
     assert rendered["spotlight"]["path_sha256"] == contract.spotlight_path_sha256(
