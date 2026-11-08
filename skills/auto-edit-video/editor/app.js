@@ -2486,8 +2486,8 @@ function fxPreviewCompositionReceipt(raw, job) {
   const inferredScope = job?.preview_options?.mode === "single"
     ? "single-effect" : job?.preview_options?.mode === "timeline" ? "full-timeline" : "";
   const scopeFieldValid = receipt.scope === "full-timeline" || receipt.scope === "single-effect";
-  const scope = scopeFieldValid
-    ? receipt.scope : inferredScope;
+  const scopeMatchesJob = !inferredScope || receipt.scope === inferredScope;
+  const scope = scopeFieldValid && scopeMatchesJob ? receipt.scope : inferredScope;
   const measurement = receipt.measurement === "sampled-local-frames" ? receipt.measurement : "";
   const statusFieldValid = ["pass", "warn", "unmeasured"].includes(receipt.status);
   const status = statusFieldValid ? receipt.status : "unmeasured";
@@ -2583,7 +2583,7 @@ function fxPreviewCompositionReceipt(raw, job) {
     && sample.reference_face_count !== null && sample.reference_face_count > 0
     && sample.visible_face_count !== null && sample.visible_face_count > 0
   ));
-  const baseValid = receiptShapeValid && receipt.version === 1 && scopeFieldValid && Boolean(scope)
+  const baseValid = receiptShapeValid && receipt.version === 1 && scopeFieldValid && scopeMatchesJob && Boolean(scope)
     && Boolean(measurement) && statusFieldValid && frameShapeValid && frameValid && shaValid
     && elapsed !== null && elapsed >= 0 && elapsed <= 60 && enginesValid && countsValid
     && Array.isArray(receipt.samples) && Array.isArray(receipt.findings)

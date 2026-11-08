@@ -336,6 +336,104 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 self.assertEqual(result[name], {"status": "unmeasured", "reason": fixed_reason, "buttons": 0}, name)
             browser.close()
 
+    def test_receipt_scope_must_match_preview_mode_in_both_directions(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
+            self.open_ready_preview(page)
+            single_unavailable = _composition_unmeasured(
+                scope="single-effect",
+                source_sha256="a" * 64,
+                media_sha256="b" * 64,
+                frame_size={"width": 360, "height": 640},
+                finding="full_timeline_required",
+                elapsed_s=0.4,
+            )
+            result = page.evaluate(
+                """singleUnavailable => {
+                    const sample = {
+                        output_at: .9, source_at: 1.3, measured: true,
+                        source_face_count: 1, reference_face_count: 1,
+                        visible_face_count: 1, text_box_count: 1,
+                    };
+                    const overlap = {
+                        kind: 'text_subject_overlap', output_at: .9, source_at: 1.3,
+                        subject_box: {x: 20, y: 30, width: 80, height: 90},
+                        text_box: {x: 24, y: 36, width: 70, height: 20},
+                    };
+                    const timelineWarn = {
+                        version: 1, scope: 'full-timeline', measurement: 'sampled-local-frames', status: 'warn',
+                        source_sha256: 'a'.repeat(64), media_sha256: 'b'.repeat(64),
+                        frame_size: {width: 360, height: 640}, sample_count: 1, measured_count: 1,
+                        elapsed_s: .4, engines: {faces: 'opencv-yunet', ocr: 'macos-vision'},
+                        samples: [sample], findings: [overlap],
+                    };
+                    const timelinePass = structuredClone(timelineWarn);
+                    timelinePass.status = 'pass';
+                    timelinePass.findings = [];
+                    const inspect = (receipt, mode) => {
+                        fxPreviewDraft.preview_options.mode = mode;
+                        fxCompareActive = false;
+                        const job = {
+                            id: `scope-${mode}`, render_duration_s: 1.6,
+                            preview_options: {mode, quality: 'standard'},
+                            time_map: [
+                                {output_start_s: 0, output_end_s: .8, source_start_s: 0, source_end_s: .8},
+                                {output_start_s: .8, output_end_s: 1.6, source_start_s: 1.2, source_end_s: 2},
+                            ],
+                        };
+                        const check = fxPreviewCompositionReceipt(receipt, job);
+                        fxPreviewRenderCompositionCheck(receipt, job);
+                        return {
+                            status: check.status,
+                            scope: check.scope,
+                            reason: check.reason,
+                            findings: check.findings,
+                            buttons: document.querySelectorAll(
+                                '#fx-preview-composition-check-list button[data-source-at]'
+                            ).length,
+                            switchHidden: document.querySelector('#fx-preview-composition-switch-timeline').hidden,
+                        };
+                    };
+                    const singleReceiptOnTimeline = structuredClone(timelineWarn);
+                    singleReceiptOnTimeline.scope = 'single-effect';
+                    return {
+                        validTimeline: inspect(timelineWarn, 'timeline'),
+                        validSingleUnavailable: inspect(singleUnavailable, 'single'),
+                        fullTimelineOnSingle: inspect(timelinePass, 'single'),
+                        singleEffectOnTimeline: inspect(singleReceiptOnTimeline, 'timeline'),
+                    };
+                }""",
+                single_unavailable,
+            )
+            self.assertEqual(result["validTimeline"], {
+                "status": "warn", "scope": "full-timeline", "reason": "",
+                "findings": [{
+                    "kind": "text_subject_overlap", "output_at": 0.9, "source_at": 1.3,
+                    "subject_box": {"x": 20, "y": 30, "width": 80, "height": 90},
+                    "text_box": {"x": 24, "y": 36, "width": 70, "height": 20},
+                }],
+                "buttons": 1, "switchHidden": True,
+            })
+            self.assertEqual(result["validSingleUnavailable"], {
+                "status": "unmeasured", "scope": "single-effect", "reason": "",
+                "findings": [{"kind": "full_timeline_required"}],
+                "buttons": 0, "switchHidden": False,
+            })
+            fixed_reason = "完整畫面檢查結果不完整，無法可靠判定"
+            self.assertEqual(result["fullTimelineOnSingle"], {
+                "status": "unmeasured", "scope": "single-effect", "reason": fixed_reason,
+                "findings": [], "buttons": 0, "switchHidden": False,
+            })
+            self.assertEqual(result["singleEffectOnTimeline"], {
+                "status": "unmeasured", "scope": "full-timeline", "reason": fixed_reason,
+                "findings": [], "buttons": 0, "switchHidden": True,
+            })
+            browser.close()
+
     def test_unknown_receipt_cannot_render_pass_and_single_action_is_hidden_in_comparison(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:

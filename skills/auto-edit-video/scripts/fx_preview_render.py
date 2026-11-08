@@ -248,12 +248,19 @@ def atomic_json(path: Path, data: dict[str, Any]) -> None:
         os.close(directory_fd)
 
 
-def media_ok(path: Path, expected: float) -> bool:
+def media_ok(
+    path: Path,
+    expected: float,
+    *,
+    metadata: dict[str, int] | None = None,
+) -> bool:
     """Validate frames, not just a possibly stale container duration header."""
+    if metadata is not None:
+        metadata.clear()
     try:
         r = subprocess.run([
             "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,pix_fmt,avg_frame_rate,nb_read_frames:format=duration",
+            "-show_entries", "stream=codec_name,pix_fmt,avg_frame_rate,nb_read_frames,width,height:format=duration",
             "-of", "json", str(path),
         ], capture_output=True, text=True, timeout=60, check=False)
         data = json.loads(r.stdout or "{}")
@@ -262,6 +269,13 @@ def media_ok(path: Path, expected: float) -> bool:
         fps = float(n) / max(float(d or 1), 1)
         frames = int(stream.get("nb_read_frames") or 0)
         duration = float((data.get("format") or {}).get("duration") or 0)
+        try:
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+        except (TypeError, ValueError):
+            width, height = 0, 0
+        if metadata is not None and 0 < width <= 16384 and 0 < height <= 16384:
+            metadata.update({"width": width, "height": height})
         return (stream.get("codec_name") == "h264" and stream.get("pix_fmt") == "yuv420p"
                 and frames >= max(1, int(expected * fps * .85))
                 and abs(duration - expected) <= max(.25, expected * .1))
@@ -803,10 +817,13 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     expected_broll = None
     observed_broll = False
     try:
-        frame_size = {
-            "width": int(canvas.get("width", 1080)),
-            "height": int(canvas.get("height", 1920)),
-        }
+        # Keep validating the frozen canvas early, but bind diagnostics to the
+        # encoded MP4 dimensions observed below.  The renderer may intentionally
+        # produce a scaled preview, and the manager verifies this binding.
+        _ = (
+            int(canvas.get("width", 1080)),
+            int(canvas.get("height", 1920)),
+        )
         if isinstance(target_material, dict):
             for candidate in state.get("overlays", []):
                 if (
@@ -869,11 +886,19 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
         raw_layout_reports = json.loads(layout_path.read_text()) if layout_path.is_file() else {}
         layout_reports = copy.deepcopy(raw_layout_reports) if isinstance(raw_layout_reports, dict) else {}
         progress("validating", "正在驗證時間軸預覽")
-        if not media_ok(full, end - start):
+        full_metadata: dict[str, int] = {}
+        if not media_ok(full, end - start, metadata=full_metadata):
             raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
         full_sha256 = file_digest(full)
         analysis_started: float | None = None
+        frame_size = (
+            full_metadata
+            if set(full_metadata) == {"width", "height"}
+            else None
+        )
         try:
+            if frame_size is None:
+                raise ValueError("encoded frame size unavailable")
             reference_data = _reference_snapshot(snapshot, shadow, timeline)
             atomic_json(path, reference_data)
             timeline.render_project(
@@ -904,13 +929,17 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
                 frame_size=frame_size,
             )
         except (Exception, SystemExit):
-            composition_check = _composition_unmeasured(
-                scope="full-timeline",
-                source_sha256=source_sha256,
-                media_sha256=full_sha256,
-                frame_size=frame_size,
-                finding="reference_unavailable",
-                elapsed_s=_bounded_analysis_elapsed(analysis_started),
+            composition_check = (
+                None
+                if frame_size is None
+                else _composition_unmeasured(
+                    scope="full-timeline",
+                    source_sha256=source_sha256,
+                    media_sha256=full_sha256,
+                    frame_size=frame_size,
+                    finding="reference_unavailable",
+                    elapsed_s=_bounded_analysis_elapsed(analysis_started),
+                )
             )
         if file_digest(full) != full_sha256:
             raise PreviewError("output_invalid", "時間軸預覽在診斷期間發生變更")
