@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -175,6 +176,78 @@ class ProjectVersionUnitTests(unittest.TestCase):
         with self.assertRaises(project_versions.ProjectVersionError) as caught:
             store.list_records()
         self.assertEqual(caught.exception.code, "version_recovery_required")
+
+    def test_only_regular_ds_store_metadata_is_ignored(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        store.records_dir.mkdir(parents=True)
+        metadata = store.records_dir / ".DS_Store"
+        metadata_bytes = b"synthetic Finder metadata"
+        metadata.write_bytes(metadata_bytes)
+        metadata.chmod(0o644)
+        self.assertEqual(store.list_records(), [])
+        self.assertEqual(store.capacity()["used"], 0)
+        self.assertEqual(metadata.read_bytes(), metadata_bytes)
+
+        metadata.unlink()
+        unknown = store.records_dir / ".unknown-metadata"
+        unknown.write_bytes(b"unknown")
+        with self.assertRaises(project_versions.ProjectVersionError) as unknown_error:
+            store.list_records()
+        self.assertEqual(unknown_error.exception.code, "version_recovery_required")
+
+        unknown.unlink()
+        corrupt = store.records_dir / f"pv_{'b' * 32}.json"
+        corrupt.write_bytes(b"truncated formal record")
+        corrupt.chmod(0o600)
+        with self.assertRaises(project_versions.ProjectVersionError) as corrupt_error:
+            store.list_records()
+        self.assertEqual(corrupt_error.exception.code, "version_recovery_required")
+
+        corrupt.unlink()
+        target = self.project / "working/finder-metadata-target"
+        target.write_bytes(metadata_bytes)
+        metadata.symlink_to(target)
+        with self.assertRaises(project_versions.ProjectVersionError) as symlink_error:
+            store.list_records()
+        self.assertEqual(symlink_error.exception.code, "version_recovery_required")
+
+        metadata.unlink()
+        metadata.mkdir()
+        with self.assertRaises(project_versions.ProjectVersionError) as directory_error:
+            store.list_records()
+        self.assertEqual(directory_error.exception.code, "version_recovery_required")
+
+    def test_hard_link_publish_is_required_and_supported_locally(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        real_link = os.link
+        published_inodes: list[tuple[int, int]] = []
+
+        def observed_link(source: Path, target: Path, **kwargs: object) -> None:
+            real_link(source, target, **kwargs)
+            published_inodes.append((source.stat().st_ino, target.stat().st_ino))
+
+        with patch.object(project_versions.os, "link", side_effect=observed_link):
+            record = self.create_record(store)
+        self.assertEqual(len(published_inodes), 1)
+        self.assertEqual(published_inodes[0][0], published_inodes[0][1])
+        self.assertEqual(store.load(record["version_id"]), record)
+
+        unsupported_store = project_versions.ProjectVersionStore(
+            Path(self.temp.name) / "unsupported-link"
+        )
+        (unsupported_store.project_dir / "working").mkdir(parents=True)
+        with patch.object(
+            project_versions.os,
+            "link",
+            side_effect=OSError(errno.ENOTSUP, "synthetic unsupported link"),
+        ):
+            with self.assertRaises(project_versions.ProjectVersionError) as unsupported:
+                self.create_record(unsupported_store)
+        self.assertEqual(unsupported.exception.status, 503)
+        self.assertEqual(unsupported.exception.code, "version_storage_unsupported")
+        self.assertEqual(unsupported.exception.details, {})
+        self.assertEqual(unsupported_store.list_records(), [])
+        self.assertEqual(list(unsupported_store.records_dir.iterdir()), [])
 
     def test_duplicate_generated_id_never_overwrites_existing_record(self) -> None:
         store = project_versions.ProjectVersionStore(self.project)

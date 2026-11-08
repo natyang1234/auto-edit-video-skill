@@ -49,7 +49,12 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
         held_details = {}
         held_restore = []
         restore_attempts = []
-        b_detail_requests = [0]
+        held_lists = []
+        list_modes = ["hold", "normal"]
+        detail_mode = {"b": "full"}
+        detail_requests = []
+        list_requests = []
+        list_faults = []
         capacity = {"used": 2, "max": 100, "named_save_available": True, "restore_backup_available": True}
         versions = [
             {"version_id": "a/b", "name": "A very long version name " * 8, "kind": "named", "created_at": "2026-11-09T01:02:03Z", "state_digest": "state-a", "render_revision": "render-a"},
@@ -68,6 +73,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 if not path.startswith("/api/project-versions"):
                     route.fallback(); return
                 if request.method == "GET" and path == "/api/project-versions":
+                    list_requests.append(path)
+                    if list_modes:
+                        mode = list_modes.pop(0)
+                        if mode == "hold":
+                            held_lists.append(route); return
+                    if list_faults:
+                        route.fulfill(status=list_faults.pop(0), json={"ok": False, "error": "list_unavailable", "error_code": "list_unavailable"}); return
                     route.fulfill(json={"ok": True, "versions": versions, "current": current, "capacity": capacity}); return
                 if request.method == "GET":
                     version = versions[0] if path.endswith("a%2Fb") else versions[1]
@@ -90,14 +102,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/rights_assertion/items/0", "kind": "removed", "saved_preview": "null", "current_preview": '{"asserted":true,"asset":"' + "x" * 180 + '"}'},
                         {"path": "/state/rights/asserted", "kind": "changed", "saved_preview": "false", "current_preview": "true"},
                     ]
-                    if version["version_id"] == "b":
-                        b_detail_requests[0] += 1
+                    detail_requests.append(version["version_id"])
                     changes = content_changes + reset_changes
                     truncated = False
-                    if version["version_id"] == "b" and b_detail_requests[0] > 1:
+                    if detail_mode.get(version["version_id"]) == "metadata_only":
                         changes = reset_changes[:1]
                         truncated = True
-                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": ["timeline"], "rights_assertion_reset": not (version["version_id"] == "b" and b_detail_requests[0] > 1), "changes": changes}}
+                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": ["timeline"], "rights_assertion_reset": detail_mode.get(version["version_id"]) != "metadata_only", "changes": changes}}
                     if version["version_id"] == "a/b":
                         held_details.setdefault("a", (route, payload)); return
                     route.fulfill(json=payload); return
@@ -113,6 +124,18 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 if body.get("name") == "權限版本":
                     route.fulfill(status=503, json={"ok": False, "error": "version_permissions_repair_required", "error_code": "version_permissions_repair_required", "details": {"record_id": "pv_0123456789abcdef0123456789abcdef", "expected_mode": "0600", "current_mode": "0644", "relative_path": "working/project_versions/records/pv_0123456789abcdef0123456789abcdef.json", "repair_action": "restrict_to_owner"}})
                     return
+                permanent_errors = {
+                    "不支援快照": (409, "unsupported_snapshot"),
+                    "遺失版本": (404, "version_not_found"),
+                    "不支援存檔": (503, "version_storage_unsupported"),
+                    "清單失敗版本": (409, "source_changed"),
+                }
+                if body.get("name") in permanent_errors:
+                    status, code = permanent_errors[body["name"]]
+                    if body["name"] == "清單失敗版本":
+                        list_faults.append(503)
+                    route.fulfill(status=status, json={"ok": False, "error": code, "error_code": code})
+                    return
                 else:
                     route.fulfill(status=201, json={"ok": True, "version": versions[0], "current": current})
             page.route("**/api/project-versions**", route)
@@ -122,6 +145,14 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             stage("open")
             page.locator("#project-versions-open").click()
             page.locator("#project-versions-dialog[open]").wait_for()
+            page.locator("#project-versions-status").get_by_text("正在讀取版本…").wait_for()
+            page.locator("#project-versions-close").click()
+            page.locator("#project-versions-open").click()
+            page.locator(".project-version-row").first.wait_for()
+            held_lists[0].fulfill(json={"ok": True, "versions": [{"version_id": "stale", "name": "過期清單", "kind": "named", "created_at": "2026-11-09T00:00:00Z"}], "current": current, "capacity": capacity})
+            page.wait_for_timeout(100)
+            self.assertNotIn("過期清單", page.locator("#project-versions-list").inner_text())
+            self.assertEqual(len(list_requests), 2)
             stage("list-open")
             for width in (1440, 1100, 390):
                 page.set_viewport_size({"width": width, "height": 900})
@@ -156,6 +187,16 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-version-name").focus()
             page.keyboard.type("版本 A")
             self.assertEqual(page.locator("#project-version-name").input_value(), "版本 A")
+            self.assertTrue(page.evaluate("""() => {
+              const event = new KeyboardEvent('keydown', {key: 's', ctrlKey: true, bubbles: true, cancelable: true});
+              document.querySelector('#project-version-name').dispatchEvent(event);
+              return event.defaultPrevented;
+            }"""))
+            self.assertFalse(page.evaluate("""() => {
+              const event = new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true, cancelable: true});
+              document.querySelector('#project-version-name').dispatchEvent(event);
+              return event.defaultPrevented;
+            }"""))
             page.locator("#project-version-name").fill("錯誤版本")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('版本名稱規則')")
@@ -167,6 +208,23 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertIn("working/project_versions/records", permission_text)
             self.assertIn("請勿刪除版本", permission_text)
             self.assertNotIn("/Users/", permission_text)
+            for name, expected in (
+                ("不支援快照", "無法安全還原"),
+                ("遺失版本", "找不到這個版本"),
+                ("不支援存檔", "不支援必要的安全版本存檔"),
+            ):
+                before_posts = len(posts)
+                before_lists = len(list_requests)
+                page.locator("#project-version-name").fill(name)
+                page.locator("#project-version-save").click()
+                page.wait_for_function(f"() => document.querySelector('#project-versions-status').textContent.includes('{expected}')")
+                message = page.locator("#project-versions-status").inner_text()
+                self.assertIn(expected, message)
+                self.assertNotIn("稍後", message)
+                self.assertEqual(len(posts), before_posts + 1)
+                self.assertEqual(len(list_requests), before_lists + 1)
+                self.assertFalse(page.locator("#project-version-save").is_disabled())
+            posts_before_named_saves = len(posts)
             page.locator("#project-version-name").fill("版本 A")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('已儲存')")
@@ -176,7 +234,9 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-version-name").fill("版本 B")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('已儲存')")
-            self.assertEqual(sum(path == "/api/project-versions" for path, _body in posts), 4)
+            self.assertEqual(len(posts), posts_before_named_saves + 2)
+            page.locator(".project-version-row").nth(1).click()
+            page.locator("#project-version-detail").get_by_text("b-saved").wait_for()
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             page.locator("#project-version-restore-dialog[open]").wait_for()
             self.assertIn("還原時會重新驗證來源影片與素材；若已變更，將停止還原。", page.locator("#project-version-restore-status").inner_text())
@@ -184,13 +244,20 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertTrue(page.locator("#project-version-restore-cancel").is_disabled())
             self.assertTrue(page.locator("#project-version-restore-dialog[open]").is_visible())
             held_restore[0].fulfill(status=409, json={"ok": False, "error": "source_changed", "error_code": "source_changed"})
-            page.wait_for_function("() => document.querySelector('#project-version-restore-status').textContent.includes('來源影片已變更')")
+            versions.append({"version_id": "backup-b", "name": "還原前自動備份", "kind": "auto_before_restore", "created_at": "2026-11-09T01:04:03Z"})
+            capacity.update({"used": 3})
+            page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('來源影片已變更')")
             self.assertEqual(len(restore_attempts), 1)
             self.assertEqual(restore_attempts[0]["expected_state_digest"], "state-now")
-            self.assertNotIn("source_changed", page.locator("#project-version-restore-status").inner_text())
-            self.assertTrue(page.locator("#project-version-restore-dialog[open]").is_visible())
-            page.locator("#project-version-restore-cancel").click()
+            self.assertFalse(page.locator("#project-version-restore-dialog").evaluate("el => el.open"))
             self.assertTrue(page.locator("#project-versions-dialog[open]").is_visible())
+            self.assertIn("還原前自動備份", page.locator("#project-versions-list").inner_text())
+            self.assertIn("已使用 3/100", page.locator("#project-versions-capacity").inner_text())
+            self.assertTrue(page.locator("#project-version-detail").is_hidden())
+            self.assertEqual(len(restore_attempts), 1)
+            page.locator(".project-version-row").nth(1).click()
+            detail_mode["b"] = "metadata_only"
+            page.locator("#project-version-detail").get_by_text("差異尚未完整顯示").wait_for()
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             self.assertFalse(page.locator("#project-version-restore-status").evaluate("el => el.classList.contains('is-error')"))
             page.locator("#project-version-restore-cancel").click()
@@ -207,5 +274,20 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             self.assertFalse(page.locator("#project-version-restore-dialog").evaluate("el => el.open"))
             self.assertIn("不會自動清理", page.locator("#project-versions-capacity").inner_text())
+            capacity.update({"used": 3, "named_save_available": True, "restore_backup_available": True})
+            page.locator("#project-versions-close").click()
+            page.locator("#project-versions-open").click()
+            page.locator(".project-version-row").first.wait_for()
+            before_posts = len(posts)
+            before_lists = len(list_requests)
+            page.locator("#project-version-name").fill("清單失敗版本")
+            page.locator("#project-version-save").click()
+            page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('無法更新版本清單')")
+            self.assertEqual(len(posts), before_posts + 1)
+            self.assertEqual(len(list_requests), before_lists + 1)
+            self.assertTrue(page.locator("#project-version-save").is_disabled())
+            self.assertEqual(page.locator("#project-versions-list .project-version-row").count(), 0)
+            self.assertTrue(page.locator("#project-version-detail").is_hidden())
+            self.assertEqual(page.locator("#project-version-detail").get_by_role("button", name="還原此版本").count(), 0)
             stage("done")
             browser.close()
