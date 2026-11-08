@@ -68,6 +68,24 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.on("console", lambda message: print(f"P7_CONSOLE {message.type}: {message.text}", flush=True))
             page.on("pageerror", lambda error: print(f"P7_PAGEERROR {error}", flush=True))
 
+            def assert_stable_project_versions_focus(label):
+                focus = page.evaluate("""() => {
+                  const active = document.activeElement;
+                  return {
+                    id: active?.id || "",
+                    connected: Boolean(active?.isConnected),
+                    disabled: Boolean(active?.disabled),
+                    mainOpen: Boolean(document.querySelector('#project-versions-dialog[open]')),
+                    restoreOpen: Boolean(document.querySelector('#project-version-restore-dialog[open]')),
+                  };
+                }""")
+                print(f"P7_FOCUS {label}={focus}", flush=True)
+                self.assertTrue(focus["mainOpen"], label)
+                self.assertFalse(focus["restoreOpen"], label)
+                self.assertTrue(focus["connected"], label)
+                self.assertFalse(focus["disabled"], label)
+                self.assertIn(focus["id"], {"project-version-name", "project-versions-close"}, label)
+
             def route(route):
                 request = route.request; path = urlparse(request.url).path
                 if not path.startswith("/api/project-versions"):
@@ -149,9 +167,12 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-versions-close").click()
             page.locator("#project-versions-open").click()
             page.locator(".project-version-row").first.wait_for()
+            page.locator("#project-versions-close").focus()
+            self.assertEqual(page.evaluate("() => document.activeElement.id"), "project-versions-close")
             held_lists[0].fulfill(json={"ok": True, "versions": [{"version_id": "stale", "name": "過期清單", "kind": "named", "created_at": "2026-11-09T00:00:00Z"}], "current": current, "capacity": capacity})
             page.wait_for_timeout(100)
             self.assertNotIn("過期清單", page.locator("#project-versions-list").inner_text())
+            self.assertEqual(page.evaluate("() => document.activeElement.id"), "project-versions-close")
             self.assertEqual(len(list_requests), 2)
             stage("list-open")
             for width in (1440, 1100, 390):
@@ -224,11 +245,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 self.assertEqual(len(posts), before_posts + 1)
                 self.assertEqual(len(list_requests), before_lists + 1)
                 self.assertFalse(page.locator("#project-version-save").is_disabled())
+                assert_stable_project_versions_focus(f"failed_save_{name}")
             posts_before_named_saves = len(posts)
             page.locator("#project-version-name").fill("版本 A")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('已儲存')")
             self.assertFalse(page.locator("#project-version-save").is_disabled())
+            assert_stable_project_versions_focus("success_save")
             save = next(body for path, body in posts if path == "/api/project-versions")
             self.assertEqual(save["expected_manifest_digest"], "manifest-now")
             page.locator("#project-version-name").fill("版本 B")
@@ -254,6 +277,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertIn("還原前自動備份", page.locator("#project-versions-list").inner_text())
             self.assertIn("已使用 3/100", page.locator("#project-versions-capacity").inner_text())
             self.assertTrue(page.locator("#project-version-detail").is_hidden())
+            assert_stable_project_versions_focus("failed_restore")
             self.assertEqual(len(restore_attempts), 1)
             page.locator(".project-version-row").nth(1).click()
             detail_mode["b"] = "metadata_only"
@@ -289,5 +313,6 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertEqual(page.locator("#project-versions-list .project-version-row").count(), 0)
             self.assertTrue(page.locator("#project-version-detail").is_hidden())
             self.assertEqual(page.locator("#project-version-detail").get_by_role("button", name="還原此版本").count(), 0)
+            assert_stable_project_versions_focus("mutation_list_failure")
             stage("done")
             browser.close()

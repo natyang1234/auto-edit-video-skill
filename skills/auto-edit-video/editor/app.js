@@ -386,6 +386,25 @@ function setProjectVersionSelection(versionId) {
   });
 }
 
+function projectVersionsFocusTargetUsable(target) {
+  if (!target || !target.isConnected || target.disabled || target.hidden || target.closest("[hidden]")) return false;
+  return target.matches("button,input,select,textarea,a[href],[tabindex]:not([tabindex='-1'])");
+}
+
+function repairProjectVersionsFocus(generation) {
+  const mainDialog = elements["project-versions-dialog"];
+  const restoreDialog = elements["project-version-restore-dialog"];
+  if (generation !== projectVersionsGeneration || !mainDialog?.open || restoreDialog?.open) return;
+  const active = document.activeElement;
+  if (projectVersionsFocusTargetUsable(active)) return;
+  const nameInput = elements["project-version-name"];
+  const closeButton = elements["project-versions-close"];
+  const target = projectVersionsPayload && projectVersionsFocusTargetUsable(nameInput)
+    ? nameInput
+    : projectVersionsFocusTargetUsable(closeButton) ? closeButton : null;
+  target?.focus();
+}
+
 function renderProjectVersions(payload) {
   const versions = Array.isArray(payload?.versions) ? payload.versions : [];
   projectVersionsPayload = payload || projectVersionsPayload;
@@ -508,6 +527,7 @@ async function saveProjectVersion(event) {
   event.preventDefault();
   if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
   const name = elements["project-version-name"].value.trim(); if (!name) return;
+  const refreshGeneration = projectVersionsGeneration + 1;
   projectVersionsMutationInFlight = true;
   elements["project-version-save"].disabled = true;
   setProjectVersionsStatus("正在儲存命名版本…");
@@ -527,6 +547,7 @@ async function saveProjectVersion(event) {
     if (elements["project-versions-dialog"].open && projectVersionsPayload) {
       renderProjectVersions(projectVersionsPayload);
     }
+    repairProjectVersionsFocus(refreshGeneration);
   }
 }
 
@@ -545,12 +566,17 @@ async function refreshProjectVersionsAfterFailure(message, { restore = false } =
 }
 async function restoreProjectVersion() {
   if (!projectVersionsPendingRestore || projectVersionsMutationInFlight) return;
+  const refreshGeneration = projectVersionsGeneration + 1;
   projectVersionsMutationInFlight = true; const dialog = elements["project-version-restore-dialog"]; dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   try { const result = await request(`/api/project-versions/${encodeURIComponent(projectVersionsPendingRestore.version.version_id)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...projectVersionsPendingRestore.tokens, confirm_restore: true }) }); if (!result?.reload_required) throw new Error("伺服器未確認還原完成"); window.location.replace(window.location.href); }
   catch (error) {
     await refreshProjectVersionsAfterFailure(projectVersionErrorMessage(error, "還原版本"), { restore: true });
   }
-  finally { projectVersionsMutationInFlight = false; if (elements["project-versions-dialog"].open && projectVersionsPayload) renderProjectVersions(projectVersionsPayload); }
+  finally {
+    projectVersionsMutationInFlight = false;
+    if (elements["project-versions-dialog"].open && projectVersionsPayload) renderProjectVersions(projectVersionsPayload);
+    repairProjectVersionsFocus(refreshGeneration);
+  }
 }
 
 function setSaveState(label, mode = "dirty") {
