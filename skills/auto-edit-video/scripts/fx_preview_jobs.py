@@ -13,9 +13,11 @@ from __future__ import annotations
 import ast
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import signal
@@ -143,6 +145,19 @@ _TEXT_FINDINGS = {
     "subject_measurement_unavailable", "dom_measurement_unavailable",
     "composite_subject_measurement_unavailable", "unrecognized_warning",
 }
+_COMPOSITION_SCOPES = {"full-timeline", "single-effect"}
+_COMPOSITION_STATUSES = {"pass", "warn", "unmeasured"}
+_COMPOSITION_FINDINGS = {
+    "text_subject_overlap",
+    "visibility_uncertain",
+    "source_subject_unmeasured",
+    "ocr_unavailable",
+    "reference_unavailable",
+    "analysis_incomplete",
+    "full_timeline_required",
+}
+_COMPOSITION_FACE_ENGINES = {"opencv-yunet", "unavailable"}
+_COMPOSITION_OCR_ENGINES = {"macos-vision", "unavailable"}
 
 
 def _bounded_text(value: Any, maximum: int = 160) -> str | None:
@@ -320,6 +335,298 @@ def _sanitize_text_layout(
         ):
             output["status"] = "warn"
     return output
+
+
+def _composition_fallback(
+    *,
+    scope: str,
+    source_sha256: str,
+    media_sha256: str,
+    frame_size: dict[str, int],
+) -> dict[str, Any]:
+    finding = (
+        "full_timeline_required"
+        if scope == "single-effect"
+        else "analysis_incomplete"
+    )
+    return {
+        "version": 1,
+        "scope": scope,
+        "measurement": "sampled-local-frames",
+        "status": "unmeasured",
+        "source_sha256": source_sha256,
+        "media_sha256": media_sha256,
+        "frame_size": dict(frame_size),
+        "sample_count": 0,
+        "measured_count": 0,
+        "elapsed_s": 0.0,
+        "engines": {"faces": "unavailable", "ocr": "unavailable"},
+        "samples": [],
+        "findings": [{"kind": finding}],
+    }
+
+
+def _composition_source_at(
+    output_at: float, time_map: list[dict[str, float]]
+) -> float | None:
+    for index, segment in enumerate(time_map):
+        output_start = float(segment["output_start_s"])
+        output_end = float(segment["output_end_s"])
+        is_last = index == len(time_map) - 1
+        if output_at < output_start - 1e-6:
+            continue
+        if output_at > output_end + 1e-6 or (
+            not is_last and output_at >= output_end - 1e-6
+        ):
+            continue
+        span = output_end - output_start
+        if span <= 0:
+            return None
+        progress_value = min(1.0, max(0.0, (output_at - output_start) / span))
+        source_start = float(segment["source_start_s"])
+        source_end = float(segment["source_end_s"])
+        return source_start + progress_value * (source_end - source_start)
+    return None
+
+
+def _sanitize_composition_box(
+    value: Any, frame_size: dict[str, int]
+) -> dict[str, float] | None:
+    if not isinstance(value, dict) or set(value) != {"x", "y", "width", "height"}:
+        return None
+    output: dict[str, float] = {}
+    for key in ("x", "y", "width", "height"):
+        number = _bounded_number(value.get(key), minimum=0, maximum=16384)
+        if number is None:
+            return None
+        output[key] = number
+    if (
+        output["width"] <= 0
+        or output["height"] <= 0
+        or output["x"] + output["width"] > frame_size["width"] + 0.5
+        or output["y"] + output["height"] > frame_size["height"] + 0.5
+    ):
+        return None
+    return output
+
+
+def _sanitize_composition_check(
+    value: Any,
+    *,
+    scope: str,
+    source_sha256: str,
+    media_sha256: str,
+    frame_size: dict[str, int],
+    render_duration_s: float,
+    time_map: list[dict[str, float]],
+) -> dict[str, Any]:
+    fallback = _composition_fallback(
+        scope=scope,
+        source_sha256=source_sha256,
+        media_sha256=media_sha256,
+        frame_size=frame_size,
+    )
+    top_keys = {
+        "version", "scope", "measurement", "status", "source_sha256",
+        "media_sha256", "frame_size", "sample_count", "measured_count",
+        "elapsed_s", "engines", "samples", "findings",
+    }
+    if not isinstance(value, dict) or set(value) != top_keys:
+        return fallback
+    if (
+        value.get("version") != 1
+        or value.get("scope") != scope
+        or value.get("scope") not in _COMPOSITION_SCOPES
+        or value.get("measurement") != "sampled-local-frames"
+        or value.get("status") not in _COMPOSITION_STATUSES
+        or value.get("source_sha256") != source_sha256
+        or value.get("media_sha256") != media_sha256
+    ):
+        return fallback
+    raw_size = value.get("frame_size")
+    if (
+        not isinstance(raw_size, dict)
+        or set(raw_size) != {"width", "height"}
+        or any(
+            isinstance(raw_size.get(key), bool)
+            or not isinstance(raw_size.get(key), int)
+            or not 0 < raw_size[key] <= 16384
+            for key in ("width", "height")
+        )
+        or raw_size != frame_size
+    ):
+        return fallback
+    sample_count = value.get("sample_count")
+    measured_count = value.get("measured_count")
+    elapsed = _bounded_number(value.get("elapsed_s"), minimum=0, maximum=60)
+    raw_samples = value.get("samples")
+    raw_findings = value.get("findings")
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or not 0 <= sample_count <= 8
+        or isinstance(measured_count, bool)
+        or not isinstance(measured_count, int)
+        or not 0 <= measured_count <= sample_count
+        or elapsed is None
+        or not isinstance(raw_samples, list)
+        or len(raw_samples) != sample_count
+        or not isinstance(raw_findings, list)
+        or len(raw_findings) > 32
+    ):
+        return fallback
+    engines = value.get("engines")
+    if (
+        not isinstance(engines, dict)
+        or set(engines) != {"faces", "ocr"}
+        or engines.get("faces") not in _COMPOSITION_FACE_ENGINES
+        or engines.get("ocr") not in _COMPOSITION_OCR_ENGINES
+    ):
+        return fallback
+    samples: list[dict[str, Any]] = []
+    declared_measured_seen = 0
+    semantic_unmeasured = False
+    sample_keys = {
+        "output_at", "source_at", "measured", "source_face_count",
+        "reference_face_count", "visible_face_count", "text_box_count",
+    }
+    for sample in raw_samples:
+        if not isinstance(sample, dict) or set(sample) != sample_keys:
+            return fallback
+        output_at = _bounded_number(
+            sample.get("output_at"), minimum=0, maximum=render_duration_s
+        )
+        source_at = _bounded_number(sample.get("source_at"), minimum=0)
+        if output_at is None or source_at is None:
+            return fallback
+        mapped_source = _composition_source_at(output_at, time_map)
+        if mapped_source is None or abs(mapped_source - source_at) > 0.03:
+            return fallback
+        measured = sample.get("measured")
+        if not isinstance(measured, bool):
+            return fallback
+        counts: dict[str, int] = {}
+        for key in (
+            "source_face_count", "reference_face_count",
+            "visible_face_count", "text_box_count",
+        ):
+            count = sample.get(key)
+            if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 10000:
+                return fallback
+            counts[key] = count
+        declared_measured_seen += int(measured)
+        if measured and any(
+            counts[key] <= 0
+            for key in (
+                "source_face_count", "reference_face_count", "visible_face_count"
+            )
+        ):
+            measured = False
+            semantic_unmeasured = True
+        samples.append(
+            {
+                "output_at": output_at,
+                "source_at": source_at,
+                "measured": measured,
+                **counts,
+            }
+        )
+    if declared_measured_seen != measured_count:
+        return fallback
+    findings: list[dict[str, Any]] = []
+    finding_keys = {"kind", "output_at", "source_at", "subject_box", "text_box"}
+    for finding in raw_findings:
+        if (
+            not isinstance(finding, dict)
+            or not set(finding).issubset(finding_keys)
+            or finding.get("kind") not in _COMPOSITION_FINDINGS
+        ):
+            return fallback
+        has_output = "output_at" in finding
+        has_source = "source_at" in finding
+        if has_output != has_source:
+            return fallback
+        clean: dict[str, Any] = {"kind": finding["kind"]}
+        if has_output:
+            output_at = _bounded_number(
+                finding.get("output_at"), minimum=0, maximum=render_duration_s
+            )
+            source_at = _bounded_number(finding.get("source_at"), minimum=0)
+            if output_at is None or source_at is None:
+                return fallback
+            mapped_source = _composition_source_at(output_at, time_map)
+            if mapped_source is None or abs(mapped_source - source_at) > 0.03:
+                return fallback
+            clean.update({"output_at": output_at, "source_at": source_at})
+        for key in ("subject_box", "text_box"):
+            if key in finding:
+                box = _sanitize_composition_box(finding.get(key), frame_size)
+                if box is None:
+                    return fallback
+                clean[key] = box
+        if finding["kind"] == "text_subject_overlap" and not {
+            "output_at", "source_at", "subject_box", "text_box"
+        }.issubset(clean):
+            return fallback
+        findings.append(clean)
+    sanitized_measured_count = sum(int(sample["measured"]) for sample in samples)
+    capability_findings = {
+        "visibility_uncertain",
+        "source_subject_unmeasured",
+        "ocr_unavailable",
+        "reference_unavailable",
+        "analysis_incomplete",
+        "full_timeline_required",
+    }
+    status = value["status"]
+    incomplete = sanitized_measured_count != sample_count
+    unavailable_engine = engines != {
+        "faces": "opencv-yunet", "ocr": "macos-vision"
+    }
+    has_capability_finding = any(
+        finding["kind"] in capability_findings for finding in findings
+    )
+    legitimate_warn = bool(
+        sample_count
+        and not incomplete
+        and not unavailable_engine
+        and findings
+        and all(finding["kind"] == "text_subject_overlap" for finding in findings)
+    )
+    if status == "pass" and (
+        scope != "full-timeline"
+        or sample_count == 0
+        or incomplete
+        or findings
+        or unavailable_engine
+    ):
+        status = "unmeasured"
+        semantic_unmeasured = True
+    elif status == "warn" and not legitimate_warn:
+        status = "unmeasured"
+        semantic_unmeasured = True
+    elif status == "unmeasured":
+        semantic_unmeasured = True
+    if incomplete or unavailable_engine or has_capability_finding:
+        status = "unmeasured"
+        semantic_unmeasured = True
+    if semantic_unmeasured and not findings:
+        findings.append({"kind": "analysis_incomplete"})
+    return {
+        "version": 1,
+        "scope": scope,
+        "measurement": "sampled-local-frames",
+        "status": status,
+        "source_sha256": source_sha256,
+        "media_sha256": media_sha256,
+        "frame_size": dict(frame_size),
+        "sample_count": sample_count,
+        "measured_count": sanitized_measured_count,
+        "elapsed_s": elapsed,
+        "engines": dict(engines),
+        "samples": samples,
+        "findings": findings,
+    }
 
 
 def _regular_nonsymlink(path: Path) -> bool:
@@ -1214,6 +1521,7 @@ class FxPreviewJobManager:
             "material": material,
             "dependencies": digests,
             "tools": self._tool_identities(),
+            "composition_analysis": self._composition_analysis_identities(),
         }
         if options["mode"] == "timeline":
             snapshot["state_snapshot"] = deepcopy(state)
@@ -1277,6 +1585,7 @@ class FxPreviewJobManager:
                 "canvas",
                 "timeline_project_inputs",
                 "timeline_python_dependencies",
+                "composition_analysis",
             )
             if key in dependencies
         }
@@ -1468,6 +1777,39 @@ class FxPreviewJobManager:
                 identities[name] = None
         return identities
 
+    @staticmethod
+    def _composition_analysis_identities() -> dict[str, Any]:
+        scripts = Path(__file__).resolve().parent
+        files: dict[str, str | None] = {}
+        for name in (
+            "composite_check.py",
+            "composite_check_worker.py",
+            "vision_ocr.py",
+        ):
+            path = scripts / name
+            files[name] = _file_sha256(path) if _regular_nonsymlink(path) else None
+
+        def distribution_version(*names: str) -> str | None:
+            for name in names:
+                try:
+                    return importlib.metadata.version(name)
+                except importlib.metadata.PackageNotFoundError:
+                    continue
+            return None
+
+        return {
+            "files": files,
+            "native": {
+                "python": platform.python_version(),
+                "macos": platform.mac_ver()[0] or None,
+                "opencv": distribution_version(
+                    "opencv-python", "opencv-contrib-python", "opencv-python-headless"
+                ),
+                "pyobjc_core": distribution_version("pyobjc-core"),
+                "pyobjc_vision": distribution_version("pyobjc-framework-Vision"),
+            },
+        }
+
     def submit(self, body: Any) -> dict[str, Any]:
         self.prune()
         comparison_anchor_job_id = self._comparison_anchor_id(body)
@@ -1567,7 +1909,15 @@ class FxPreviewJobManager:
         }
         cache_media = self.cache_dir / f"{cache_key}.mp4"
         cache_receipt = self.cache_dir / f"{cache_key}.json"
-        cached = self._valid_cache_hit(cache_media, cache_receipt, cache_key)
+        cached = self._valid_cache_hit(
+            cache_media,
+            cache_receipt,
+            cache_key,
+            source_sha256=source_identity["sha256"],
+            sample_window=sample_window,
+            preview_options=preview_options,
+            frame_size=dependencies["canvas"],
+        )
         with self._lock:
             if comparison_anchor_job_id is not None:
                 anchor = self._jobs.get(comparison_anchor_job_id)
@@ -1619,7 +1969,17 @@ class FxPreviewJobManager:
             raise FxPreviewJobError(500, "worker_start_failed", "無法啟動本機 FX 預覽工作") from exc
         return self.public_job(job_id)
 
-    def _valid_cache_hit(self, media: Path, receipt_path: Path, cache_key: str) -> dict[str, Any] | None:
+    def _valid_cache_hit(
+        self,
+        media: Path,
+        receipt_path: Path,
+        cache_key: str,
+        *,
+        source_sha256: str,
+        sample_window: dict[str, float],
+        preview_options: dict[str, str],
+        frame_size: dict[str, int],
+    ) -> dict[str, Any] | None:
         self._assert_storage_safe("working", "root", "cache")
         cache_fd = self._storage_pins["cache"].fd
         try:
@@ -1640,10 +2000,36 @@ class FxPreviewJobManager:
         try:
             self._assert_storage_safe("working", "root", "cache")
             duration = float(receipt.get("duration_s"))
-            self.artifact_validator(media, duration)
+            metadata = self.artifact_validator(media, duration)
             self._assert_storage_safe("working", "root", "cache")
         except (TypeError, ValueError, OSError, subprocess.SubprocessError):
             return None
+        try:
+            time_map = self._normalized_time_map(
+                receipt.get("time_map"),
+                sample_window,
+                duration,
+                mode=preview_options["mode"],
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        actual_frame_size = {
+            "width": int(metadata.get("width", frame_size["width"])),
+            "height": int(metadata.get("height", frame_size["height"])),
+        }
+        composition_check = _sanitize_composition_check(
+            receipt.get("composition_check"),
+            scope=(
+                "full-timeline"
+                if preview_options["mode"] == "timeline"
+                else "single-effect"
+            ),
+            source_sha256=source_sha256,
+            media_sha256=actual,
+            frame_size=actual_frame_size,
+            render_duration_s=duration,
+            time_map=time_map,
+        )
         now = time.time()
         try:
             os.utime(media.name, (now, now), dir_fd=cache_fd, follow_symlinks=False)
@@ -1655,8 +2041,9 @@ class FxPreviewJobManager:
             "sha256": expected,
             "bytes": media_info.st_size,
             "duration_s": duration,
-            "time_map": receipt.get("time_map", []),
+            "time_map": time_map,
             "text_layout": _sanitize_text_layout(receipt.get("text_layout")),
+            "composition_check": composition_check,
         }
 
     @staticmethod
@@ -1704,7 +2091,7 @@ class FxPreviewJobManager:
                 or normalized["source_end_s"] > sample_end + 1e-6
                 or normalized["source_start_s"] < previous_source_end - 1e-6
                 or normalized["source_end_s"] <= normalized["source_start_s"]
-                or normalized["output_start_s"] < previous_output_end - 1e-6
+                or abs(normalized["output_start_s"] - previous_output_end) > 1e-6
                 or normalized["output_end_s"] <= normalized["output_start_s"]
                 or normalized["output_end_s"] > render_duration_s + 1e-6
             ):
@@ -1990,6 +2377,23 @@ class FxPreviewJobManager:
             size = output_info.st_size
             if size <= 0 or size > MAX_PREVIEW_BYTES:
                 raise ValueError("preview size invalid")
+            actual_frame_size = {
+                "width": int(metadata.get("width", deps["canvas"]["width"])),
+                "height": int(metadata.get("height", deps["canvas"]["height"])),
+            }
+            composition_check = _sanitize_composition_check(
+                result.get("composition_check"),
+                scope=(
+                    "full-timeline"
+                    if preview_options["mode"] == "timeline"
+                    else "single-effect"
+                ),
+                source_sha256=source["sha256"],
+                media_sha256=digest,
+                frame_size=actual_frame_size,
+                render_duration_s=render_duration,
+                time_map=time_map,
+            )
             receipt = {
                 "schema_version": 1,
                 "cache_key": job["cache_key"],
@@ -1998,6 +2402,7 @@ class FxPreviewJobManager:
                 "duration_s": metadata.get("duration_s", render_duration),
                 "time_map": time_map,
                 "text_layout": text_layout,
+                "composition_check": composition_check,
                 "created_at": time.time(),
             }
             self._touch_renderer_cache()
@@ -2038,6 +2443,7 @@ class FxPreviewJobManager:
                             "duration_s": receipt["duration_s"],
                             "time_map": time_map,
                             "text_layout": text_layout,
+                            "composition_check": composition_check,
                         },
                         "error": None,
                     }
@@ -2227,7 +2633,7 @@ class FxPreviewJobManager:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=codec_name:format=duration",
+                "stream=codec_name,width,height:format=duration",
                 "-of",
                 "json",
                 str(path),
@@ -2242,7 +2648,11 @@ class FxPreviewJobManager:
             raise ValueError("preview MP4 has no visual stream")
         if abs(duration - expected_duration) > max(0.25, expected_duration * 0.1):
             raise ValueError("preview MP4 duration mismatch")
-        return {"duration_s": duration}
+        stream = payload["streams"][0]
+        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+        if not 0 < width <= 16384 or not 0 < height <= 16384:
+            raise ValueError("preview MP4 frame size is invalid")
+        return {"duration_s": duration, "width": width, "height": height}
 
     def _finish_failed(self, job_id: str, code: str, message: str) -> None:
         job = self._jobs.get(job_id)
@@ -2415,6 +2825,8 @@ class FxPreviewJobManager:
             public["time_map"] = deepcopy(media.get("time_map") or [])
             if media.get("text_layout") is not None:
                 public["text_layout"] = deepcopy(media["text_layout"])
+            if media.get("composition_check") is not None:
+                public["composition_check"] = deepcopy(media["composition_check"])
         if isinstance(job.get("error"), dict):
             public["error"] = dict(job["error"])
         return public

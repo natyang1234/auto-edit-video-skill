@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="/fx-preview-panel.css">
     <link rel="stylesheet" href="/style-presets.css">
     <link rel="stylesheet" href="/fx-comparison.css">
+    <link rel="stylesheet" href="/fx-composite-check.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
@@ -711,12 +712,26 @@
             <p id="fx-preview-status" class="fx-preview-status" role="status" aria-live="polite">尚未選擇風格。</p>
             <div class="fx-preview-layout-check" id="fx-preview-layout-check" hidden aria-labelledby="fx-preview-layout-check-heading">
               <div class="fx-preview-layout-check-head">
-                <h3 class="fx-preview-subheading" id="fx-preview-layout-check-heading">畫面檢查</h3>
+                <h3 class="fx-preview-subheading" id="fx-preview-layout-check-heading">特效排版</h3>
                 <button class="button button-secondary fx-preview-layout-check-toggle" id="fx-preview-layout-check-toggle" type="button" aria-expanded="false" aria-controls="fx-preview-layout-check-list">查看細節</button>
               </div>
+              <p class="fx-preview-layout-check-note">只反映目前特效的排版提示，不是整段成片的完整畫面檢查。</p>
               <p class="fx-preview-layout-check-summary" id="fx-preview-layout-check-summary"></p>
               <ul class="fx-preview-layout-check-list" id="fx-preview-layout-check-list" hidden></ul>
             </div>
+            <section class="fx-preview-composition-check" id="fx-preview-composition-check" hidden aria-labelledby="fx-preview-composition-check-heading">
+              <div class="fx-preview-composition-check-head">
+                <div>
+                  <h3 class="fx-preview-subheading" id="fx-preview-composition-check-heading">完整畫面檢查</h3>
+                  <p class="fx-preview-composition-check-kicker">抽樣檢查完成畫面與來源人物位置</p>
+                </div>
+                <span class="fx-preview-composition-check-status" id="fx-preview-composition-check-status" aria-live="polite"></span>
+              </div>
+              <p class="fx-preview-composition-check-summary" id="fx-preview-composition-check-summary" role="status" aria-live="polite"></p>
+              <p class="fx-preview-composition-check-samples" id="fx-preview-composition-check-samples"></p>
+              <ul class="fx-preview-composition-check-list" id="fx-preview-composition-check-list" aria-label="完整畫面檢查提醒"></ul>
+              <button class="button button-secondary fx-preview-composition-check-switch" id="fx-preview-composition-switch-timeline" type="button" hidden>檢查完整時間軸</button>
+            </section>
           </div>
 
           <div class="fx-preview-settings">

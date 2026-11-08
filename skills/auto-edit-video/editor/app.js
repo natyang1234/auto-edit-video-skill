@@ -44,6 +44,10 @@ let fxPreviewJob = null;
 // separate from the job that is running (and eventually confirmable).
 let fxPreviewVisibleJob = null;
 let fxPreviewVisibleMeta = null;
+// Metadata callbacks can arrive after a different comparison candidate has
+// become current. Every visible-media replacement advances this token so an
+// old event cannot seek the newly selected video pair.
+let fxPreviewVisibleMediaToken = 0;
 let fxPreviewPollTimer = null;
 let fxPreviewDebounceTimer = null;
 let fxPreviewCancelPromise = null;
@@ -188,6 +192,9 @@ function cacheElements() {
     "fx-preview-video", "fx-preview-source-video", "fx-preview-source-time", "fx-preview-effect-time",
     "fx-preview-layout-check", "fx-preview-layout-check-heading", "fx-preview-layout-check-toggle",
     "fx-preview-layout-check-summary", "fx-preview-layout-check-list",
+    "fx-preview-composition-check", "fx-preview-composition-check-heading", "fx-preview-composition-check-status",
+    "fx-preview-composition-check-summary", "fx-preview-composition-check-samples", "fx-preview-composition-check-list",
+    "fx-preview-composition-switch-timeline",
     "fx-preview-resync", "fx-preview-draft-notice", "fx-preview-draft-copy", "fx-preview-restore-draft",
     "fx-preview-discard-draft", "fx-preview-retry", "fx-preview-cancel-upgrade", "fx-preview-cancel", "fx-preview-confirm"
   ].forEach((id) => { elements[id] = byId(id); });
@@ -2302,15 +2309,15 @@ function fxPreviewRenderTextLayout(textLayout = null) {
   }
 
   if (disabled) {
-    summary.textContent = `畫面檢查：${FX_PREVIEW_LAYOUT_CHECK_DISABLED}`;
+    summary.textContent = `特效排版：${FX_PREVIEW_LAYOUT_CHECK_DISABLED}`;
   } else if (unavailable) {
-    summary.textContent = `畫面檢查：${FX_PREVIEW_LAYOUT_CHECK_UNAVAILABLE}`;
+    summary.textContent = `特效排版：${FX_PREVIEW_LAYOUT_CHECK_UNAVAILABLE}`;
   } else if (status === "warn" || details.length) {
     summary.textContent = details.length
-      ? `畫面檢查：有 ${details.length} 項提醒`
-      : "畫面檢查：有提醒，請看畫面確認";
+      ? `特效排版：有 ${details.length} 項提醒`
+      : "特效排版：有提醒，請看畫面確認";
   } else {
-    summary.textContent = "畫面檢查：通過";
+    summary.textContent = "特效排版：通過";
   }
   details.forEach((detail) => {
     const item = document.createElement("li");
@@ -2329,6 +2336,387 @@ function fxPreviewToggleTextLayoutDetails() {
   list.hidden = expanded;
   toggle.setAttribute("aria-expanded", String(!expanded));
   toggle.textContent = expanded ? "查看細節" : "收合細節";
+}
+
+const FX_PREVIEW_COMPOSITION_FINDING_LABELS = Object.freeze({
+  text_subject_overlap: "文字可能遮住人物或臉",
+  visibility_uncertain: "人物是否被遮住，無法確認",
+  source_subject_unmeasured: "來源人物未能可靠量測",
+  ocr_unavailable: "文字辨識未完成",
+  reference_unavailable: "來源畫面參照未完成",
+  analysis_incomplete: "抽樣檢查未完成",
+  full_timeline_required: "完整畫面檢查需要完整時間軸",
+});
+const FX_PREVIEW_COMPOSITION_FINDING_KINDS = new Set(Object.keys(FX_PREVIEW_COMPOSITION_FINDING_LABELS));
+const FX_PREVIEW_COMPOSITION_RECEIPT_KEYS = new Set([
+  "version", "scope", "measurement", "status", "source_sha256", "media_sha256", "frame_size",
+  "sample_count", "measured_count", "elapsed_s", "engines", "samples", "findings",
+]);
+const FX_PREVIEW_COMPOSITION_SAMPLE_KEYS = new Set([
+  "output_at", "source_at", "measured", "source_face_count", "reference_face_count",
+  "visible_face_count", "text_box_count",
+]);
+const FX_PREVIEW_COMPOSITION_FINDING_KEYS = new Set([
+  "kind", "output_at", "source_at", "subject_box", "text_box",
+]);
+const FX_PREVIEW_COMPOSITION_ENGINE_KEYS = new Set(["faces", "ocr"]);
+const FX_PREVIEW_COMPOSITION_FRAME_KEYS = new Set(["width", "height"]);
+const FX_PREVIEW_COMPOSITION_BOX_KEYS = new Set(["x", "y", "width", "height"]);
+const FX_PREVIEW_COMPOSITION_SHA_RE = /^[0-9a-f]{64}$/;
+const FX_PREVIEW_COMPOSITION_UNMEASURED = "完整畫面檢查：目前無法可靠量測，請看預覽確認。";
+
+function fxPreviewFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function fxPreviewNonNegativeInteger(value, max = 1000000) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= max ? number : null;
+}
+
+function fxPreviewCompositionMapSegments(job) {
+  if (!Array.isArray(job?.time_map)) return [];
+  const segments = job.time_map.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const outputStart = fxPreviewFiniteNumber(item.output_start_s);
+    const outputEnd = fxPreviewFiniteNumber(item.output_end_s);
+    const sourceStart = fxPreviewFiniteNumber(item.source_start_s);
+    const sourceEnd = fxPreviewFiniteNumber(item.source_end_s);
+    if ([outputStart, outputEnd, sourceStart, sourceEnd].some((value) => value === null)
+      || outputStart < 0 || sourceStart < 0 || outputEnd <= outputStart || sourceEnd <= sourceStart) return null;
+    return { outputStart, outputEnd, sourceStart, sourceEnd };
+  }).filter(Boolean);
+  if (!segments.length || segments[0].outputStart > 0.012) return [];
+  for (let index = 1; index < segments.length; index += 1) {
+    const previous = segments[index - 1];
+    const current = segments[index];
+    if (Math.abs(current.outputStart - previous.outputEnd) > 0.012
+      || current.sourceStart < previous.sourceEnd - 0.012) return [];
+  }
+  return segments;
+}
+
+function fxPreviewCompositionMapPair(outputAt, sourceAt, job, requireMetadata = false) {
+  const output = fxPreviewFiniteNumber(outputAt);
+  const source = fxPreviewFiniteNumber(sourceAt);
+  if (output === null || source === null || output < 0 || source < 0) return null;
+  const outputVideo = elements["fx-preview-video"];
+  const sourceVideo = elements["fx-preview-source-video"];
+  if (requireMetadata && (!outputVideo || !sourceVideo || outputVideo.readyState < 1 || sourceVideo.readyState < 1)) return null;
+  const outputDuration = fxPreviewFiniteNumber(job?.render_duration_s) ?? fxPreviewFiniteNumber(outputVideo?.duration);
+  const sourceDuration = fxPreviewFiniteNumber(sourceVideo?.duration) ?? fxPreviewFiniteNumber(duration());
+  if (outputDuration === null || sourceDuration === null
+    || output > outputDuration + 0.01 || source > sourceDuration + 0.01) return null;
+  const epsilon = 0.012;
+  for (const segment of fxPreviewCompositionMapSegments(job)) {
+    const outputInside = output >= segment.outputStart - epsilon && output <= segment.outputEnd + epsilon;
+    const sourceInside = source >= segment.sourceStart - epsilon && source <= segment.sourceEnd + epsilon;
+    if (!outputInside || !sourceInside) continue;
+    const outputSpan = segment.outputEnd - segment.outputStart;
+    const sourceSpan = segment.sourceEnd - segment.sourceStart;
+    const progress = Math.max(0, Math.min(1, (output - segment.outputStart) / outputSpan));
+    const expectedSource = segment.sourceStart + progress * sourceSpan;
+    if (Math.abs(expectedSource - source) <= 0.03) {
+      return { outputAt: output, sourceAt: source, segment };
+    }
+  }
+  return null;
+}
+
+function fxPreviewCompositionMapOutput(outputAt, job) {
+  const output = fxPreviewFiniteNumber(outputAt);
+  if (output === null || output < 0) return null;
+  const segment = fxPreviewCompositionMapSegments(job).find((item) => (
+    output >= item.outputStart - 0.012 && output <= item.outputEnd + 0.012
+  ));
+  if (!segment) return null;
+  const progress = Math.max(0, Math.min(1, (output - segment.outputStart) / (segment.outputEnd - segment.outputStart)));
+  return segment.sourceStart + progress * (segment.sourceEnd - segment.sourceStart);
+}
+
+function fxPreviewCompositionMapSource(sourceAt, job) {
+  const source = fxPreviewFiniteNumber(sourceAt);
+  if (source === null || source < 0) return null;
+  const segment = fxPreviewCompositionMapSegments(job).find((item) => (
+    source >= item.sourceStart - 0.012 && source <= item.sourceEnd + 0.012
+  ));
+  if (!segment) return null;
+  const progress = Math.max(0, Math.min(1, (source - segment.sourceStart) / (segment.sourceEnd - segment.sourceStart)));
+  return segment.outputStart + progress * (segment.outputEnd - segment.outputStart);
+}
+
+function fxPreviewCompositionBoxValid(box, frameSize) {
+  if (!box || typeof box !== "object" || Array.isArray(box)) return false;
+  if (Object.keys(box).some((key) => !FX_PREVIEW_COMPOSITION_BOX_KEYS.has(key))) return false;
+  const x = fxPreviewFiniteNumber(box.x);
+  const y = fxPreviewFiniteNumber(box.y);
+  const width = fxPreviewFiniteNumber(box.width);
+  const height = fxPreviewFiniteNumber(box.height);
+  const frameWidth = fxPreviewFiniteNumber(frameSize?.width);
+  const frameHeight = fxPreviewFiniteNumber(frameSize?.height);
+  return [x, y, width, height, frameWidth, frameHeight].every((value) => value !== null)
+    && width > 0 && height > 0 && x >= 0 && y >= 0
+    && x + width <= frameWidth + 0.01 && y + height <= frameHeight + 0.01;
+}
+
+function fxPreviewCompositionReceipt(raw, job) {
+  const fallback = {
+    version: 1,
+    scope: "",
+    measurement: "",
+    status: "unmeasured",
+    source_sha256: "",
+    media_sha256: "",
+    frame_size: null,
+    sample_count: null,
+    measured_count: null,
+    elapsed_s: null,
+    engines: {},
+    samples: [],
+    findings: [],
+    reason: "完整畫面檢查結果未提供",
+  };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fallback;
+  const receipt = deepCopy(raw);
+  const unknownReceiptKeys = Object.keys(receipt).some((key) => !FX_PREVIEW_COMPOSITION_RECEIPT_KEYS.has(key));
+  const inferredScope = job?.preview_options?.mode === "single"
+    ? "single-effect" : job?.preview_options?.mode === "timeline" ? "full-timeline" : "";
+  const scopeFieldValid = receipt.scope === "full-timeline" || receipt.scope === "single-effect";
+  const scope = scopeFieldValid
+    ? receipt.scope : inferredScope;
+  const measurement = receipt.measurement === "sampled-local-frames" ? receipt.measurement : "";
+  const status = ["pass", "warn", "unmeasured"].includes(receipt.status) ? receipt.status : "unmeasured";
+  const frameSize = receipt.frame_size && typeof receipt.frame_size === "object" && !Array.isArray(receipt.frame_size)
+    ? { width: fxPreviewFiniteNumber(receipt.frame_size.width), height: fxPreviewFiniteNumber(receipt.frame_size.height) }
+    : null;
+  const frameShapeValid = Boolean(receipt.frame_size && typeof receipt.frame_size === "object"
+    && !Array.isArray(receipt.frame_size)
+    && Object.keys(receipt.frame_size).every((key) => FX_PREVIEW_COMPOSITION_FRAME_KEYS.has(key)));
+  const frameValid = Boolean(frameSize && Number.isInteger(frameSize.width) && Number.isInteger(frameSize.height)
+    && frameSize.width > 0 && frameSize.height > 0 && frameSize.width <= 16384 && frameSize.height <= 16384);
+  const sampleCount = fxPreviewNonNegativeInteger(receipt.sample_count, 8);
+  const measuredCount = fxPreviewNonNegativeInteger(receipt.measured_count, 8);
+  const elapsed = fxPreviewFiniteNumber(receipt.elapsed_s);
+  const engines = receipt.engines && typeof receipt.engines === "object" && !Array.isArray(receipt.engines)
+    ? { faces: receipt.engines.faces, ocr: receipt.engines.ocr }
+    : {};
+  const enginesValid = engines.faces === "opencv-yunet" && engines.ocr === "macos-vision"
+    && Object.keys(receipt.engines || {}).every((key) => FX_PREVIEW_COMPOSITION_ENGINE_KEYS.has(key));
+  const rawSamples = Array.isArray(receipt.samples) ? receipt.samples : [];
+  const samplesShapeValid = rawSamples.length <= 8 && rawSamples.every((sample) => (
+    sample && typeof sample === "object" && !Array.isArray(sample)
+    && Object.keys(sample).every((key) => FX_PREVIEW_COMPOSITION_SAMPLE_KEYS.has(key))
+  ));
+  const samples = rawSamples.slice(0, 8).map((sample) => ({
+    output_at: fxPreviewFiniteNumber(sample?.output_at),
+    source_at: fxPreviewFiniteNumber(sample?.source_at),
+    measured: sample?.measured === true,
+    source_face_count: fxPreviewNonNegativeInteger(sample?.source_face_count, 64),
+    reference_face_count: fxPreviewNonNegativeInteger(sample?.reference_face_count, 64),
+    visible_face_count: fxPreviewNonNegativeInteger(sample?.visible_face_count, 64),
+    text_box_count: fxPreviewNonNegativeInteger(sample?.text_box_count, 128),
+  }));
+  const sampleValuesValid = samples.every((sample) => (
+    sample.output_at !== null && sample.source_at !== null && typeof sample.measured === "boolean"
+    && sample.source_face_count !== null && sample.reference_face_count !== null
+    && sample.visible_face_count !== null && sample.text_box_count !== null
+  ));
+  const rawFindings = Array.isArray(receipt.findings) ? receipt.findings : [];
+  const findingsShapeValid = rawFindings.length <= 32 && rawFindings.every((finding) => (
+    finding && typeof finding === "object" && !Array.isArray(finding)
+    && Object.keys(finding).every((key) => FX_PREVIEW_COMPOSITION_FINDING_KEYS.has(key))
+    && FX_PREVIEW_COMPOSITION_FINDING_KINDS.has(finding.kind)
+    && (finding.kind !== "text_subject_overlap"
+      || (Object.prototype.hasOwnProperty.call(finding, "subject_box")
+        && Object.prototype.hasOwnProperty.call(finding, "text_box")))
+  ));
+  const findings = rawFindings.slice(0, 32).map((finding) => {
+    const item = { kind: finding.kind };
+    for (const key of ["output_at", "source_at"]) {
+      if (Object.prototype.hasOwnProperty.call(finding, key)) item[key] = fxPreviewFiniteNumber(finding[key]);
+    }
+    for (const key of ["subject_box", "text_box"]) {
+      if (Object.prototype.hasOwnProperty.call(finding, key)) item[key] = deepCopy(finding[key]);
+    }
+    return item;
+  });
+  const samplePairsValid = samplesShapeValid && samples.every((sample) => (
+    sample.output_at !== null && sample.source_at !== null
+    && fxPreviewCompositionMapPair(sample.output_at, sample.source_at, job)
+  ));
+  const timedFindingsValid = findingsShapeValid && findings.every((finding) => {
+    const hasTimes = finding.output_at !== undefined || finding.source_at !== undefined;
+    if (!hasTimes) return true;
+    return finding.output_at !== null && finding.source_at !== undefined && finding.source_at !== null
+      && fxPreviewCompositionMapPair(finding.output_at, finding.source_at, job);
+  });
+  const boxesValid = findingsShapeValid && findings.every((finding) => (
+    (!Object.prototype.hasOwnProperty.call(finding, "subject_box") || fxPreviewCompositionBoxValid(finding.subject_box, frameSize))
+    && (!Object.prototype.hasOwnProperty.call(finding, "text_box") || fxPreviewCompositionBoxValid(finding.text_box, frameSize))
+  ));
+  const sourceSha = String(receipt.source_sha256 || "");
+  const mediaSha = String(receipt.media_sha256 || "");
+  const shaValid = FX_PREVIEW_COMPOSITION_SHA_RE.test(sourceSha)
+    && FX_PREVIEW_COMPOSITION_SHA_RE.test(mediaSha)
+    && sourceSha !== "0".repeat(64) && mediaSha !== "0".repeat(64);
+  const countsValid = sampleCount !== null && measuredCount !== null && measuredCount <= sampleCount
+    && sampleCount === rawSamples.length;
+  const baseValid = !unknownReceiptKeys && receipt.version === 1 && scopeFieldValid && Boolean(scope) && Boolean(measurement)
+    && frameShapeValid && frameValid && elapsed !== null && elapsed >= 0 && enginesValid && countsValid
+    && samplesShapeValid && sampleValuesValid && samplePairsValid && findingsShapeValid && timedFindingsValid && boxesValid;
+  const passValid = baseValid && shaValid && scope === "full-timeline" && status === "pass"
+    && sampleCount > 0 && measuredCount === sampleCount && samples.length === sampleCount
+    && samples.every((sample) => sample.measured === true && sample.source_face_count !== null
+      && sample.reference_face_count !== null && sample.visible_face_count !== null && sample.text_box_count !== null)
+    && findings.length === 0;
+  let safeStatus = status;
+  let reason = "";
+  if (!baseValid || (status === "pass" && !passValid)) {
+    safeStatus = "unmeasured";
+    reason = "完整畫面檢查結果不完整，無法可靠判定";
+  }
+  return {
+    version: 1,
+    scope,
+    measurement,
+    status: safeStatus,
+    source_sha256: sourceSha,
+    media_sha256: mediaSha,
+    frame_size: frameValid ? frameSize : null,
+    sample_count: countsValid ? sampleCount : null,
+    measured_count: countsValid ? measuredCount : null,
+    elapsed_s: elapsed !== null && elapsed >= 0 ? elapsed : null,
+    engines: enginesValid ? engines : {},
+    samples,
+    findings: findingsShapeValid ? findings : [],
+    reason,
+  };
+}
+
+function fxPreviewCompositionFindingLabel(finding) {
+  return FX_PREVIEW_COMPOSITION_FINDING_LABELS[finding?.kind] || "檢查提醒";
+}
+
+function fxPreviewCompositionStatusLabel(status) {
+  return status === "pass" ? "抽樣通過" : status === "warn" ? "有提醒" : "未量測";
+}
+
+function fxPreviewCompositionJumpToIssue(outputAt, sourceAt, job, token) {
+  if (token !== fxPreviewVisibleMediaToken || String(fxPreviewVisibleJob?.id || "") !== String(job?.id || "")) return;
+  const pair = fxPreviewCompositionMapPair(outputAt, sourceAt, job, true);
+  const source = elements["fx-preview-source-video"];
+  const preview = elements["fx-preview-video"];
+  if (!pair || !source || !preview) {
+    fxPreviewSetStatus("這個提醒的時間目前無法可靠對應。", "error");
+    return;
+  }
+  source.pause();
+  preview.pause();
+  source.currentTime = pair.sourceAt;
+  preview.currentTime = pair.outputAt;
+  if (elements["fx-preview-source-time"]) elements["fx-preview-source-time"].textContent = formatTime(pair.sourceAt);
+  if (elements["fx-preview-effect-time"]) elements["fx-preview-effect-time"].textContent = formatTime(pair.outputAt);
+  fxPreviewSetStatus(`已停在原片 ${formatTime(pair.sourceAt)}／預覽 ${formatTime(pair.outputAt)}。`, "success");
+}
+
+function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisibleJob) {
+  const panel = elements["fx-preview-composition-check"];
+  const statusNode = elements["fx-preview-composition-check-status"];
+  const summary = elements["fx-preview-composition-check-summary"];
+  const samples = elements["fx-preview-composition-check-samples"];
+  const list = elements["fx-preview-composition-check-list"];
+  const switchButton = elements["fx-preview-composition-switch-timeline"];
+  if (!panel || !statusNode || !summary || !samples || !list || !switchButton) return;
+  panel.hidden = !job;
+  panel.removeAttribute("data-status");
+  statusNode.textContent = "";
+  summary.textContent = "";
+  samples.textContent = "";
+  list.replaceChildren();
+  switchButton.hidden = true;
+  switchButton.disabled = false;
+  if (!job) return;
+  const check = fxPreviewCompositionReceipt(rawCheck, job);
+  panel.dataset.status = check.status;
+  statusNode.textContent = fxPreviewCompositionStatusLabel(check.status);
+  const scopeSingle = check.scope === "single-effect"
+    || (check.scope === "" && !fxCompareActive && fxPreviewDraft?.preview_options?.mode === "single");
+  const fullTimelineRequired = check.findings.some((finding) => finding.kind === "full_timeline_required");
+  if (check.status === "pass") {
+    summary.textContent = `抽樣 ${check.sample_count} 個時間點，未發現明顯文字遮住人物；不代表每一格都已檢查。`;
+  } else if (scopeSingle && fullTimelineRequired) {
+    summary.textContent = "單一效果預覽不是完整時間軸，尚未完成完整畫面檢查。";
+  } else if (check.status === "warn") {
+    const count = check.findings.length;
+    summary.textContent = count ? `抽樣 ${check.sample_count ?? "—"} 個時間點，發現 ${count} 項提醒。` : "抽樣檢查有提醒，請看預覽確認。";
+  } else {
+    summary.textContent = scopeSingle
+      ? "單一效果預覽不是完整時間軸；目前無法可靠量測。"
+      : FX_PREVIEW_COMPOSITION_UNMEASURED;
+  }
+  samples.textContent = check.sample_count === null
+    ? "抽樣數量未能確認。"
+    : `抽樣 ${check.sample_count} 個時間點 · 完成量測 ${check.measured_count ?? "—"} 個`
+      + (check.elapsed_s === null ? "" : ` · 檢查耗時 ${check.elapsed_s.toFixed(1)} 秒`);
+  const token = fxPreviewVisibleMediaToken;
+  const visibleJob = deepCopy(job);
+  const timedGroups = new Map();
+  const untimedFindings = [];
+  check.findings.slice(0, 32).forEach((finding) => {
+    const hasTimes = finding.output_at !== undefined || finding.source_at !== undefined;
+    const pair = hasTimes ? fxPreviewCompositionMapPair(finding.output_at, finding.source_at, visibleJob, false) : null;
+    if (pair) {
+      const key = `${formatTime(pair.sourceAt)}|${formatTime(pair.outputAt)}`;
+      const group = timedGroups.get(key) || {
+        sourceAt: pair.sourceAt,
+        outputAt: pair.outputAt,
+        labels: [],
+      };
+      const label = fxPreviewCompositionFindingLabel(finding);
+      if (!group.labels.includes(label)) group.labels.push(label);
+      timedGroups.set(key, group);
+      return;
+    }
+    untimedFindings.push(finding);
+  });
+  [...timedGroups.values(), ...untimedFindings].forEach((entry) => {
+    const timed = Object.prototype.hasOwnProperty.call(entry, "sourceAt");
+    const item = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = timed ? entry.labels.join("、") : fxPreviewCompositionFindingLabel(entry);
+    item.append(label);
+    if (timed) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button button-secondary";
+      button.textContent = `查看原片時間 ${formatTime(entry.sourceAt)}`;
+      button.setAttribute("aria-label", `查看原片 ${formatTime(entry.sourceAt)}（預覽 ${formatTime(entry.outputAt)}）`);
+      button.dataset.outputAt = String(entry.outputAt);
+      button.dataset.sourceAt = String(entry.sourceAt);
+      button.addEventListener("focus", () => button.scrollIntoView({ block: "nearest" }));
+      button.addEventListener("click", () => fxPreviewCompositionJumpToIssue(
+        entry.outputAt, entry.sourceAt, visibleJob, token,
+      ));
+      item.append(button);
+    }
+    list.append(item);
+  });
+  if (check.status === "warn" && !check.findings.length) {
+    const item = document.createElement("li");
+    item.textContent = "抽樣結果需要人工看預覽確認。";
+    list.append(item);
+  }
+  const canSwitch = scopeSingle && !fxCompareActive && fxPreviewDraft?.preview_options?.mode !== "timeline";
+  switchButton.hidden = !canSwitch;
+  switchButton.disabled = fxCompareActive;
+}
+
+function fxPreviewSwitchToTimeline() {
+  if (fxCompareActive || !fxPreviewDraft || !elements["fx-preview-mode"]) return;
+  if (elements["fx-preview-mode"].value === "timeline") return;
+  elements["fx-preview-mode"].value = "timeline";
+  elements["fx-preview-mode"].dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 function fxPreviewUpdateWindowControls() {
@@ -2368,6 +2756,7 @@ function fxPreviewUpdateWindowControls() {
 }
 
 function fxPreviewSetVisibleMedia(job) {
+  fxPreviewVisibleMediaToken += 1;
   fxPreviewVisibleJob = job ? deepCopy(job) : null;
   if (!job) {
     fxPreviewVisibleMeta = null;
@@ -2378,25 +2767,27 @@ function fxPreviewSetVisibleMedia(job) {
     render_duration_s: Number.isFinite(renderDuration) ? renderDuration : null,
     time_map: Array.isArray(job.time_map) ? deepCopy(job.time_map) : [],
     text_layout: job.text_layout && typeof job.text_layout === "object" ? deepCopy(job.text_layout) : null,
+    composition_check: job.composition_check && typeof job.composition_check === "object"
+      ? deepCopy(job.composition_check) : null,
   };
   fxPreviewRenderTextLayout(fxPreviewVisibleMeta.text_layout);
+  fxPreviewRenderCompositionCheck(fxPreviewVisibleMeta.composition_check, fxPreviewVisibleJob);
 }
 
 function fxPreviewClearVisibleMedia() {
+  fxPreviewVisibleMediaToken += 1;
   fxPreviewVisibleJob = null;
   fxPreviewVisibleMeta = null;
   fxPreviewRenderTextLayout(null);
+  fxPreviewRenderCompositionCheck(null, null);
 }
 
 function fxPreviewSourceTimeForEffectTime(effectTime) {
   const map = Array.isArray(fxPreviewVisibleMeta?.time_map) ? fxPreviewVisibleMeta.time_map : [];
   const point = Math.max(0, Number(effectTime) || 0);
-  const segment = map.find((item) => point >= Number(item.output_start_s) - 0.001 && point <= Number(item.output_end_s) + 0.001);
-  if (segment) {
-    const outputSpan = Math.max(0.001, Number(segment.output_end_s) - Number(segment.output_start_s));
-    const progress = Math.max(0, Math.min(1, (point - Number(segment.output_start_s)) / outputSpan));
-    return Number(segment.source_start_s) + progress * (Number(segment.source_end_s) - Number(segment.source_start_s));
-  }
+  const mapped = fxPreviewCompositionMapOutput(point, fxPreviewVisibleJob);
+  if (mapped !== null) return mapped;
+  if (map.length) return null;
   return Math.max(0, Number(fxPreviewDraft?.window?.start_s || 0) + Math.max(0, Number(effectTime) || 0));
 }
 
@@ -2432,8 +2823,14 @@ function fxPreviewSyncVideos(origin = "effect") {
     ? Math.max(0, Number(source.currentTime) || 0)
     : fxPreviewSourceTimeForEffectTime(effect.currentTime);
   const effectTime = origin === "source"
-    ? Math.max(0, sourceTime - Number(fxPreviewDraft.window.start_s || 0))
+    ? fxPreviewCompositionMapSource(sourceTime, fxPreviewVisibleJob)
+      ?? (Array.isArray(fxPreviewVisibleMeta?.time_map) && fxPreviewVisibleMeta.time_map.length
+        ? null : Math.max(0, sourceTime - Number(fxPreviewDraft.window.start_s || 0)))
     : Math.max(0, Number(effect.currentTime) || 0);
+  if (sourceTime === null || effectTime === null) {
+    fxPreviewSyncing = false;
+    return;
+  }
   if (Math.abs(Number(source.currentTime || 0) - sourceTime) > 0.08) source.currentTime = sourceTime;
   if (Math.abs(Number(effect.currentTime || 0) - effectTime) > 0.08) effect.currentTime = effectTime;
   if (elements["fx-preview-source-time"]) elements["fx-preview-source-time"].textContent = formatTime(sourceTime);
@@ -2444,11 +2841,18 @@ function fxPreviewSyncVideos(origin = "effect") {
 function fxPreviewPrepareSourceVideo() {
   const source = elements["fx-preview-source-video"];
   if (!source || !sourceMediaUrl) return;
+  const mediaToken = fxPreviewVisibleMediaToken;
+  const visibleJobId = String(fxPreviewVisibleJob?.id || "");
+  const expectedSourceUrl = new URL(sourceMediaUrl, location.href).href;
   if (source.src !== new URL(sourceMediaUrl, location.href).href) {
     source.src = sourceMediaUrl;
     source.load();
   }
-  const setStart = () => fxPreviewSyncVideos("effect");
+  const setStart = () => {
+    if (mediaToken !== fxPreviewVisibleMediaToken || visibleJobId !== String(fxPreviewVisibleJob?.id || "")
+      || source.src !== expectedSourceUrl) return;
+    fxPreviewSyncVideos("effect");
+  };
   if (source.readyState >= 1) setStart();
   else source.addEventListener("loadedmetadata", setStart, { once: true });
 }
@@ -3028,7 +3432,7 @@ function fxCompareSetInteractionLocks() {
   const confirmationLocked = fxCompareConfirming;
   ["fx-preview-search", "fx-preview-source", "fx-preview-duration", "fx-preview-apply-source",
     "fx-preview-apply-duration", "fx-preview-mode", "fx-preview-quality", "fx-preview-text-fit",
-    "fx-preview-restore-draft", "fx-preview-discard-draft"].forEach((id) => {
+    "fx-preview-restore-draft", "fx-preview-discard-draft", "fx-preview-composition-switch-timeline"].forEach((id) => {
     if (elements[id]) elements[id].disabled = roundLocked;
   });
   document.querySelectorAll("#fx-preview-fields input, #fx-preview-fields select, #fx-preview-advanced-fields input, #fx-preview-advanced-fields select")
@@ -3082,6 +3486,7 @@ function fxCompareRender() {
     return card;
   }));
   fxCompareSetInteractionLocks();
+  if (fxPreviewVisibleMeta) fxPreviewRenderCompositionCheck(fxPreviewVisibleMeta.composition_check, fxPreviewVisibleJob);
 }
 
 function fxCompareEnter() {
@@ -3337,12 +3742,9 @@ async function fxCompareWaitTerminal(candidate, run, statusTimeoutMs = FX_PREVIE
 function fxCompareEffectTimeForSourceTime(sourceTime, job) {
   const map = Array.isArray(job?.time_map) ? job.time_map : [];
   const point = Math.max(0, Number(sourceTime) || 0);
-  const segment = map.find((item) => point >= Number(item.source_start_s) - 0.001 && point <= Number(item.source_end_s) + 0.001);
-  if (segment) {
-    const sourceSpan = Math.max(0.001, Number(segment.source_end_s) - Number(segment.source_start_s));
-    const progress = Math.max(0, Math.min(1, (point - Number(segment.source_start_s)) / sourceSpan));
-    return Number(segment.output_start_s) + progress * (Number(segment.output_end_s) - Number(segment.output_start_s));
-  }
+  const mapped = fxPreviewCompositionMapSource(point, job);
+  if (mapped !== null) return mapped;
+  if (map.length) return null;
   return Math.max(0, point - Number(fxCompareFrozen?.window?.start_s || 0));
 }
 
@@ -3381,7 +3783,7 @@ function fxCompareSelect(id) {
   const applyMedia = () => {
     if (!fxCompareSelectionCurrent(session, selectionToken, id, jobId)) return;
     if (sourceVideo) sourceVideo.currentTime = sourceTime;
-    video.currentTime = effectTime;
+    if (effectTime !== null) video.currentTime = effectTime;
     fxPreviewSyncVideos("effect");
     if (wasPlaying) {
       video.play().catch(() => {});
@@ -5427,6 +5829,7 @@ function bindEvents() {
     fxPreviewSetStatus("已取消清晰版；快速版仍可播放，但必須取得清晰版才能套用。", "error");
   });
   elements["fx-preview-layout-check-toggle"].addEventListener("click", fxPreviewToggleTextLayoutDetails);
+  elements["fx-preview-composition-switch-timeline"].addEventListener("click", fxPreviewSwitchToTimeline);
   elements["fx-preview-resync"].addEventListener("click", () => fxPreviewSyncVideos("effect"));
   elements["fx-preview-source-video"].addEventListener("play", () => fxPreviewPlayBoth("source"));
   elements["fx-preview-video"].addEventListener("play", () => fxPreviewPlayBoth("effect"));
