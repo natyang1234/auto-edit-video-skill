@@ -405,6 +405,21 @@ function repairProjectVersionsFocus(generation) {
   target?.focus();
 }
 
+function clearProjectVersionsView() {
+  projectVersionsDetailGeneration += 1;
+  projectVersionsPendingRestore = null;
+  projectVersionsSelected = null;
+  projectVersionsPayload = null;
+  projectVersionsCurrent = null;
+  projectVersionsCapacity = null;
+  elements["project-version-detail"].hidden = true;
+  elements["project-version-detail"].replaceChildren();
+  elements["project-version-detail-empty"].hidden = false;
+  elements["project-versions-list"].replaceChildren();
+  elements["project-versions-capacity"].textContent = "";
+  elements["project-version-save"].disabled = true;
+}
+
 function renderProjectVersions(payload) {
   const versions = Array.isArray(payload?.versions) ? payload.versions : [];
   projectVersionsPayload = payload || projectVersionsPayload;
@@ -440,12 +455,20 @@ function renderProjectVersions(payload) {
 
 async function loadProjectVersions() {
   const generation = ++projectVersionsGeneration;
+  clearProjectVersionsView();
   setProjectVersionsStatus("正在讀取版本…");
   try {
     const payload = await request("/api/project-versions");
-    if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return;
+    if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return false;
     renderProjectVersions(payload); setProjectVersionsStatus("");
-  } catch (error) { if (generation === projectVersionsGeneration && elements["project-versions-dialog"].open) setProjectVersionsStatus(`無法讀取版本：${error.message}`, true); }
+    return true;
+  } catch (error) {
+    if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return false;
+    clearProjectVersionsView();
+    setProjectVersionsStatus(`無法讀取版本：${error.message}`, true);
+    if (!projectVersionsMutationInFlight) repairProjectVersionsFocus(generation);
+    return false;
+  }
 }
 
 async function loadProjectVersionDetail(version) {
@@ -538,8 +561,12 @@ async function saveProjectVersion(event) {
       body: JSON.stringify({ name, ...versionTokens(projectVersionsCurrent) }),
     });
     elements["project-version-name"].value = "";
-    await loadProjectVersions();
-    setProjectVersionsStatus("版本已儲存。");
+    const refreshed = await loadProjectVersions();
+    if (refreshed) {
+      setProjectVersionsStatus("版本已儲存。");
+    } else if (refreshGeneration === projectVersionsGeneration && elements["project-versions-dialog"].open) {
+      setProjectVersionsStatus("版本已儲存，但無法更新版本清單，請關閉後重新開啟。", true);
+    }
   } catch (error) {
     await refreshProjectVersionsAfterFailure(projectVersionErrorMessage(error, "儲存版本"));
   } finally {
@@ -556,13 +583,17 @@ let projectVersionsCapacity = null;
 let projectVersionsPayload = null;
 async function refreshProjectVersionsAfterFailure(message, { restore = false } = {}) {
   const generation = ++projectVersionsGeneration;
-  projectVersionsDetailGeneration += 1; projectVersionsPendingRestore = null; projectVersionsSelected = null;
   if (restore && elements["project-version-restore-dialog"].open) elements["project-version-restore-dialog"].close();
-  elements["project-version-detail"].hidden = true; elements["project-version-detail-empty"].hidden = false;
-  projectVersionsPayload = null; projectVersionsCurrent = null; projectVersionsCapacity = null;
-  elements["project-version-save"].disabled = true; elements["project-versions-list"].replaceChildren();
-  try { const payload = await request("/api/project-versions"); if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return; renderProjectVersions(payload); setProjectVersionsStatus(message, true); }
-  catch (_error) { if (generation === projectVersionsGeneration) setProjectVersionsStatus(`${message}；無法更新版本清單，請關閉後重新開啟。`, true); }
+  clearProjectVersionsView();
+  try {
+    const payload = await request("/api/project-versions");
+    if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return;
+    renderProjectVersions(payload); setProjectVersionsStatus(message, true);
+  } catch (_error) {
+    if (generation === projectVersionsGeneration && elements["project-versions-dialog"].open) {
+      setProjectVersionsStatus(`${message}；無法更新版本清單，請關閉後重新開啟。`, true);
+    }
+  }
 }
 async function restoreProjectVersion() {
   if (!projectVersionsPendingRestore || projectVersionsMutationInFlight) return;
@@ -6864,8 +6895,6 @@ function bindEvents() {
     projectVersionsTrigger = event.currentTarget;
     if (projectVersionsBusy()) { showToast(projectVersionsBusyMessage(), "error"); return; }
     elements["project-versions-dialog"].showModal();
-    projectVersionsSelected = null; projectVersionsPendingRestore = null;
-    elements["project-version-detail"].hidden = true; elements["project-version-detail-empty"].hidden = false;
     await loadProjectVersions();
   });
   elements["project-versions-close"].addEventListener("click", () => { if (!projectVersionsMutationInFlight) elements["project-versions-dialog"].close(); });

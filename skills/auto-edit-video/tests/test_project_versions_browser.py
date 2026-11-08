@@ -50,6 +50,8 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
         held_restore = []
         restore_attempts = []
         held_lists = []
+        held_saved_refresh = []
+        saved_refresh = {"hold": False}
         list_modes = ["hold", "normal"]
         detail_mode = {"b": "full"}
         detail_requests = []
@@ -96,6 +98,9 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         mode = list_modes.pop(0)
                         if mode == "hold":
                             held_lists.append(route); return
+                    if saved_refresh["hold"]:
+                        saved_refresh["hold"] = False
+                        held_saved_refresh.append(route); return
                     if list_faults:
                         route.fulfill(status=list_faults.pop(0), json={"ok": False, "error": "list_unavailable", "error_code": "list_unavailable"}); return
                     route.fulfill(json={"ok": True, "versions": versions, "current": current, "capacity": capacity}); return
@@ -141,6 +146,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     return
                 if body.get("name") == "權限版本":
                     route.fulfill(status=503, json={"ok": False, "error": "version_permissions_repair_required", "error_code": "version_permissions_repair_required", "details": {"record_id": "pv_0123456789abcdef0123456789abcdef", "expected_mode": "0600", "current_mode": "0644", "relative_path": "working/project_versions/records/pv_0123456789abcdef0123456789abcdef.json", "repair_action": "restrict_to_owner"}})
+                    return
+                if body.get("name") == "儲存後清單失敗":
+                    saved_after_list_failure = {"version_id": "saved-after-list-failure", "name": "儲存後清單失敗", "kind": "named", "created_at": "2026-11-09T01:05:03Z", "state_digest": "state-saved-after-list-failure", "render_revision": "render-saved-after-list-failure"}
+                    versions.insert(0, saved_after_list_failure)
+                    capacity.update({"used": 4})
+                    saved_refresh["hold"] = True
+                    route.fulfill(status=201, json={"ok": True, "version": saved_after_list_failure, "current": current})
                     return
                 permanent_errors = {
                     "不支援快照": (409, "unsupported_snapshot"),
@@ -287,6 +299,16 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-version-restore-cancel").click()
             page.locator("#project-versions-close").click()
             self.assertEqual(page.evaluate("() => document.activeElement.id"), "project-versions-open")
+            list_faults.append(503)
+            page.locator("#project-versions-open").click()
+            page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('無法讀取版本')")
+            self.assertEqual(page.locator("#project-versions-list .project-version-row").count(), 0)
+            self.assertTrue(page.locator("#project-version-save").is_disabled())
+            self.assertEqual(page.locator("#project-versions-capacity").inner_text(), "")
+            self.assertTrue(page.locator("#project-version-detail").is_hidden())
+            self.assertEqual(page.locator("#project-version-detail").get_by_role("button", name="還原此版本").count(), 0)
+            page.locator("#project-versions-close").click()
+            self.assertEqual(page.evaluate("() => document.activeElement.id"), "project-versions-open")
             capacity.update({"used": 100, "named_save_available": False, "restore_backup_available": False})
             page.locator("#project-versions-open").click()
             page.locator(".project-version-row").nth(1).click()
@@ -302,6 +324,44 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-versions-close").click()
             page.locator("#project-versions-open").click()
             page.locator(".project-version-row").first.wait_for()
+            page.locator(".project-version-row").nth(1).click()
+            page.locator("#project-version-detail").get_by_text("差異尚未完整顯示").wait_for()
+            before_posts = len(posts)
+            before_lists = len(list_requests)
+            page.locator("#project-version-name").fill("儲存後清單失敗")
+            page.locator("#project-version-save").click()
+            page.wait_for_timeout(100)
+            self.assertEqual(len(held_saved_refresh), 1)
+            pending_refresh_state = page.evaluate("""() => ({
+              rows: document.querySelectorAll('#project-versions-list .project-version-row').length,
+              capacity: document.querySelector('#project-versions-capacity').textContent,
+              detailHidden: document.querySelector('#project-version-detail').hidden,
+              restoreActions: document.querySelectorAll('#project-version-detail button').length,
+              saveDisabled: document.querySelector('#project-version-save').disabled,
+            })""")
+            print(f"P7_PENDING saved_then_list_refresh={pending_refresh_state}", flush=True)
+            self.assertEqual(pending_refresh_state["rows"], 0)
+            self.assertEqual(pending_refresh_state["capacity"], "")
+            self.assertTrue(pending_refresh_state["detailHidden"])
+            self.assertEqual(pending_refresh_state["restoreActions"], 0)
+            self.assertTrue(pending_refresh_state["saveDisabled"])
+            held_saved_refresh[0].fulfill(status=503, json={"ok": False, "error": "list_unavailable", "error_code": "list_unavailable"})
+            page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('版本已儲存')")
+            status_after_saved_list_failure = page.locator("#project-versions-status").inner_text()
+            self.assertIn("版本已儲存，但無法更新版本清單", status_after_saved_list_failure)
+            self.assertTrue(page.locator("#project-versions-status").evaluate("el => el.classList.contains('is-error')"))
+            self.assertEqual(len(posts), before_posts + 1)
+            self.assertEqual(len(list_requests), before_lists + 1)
+            self.assertNotIn("儲存後清單失敗", page.locator("#project-versions-list").inner_text())
+            self.assertTrue(page.locator("#project-version-save").is_disabled())
+            self.assertTrue(page.locator("#project-version-detail").is_hidden())
+            self.assertEqual(page.locator("#project-version-detail").get_by_role("button", name="還原此版本").count(), 0)
+            assert_stable_project_versions_focus("saved_then_list_failure")
+            page.locator("#project-versions-close").click()
+            page.locator("#project-versions-open").click()
+            page.get_by_role("button", name="儲存後清單失敗").wait_for()
+            self.assertIn("儲存後清單失敗", page.locator("#project-versions-list").inner_text())
+
             before_posts = len(posts)
             before_lists = len(list_requests)
             page.locator("#project-version-name").fill("清單失敗版本")
