@@ -228,6 +228,37 @@ class FxComparisonBrowserTests(unittest.TestCase):
             self.assertEqual(len(posted[before:]), 3)
             browser.close()
 
+    def test_confirmed_comparison_unlocks_close_before_next_single_preview(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_comparison_api(page)
+            self.prepare_candidates(page)
+            page.locator("#fx-preview-compare-start").click()
+            page.wait_for_function(
+                "() => fxCompareCandidates.length === 3 && fxCompareCandidates.every(item => item.state === 'ready')"
+            )
+            page.locator("#fx-preview-compare-candidates [data-fx-compare-id]").first.click()
+            page.wait_for_function("() => !document.querySelector('#fx-preview-confirm').disabled")
+            page.locator("#fx-preview-confirm").click()
+            page.locator("#fx-preview-dialog").wait_for(state="hidden")
+            page.wait_for_function("() => !fxCompareActive && !fxCompareConfirming")
+
+            # A successful comparison advances its session. The reused close
+            # control must be unlocked before the next, independent preview.
+            page.locator('[data-add-type="fx"]').click()
+            page.locator("#fx-preview-dialog[open]").wait_for()
+            close_state = page.evaluate("""() => ({
+                disabled: document.querySelector('#fx-preview-close').disabled,
+                compare_active: fxCompareActive,
+                confirming: fxCompareConfirming,
+                session: fxCompareSession,
+            })""")
+            self.assertFalse(close_state["disabled"], close_state)
+            browser.close()
+
     def test_compare_start_retries_rejected_single_cancel_promise(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:

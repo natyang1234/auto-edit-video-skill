@@ -4271,7 +4271,12 @@ async function confirmFxPreview() {
     fxPreviewJob = null;
     clearTimeout(fxPreviewPollTimer);
     elements["fx-preview-video"].pause();
-    if (confirmSnapshot.comparison) fxCompareResetState();
+    if (confirmSnapshot.comparison) {
+      fxCompareResetState();
+      // Reset advances the session, so the finally block's session guard
+      // cannot re-render the reused dialog controls.
+      fxCompareRender();
+    }
     dialog.close("confirm");
   } catch (error) {
     if (error.status === 409) {
