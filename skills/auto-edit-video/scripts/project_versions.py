@@ -2,6 +2,9 @@
 
 This module owns only bounded JSON records and the three-file restore journal.
 Editor-specific validation (source/assets/plans) remains in ``editor_server``.
+Immutable no-overwrite publication requires same-filesystem hard-link support;
+there is deliberately no rename or direct-write fallback that could replace or
+partially expose a formal record.
 The threat model is a cooperative local writer; records are integrity checked,
 but their SHA-256 values are not authentication against a malicious account.
 """
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -29,6 +33,14 @@ MAX_RECORD_BYTES = 32 * 1024 * 1024
 MAX_JOURNAL_BYTES = 128 * 1024 * 1024
 VERSION_ID_RE = re.compile(r"pv_[0-9a-f]{32}")
 RECORD_TEMP_RE = re.compile(r"\.pv-record-[0-9a-f]{32}\.tmp")
+UNSUPPORTED_LINK_ERRNOS = frozenset(
+    {
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+        errno.ENOSYS,
+        errno.EPERM,
+    }
+)
 
 RESTORABLE_STATE_FIELDS = frozenset(
     {
@@ -611,6 +623,24 @@ class ProjectVersionStore:
         records: list[dict[str, Any]] = []
         removed_temporary = False
         for entry in sorted(os.scandir(self.records_dir), key=lambda item: item.name):
+            if entry.name == ".DS_Store":
+                try:
+                    metadata_info = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise ProjectVersionError(
+                        503,
+                        "version_recovery_required",
+                        "版本儲存區包含無法驗證的記錄",
+                    ) from exc
+                if not stat.S_ISREG(metadata_info.st_mode):
+                    raise ProjectVersionError(
+                        503,
+                        "version_recovery_required",
+                        "版本儲存區包含無法驗證的記錄",
+                    )
+                # Known Finder metadata is not a version record. Never read,
+                # remove, validate, or include it in capacity accounting.
+                continue
             if RECORD_TEMP_RE.fullmatch(entry.name) is not None:
                 try:
                     info = entry.stat(follow_symlinks=False)
@@ -760,7 +790,17 @@ class ProjectVersionStore:
 
                 # A hard link publishes the already-fsynced inode atomically
                 # without ever replacing an existing immutable record.
-                os.link(temporary, path, follow_symlinks=False)
+                try:
+                    os.link(temporary, path, follow_symlinks=False)
+                except OSError as exc:
+                    if exc.errno in UNSUPPORTED_LINK_ERRNOS:
+                        raise ProjectVersionError(
+                            503,
+                            "version_storage_unsupported",
+                            "目前專案位置不支援或不允許安全儲存版本；"
+                            "請將完整專案移到本機支援位置後重試",
+                        ) from exc
+                    raise
                 published = True
                 _fsync_directory(self.records_dir)
             except FileExistsError:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import json
@@ -1218,27 +1219,152 @@ class ProjectVersionsApiTests(unittest.TestCase):
         status, listing = self.request("GET", "/api/project-versions")
         self.assertEqual(status, 200, listing)
         current = listing["current"]
-        for name in (
-            "A\u0085B",
-            "A\u009fB",
-            "A\u2028B",
-            "A\u2029B",
-            "A\u2028",
-            "\u2029A",
-        ):
-            with self.subTest(name=name.encode("unicode_escape").decode("ascii")):
-                status, result = self.request(
-                    "POST",
-                    "/api/project-versions",
-                    {
-                        "name": name,
-                        "expected_state_digest": current["state_digest"],
-                        "expected_render_revision": current["render_revision"],
-                        "expected_manifest_digest": current["manifest_digest"],
-                    },
-                )
-                self.assertEqual(status, 422, result)
-                self.assertEqual(result["reason"], "validation_error")
+        capture_calls = 0
+        source_hash_calls = 0
+        source_path = (self.project / "source/original.mov").resolve()
+        real_capture = editor_server.EditorHandler._capture_project_version
+        real_hash = editor_server.file_sha256
+
+        def counted_capture(handler, store, **kwargs):
+            nonlocal capture_calls
+            capture_calls += 1
+            return real_capture(handler, store, **kwargs)
+
+        def counted_hash(path: Path) -> str:
+            nonlocal source_hash_calls
+            if path.resolve() == source_path:
+                source_hash_calls += 1
+            return real_hash(path)
+
+        with patch.object(
+            editor_server.EditorHandler,
+            "_capture_project_version",
+            new=counted_capture,
+        ), patch.object(editor_server, "file_sha256", side_effect=counted_hash):
+            for name in (
+                "A\u0085B",
+                "A\u009fB",
+                "A\u2028B",
+                "A\u2029B",
+                "A\u2028",
+                "\u2029A",
+            ):
+                with self.subTest(name=name.encode("unicode_escape").decode("ascii")):
+                    status, result = self.request(
+                        "POST",
+                        "/api/project-versions",
+                        {
+                            "name": name,
+                            "expected_state_digest": current["state_digest"],
+                            "expected_render_revision": current["render_revision"],
+                            "expected_manifest_digest": current["manifest_digest"],
+                        },
+                    )
+                    self.assertEqual(status, 422, result)
+                    self.assertEqual(result["reason"], "validation_error")
+        self.assertEqual(capture_calls, 0)
+        self.assertEqual(source_hash_calls, 0)
+        self.assertEqual(project_versions.ProjectVersionStore(self.project).list_records(), [])
+
+    def test_named_capacity_is_rejected_before_capture_or_source_hash(self) -> None:
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        capture_calls = 0
+        source_hash_calls = 0
+        source_path = (self.project / "source/original.mov").resolve()
+        real_capture = editor_server.EditorHandler._capture_project_version
+        real_hash = editor_server.file_sha256
+
+        def full_inventory(store):
+            return project_versions.ProjectVersionInventory(
+                store._inventory_key, [{}] * 99
+            )
+
+        def counted_capture(handler, store, **kwargs):
+            nonlocal capture_calls
+            capture_calls += 1
+            return real_capture(handler, store, **kwargs)
+
+        def counted_hash(path: Path) -> str:
+            nonlocal source_hash_calls
+            if path.resolve() == source_path:
+                source_hash_calls += 1
+            return real_hash(path)
+
+        with patch.object(
+            project_versions.ProjectVersionStore,
+            "inventory",
+            autospec=True,
+            side_effect=full_inventory,
+        ), patch.object(
+            editor_server.EditorHandler,
+            "_capture_project_version",
+            new=counted_capture,
+        ), patch.object(editor_server, "file_sha256", side_effect=counted_hash):
+            status, result = self.request(
+                "POST",
+                "/api/project-versions",
+                {
+                    "name": "capacity reserved",
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                },
+            )
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "version_capacity_reserved")
+        self.assertEqual(capture_calls, 0)
+        self.assertEqual(source_hash_calls, 0)
+        self.assertEqual(project_versions.ProjectVersionStore(self.project).list_records(), [])
+
+    def test_unsupported_hard_link_is_specific_and_writes_no_authority(self) -> None:
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        body = {
+            "name": "unsupported hard link",
+            "expected_state_digest": current["state_digest"],
+            "expected_render_revision": current["render_revision"],
+            "expected_manifest_digest": current["manifest_digest"],
+        }
+        authority_before = {
+            relative: (self.project / relative).read_bytes()
+            for relative in (
+                "project.json",
+                "working/rights_assertion.json",
+                "working/editor_state.json",
+            )
+        }
+        with patch.object(
+            project_versions.os,
+            "link",
+            side_effect=OSError(errno.ENOTSUP, "synthetic unsupported link"),
+        ) as unsupported_link:
+            status, result = self.request("POST", "/api/project-versions", body)
+        self.assertEqual(status, 503, result)
+        self.assertEqual(unsupported_link.call_count, 1)
+        self.assertEqual(result["reason"], "version_storage_unsupported")
+        self.assertNotIn(str(self.project), json.dumps(result, ensure_ascii=False))
+        self.assertEqual(set(result), {"ok", "reason", "error"})
+        self.assertEqual(project_versions.ProjectVersionStore(self.project).list_records(), [])
+        self.assertEqual(
+            authority_before,
+            {
+                relative: (self.project / relative).read_bytes()
+                for relative in authority_before
+            },
+        )
+
+        with patch.object(
+            project_versions.os,
+            "link",
+            side_effect=OSError(errno.EIO, "synthetic generic I/O"),
+        ) as failed_link:
+            status, result = self.request("POST", "/api/project-versions", body)
+        self.assertEqual(status, 503, result)
+        self.assertEqual(failed_link.call_count, 1)
+        self.assertEqual(result["reason"], "version_storage_unavailable")
         self.assertEqual(project_versions.ProjectVersionStore(self.project).list_records(), [])
 
     def test_mid_restore_http_failure_blocks_writes_then_restart_rolls_forward(self) -> None:

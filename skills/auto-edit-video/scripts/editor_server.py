@@ -6440,14 +6440,21 @@ class EditorHandler(BaseHTTPRequestHandler):
                 raise project_versions.ProjectVersionError(
                     422, "validation_error", "版本儲存請求欄位不完整"
                 )
+            normalized_name = project_versions.validate_name(body["name"])
             state, manifest, current = self._project_version_context()
             self._require_project_version_cas(body, current)
             serial_acquired = self._acquire_project_version_quiescence()
             store = project_versions.ProjectVersionStore(self.server.project_dir)
             inventory = store.inventory()
+            if not store.capacity(inventory)["named_save_available"]:
+                raise project_versions.ProjectVersionError(
+                    409,
+                    "version_capacity_reserved",
+                    "版本空間需保留給還原前自動備份",
+                )
             record = self._capture_project_version(
                 store,
-                name=body["name"],
+                name=normalized_name,
                 kind="named",
                 state=state,
                 manifest=manifest,

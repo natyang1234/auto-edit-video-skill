@@ -307,9 +307,12 @@ function projectVersionErrorMessage(error, action) {
     revision_conflict: "專案內容已變更，請關閉後重新查看差異。",
     project_busy: "專案正在處理中，完成後再試。",
     validation_error: "輸入內容不符合版本名稱規則，請檢查後再試。",
+    unsupported_snapshot: "此版本包含目前無法安全還原的專案內容，請保留版本並檢查專案設定。",
+    version_not_found: "找不到這個版本；請重新讀取版本清單後選擇仍存在的版本。",
     version_capacity_reserved: "版本容量已保留給還原前備份，目前不能新增命名版本。",
     version_capacity_exhausted: "版本容量已滿，無法執行此操作。系統不會自動清理版本。",
     version_storage_unavailable: "版本資料目前無法安全讀寫，請先重新讀取版本清單再試。",
+    version_storage_unsupported: "目前位置不支援必要的安全版本存檔。請將完整專案移到本機支援的位置後再試。",
     version_permissions_repair_required: "版本檔案的分享權限已變更。請在專案資料夾的 working/project_versions/records 中，將該版本檔設為僅本人可讀寫，再重新讀取清單。請勿刪除版本。",
     version_recovery_required: "版本紀錄需要安全復原，請先處理後再試。",
   };
@@ -497,7 +500,8 @@ function openProjectVersionRestore(response) {
   if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
   projectVersionsPendingRestore = { version: response.version, tokens: versionTokens(response.current) };
   elements["project-version-restore-name"].textContent = `要還原：「${response.version?.name || "此版本"}」`;
-  elements["project-version-restore-status"].textContent = "還原時會重新驗證來源影片與素材；若已變更，將停止還原。"; elements["project-version-restore-status"].classList.remove("is-error"); elements["project-version-restore-dialog"].showModal();
+  const dialog = elements["project-version-restore-dialog"]; dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  elements["project-version-restore-status"].textContent = "還原時會重新驗證來源影片與素材；若已變更，將停止還原。"; elements["project-version-restore-status"].classList.remove("is-error"); dialog.showModal();
 }
 
 async function saveProjectVersion(event) {
@@ -517,7 +521,7 @@ async function saveProjectVersion(event) {
     await loadProjectVersions();
     setProjectVersionsStatus("版本已儲存。");
   } catch (error) {
-    setProjectVersionsStatus(projectVersionErrorMessage(error, "儲存版本"), true);
+    await refreshProjectVersionsAfterFailure(projectVersionErrorMessage(error, "儲存版本"));
   } finally {
     projectVersionsMutationInFlight = false;
     if (elements["project-versions-dialog"].open && projectVersionsPayload) {
@@ -529,16 +533,24 @@ async function saveProjectVersion(event) {
 let projectVersionsCurrent = null;
 let projectVersionsCapacity = null;
 let projectVersionsPayload = null;
+async function refreshProjectVersionsAfterFailure(message, { restore = false } = {}) {
+  const generation = ++projectVersionsGeneration;
+  projectVersionsDetailGeneration += 1; projectVersionsPendingRestore = null; projectVersionsSelected = null;
+  if (restore && elements["project-version-restore-dialog"].open) elements["project-version-restore-dialog"].close();
+  elements["project-version-detail"].hidden = true; elements["project-version-detail-empty"].hidden = false;
+  projectVersionsPayload = null; projectVersionsCurrent = null; projectVersionsCapacity = null;
+  elements["project-version-save"].disabled = true; elements["project-versions-list"].replaceChildren();
+  try { const payload = await request("/api/project-versions"); if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return; renderProjectVersions(payload); setProjectVersionsStatus(message, true); }
+  catch (_error) { if (generation === projectVersionsGeneration) setProjectVersionsStatus(`${message}；無法更新版本清單，請關閉後重新開啟。`, true); }
+}
 async function restoreProjectVersion() {
   if (!projectVersionsPendingRestore || projectVersionsMutationInFlight) return;
   projectVersionsMutationInFlight = true; const dialog = elements["project-version-restore-dialog"]; dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   try { const result = await request(`/api/project-versions/${encodeURIComponent(projectVersionsPendingRestore.version.version_id)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...projectVersionsPendingRestore.tokens, confirm_restore: true }) }); if (!result?.reload_required) throw new Error("伺服器未確認還原完成"); window.location.replace(window.location.href); }
   catch (error) {
-    elements["project-version-restore-status"].textContent = projectVersionErrorMessage(error, "還原版本");
-    elements["project-version-restore-status"].classList.add("is-error");
-    dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+    await refreshProjectVersionsAfterFailure(projectVersionErrorMessage(error, "還原版本"), { restore: true });
   }
-  finally { projectVersionsMutationInFlight = false; }
+  finally { projectVersionsMutationInFlight = false; if (elements["project-versions-dialog"].open && projectVersionsPayload) renderProjectVersions(projectVersionsPayload); }
 }
 
 function setSaveState(label, mode = "dirty") {
@@ -7204,8 +7216,9 @@ function bindEvents() {
     if (elements["project-versions-dialog"]?.open || elements["project-version-restore-dialog"]?.open) {
       const tag = document.activeElement?.tagName;
       const isEditable = ["INPUT", "TEXTAREA"].includes(tag) || document.activeElement?.isContentEditable;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); return; }
       if (isEditable || (tag === "BUTTON" && event.code === "Space")) return;
-      if ((event.metaKey || event.ctrlKey) && ["s", "z"].includes(event.key.toLowerCase())) event.preventDefault();
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") event.preventDefault();
       if (event.code === "Space") event.preventDefault();
       return;
     }
