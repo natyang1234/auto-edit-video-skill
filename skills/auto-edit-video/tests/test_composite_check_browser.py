@@ -185,6 +185,86 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 }"""
             )
             self.assertEqual(result, "unmeasured")
+
+            # Receipt/time-map values arrive from JSON and must already be
+            # numbers. JavaScript coercion of null, booleans, arrays or numeric
+            # strings must never manufacture a trusted timestamp or count.
+            page.evaluate("""() => {
+                for (const id of ['fx-preview-video', 'fx-preview-source-video']) {
+                    const video = document.getElementById(id);
+                    video.src = '/media/source';
+                    video.load();
+                }
+            }""")
+            page.wait_for_function(
+                "() => document.querySelector('#fx-preview-video').readyState >= 1 && "
+                "document.querySelector('#fx-preview-source-video').readyState >= 1",
+                timeout=15000,
+            )
+            strict = page.evaluate(
+                """() => {
+                    const job = {render_duration_s: 1.6, time_map: [
+                        {output_start_s: 0, output_end_s: .8, source_start_s: 0, source_end_s: .8},
+                        {output_start_s: .8, output_end_s: 1.6, source_start_s: 1.2, source_end_s: 2},
+                    ]};
+                    const valid = {
+                        version: 1, scope: 'full-timeline', measurement: 'sampled-local-frames',
+                        status: 'warn', source_sha256: 'a'.repeat(64), media_sha256: 'b'.repeat(64),
+                        frame_size: {width: 360, height: 640}, sample_count: 1, measured_count: 1,
+                        elapsed_s: .1, engines: {faces: 'opencv-yunet', ocr: 'macos-vision'},
+                        samples: [{output_at: .2, source_at: .2, measured: true,
+                            source_face_count: 1, reference_face_count: 1, visible_face_count: 1,
+                            text_box_count: 0}],
+                        findings: [{kind: 'visibility_uncertain', output_at: .2, source_at: .2}],
+                    };
+                    const variants = [
+                        receipt => { receipt.findings[0].output_at = null; },
+                        receipt => { receipt.findings[0].source_at = []; },
+                        receipt => { receipt.samples[0].output_at = ''; },
+                        receipt => { receipt.sample_count = true; },
+                        receipt => { receipt.measured_count = '1'; },
+                        receipt => { receipt.frame_size.width = '360'; },
+                        receipt => { receipt.elapsed_s = []; },
+                    ];
+                    const statuses = variants.map(change => {
+                        const receipt = structuredClone(valid);
+                        change(receipt);
+                        return fxPreviewCompositionReceipt(receipt, job).status;
+                    });
+                    const malformedMapJob = {render_duration_s: 1.6, time_map: [
+                        {output_start_s: '0', output_end_s: .8, source_start_s: 0, source_end_s: .8},
+                    ]};
+                    const durationFallbackJob = {render_duration_s: null, time_map: job.time_map};
+                    fxPreviewSetVisibleMedia(durationFallbackJob);
+                    const malformedTimedFinding = structuredClone(valid);
+                    malformedTimedFinding.findings[0].output_at = null;
+                    malformedTimedFinding.findings[0].source_at = null;
+                    fxPreviewRenderCompositionCheck(malformedTimedFinding, job);
+                    return {
+                        finiteInvalid: [null, '', [], true, '0.2'].map(fxPreviewFiniteNumber),
+                        integerInvalid: [null, '', [], true, '1'].map(value => fxPreviewNonNegativeInteger(value, 8)),
+                        numericZero: [fxPreviewFiniteNumber(0), fxPreviewNonNegativeInteger(0, 8)],
+                        statuses,
+                        malformedMapPair: fxPreviewCompositionMapPair(0.2, 0.2, malformedMapJob),
+                        durationFallbackPair: fxPreviewCompositionMapPair(0.2, 0.2, durationFallbackJob),
+                        visibleDuration: fxPreviewVisibleMeta.render_duration_s,
+                        malformedStatus: document.querySelector('#fx-preview-composition-check').dataset.status,
+                        malformedButtonCount: document.querySelectorAll(
+                            '#fx-preview-composition-check-list button[data-source-at]'
+                        ).length,
+                    };
+                }"""
+            )
+            self.assertEqual(strict["finiteInvalid"], [None] * 5)
+            self.assertEqual(strict["integerInvalid"], [None] * 5)
+            self.assertEqual(strict["numericZero"], [0, 0])
+            self.assertEqual(strict["statuses"], ["unmeasured"] * 7)
+            self.assertIsNone(strict["malformedMapPair"])
+            self.assertAlmostEqual(strict["durationFallbackPair"]["outputAt"], 0.2)
+            self.assertAlmostEqual(strict["durationFallbackPair"]["sourceAt"], 0.2)
+            self.assertIsNone(strict["visibleDuration"])
+            self.assertEqual(strict["malformedStatus"], "unmeasured")
+            self.assertEqual(strict["malformedButtonCount"], 0)
             page.evaluate("() => { fxCompareActive = true; fxCompareRender(); }")
             self.assertFalse(switch.is_visible())
             browser.close()

@@ -349,6 +349,12 @@ def _read_bounded_json(path: Path, maximum: int) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _bounded_analysis_elapsed(started: float | None) -> float:
+    if started is None:
+        return 0.0
+    return round(min(60.0, max(0.0, time.monotonic() - started)), 3)
+
+
 def _run_composition_check(
     *,
     composite: Path,
@@ -862,7 +868,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
         if not media_ok(full, end - start):
             raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
         full_sha256 = file_digest(full)
-        optional_started = time.monotonic()
+        analysis_started: float | None = None
         try:
             reference_data = _reference_snapshot(snapshot, shadow, timeline)
             atomic_json(path, reference_data)
@@ -879,6 +885,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
             )
             if not media_ok(reference, end - start):
                 raise ValueError("reference video did not validate")
+            analysis_started = time.monotonic()
             composition_check = _run_composition_check(
                 composite=full,
                 reference=reference,
@@ -892,14 +899,14 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
                 scope="full-timeline",
                 frame_size=frame_size,
             )
-        except Exception:
+        except (Exception, SystemExit):
             composition_check = _composition_unmeasured(
                 scope="full-timeline",
                 source_sha256=source_sha256,
                 media_sha256=full_sha256,
                 frame_size=frame_size,
                 finding="reference_unavailable",
-                elapsed_s=time.monotonic() - optional_started,
+                elapsed_s=_bounded_analysis_elapsed(analysis_started),
             )
         if file_digest(full) != full_sha256:
             raise PreviewError("output_invalid", "時間軸預覽在診斷期間發生變更")

@@ -2366,13 +2366,12 @@ const FX_PREVIEW_COMPOSITION_SHA_RE = /^[0-9a-f]{64}$/;
 const FX_PREVIEW_COMPOSITION_UNMEASURED = "完整畫面檢查：目前無法可靠量測，請看預覽確認。";
 
 function fxPreviewFiniteNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function fxPreviewNonNegativeInteger(value, max = 1000000) {
-  const number = Number(value);
-  return Number.isInteger(number) && number >= 0 && number <= max ? number : null;
+  return typeof value === "number" && Number.isInteger(value)
+    && value >= 0 && value <= max ? value : null;
 }
 
 function fxPreviewCompositionMapSegments(job) {
@@ -2762,9 +2761,9 @@ function fxPreviewSetVisibleMedia(job) {
     fxPreviewVisibleMeta = null;
     return;
   }
-  const renderDuration = Number(job.render_duration_s);
+  const renderDuration = fxPreviewFiniteNumber(job.render_duration_s);
   fxPreviewVisibleMeta = {
-    render_duration_s: Number.isFinite(renderDuration) ? renderDuration : null,
+    render_duration_s: renderDuration,
     time_map: Array.isArray(job.time_map) ? deepCopy(job.time_map) : [],
     text_layout: job.text_layout && typeof job.text_layout === "object" ? deepCopy(job.text_layout) : null,
     composition_check: job.composition_check && typeof job.composition_check === "object"
