@@ -5002,11 +5002,6 @@ async function openFxPreviewDialog(trigger = document.activeElement, replaceOver
       // Material and subject belong to this project, never to the portable preset.
       if (overlay?.code === first.code && first.code === "B1") fxPreviewDraft.material = overlay.material ? deepCopy(overlay.material) : null;
       if (overlay?.code === first.code && first.code === "P5") fxPreviewDraft.subject = overlay.subject ? deepCopy(overlay.subject) : null;
-      // A manual path is also project-specific (source time and coordinates);
-      // never let a portable/brand preset transfer it across projects.
-      delete fxPreviewDraft.spotlight_path;
-      fxPreviewDraft.spotlight_mode = "automatic";
-      fxPreviewDraft.__spotlightModeOverride = "automatic";
     }
   }
   fxPreviewDraftSignature = fxPreviewSignature();
