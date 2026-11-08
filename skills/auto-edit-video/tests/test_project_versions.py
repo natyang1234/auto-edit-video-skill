@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,6 +118,82 @@ class ProjectVersionUnitTests(unittest.TestCase):
             store.list_records()
         self.assertEqual(caught.exception.code, "version_recovery_required")
 
+    def test_partial_write_and_file_fsync_faults_never_publish_a_final_record(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        real_write = os.write
+
+        writes = 0
+
+        def partial_then_fail(descriptor: int, data: bytes | memoryview) -> int:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                return real_write(descriptor, bytes(data[:17]))
+            raise OSError("synthetic partial write")
+
+        with patch.object(project_versions.os, "write", side_effect=partial_then_fail):
+            with self.assertRaises(OSError):
+                self.create_record(store)
+        self.assertEqual(store.list_records(), [])
+        self.assertEqual(list(store.records_dir.iterdir()), [])
+
+        with patch.object(project_versions.os, "fsync", side_effect=OSError("synthetic fsync")):
+            with self.assertRaises(OSError):
+                self.create_record(store)
+        self.assertEqual(store.list_records(), [])
+        self.assertEqual(list(store.records_dir.iterdir()), [])
+
+    def test_leftover_temp_is_cleaned_but_corrupt_final_record_is_not_hidden(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        store.records_dir.mkdir(parents=True)
+        leftover = store.records_dir / f".pv-record-{'a' * 32}.tmp"
+        leftover.write_bytes(b"incomplete pre-publication bytes")
+        leftover.chmod(0o600)
+        self.assertEqual(store.list_records(), [])
+        self.assertFalse(leftover.exists())
+
+        corrupt = store.records_dir / f"pv_{'b' * 32}.json"
+        corrupt.write_bytes(b"truncated formal record")
+        corrupt.chmod(0o600)
+        with self.assertRaises(project_versions.ProjectVersionError) as caught:
+            store.list_records()
+        self.assertEqual(caught.exception.code, "version_recovery_required")
+
+    def test_duplicate_generated_id_never_overwrites_existing_record(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        first = self.create_record(store)
+        first_path = store.records_dir / f"{first['version_id']}.json"
+        first_bytes = first_path.read_bytes()
+        duplicate_hex = str(first["version_id"])[3:]
+        new_hex = "c" * 32
+        generated = [
+            uuid.UUID(hex=duplicate_hex),
+            uuid.UUID(hex="d" * 32),
+            uuid.UUID(hex=new_hex),
+            uuid.UUID(hex="e" * 32),
+        ]
+        with patch.object(project_versions.uuid, "uuid4", side_effect=generated):
+            second = self.create_record(store)
+        self.assertEqual(first_path.read_bytes(), first_bytes)
+        self.assertEqual(second["version_id"], f"pv_{new_hex}")
+        self.assertEqual(len(store.list_records()), 2)
+
+    def test_directory_fsync_failure_after_publish_preserves_complete_record(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        with patch.object(
+            project_versions,
+            "_fsync_directory",
+            side_effect=OSError("synthetic directory fsync failure"),
+        ):
+            with self.assertRaises(OSError):
+                self.create_record(store)
+        records = store.list_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["name"], "Version A")
+        self.assertFalse(
+            any(project_versions.RECORD_TEMP_RE.fullmatch(path.name) for path in store.records_dir.iterdir())
+        )
+
     def test_capacity_reserves_one_auto_backup_and_never_overwrites(self) -> None:
         store = project_versions.ProjectVersionStore(self.project)
         with patch.object(store, "list_records", return_value=[{}] * 99):
@@ -183,9 +261,7 @@ class ProjectVersionUnitTests(unittest.TestCase):
                     "_atomic_replace_exact",
                     side_effect=fail_after_selected_write,
                 ):
-                    with self.assertRaises(
-                        (OSError, project_versions.ProjectVersionRecoveryError)
-                    ):
+                    with self.assertRaises(project_versions.ProjectVersionRecoveryError):
                         project_versions.execute_restore(project, backup, targets)
                 self.assertTrue((project / project_versions.JOURNAL_REL).exists())
                 project_versions.recover_restore_transaction(project)
@@ -198,6 +274,52 @@ class ProjectVersionUnitTests(unittest.TestCase):
                     {"restored": "state"},
                 )
                 self.assertFalse((project / project_versions.JOURNAL_REL).exists())
+
+    def test_post_commit_cleanup_fsync_failure_rebuilds_committed_marker(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        backup = self.create_record(store)
+        targets = {
+            "project.json": project_versions.json_bytes({"restored": "manifest"}),
+            "working/rights_assertion.json": project_versions.json_bytes(
+                project_versions.empty_rights_assertion()
+            ),
+            "working/editor_state.json": project_versions.json_bytes(
+                {"restored": "state"}
+            ),
+        }
+        real_fsync_directory = project_versions._fsync_directory
+        calls = 0
+
+        def fail_once_after_committed_unlink(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 6:
+                self.assertFalse(
+                    (self.project / project_versions.JOURNAL_REL).exists()
+                )
+                raise OSError("synthetic committed cleanup fsync failure")
+            real_fsync_directory(path)
+
+        with patch.object(
+            project_versions,
+            "_fsync_directory",
+            side_effect=fail_once_after_committed_unlink,
+        ):
+            with self.assertRaises(project_versions.ProjectVersionRecoveryError):
+                project_versions.execute_restore(self.project, backup, targets)
+
+        journal_path = self.project / project_versions.JOURNAL_REL
+        self.assertTrue(journal_path.exists())
+        journal, _decoded = project_versions._read_journal(self.project)
+        self.assertEqual(journal["phase"], "committed")
+        for relative, expected in targets.items():
+            self.assertEqual((self.project / relative).read_bytes(), expected)
+        with self.assertRaises(project_versions.ProjectVersionRecoveryError):
+            project_versions.ensure_restore_ready(self.project)
+
+        project_versions.recover_restore_transaction(self.project)
+        self.assertFalse(journal_path.exists())
+        project_versions.ensure_restore_ready(self.project)
 
     def test_diff_is_current_to_saved_bounded_and_does_not_hide_resets(self) -> None:
         diff = project_versions.diff_values(

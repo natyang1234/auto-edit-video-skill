@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,9 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
 
     def setUp(self):
         base.EditorBrowserSmokeTests.setUp(self)
+        evidence_root = Path(os.environ.get("P7_UI_STUB_EVIDENCE_DIR", self.project / "qa/p7-ui-stub"))
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        self._stub_evidence_dir = evidence_root
         # The fixture's source binding is a real SHA of the generated video,
         # not the old fake-source shortcut used by some browser tests.
         source = self.project / "source/source.mp4"
@@ -68,6 +72,11 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/state/overlays/0/text", "kind": "changed", "saved_preview": f"{version['version_id']}-saved", "current_preview": "current"},
                         {"path": "/state/overlays/1/text", "kind": "changed", "saved_preview": '"true"', "current_preview": '"caption B"'},
                         {"path": "/state/custom/setting", "kind": "changed", "saved_preview": "null", "current_preview": "true"},
+                        {"path": "/state/segments/1/id", "kind": "changed", "saved_preview": '"segment-0000a002"', "current_preview": '"segment-0000b002"'},
+                        {"path": "/state/segments/1/source_start", "kind": "changed", "saved_preview": "1.05", "current_preview": "1.15"},
+                        {"path": "/state/segments/1/source_end", "kind": "changed", "saved_preview": "1.9", "current_preview": "1.95"},
+                        {"path": "/state/overlays/2/text", "kind": "changed", "saved_preview": '"segment-0000a002"', "current_preview": '"user caption"'},
+                        {"path": "/state/highlights/0/review_status", "kind": "changed", "saved_preview": '"pending"', "current_preview": '"approved"'},
                     ] + [
                         {"path": f"/state/overlays/{index + 2}/text", "kind": "changed", "saved_preview": f'"saved {index}"', "current_preview": f'"current {index}"'}
                         for index in range(78)
@@ -75,7 +84,6 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     reset_changes = [
                         {"path": "/manifest/approvals/timeline/note", "kind": "changed", "saved_preview": '"Invalidated note"', "current_preview": "null"},
                         {"path": "/rights_assertion/revision", "kind": "changed", "saved_preview": '"' + "a" * 64 + '"', "current_preview": '"' + "b" * 64 + '"'},
-                        {"path": "/state/highlights/0/review_status", "kind": "changed", "saved_preview": '"pending"', "current_preview": '"approved"'},
                     ]
                     if version["version_id"] == "b":
                         b_detail_requests[0] += 1
@@ -84,7 +92,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     if version["version_id"] == "b" and b_detail_requests[0] > 1:
                         changes = reset_changes[:1]
                         truncated = True
-                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "changes": changes}}
+                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": ["timeline"], "changes": changes}}
                     if version["version_id"] == "a/b":
                         held_details.setdefault("a", (route, payload)); return
                     route.fulfill(json=payload); return
@@ -102,7 +110,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.route("**/api/project-versions**", route)
             stage("goto")
             page.goto(f"http://{host}:{port}/", wait_until="domcontentloaded")
-            page.screenshot(path="/private/tmp/p7-project-versions-before-open.png", full_page=True)
+            page.screenshot(path=str(self._stub_evidence_dir / "before-open.png"), full_page=True)
             stage("open")
             page.locator("#project-versions-open").click()
             page.locator("#project-versions-dialog[open]").wait_for()
@@ -110,7 +118,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             for width in (1440, 1100, 390):
                 page.set_viewport_size({"width": width, "height": 900})
                 self.assertLessEqual(page.evaluate("() => document.documentElement.scrollWidth"), width)
-                page.screenshot(path=f"/private/tmp/p7-project-versions-{width}.png", full_page=True)
+                page.screenshot(path=str(self._stub_evidence_dir / f"viewport-{width}.png"), full_page=True)
             page.set_viewport_size({"width": 1100, "height": 900})
             page.locator(".project-version-row").first.click()
             page.locator(".project-version-row").nth(1).click()
@@ -121,9 +129,17 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertIn("b-saved", page.locator("#project-version-detail").inner_text())
             self.assertIn("目前：current → 還原為：b-saved", page.locator("#project-version-detail").inner_text())
             detail_text = page.locator("#project-version-detail").inner_text()
+            self.assertIn("還原時會重新驗證來源影片與素材；若已變更，將停止還原。", detail_text)
             self.assertIn("還原為：true", detail_text)
             self.assertIn("目前：啟用 → 還原為：未設定", detail_text)
-            self.assertIn("時間軸／素材權利／精華片段需重新確認", detail_text)
+            self.assertIn("目前：已核可 → 還原為：待確認", detail_text)
+            self.assertNotIn("目前：approved → 還原為：pending", detail_text)
+            self.assertIn("第2段開始時間", detail_text)
+            self.assertIn("第2段結束時間", detail_text)
+            self.assertIn("還原為：segment-0000a002", detail_text)
+            self.assertNotIn("目前：segment-0000b002", detail_text)
+            self.assertIn("時間軸需重新確認", detail_text)
+            self.assertNotIn("素材權利需重新確認", detail_text)
             self.assertNotIn("Invalidated note", detail_text)
             self.assertNotIn("a" * 64, detail_text)
             self.assertLess(detail_text.index("剪輯內容"), detail_text.index("重新確認"))
@@ -149,6 +165,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertEqual(sum(path == "/api/project-versions" for path, _body in posts), 3)
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             page.locator("#project-version-restore-dialog[open]").wait_for()
+            self.assertIn("還原時會重新驗證來源影片與素材；若已變更，將停止還原。", page.locator("#project-version-restore-status").inner_text())
             page.locator("#project-version-restore-confirm").click()
             self.assertTrue(page.locator("#project-version-restore-cancel").is_disabled())
             self.assertTrue(page.locator("#project-version-restore-dialog[open]").is_visible())
@@ -171,6 +188,6 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertNotIn("沒有需要直接還原的剪輯內容", metadata_only_text)
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             self.assertFalse(page.locator("#project-version-restore-dialog").evaluate("el => el.open"))
-            self.assertIn("不會自動清理", page.locator("#project-versions-status").inner_text())
+            self.assertIn("不會自動清理", page.locator("#project-versions-capacity").inner_text())
             stage("done")
             browser.close()
