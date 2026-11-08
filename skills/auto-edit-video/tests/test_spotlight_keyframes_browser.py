@@ -423,6 +423,231 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
             self.assertIn("有限數字", page.locator("#spotlight-validation").inner_text())
             browser.close()
 
+    def test_canonical_add_replaces_cap_and_preserves_incomplete_rows(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            page_errors = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function("() => fxPreviewDraft?.spotlight_path?.keyframes?.length === 2")
+
+            def seed_path(points):
+                page.evaluate(
+                    """(points) => {
+                        fxPreviewDraft.apply_window = {start_s: 0, duration_s: 2};
+                        fxPreviewDraft.spotlight_mode = 'manual';
+                        fxPreviewDraft.spotlight_path = {
+                            version: 1, interpolation: 'smoothstep', keyframes: points,
+                        };
+                        fxPreviewSpotlightSelectedIndex = -1;
+                        fxPreviewSpotlightRenderPanel();
+                    }""",
+                    points,
+                )
+                page.wait_for_function(
+                    "(count) => document.querySelectorAll('#spotlight-keyframe-list .spotlight-keyframe-row').length === count",
+                    arg=len(points),
+                )
+
+            seed_path([
+                {"source_at": 0, "x": 0.8, "y": 0.4},
+                {"source_at": 1, "x": 0.2, "y": 0.5},
+                {"source_at": 2, "x": 0.3, "y": 0.6},
+            ])
+            first_time = page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").first.locator("input").nth(0)
+            first_time.fill("0.0004")
+            first_time.evaluate("el => el.blur()")
+            page.wait_for_function("() => fxPreviewDraft.spotlight_path.keyframes[0].source_at === 0.0004")
+            unrelated_before = page.evaluate(
+                "() => structuredClone(fxPreviewDraft.spotlight_path.keyframes.slice(1))"
+            )
+            for selector, value in (
+                ("#spotlight-point-time", "0.0004"),
+                ("#spotlight-point-x", "0.200000"),
+                ("#spotlight-point-y", "0.700000"),
+            ):
+                page.locator(selector).fill(value)
+            page.locator("#spotlight-add-point").click()
+            under_cap = page.evaluate("""() => ({
+                path: structuredClone(fxPreviewDraft.spotlight_path.keyframes),
+                validation: document.querySelector('#spotlight-validation')?.textContent || '',
+            })""")
+            self.assertEqual(len(under_cap["path"]), 3)
+            self.assertEqual(under_cap["path"][0], {"source_at": 0, "x": 0.2, "y": 0.7})
+            self.assertEqual(under_cap["path"][1:], unrelated_before)
+
+            cap_points = [
+                {"source_at": 0.0004 if index == 0 else index * 2 / 63, "x": 0.8 if index == 0 else 0.2, "y": 0.5}
+                for index in range(64)
+            ]
+            seed_path(cap_points)
+            for selector, value in (
+                ("#spotlight-point-time", "0.0004"),
+                ("#spotlight-point-x", "0.200000"),
+                ("#spotlight-point-y", "0.500000"),
+            ):
+                page.locator(selector).fill(value)
+            page.locator("#spotlight-add-point").click()
+            replacement = page.evaluate("""() => ({
+                count: fxPreviewDraft.spotlight_path.keyframes.length,
+                first: structuredClone(fxPreviewDraft.spotlight_path.keyframes[0]),
+                validation: document.querySelector('#spotlight-validation')?.textContent || '',
+            })""")
+            self.assertEqual(replacement["count"], 64)
+            self.assertEqual(replacement["first"], {"source_at": 0, "x": 0.2, "y": 0.5})
+
+            for selector, value in (
+                ("#spotlight-point-time", "0.001000"),
+                ("#spotlight-point-x", "0.300000"),
+                ("#spotlight-point-y", "0.600000"),
+            ):
+                page.locator(selector).fill(value)
+            page.locator("#spotlight-add-point").click()
+            distinct = page.evaluate("""() => ({
+                count: fxPreviewDraft.spotlight_path.keyframes.length,
+                first: structuredClone(fxPreviewDraft.spotlight_path.keyframes[0]),
+                validation: document.querySelector('#spotlight-validation')?.textContent || '',
+            })""")
+            self.assertEqual(distinct["count"], 64)
+            self.assertEqual(distinct["first"], {"source_at": 0, "x": 0.2, "y": 0.5})
+            self.assertIn("最多 64", distinct["validation"])
+
+            seed_path([
+                {"source_at": 0, "x": 0.1, "y": 0.2},
+                {"source_at": 1, "x": 0.3, "y": 0.4},
+                {"source_at": 2, "x": 0.5, "y": 0.6},
+            ])
+            page.evaluate("() => { fxPreviewDraft.spotlight_path.keyframes[0].source_at = NaN; fxPreviewSpotlightRenderPanel(); }")
+            for selector, value in (
+                ("#spotlight-point-time", "0.001000"),
+                ("#spotlight-point-x", "0.700000"),
+                ("#spotlight-point-y", "0.800000"),
+            ):
+                page.locator(selector).fill(value)
+            page.locator("#spotlight-add-point").click()
+            incomplete = page.evaluate("""() => {
+                const path = fxPreviewDraft.spotlight_path.keyframes;
+                return {
+                    nanFirst: Number.isNaN(path[0].source_at),
+                    unchangedSecond: path.some(point => point.source_at === 1 && point.x === 0.3 && point.y === 0.4),
+                    validation: document.querySelector('#spotlight-validation')?.textContent || '',
+                };
+            }""")
+            self.assertTrue(incomplete["nanFirst"])
+            self.assertTrue(incomplete["unchangedSecond"])
+            self.assertEqual(page_errors, [])
+            browser.close()
+
+    def test_manual_pointer_geometry_svg_visibility_and_automatic_bottom_click(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function("() => { const v = document.querySelector('#fx-preview-source-video'); return v && v.readyState >= 1 && v.videoWidth > 0; }")
+            page.locator("#spotlight-source-stage").scroll_into_view_if_needed()
+
+            manual = page.evaluate("""() => {
+                const target = document.querySelector('#spotlight-source-click-target');
+                const svg = document.querySelector('#spotlight-path-overlay');
+                const stage = document.querySelector('#spotlight-source-stage').getBoundingClientRect();
+                const content = fxPreviewSpotlightContentRect();
+                const expectedBottom = content.videoRect.bottom - stage.top - 56;
+                const clampedBottom = Math.max(content.top, Math.min(content.top + content.height, expectedBottom));
+                const rect = target.getBoundingClientRect();
+                return {
+                    targetHidden: target.hidden,
+                    targetTop: rect.top - stage.top,
+                    targetBottom: rect.bottom - stage.top,
+                    expectedBottom: clampedBottom,
+                    svgDisplay: getComputedStyle(svg).display,
+                    content,
+                };
+            }""")
+            self.assertFalse(manual["targetHidden"])
+            self.assertAlmostEqual(manual["targetTop"], manual["content"]["top"], delta=1)
+            self.assertAlmostEqual(manual["targetBottom"], manual["expectedBottom"], delta=1)
+            self.assertNotEqual(manual["svgDisplay"], "none")
+
+            page.locator("#spotlight-mode-automatic").check()
+            page.wait_for_function("() => fxPreviewDraft?.spotlight_mode === 'automatic'")
+            automatic_hidden = page.evaluate("""() => ({
+                targetHidden: document.querySelector('#spotlight-source-click-target').hidden,
+                svgDisplay: getComputedStyle(document.querySelector('#spotlight-path-overlay')).display,
+            })""")
+            self.assertTrue(automatic_hidden["targetHidden"])
+            self.assertEqual(automatic_hidden["svgDisplay"], "none")
+
+            # Automatic mode keeps the original source-video click route.  A
+            # normal picture click stays an actual browser mouse event.
+            geometry = page.evaluate("""() => {
+                const video = document.querySelector('#fx-preview-source-video');
+                const content = fxPreviewSpotlightContentRect();
+                return {
+                    video: video.getBoundingClientRect().toJSON(),
+                    content,
+                };
+            }""")
+            page.evaluate("() => { fxPreviewDraft.subject = null; }")
+            video = geometry["video"]
+            content = geometry["content"]
+            page.locator("#fx-preview-source-video").click(
+                position={"x": video["width"] / 2, "y": video["height"] / 2}
+            )
+            subject = page.evaluate("() => fxPreviewDraft.subject")
+            self.assertIsNotNone(subject, geometry)
+
+            # The native control strip can consume a real mouse click.  Check
+            # the former lower-56 guard through a delivered event carrying real
+            # client coordinates, without pretending this is native-control
+            # acceptance.
+            lower_strip = page.evaluate("""() => {
+                const video = document.querySelector('#fx-preview-source-video');
+                const rect = video.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.bottom - 20;
+                fxPreviewDraft.subject = null;
+                video.dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: x, clientY: y}));
+                return {subject: fxPreviewDraft.subject, x, y, rect: rect.toJSON()};
+            }""")
+            self.assertIsNotNone(lower_strip["subject"], lower_strip)
+
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function("() => fxPreviewDraft?.spotlight_mode === 'manual'")
+            page.set_viewport_size({"width": 390, "height": 844})
+            page.evaluate("() => fxPreviewSpotlightRenderPanel()")
+            narrow = page.evaluate("""() => {
+                const target = document.querySelector('#spotlight-source-click-target');
+                const stage = document.querySelector('#spotlight-source-stage').getBoundingClientRect();
+                const content = fxPreviewSpotlightContentRect();
+                const rect = target.getBoundingClientRect();
+                const expectedBottom = content.videoRect.bottom - stage.top - 56;
+                return {
+                    targetHidden: target.hidden,
+                    targetTop: rect.top - stage.top,
+                    targetBottom: rect.bottom - stage.top,
+                    expectedBottom: Math.max(content.top, Math.min(content.top + content.height, expectedBottom)),
+                    content,
+                };
+            }""")
+            self.assertFalse(narrow["targetHidden"])
+            self.assertAlmostEqual(narrow["targetBottom"], narrow["expectedBottom"], delta=1)
+            browser.close()
+
     def test_manual_hold_resets_when_selecting_another_effect(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:

@@ -513,6 +513,28 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
             raise ManualSpotlightUnsupportedError(
                 "目前固定的聚光燈 renderer 不支援手動路徑，請重新載入相容版本"
             )
+        try:
+            # Match compose.render_clip's rounding and check order before
+            # expensive matte work.
+            total = compose.probe(os.path.abspath(source))["duration"]
+            requested_duration = round(float(dur), 3)
+            requested_end = round(start + requested_duration, 3)
+            source_end = round(total, 3)
+            if requested_end > source_end:
+                raise SystemExit(
+                    f"手動聚光燈時窗超出原片長：請求至 {requested_end:.3f}s，原片至 {source_end:.3f}s"
+                )
+            clipped_duration = round(min(float(dur), total - start), 3)
+            if clipped_duration <= 0:
+                raise SystemExit("秒數超出片長")
+            clipped_end = round(start + clipped_duration, 3)
+            if clipped_end != requested_end:
+                raise SystemExit(
+                    f"手動聚光燈時窗會因原片長裁短：請求至 {requested_end:.3f}s，實際僅能至 {clipped_end:.3f}s"
+                )
+        except SystemExit as exc:
+            _log({"layer": overlay.get("id"), "code": code, "error": str(exc)})
+            return None
     theme, main = theme_for_pack(pack_id)
     scheme = str(overlay.get("scheme") or "")
     values = {k: str(v) for k, v in (overlay.get("values") or {}).items()}
