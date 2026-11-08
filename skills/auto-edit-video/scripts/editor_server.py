@@ -41,6 +41,7 @@ import asset_registry
 import style_presets
 import contract_registry
 import delivery_envelope
+import project_versions
 from asset_provider_service import AssetProviderError, AssetProviderService
 from local_http_security import (
     csrf_token_matches,
@@ -1335,6 +1336,134 @@ def load_layer_bundle(project_dir: Path) -> tuple[dict[str, Any], dict[str, Any]
         "revision": "0" * 64,
     }
     return layers, visual_plan
+
+
+PROJECT_VERSION_DEPENDENCIES = (
+    Path("working/highlight_plan.json"),
+    LAYERS_REL,
+    VISUAL_PLAN_REL,
+)
+
+
+def project_version_tokens(
+    state: dict[str, Any], manifest: dict[str, Any]
+) -> dict[str, str]:
+    """Strict persisted-state CAS plus the narrower render identity."""
+    return {
+        "state_digest": project_versions.canonical_digest(state),
+        "render_revision": editor_state_revision(state),
+        "manifest_digest": project_versions.canonical_digest(manifest),
+    }
+
+
+def project_version_source_binding(
+    project_dir: Path, manifest: dict[str, Any], state: dict[str, Any]
+) -> dict[str, str]:
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    relative = str(source.get("staged_path") or "")
+    declared = str(source.get("sha256") or "")
+    if (
+        not relative
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+        or re.fullmatch(r"[0-9a-f]{64}", declared) is None
+        or state.get("source_sha256") != declared
+    ):
+        raise project_versions.ProjectVersionError(
+            409, "source_changed", "專案來源綁定已變更，無法建立或還原版本"
+        )
+    entry = project_dir / relative
+    try:
+        if entry.is_symlink():
+            raise ValueError("source is a symlink")
+        resolved = project_entry_path(project_dir, relative)
+    except (OSError, ValueError) as exc:
+        raise project_versions.ProjectVersionError(
+            409, "source_changed", "專案來源檔案已變更或遺失"
+        ) from exc
+    if not resolved.is_file() or file_sha256(resolved) != declared:
+        raise project_versions.ProjectVersionError(
+            409, "source_changed", "專案來源檔案已變更或遺失"
+        )
+    return {"path": relative, "sha256": declared}
+
+
+def project_version_dependency_bindings(project_dir: Path) -> dict[str, Any]:
+    bindings: dict[str, Any] = {}
+    for relative in PROJECT_VERSION_DEPENDENCIES:
+        entry = project_dir / relative
+        if not os.path.lexists(entry):
+            bindings[relative.as_posix()] = {"exists": False, "sha256": None}
+            continue
+        try:
+            if entry.is_symlink():
+                raise ValueError("dependency is a symlink")
+            resolved = project_entry_path(project_dir, relative.as_posix())
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise project_versions.ProjectVersionError(
+                409,
+                "dependency_changed",
+                "專案所需的編輯計畫無法驗證",
+            ) from exc
+        bindings[relative.as_posix()] = {
+            "exists": True,
+            "sha256": project_versions.canonical_digest(payload),
+        }
+    return bindings
+
+
+def project_version_snapshot(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, str], dict[str, str], dict[str, Any]]:
+    """Build and validate the exact sanitized state a record can restore."""
+    duration = float(manifest.get("source", {}).get("duration_s", 0.0))
+    snapshot = project_versions.sanitize_state(state)
+    if snapshot.get("project_id") != manifest.get("project_id"):
+        raise project_versions.ProjectVersionError(
+            409, "unsupported_snapshot", "版本內容不屬於目前專案"
+        )
+    source_binding = project_version_source_binding(project_dir, manifest, snapshot)
+    plan = read_json(project_dir / "working/highlight_plan.json", {}) or {}
+    if snapshot.get("highlight_plan_revision") != plan.get("plan_revision"):
+        raise project_versions.ProjectVersionError(
+            409, "dependency_changed", "版本使用的精華計畫已變更"
+        )
+    snapshot["project_dir"] = str(project_dir)
+    errors = validate_editor_state(snapshot, duration)
+    snapshot.pop("project_dir", None)
+    if errors:
+        raise project_versions.ProjectVersionError(
+            409,
+            "unsupported_snapshot",
+            "版本內容無法通過目前的編輯格式驗證",
+            details={"errors": errors[:8]},
+        )
+    try:
+        assets = referenced_asset_digests(project_dir, snapshot)
+    except ValueError as exc:
+        raise project_versions.ProjectVersionError(
+            409, "asset_changed", "版本引用的素材已變更或遺失"
+        ) from exc
+    snapshot_for_revision = copy.deepcopy(snapshot)
+    snapshot_for_revision["asset_digests"] = assets
+    if isinstance(snapshot_for_revision.get("audio_event_edits"), dict):
+        try:
+            _render_id, source_plan, _source_hash = resolve_audio_event_source(
+                project_dir, snapshot_for_revision
+            )
+            resolve_studio_audio_plan(
+                source_plan, snapshot_for_revision["audio_event_edits"]
+            )
+        except AudioEventEditError as exc:
+            raise project_versions.ProjectVersionError(
+                409, "dependency_changed", "版本使用的聲音事件計畫已變更"
+            ) from exc
+    render_revision = editor_state_revision(snapshot_for_revision)
+    dependencies = project_version_dependency_bindings(project_dir)
+    return snapshot, render_revision, source_binding, assets, dependencies
 
 
 VARIANT_SNAPSHOTS_REL = Path("working/variant_snapshots")
@@ -4003,6 +4132,10 @@ class EditorServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], project_dir: Path):
         resolved_project = project_dir.resolve()
+        # A retained project-version journal is an authority boundary.  Finish
+        # its deterministic forward recovery before any migration or request
+        # can read or write the project.
+        project_versions.recover_restore_transaction(resolved_project)
         # Controlled initialization is an explicit local mutation boundary.
         # Complete exact legacy provenance migration before binding the HTTP
         # server so no GET/HEAD request can become a migration trigger.
@@ -4321,6 +4454,18 @@ class EditorHandler(BaseHTTPRequestHandler):
     def _dispatch_project_mutation(self, handler: Any) -> None:
         """Serialize journal gate and the whole authoritative handler."""
         with self.server.project_lock:
+            try:
+                project_versions.ensure_restore_ready(self.server.project_dir)
+            except project_versions.ProjectVersionRecoveryError as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "reason": "version_recovery_required",
+                        "error": "專案版本還原尚未安全完成；請重新啟動編輯器",
+                    },
+                    status=503,
+                )
+                return
             try:
                 ensure_caption_preset_mutation_ready(self.server.project_dir)
             except CaptionPresetRecoveryError as exc:
@@ -5850,6 +5995,384 @@ class EditorHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         return parsed.path, urllib.parse.parse_qs(parsed.query)
 
+    def _send_project_version_error(
+        self, exc: project_versions.ProjectVersionError
+    ) -> None:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "reason": exc.code,
+            "error": exc.message,
+        }
+        payload.update(exc.details)
+        self.send_json(payload, status=exc.status)
+
+    def _project_version_context(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+        state = read_json(self.server.project_dir / STATE_REL, None)
+        manifest = read_json(self.server.project_dir / "project.json", None)
+        if not isinstance(state, dict) or not isinstance(manifest, dict):
+            raise project_versions.ProjectVersionError(
+                409,
+                "unsupported_snapshot",
+                "目前專案內容無法驗證，請先重新載入編輯器",
+            )
+        return state, manifest, project_version_tokens(state, manifest)
+
+    def _require_project_version_cas(
+        self, body: dict[str, Any], current: dict[str, str]
+    ) -> None:
+        expected = {
+            "state_digest": body.get("expected_state_digest"),
+            "render_revision": body.get("expected_render_revision"),
+            "manifest_digest": body.get("expected_manifest_digest"),
+        }
+        if any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in expected.values()
+        ) or expected != current:
+            raise project_versions.ProjectVersionError(
+                409,
+                "revision_conflict",
+                "專案內容已變更，請重新載入版本清單",
+                details={"current": current},
+            )
+
+    def _acquire_project_version_quiescence(self) -> bool:
+        """Fail closed without reversing caption worker's serial→project order."""
+        reasons: list[str] = []
+        if self.server.pipeline_active_owner is not None:
+            reasons.append("pipeline")
+        if self.server.render_status.get("state") in {"running", "rendering"}:
+            reasons.append("render")
+        if self.server.fx_preview_jobs.has_active_job():
+            reasons.append("fx_preview")
+        with self.server.caption_job_lock:
+            if self.server.caption_job.get("state") == "rendering":
+                reasons.append("caption")
+        serial_acquired = self.server.caption_render_serial.acquire(blocking=False)
+        if not serial_acquired and "caption" not in reasons:
+            reasons.append("caption")
+        if reasons:
+            if serial_acquired:
+                self.server.caption_render_serial.release()
+            raise project_versions.ProjectVersionError(
+                409,
+                "project_busy",
+                "專案仍有背景工作，完成後才能操作版本",
+                details={"busy_reasons": sorted(set(reasons))},
+            )
+        return True
+
+    def _capture_project_version(
+        self,
+        store: project_versions.ProjectVersionStore,
+        *,
+        name: str,
+        kind: str,
+        state: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        snapshot, snapshot_render, source, assets, dependencies = project_version_snapshot(
+            self.server.project_dir, manifest, state
+        )
+        if assets != (state.get("asset_digests") or {}):
+            raise project_versions.ProjectVersionError(
+                409, "asset_changed", "目前素材與已儲存的編輯內容不一致"
+            )
+        return store.create(
+            name=name,
+            kind=kind,
+            state=state,
+            captured_render_revision=editor_state_revision(state),
+            snapshot_state=snapshot,
+            snapshot_render_revision=snapshot_render,
+            source_binding=source,
+            asset_bindings=assets,
+            dependency_bindings=dependencies,
+        )
+
+    def _restore_candidate(
+        self,
+        record: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+        if record.get("project_id") != manifest.get("project_id"):
+            raise project_versions.ProjectVersionError(
+                409, "unsupported_snapshot", "版本不屬於目前專案"
+            )
+        snapshot = copy.deepcopy(record["snapshot_state"])
+        sanitized, render_revision, source, assets, dependencies = project_version_snapshot(
+            self.server.project_dir, manifest, snapshot
+        )
+        if project_versions.canonical_digest(sanitized) != record["snapshot_state_digest"]:
+            raise project_versions.ProjectVersionError(
+                409, "unsupported_snapshot", "版本內容完整性驗證失敗"
+            )
+        if source != record["source_binding"]:
+            raise project_versions.ProjectVersionError(
+                409, "source_changed", "版本保存時的來源已變更"
+            )
+        if assets != record["asset_bindings"]:
+            raise project_versions.ProjectVersionError(
+                409, "asset_changed", "版本保存時的素材已變更"
+            )
+        if dependencies != record["dependency_bindings"]:
+            raise project_versions.ProjectVersionError(
+                409, "dependency_changed", "版本保存時的編輯計畫已變更"
+            )
+        if render_revision != record["snapshot_render_revision"]:
+            raise project_versions.ProjectVersionError(
+                409, "asset_changed", "版本使用的字型或素材綁定已變更"
+            )
+        timestamp = now_utc()
+        restored = copy.deepcopy(sanitized)
+        restored["asset_digests"] = assets
+        restored["updated_at"] = timestamp
+        restored["revision"] = editor_state_revision(restored)
+        restored["project_dir"] = str(self.server.project_dir)
+        errors = validate_editor_state(
+            restored, float(manifest.get("source", {}).get("duration_s", 0.0))
+        )
+        restored.pop("project_dir", None)
+        if errors:
+            raise project_versions.ProjectVersionError(
+                409,
+                "unsupported_snapshot",
+                "版本內容無法通過目前的編輯格式驗證",
+                details={"errors": errors[:8]},
+            )
+        target_manifest, invalidated = project_versions.sanitize_manifest(
+            manifest, GATES, timestamp=timestamp
+        )
+        return restored, target_manifest, project_versions.empty_rights_assertion(), invalidated
+
+    def handle_project_versions_list(self) -> None:
+        try:
+            _state, _manifest, current = self._project_version_context()
+            store = project_versions.ProjectVersionStore(self.server.project_dir)
+            records = store.list_records()
+            self.send_json(
+                {
+                    "ok": True,
+                    "versions": [project_versions.metadata(item) for item in records],
+                    "current": current,
+                    "capacity": store.capacity(),
+                }
+            )
+        except project_versions.ProjectVersionError as exc:
+            self._send_project_version_error(exc)
+
+    def handle_project_version_detail(self, version_id: str) -> None:
+        try:
+            state, manifest, current = self._project_version_context()
+            store = project_versions.ProjectVersionStore(self.server.project_dir)
+            record = store.load(version_id)
+            restored, target_manifest, target_rights, invalidated = self._restore_candidate(
+                record, manifest
+            )
+            current_state = {
+                key: copy.deepcopy(value)
+                for key, value in state.items()
+                if key in project_versions.RESTORABLE_STATE_FIELDS
+            }
+            current_authority = {
+                "state": current_state,
+                "manifest": {
+                    "approvals": copy.deepcopy(manifest.get("approvals") or {}),
+                    "stages": copy.deepcopy(manifest.get("stages") or {}),
+                },
+                "rights_assertion": read_json(
+                    self.server.project_dir / RIGHTS_REL,
+                    project_versions.empty_rights_assertion(),
+                ),
+            }
+            saved_authority = {
+                "state": {
+                    key: copy.deepcopy(value)
+                    for key, value in restored.items()
+                    if key in project_versions.RESTORABLE_STATE_FIELDS
+                },
+                "manifest": {
+                    "approvals": copy.deepcopy(target_manifest.get("approvals") or {}),
+                    "stages": copy.deepcopy(target_manifest.get("stages") or {}),
+                },
+                "rights_assertion": target_rights,
+            }
+            diff = project_versions.diff_values(current_authority, saved_authority)
+            diff["approval_resets"] = invalidated
+            diff["direction"] = {"from": "current", "to": "saved"}
+            self.send_json(
+                {
+                    "ok": True,
+                    "version": project_versions.metadata(record),
+                    "current": current,
+                    "diff": diff,
+                }
+            )
+        except project_versions.ProjectVersionError as exc:
+            self._send_project_version_error(exc)
+
+    def handle_project_version_create(self) -> None:
+        serial_acquired = False
+        try:
+            try:
+                body = self.read_json_body()
+            except ValueError as exc:
+                raise project_versions.ProjectVersionError(
+                    422, "validation_error", "版本儲存請求不是有效 JSON"
+                ) from exc
+            expected_fields = {
+                "name",
+                "expected_state_digest",
+                "expected_render_revision",
+                "expected_manifest_digest",
+            }
+            if not isinstance(body, dict) or set(body) != expected_fields:
+                raise project_versions.ProjectVersionError(
+                    422, "validation_error", "版本儲存請求欄位不完整"
+                )
+            state, manifest, current = self._project_version_context()
+            self._require_project_version_cas(body, current)
+            serial_acquired = self._acquire_project_version_quiescence()
+            store = project_versions.ProjectVersionStore(self.server.project_dir)
+            record = self._capture_project_version(
+                store,
+                name=body["name"],
+                kind="named",
+                state=state,
+                manifest=manifest,
+            )
+            self.send_json(
+                {
+                    "ok": True,
+                    "version": project_versions.metadata(record),
+                    "current": current,
+                },
+                status=201,
+            )
+        except project_versions.ProjectVersionError as exc:
+            self._send_project_version_error(exc)
+        except (OSError, TypeError, ValueError) as exc:
+            self._send_project_version_error(
+                project_versions.ProjectVersionError(
+                    503, "version_recovery_required", "版本記錄無法安全寫入"
+                )
+            )
+        finally:
+            if serial_acquired:
+                self.server.caption_render_serial.release()
+
+    def handle_project_version_restore(self, version_id: str) -> None:
+        serial_acquired = False
+        try:
+            try:
+                body = self.read_json_body()
+            except ValueError as exc:
+                raise project_versions.ProjectVersionError(
+                    422, "validation_error", "版本還原請求不是有效 JSON"
+                ) from exc
+            expected_fields = {
+                "expected_state_digest",
+                "expected_render_revision",
+                "expected_manifest_digest",
+                "confirm_restore",
+            }
+            if (
+                not isinstance(body, dict)
+                or set(body) != expected_fields
+                or body.get("confirm_restore") is not True
+            ):
+                raise project_versions.ProjectVersionError(
+                    422, "validation_error", "還原前必須明確確認完整請求"
+                )
+            state, manifest, current = self._project_version_context()
+            self._require_project_version_cas(body, current)
+            serial_acquired = self._acquire_project_version_quiescence()
+            store = project_versions.ProjectVersionStore(self.server.project_dir)
+            record = store.load(version_id)
+            restored, target_manifest, target_rights, invalidated = self._restore_candidate(
+                record, manifest
+            )
+            capacity = store.capacity()
+            if not capacity["restore_backup_available"]:
+                raise project_versions.ProjectVersionError(
+                    507,
+                    "version_capacity_exhausted",
+                    "版本空間已滿，無法先建立還原前備份",
+                )
+            automatic = self._capture_project_version(
+                store,
+                name=f"還原前自動備份 {now_utc()}",
+                kind="auto_before_restore",
+                state=state,
+                manifest=manifest,
+            )
+
+            # Re-read every CAS and external binding after the durable backup.
+            state2, manifest2, current2 = self._project_version_context()
+            if current2 != current:
+                raise project_versions.ProjectVersionError(
+                    409,
+                    "revision_conflict",
+                    "建立備份後專案內容已變更，未執行還原",
+                    details={"current": current2},
+                )
+            (
+                _current_snapshot,
+                _current_snapshot_render,
+                _current_source,
+                current_assets,
+                _current_dependencies,
+            ) = project_version_snapshot(self.server.project_dir, manifest2, state2)
+            if current_assets != (state2.get("asset_digests") or {}):
+                raise project_versions.ProjectVersionError(
+                    409,
+                    "asset_changed",
+                    "建立備份後目前素材已變更，未執行還原",
+                )
+            restored, target_manifest, target_rights, invalidated = self._restore_candidate(
+                record, manifest2
+            )
+            targets = {
+                "project.json": project_versions.json_bytes(target_manifest),
+                "working/rights_assertion.json": project_versions.json_bytes(target_rights),
+                "working/editor_state.json": project_versions.json_bytes(restored),
+            }
+            try:
+                project_versions.execute_restore(
+                    self.server.project_dir, automatic, targets
+                )
+            except project_versions.ProjectVersionRecoveryError as exc:
+                raise project_versions.ProjectVersionError(
+                    503,
+                    "version_recovery_required",
+                    "版本還原尚未安全完成；請重新啟動編輯器",
+                ) from exc
+            updated = project_version_tokens(restored, target_manifest)
+            self.send_json(
+                {
+                    "ok": True,
+                    "restored_version": project_versions.metadata(record),
+                    "automatic_backup": project_versions.metadata(automatic),
+                    "current": updated,
+                    "approvals_invalidated": invalidated,
+                    "reload_required": True,
+                }
+            )
+        except project_versions.ProjectVersionError as exc:
+            self._send_project_version_error(exc)
+        except (OSError, TypeError, ValueError):
+            self._send_project_version_error(
+                project_versions.ProjectVersionError(
+                    503, "version_recovery_required", "版本還原無法安全完成"
+                )
+            )
+        finally:
+            if serial_acquired:
+                self.server.caption_render_serial.release()
+
     def do_HEAD(self) -> None:
         self.do_GET()
 
@@ -5981,6 +6504,22 @@ class EditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self.send_json({"ok": True, "project": str(project)})
+            return
+        if path == "/api/project-versions":
+            self._dispatch_project_mutation(self.handle_project_versions_list)
+            return
+        version_detail = re.fullmatch(r"/api/project-versions/(pv_[0-9a-f]{32})", path)
+        if version_detail:
+            self._dispatch_project_mutation(
+                lambda: self.handle_project_version_detail(version_detail.group(1))
+            )
+            return
+        if path.startswith("/api/project-versions/"):
+            self._send_project_version_error(
+                project_versions.ProjectVersionError(
+                    404, "version_not_found", "找不到指定版本"
+                )
+            )
             return
         if path == "/api/project":
             self._dispatch_project_mutation(lambda: self.handle_project_get(project))
@@ -6556,6 +7095,24 @@ class EditorHandler(BaseHTTPRequestHandler):
         if not self.allow_request(mutation=True):
             return
         path, query = self.route()
+        if path == "/api/project-versions":
+            self._dispatch_project_mutation(self.handle_project_version_create)
+            return
+        version_restore = re.fullmatch(
+            r"/api/project-versions/(pv_[0-9a-f]{32})/restore", path
+        )
+        if version_restore:
+            self._dispatch_project_mutation(
+                lambda: self.handle_project_version_restore(version_restore.group(1))
+            )
+            return
+        if path.startswith("/api/project-versions/"):
+            self._send_project_version_error(
+                project_versions.ProjectVersionError(
+                    404, "version_not_found", "找不到指定版本"
+                )
+            )
+            return
         if path == "/api/style-presets":
             self.handle_style_preset_create()
             return
