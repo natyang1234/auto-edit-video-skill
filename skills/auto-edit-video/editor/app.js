@@ -203,6 +203,7 @@ function cacheElements() {
     "spotlight-point-time", "spotlight-point-x", "spotlight-point-y", "spotlight-add-point",
     "spotlight-update-point", "spotlight-delete-point", "spotlight-reconcile", "spotlight-reconcile-start",
     "spotlight-reconcile-end", "spotlight-keyframe-list", "spotlight-validation", "spotlight-crop-note",
+    "spotlight-manual-hold-notice", "spotlight-manual-hold-release",
     "manual-spotlight-timing-note", "manual-spotlight-timing-open",
     "fx-preview-layout-check", "fx-preview-layout-check-heading", "fx-preview-layout-check-toggle",
     "fx-preview-layout-check-summary", "fx-preview-layout-check-list",
@@ -2377,7 +2378,11 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
     subject: seed?.subject ?? overlay?.subject ?? null,
     spotlight_mode: effect.code === "P5" ? spotlightMode : "automatic",
     spotlight_path: effect.code === "P5" && spotlightMode === "manual"
-      ? (seed?.spotlight_path ? deepCopy(seed.spotlight_path) : overlay?.spotlight_path ? deepCopy(overlay.spotlight_path) : null)
+      ? (seed?.spotlight_path
+        ? deepCopy(seed.spotlight_path)
+        : (seed?.spotlight_mode === "manual" || seed?.__spotlightModeOverride === "manual")
+          ? null
+          : overlay?.spotlight_path ? deepCopy(overlay.spotlight_path) : null)
       : null,
     // Keep an explicit P5 mode choice while browsing other effects.  This is
     // draft-only metadata; request bodies still include only the documented
@@ -2392,6 +2397,12 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
     delete draft.spotlight_mode;
     delete draft.spotlight_path;
     if (effect.code === "P5") draft.spotlight_mode = "automatic";
+  }
+  if (effect.code === "P5" && spotlightMode === "manual" && !draft.spotlight_path) {
+    // A manual mode carried across another effect still needs a complete,
+    // source-time-bounded path.  Use an actual subject when one exists;
+    // fxPreviewEnsureManualPath otherwise records the explicit center default.
+    fxPreviewEnsureManualPath(draft);
   }
   return draft;
 }
@@ -3198,11 +3209,30 @@ function fxPreviewSpotlightCurrentSourceTime() {
   return Math.max(0, Number(elements["fx-preview-source-video"]?.currentTime) || 0);
 }
 
+function fxPreviewSetManualHoldNotice(visible = Boolean(
+  fxPreviewDraft?.code === "P5"
+  && fxPreviewDraft.spotlight_mode === "manual"
+  && fxPreviewManualSourceHold
+)) {
+  const notice = elements["spotlight-manual-hold-notice"];
+  if (!notice) return;
+  notice.hidden = !visible;
+}
+
 function fxPreviewSpotlightHoldMedia() {
   fxPreviewManualSourceHold = true;
   fxPreviewManualInteractionToken += 1;
   elements["fx-preview-source-video"]?.pause();
   elements["fx-preview-video"]?.pause();
+  fxPreviewSetManualHoldNotice();
+}
+
+function fxPreviewReleaseManualHold() {
+  fxPreviewManualSourceHold = false;
+  fxPreviewManualInteractionToken += 1;
+  fxPreviewSetManualHoldNotice(false);
+  fxPreviewSyncVideos("effect");
+  fxPreviewSpotlightRenderCurrentTime();
 }
 
 function fxPreviewSpotlightRenderCurrentTime() {
@@ -3296,6 +3326,7 @@ function fxPreviewSpotlightRenderPanel({ renderList = true } = {}) {
   if (!panel) return;
   const isP5 = fxPreviewDraft?.code === "P5";
   panel.hidden = !isP5;
+  fxPreviewSetManualHoldNotice();
   if (!isP5) {
     fxPreviewSpotlightRenderCropNote([]);
     fxPreviewSpotlightRenderOverlay();
@@ -3470,6 +3501,7 @@ function fxPreviewSetSpotlightMode(mode) {
     fxPreviewSpotlightSelectedIndex = -1;
     fxPreviewManualSourceHold = false;
     fxPreviewManualInteractionToken += 1;
+    fxPreviewSetManualHoldNotice(false);
   }
   fxPreviewSpotlightRenderPanel();
   fxPreviewDraftChanged();
@@ -4825,6 +4857,7 @@ function fxPreviewSelectEffect(code) {
     // selected effect must be allowed to resume normal playback/sync.
     fxPreviewManualSourceHold = false;
     fxPreviewManualInteractionToken += 1;
+    fxPreviewSetManualHoldNotice(false);
   }
   fxPreviewRememberRecent(effect.code);
   fxPreviewPersistDraft();
@@ -4890,6 +4923,7 @@ async function openFxPreviewDialog(trigger = document.activeElement, replaceOver
   fxPreviewSpotlightSelectedIndex = -1;
   fxPreviewManualSourceHold = false;
   fxPreviewManualInteractionToken += 1;
+  fxPreviewSetManualHoldNotice(false);
   activeFxPreviewCategory = "";
   fxPreviewLibraryFilter = "";
   elements["fx-preview-search"].value = "";
@@ -5087,6 +5121,7 @@ function cleanupFxPreviewDialog() {
   fxPreviewSpotlightSelectedIndex = -1;
   fxPreviewManualSourceHold = false;
   fxPreviewManualInteractionToken += 1;
+  fxPreviewSetManualHoldNotice(false);
   fxPreviewClearVisibleMedia();
   fxPreviewReadySignature = "";
   fxPreviewDraftSignature = "";
@@ -6684,11 +6719,8 @@ function bindEvents() {
   });
   elements["fx-preview-layout-check-toggle"].addEventListener("click", fxPreviewToggleTextLayoutDetails);
   elements["fx-preview-composition-switch-timeline"].addEventListener("click", fxPreviewSwitchToTimeline);
-  elements["fx-preview-resync"].addEventListener("click", () => {
-    fxPreviewManualSourceHold = false;
-    fxPreviewSyncVideos("effect");
-    fxPreviewSpotlightRenderCurrentTime();
-  });
+  elements["fx-preview-resync"].addEventListener("click", fxPreviewReleaseManualHold);
+  elements["spotlight-manual-hold-release"].addEventListener("click", fxPreviewReleaseManualHold);
   elements["fx-preview-source-video"].addEventListener("play", () => {
     if (fxPreviewManualSourceHold) {
       elements["fx-preview-source-video"].pause();

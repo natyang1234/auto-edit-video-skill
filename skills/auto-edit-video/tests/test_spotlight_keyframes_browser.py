@@ -225,6 +225,123 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
             self.assertFalse(page.evaluate("() => fxPreviewManualSourceHold"))
             browser.close()
 
+    def test_manual_path_rebuilds_after_switching_through_non_p5_effect(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function("() => fxPreviewDraft?.spotlight_path?.keyframes?.length === 2")
+            page.locator("#fx-preview-search").fill("T3")
+            page.locator("#fx-preview-grid .fx-preview-card").first.click()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'T3'")
+            page.locator("#fx-preview-search").fill("P5")
+            page.locator("#fx-preview-grid .fx-preview-card").first.click()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'P5'")
+            result = page.evaluate("""() => {
+                const bounds = fxPreviewSpotlightBounds();
+                const path = fxPreviewDraft.spotlight_path;
+                return {mode: fxPreviewDraft.spotlight_mode, path, bounds};
+            }""")
+            self.assertEqual(result["mode"], "manual")
+            self.assertIsNotNone(result["path"])
+            self.assertEqual(len(result["path"]["keyframes"]), 2)
+            self.assertEqual(result["path"]["keyframes"][0]["source_at"], result["bounds"]["start"])
+            self.assertEqual(result["path"]["keyframes"][-1]["source_at"], result["bounds"]["end"])
+            browser.close()
+
+    def test_explicit_automatic_survives_non_p5_effect_without_path(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.locator("#spotlight-mode-automatic").check()
+            page.wait_for_function("() => fxPreviewDraft?.spotlight_mode === 'automatic' && !fxPreviewDraft.spotlight_path")
+            page.locator("#fx-preview-search").fill("T3")
+            page.locator("#fx-preview-grid .fx-preview-card").first.click()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'T3'")
+            page.locator("#fx-preview-search").fill("P5")
+            page.locator("#fx-preview-grid .fx-preview-card").first.click()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'P5'")
+            draft = page.evaluate("() => ({mode: fxPreviewDraft.spotlight_mode, hasPath: Object.prototype.hasOwnProperty.call(fxPreviewDraft, 'spotlight_path')})")
+            self.assertEqual(draft, {"mode": "automatic", "hasPath": False})
+            browser.close()
+
+    def test_manual_hold_notice_release_resumes_sync_without_autoplay(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function("() => document.querySelector('#spotlight-source-click-target')?.getBoundingClientRect().width > 0")
+            page.locator("#spotlight-source-click-target").click(position={"x": 90, "y": 120})
+            page.wait_for_function("() => fxPreviewManualSourceHold")
+            notice = page.locator("#spotlight-manual-hold-notice")
+            self.assertTrue(notice.is_visible())
+            self.assertIn("定位中已暫停同步。恢復同步後即可播放試看。", notice.inner_text())
+            release = page.locator("#spotlight-manual-hold-release")
+            self.assertEqual(release.inner_text(), "恢復同步")
+            self.assertEqual(release.evaluate("el => getComputedStyle(el).minHeight"), "44px")
+            ART.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(ART / "p6-ui-r3-1100-manual-hold.png"), full_page=True)
+
+            # Seeking and a native row edit keep the visible hold affordance.
+            page.locator("#spotlight-seek-end").click()
+            self.assertTrue(notice.is_visible())
+            page.locator("#spotlight-keyframe-list input").first.fill(
+                page.locator("#spotlight-keyframe-list input").first.input_value()
+            )
+            self.assertTrue(notice.is_visible())
+            token_before = page.evaluate("() => fxPreviewManualInteractionToken")
+            confirm_before = page.locator("#fx-preview-confirm").is_disabled()
+            page.locator("#spotlight-manual-hold-release").click()
+            self.assertFalse(page.evaluate("() => fxPreviewManualSourceHold"))
+            self.assertGreater(page.evaluate("() => fxPreviewManualInteractionToken"), token_before)
+            self.assertFalse(notice.is_visible())
+            self.assertEqual(page.locator("#fx-preview-confirm").is_disabled(), confirm_before)
+            self.assertTrue(page.locator("#fx-preview-source-video").evaluate("el => el.paused"))
+            self.assertTrue(page.locator("#fx-preview-video").evaluate("el => el.paused"))
+
+            # After release, both native play handlers take the normal sync
+            # branch; they no longer pause the media because of manual hold.
+            calls = page.evaluate("""() => {
+                const source = elements['fx-preview-source-video'];
+                const effect = elements['fx-preview-video'];
+                const events = [];
+                source.play = () => { events.push('source.play'); return Promise.resolve(); };
+                effect.play = () => { events.push('effect.play'); return Promise.resolve(); };
+                source.pause = () => events.push('source.pause');
+                effect.pause = () => events.push('effect.pause');
+                source.dispatchEvent(new Event('play'));
+                effect.dispatchEvent(new Event('play'));
+                return {hold: fxPreviewManualSourceHold, events};
+            }""")
+            self.assertFalse(calls["hold"])
+            self.assertIn("source.play", calls["events"])
+            self.assertIn("effect.play", calls["events"])
+            self.assertNotIn("source.pause", calls["events"])
+            self.assertNotIn("effect.pause", calls["events"])
+            browser.close()
+
     def test_saved_manual_inspector_timing_is_locked_and_routes_to_preview(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:
