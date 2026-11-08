@@ -1,0 +1,22 @@
+.project-versions-dialog, .project-version-restore-dialog { border: 1px solid var(--line, #d5cdc4); border-radius: 16px; color: var(--ink, #251d19); background: var(--paper, #fffdf9); box-shadow: 0 22px 70px #24130d55; max-width: min(920px, calc(100vw - 28px)); max-height: min(820px, calc(100vh - 28px)); padding: 0; }
+.project-versions-dialog::backdrop, .project-version-restore-dialog::backdrop { background: #24130d88; }
+.project-versions-sheet { padding: clamp(18px, 3vw, 34px); min-width: min(860px, calc(100vw - 56px)); }
+.project-versions-heading { display: flex; justify-content: space-between; gap: 16px; align-items: start; border-bottom: 1px solid var(--line, #d5cdc4); padding-bottom: 13px; }
+.project-versions-heading h2, .project-version-restore-dialog h2 { margin: 3px 0 0; font-size: 1.45rem; }
+.project-versions-intro { max-width: 65ch; line-height: 1.55; }
+.project-versions-status { min-height: 1.4em; color: var(--muted, #685d56); }
+.project-versions-status.is-error, .project-version-restore-dialog [role=status].is-error { color: #a3291e; }
+.project-version-save-form { display: flex; gap: 10px; align-items: end; padding: 14px; background: #f3ede6; border-left: 3px solid var(--accent, #a92f25); }
+.project-version-save-form .field { flex: 1; min-width: 0; }
+.project-version-save-form input { width: 100%; }
+.project-versions-capacity { font-size: .86rem; color: var(--muted, #685d56); }
+.project-versions-layout { display: grid; grid-template-columns: minmax(250px, .9fr) minmax(300px, 1.1fr); gap: 22px; }
+.project-versions-layout h3 { font-size: .92rem; letter-spacing: .05em; text-transform: uppercase; }
+.project-versions-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
+.project-version-row { width: 100%; text-align: left; display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; padding: 12px; border: 1px solid var(--line, #d5cdc4); background: #fffdf9; border-radius: 9px; color: inherit; }
+.project-version-row:hover, .project-version-row:focus-visible, .project-version-row.is-selected { border-color: var(--accent, #a92f25); outline: none; box-shadow: 0 0 0 2px #a92f2533; }
+.project-version-row strong { overflow-wrap: anywhere; }.project-version-row small { color: var(--muted, #685d56); }.project-version-badge { color: #8d281f; font-size: .75rem; font-weight: 700; }
+.project-version-detail { border: 1px solid var(--line, #d5cdc4); border-radius: 9px; padding: 13px; max-height: 405px; overflow: auto; }
+.project-version-detail h4 { margin: 0 0 7px; overflow-wrap: anywhere; }.project-version-detail h5 { margin: 15px 0 4px; font-size: .82rem; letter-spacing: .04em; text-transform: uppercase; }.project-version-detail ul { margin: 10px 0; padding-left: 1.2rem; }.project-version-detail li { overflow-wrap: anywhere; margin: 8px 0; }.project-version-preview { display: block; margin-top: 3px; line-height: 1.45; color: var(--muted, #685d56); }.project-version-reset-summary { margin: 14px 0 0; padding: 9px 10px; border-left: 3px solid var(--accent, #a92f25); background: #f3ede6; line-height: 1.5; }.project-version-detail-actions { display: flex; justify-content: end; margin-top: 14px; }
+.project-version-restore-dialog { padding: clamp(20px, 4vw, 32px); max-width: 520px; }.project-version-dialog-actions { display: flex; justify-content: end; gap: 10px; margin-top: 22px; }
+@media (max-width: 680px) { .project-versions-sheet { min-width: 0; }.project-versions-layout { grid-template-columns: 1fr; }.project-version-save-form { align-items: stretch; flex-direction: column; }.project-version-save-form .button { width: 100%; }.project-versions-dialog { width: calc(100vw - 18px); }.project-versions-list { max-height: 220px; } }

@@ -11,6 +11,7 @@
     <link rel="stylesheet" href="/fx-comparison.css">
     <link rel="stylesheet" href="/fx-composite-check.css">
     <link rel="stylesheet" href="/spotlight-keyframes.css">
+    <link rel="stylesheet" href="/project-versions.css">
   </head>
   <body>
     <a class="skip-link" href="#preview-workspace">跳到影片預覽</a>
@@ -37,6 +38,7 @@
           <span>等待載入</span>
         </div>
         <button class="button button-quiet" id="save-button" type="button">儲存</button>
+        <button class="button button-quiet" id="project-versions-open" type="button" aria-haspopup="dialog">專案版本</button>
         <button class="button button-primary" id="render-button" type="button">輸出預覽</button>
       </div>
     </header>
@@ -849,6 +851,32 @@
     <dialog id="preset-review" class="preset-review" aria-labelledby="preset-review-title">
       <h2 id="preset-review-title">確認差異</h2><pre id="preset-review-details"></pre>
       <div class="preset-actions"><button type="button" id="preset-review-cancel">取消</button><button type="button" id="preset-review-confirm">確認</button></div>
+    </dialog>
+    <dialog id="project-versions-dialog" class="project-versions-dialog" aria-labelledby="project-versions-title">
+      <section class="project-versions-sheet">
+        <header class="project-versions-heading">
+          <div><p class="eyebrow">PROJECT HISTORY</p><h2 id="project-versions-title">專案版本</h2></div>
+          <button class="icon-button" id="project-versions-close" type="button" aria-label="關閉專案版本">×</button>
+        </header>
+        <p class="project-versions-intro">保存目前已儲存的剪輯內容。還原前會先自動備份目前版本，且既有核可將需要重新確認。</p>
+        <p id="project-versions-status" class="project-versions-status" role="status" aria-live="polite"></p>
+        <form id="project-version-save-form" class="project-version-save-form">
+          <label class="field"><span>版本名稱</span><input id="project-version-name" maxlength="80" required autocomplete="off" placeholder="例如：開頭節奏確認版"></label>
+          <button class="button button-primary" id="project-version-save" type="submit">儲存命名版本</button>
+        </form>
+        <p id="project-versions-capacity" class="project-versions-capacity"></p>
+        <div class="project-versions-layout">
+          <section aria-labelledby="project-versions-list-title"><h3 id="project-versions-list-title">可還原版本</h3><div id="project-versions-list" class="project-versions-list"></div></section>
+          <section class="project-version-detail" aria-labelledby="project-version-detail-title"><h3 id="project-version-detail-title">差異</h3><p id="project-version-detail-empty">選擇一個版本查看與目前內容的差異。</p><div id="project-version-detail" hidden></div></section>
+        </div>
+      </section>
+    </dialog>
+    <dialog id="project-version-restore-dialog" class="project-version-restore-dialog" aria-labelledby="project-version-restore-title">
+      <h2 id="project-version-restore-title">確認還原版本</h2>
+      <p>將先自動備份目前內容，然後才還原選取版本。現有核可將失效並需要重新確認。</p>
+      <p id="project-version-restore-name"></p>
+      <p id="project-version-restore-status" role="status" aria-live="polite"></p>
+      <div class="project-version-dialog-actions"><button class="button button-secondary" id="project-version-restore-cancel" type="button">取消</button><button class="button button-primary" id="project-version-restore-confirm" type="button">確認還原</button></div>
     </dialog>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <script src="/app.js" defer></script>

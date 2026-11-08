@@ -33,6 +33,14 @@ const loadingProjectFontIds = new Set();
 let projectFontPreviewError = "";
 let lastSaveSucceeded = true;
 let presetSaveInFlight = 0;
+// Version data belongs to the server.  These counters make a late response
+// harmless after the dialog is closed, refreshed, or a different row picked.
+let projectVersionsGeneration = 0;
+let projectVersionsDetailGeneration = 0;
+let projectVersionsMutationInFlight = false;
+let projectVersionsTrigger = null;
+let projectVersionsSelected = null;
+let projectVersionsPendingRestore = null;
 // FX previews are deliberately local drafts. They never touch editor state
 // until the server compare-and-swap confirm succeeds.
 let fxPreviewDraft = null;
@@ -148,7 +156,7 @@ function directorUnavailableReason(preset) {
 
 function cacheElements() {
   [
-    "project-name", "platform-select", "director-select", "style-pack-select", "save-state", "save-button",
+    "project-name", "platform-select", "director-select", "style-pack-select", "save-state", "save-button", "project-versions-open", "project-versions-dialog", "project-versions-close", "project-versions-status", "project-version-save-form", "project-version-name", "project-version-save", "project-versions-capacity", "project-versions-list", "project-version-detail", "project-version-detail-empty", "project-version-restore-dialog", "project-version-restore-name", "project-version-restore-status", "project-version-restore-cancel", "project-version-restore-confirm",
     "template-select", "template-group-tabs", "template-grid", "template-controls",
     "template-name", "template-description", "template-motion-chip", "frame-controls",
     "template-frame-x", "template-frame-x-output", "template-frame-y", "template-frame-y-output",
@@ -263,6 +271,249 @@ function showToast(message, tone = "info") {
   elements.toast.textContent = message;
   elements.toast.style.borderLeftColor = tone === "error" ? "var(--danger)" : tone === "success" ? "var(--green)" : "var(--amber)";
   toastTimer = setTimeout(() => { elements.toast.hidden = true; }, 4200);
+}
+
+function versionTokens(value) {
+  return {
+    expected_state_digest: value?.state_digest || "",
+    expected_render_revision: value?.render_revision || "",
+    expected_manifest_digest: value?.manifest_digest || "",
+  };
+}
+
+function projectVersionsBusy() {
+  return stateDirty || !lastSaveSucceeded || presetSaveInFlight > 0 || pipelineBusy || renderBusy
+    || fxCompareActive || Boolean(fxPreviewDraft) || Boolean(elements["fx-preview-dialog"]?.open);
+}
+
+function projectVersionsBusyMessage() {
+  if (stateDirty || !lastSaveSucceeded || presetSaveInFlight > 0) return "目前編輯尚未儲存完成，請先等自動儲存完成。";
+  if (pipelineBusy) return "本機自動處理中，完成後才能管理版本。";
+  if (renderBusy) return "輸出處理中，完成後才能管理版本。";
+  return "特效試看或比較進行中，完成或關閉後才能管理版本。";
+}
+
+function setProjectVersionsStatus(message = "", error = false) {
+  elements["project-versions-status"].textContent = message;
+  elements["project-versions-status"].classList.toggle("is-error", error);
+}
+
+function projectVersionErrorMessage(error, action) {
+  const code = String(error?.code || error?.reason || "").toLowerCase();
+  const messages = {
+    source_changed: "來源影片已變更，請確認目前專案內容後重新查看版本。",
+    asset_changed: "引用素材已變更，請確認素材後重新查看版本。",
+    dependency_changed: "必要依賴已變更，請確認專案內容後重新查看版本。",
+    revision_conflict: "專案內容已變更，請關閉後重新查看差異。",
+    project_busy: "專案正在處理中，完成後再試。",
+    validation_error: "輸入內容不符合版本名稱規則，請檢查後再試。",
+    version_capacity_reserved: "版本容量已保留給還原前備份，目前不能新增命名版本。",
+    version_capacity_exhausted: "版本容量已滿，無法執行此操作。系統不會自動清理版本。",
+    version_recovery_required: "版本紀錄需要安全復原，請先處理後再試。",
+  };
+  return messages[code] || `${action}失敗，請稍後重新查看版本。`;
+}
+
+function projectVersionChangeLabel(path) {
+  const value = String(path || "").replace(/^\/state(?=\/|$)/, "");
+  if (/^\/overlays\/\d+\/(text|content)$/.test(value)) return "圖層文字";
+  if (/^\/overlays\/\d+\/(style|layout)/.test(value)) return "圖層樣式與位置";
+  if (/spotlight|subject.*(?:x|y)|manual_path/i.test(value)) return "聚光燈位置";
+  if (/caption|subtitle|effect_span/i.test(value)) return "字幕樣式";
+  if (/highlight|segment|clip/i.test(value)) return "片段設定";
+  if (/canvas|width|height|platform/i.test(value)) return "輸出尺寸";
+  if (/publish|title|hashtags|cover/i.test(value)) return "發佈文案";
+  if (/asset|rights|license/i.test(value)) return "素材權利";
+  if (/approval|approved|review/i.test(value)) return "人工核可狀態";
+  return "其他編輯設定";
+}
+
+function projectVersionPreview(value) {
+  let parsed = value;
+  if (typeof value === "string") {
+    try { parsed = JSON.parse(value); } catch (_error) { parsed = value; }
+  }
+  if (parsed === null) return "未設定";
+  if (parsed === true) return "啟用";
+  if (parsed === false) return "關閉";
+  if (typeof parsed === "number") return String(parsed);
+  if (typeof parsed === "string") return parsed;
+  return JSON.stringify(parsed);
+}
+
+function projectVersionResetCategory(change) {
+  const path = String(change?.path || "");
+  const gate = path.match(/^\/manifest\/approvals\/([^/]+)/)?.[1];
+  const gateLabels = {
+    destructive_edit: "剪接",
+    highlight_selection: "精華片段",
+    timeline: "時間軸",
+    final: "輸出",
+  };
+  if (gate) return gateLabels[gate] || "其他核可";
+  if (/^\/(?:rights_assertion|state\/rights)\//.test(path)) return "素材權利";
+  const stage = path.match(/^\/manifest\/stages\/([^/]+)/)?.[1];
+  const stageLabels = { edit_review: "剪接", highlight_plan: "精華片段", timeline_review: "時間軸", render: "輸出", qa: "輸出" };
+  if (stage) return stageLabels[stage] || "其他核可";
+  if (/^\/manifest\/updated_at(?:\/|$)/.test(path)) return "其他核可";
+  if (/^\/state\/highlights\/\d+\/review_status$/.test(path)
+    && projectVersionPreview(change.current_preview) === "approved"
+    && projectVersionPreview(change.saved_preview) === "pending") return "精華片段";
+  return "";
+}
+
+function setProjectVersionSelection(versionId) {
+  elements["project-versions-list"].querySelectorAll(".project-version-row").forEach((row) => {
+    const selected = row.dataset.versionId === String(versionId);
+    row.classList.toggle("is-selected", selected);
+    row.setAttribute("aria-pressed", String(selected));
+  });
+}
+
+function renderProjectVersions(payload) {
+  const versions = Array.isArray(payload?.versions) ? payload.versions : [];
+  projectVersionsPayload = payload || projectVersionsPayload;
+  projectVersionsCurrent = payload?.current || projectVersionsCurrent;
+  projectVersionsCapacity = payload?.capacity || projectVersionsCapacity;
+  const capacity = payload?.capacity || {};
+  elements["project-versions-capacity"].textContent = `已使用 ${Number(capacity.used || 0)}/${Number(capacity.max || 0)} 個版本`;
+  const saveDisabled = projectVersionsBusy() || projectVersionsMutationInFlight || capacity.named_save_available === false;
+  elements["project-version-save"].disabled = saveDisabled;
+  elements["project-version-name"].disabled = projectVersionsMutationInFlight;
+  if (capacity.named_save_available === false) setProjectVersionsStatus("命名版本容量已滿，無法再儲存。", true);
+  const list = elements["project-versions-list"];
+  list.replaceChildren();
+  if (!versions.length) { const empty = document.createElement("p"); empty.textContent = "尚無可還原版本。"; list.append(empty); return; }
+  versions.forEach((version) => {
+    const row = document.createElement("button"); row.type = "button"; row.className = "project-version-row"; row.dataset.versionId = String(version.version_id);
+    row.classList.toggle("is-selected", projectVersionsSelected?.version_id === version.version_id);
+    row.setAttribute("aria-pressed", String(projectVersionsSelected?.version_id === version.version_id));
+    const title = document.createElement("strong"); title.textContent = version.name || "未命名版本";
+    const time = document.createElement("small"); time.textContent = version.created_at ? new Date(version.created_at).toLocaleString("zh-TW") : "時間不明";
+    row.append(title, time);
+    if (version.kind === "auto_before_restore") { const badge = document.createElement("span"); badge.className = "project-version-badge"; badge.textContent = "還原前自動備份"; row.append(badge); }
+    row.addEventListener("click", () => loadProjectVersionDetail(version)); list.append(row);
+  });
+}
+
+async function loadProjectVersions() {
+  const generation = ++projectVersionsGeneration;
+  setProjectVersionsStatus("正在讀取版本…");
+  try {
+    const payload = await request("/api/project-versions");
+    if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return;
+    renderProjectVersions(payload); setProjectVersionsStatus("");
+  } catch (error) { if (generation === projectVersionsGeneration && elements["project-versions-dialog"].open) setProjectVersionsStatus(`無法讀取版本：${error.message}`, true); }
+}
+
+async function loadProjectVersionDetail(version) {
+  const generation = ++projectVersionsDetailGeneration;
+  projectVersionsSelected = version;
+  setProjectVersionSelection(version.version_id);
+  elements["project-version-detail-empty"].hidden = true;
+  elements["project-version-detail"].hidden = false;
+  elements["project-version-detail"].textContent = "正在讀取差異…";
+  try {
+    const response = await request(`/api/project-versions/${encodeURIComponent(version.version_id)}`);
+    if (generation !== projectVersionsDetailGeneration || !elements["project-versions-dialog"].open || projectVersionsSelected?.version_id !== version.version_id) return;
+    const detail = elements["project-version-detail"]; detail.replaceChildren();
+    const changes = Array.isArray(response?.diff?.changes) ? response.diff.changes : [];
+    const contentChanges = [];
+    const resetCategories = new Set();
+    changes.forEach((change) => {
+      const reset = projectVersionResetCategory(change);
+      if (reset) resetCategories.add(reset); else contentChanges.push(change);
+    });
+    const title = document.createElement("h4");
+    title.textContent = response?.version?.name || "選定版本";
+    detail.append(title);
+    const shownChanges = contentChanges.slice(0, 80);
+    const partial = Boolean(response?.diff?.truncated) || contentChanges.length > shownChanges.length;
+    const summary = document.createElement("p");
+    if (!response?.diff?.changed) {
+      summary.textContent = "與目前內容沒有差異";
+    } else if (partial) {
+      summary.textContent = `目前顯示 ${shownChanges.length} 項剪輯內容；差異尚未完整顯示。`;
+    } else {
+      summary.textContent = `剪輯內容 ${contentChanges.length} 項差異${resetCategories.size ? `；另有 ${resetCategories.size} 項重新確認提醒。` : "。"}`;
+    }
+    detail.append(summary);
+    const contentTitle = document.createElement("h5"); contentTitle.textContent = "剪輯內容"; detail.append(contentTitle);
+    const list = document.createElement("ul"); list.className = "project-version-content-changes";
+    shownChanges.forEach((change) => {
+      const item = document.createElement("li");
+      const label = document.createElement("strong");
+      const kind = change.kind === "added" ? "新增" : change.kind === "removed" ? "移除" : "變更";
+      label.textContent = `${kind}：${projectVersionChangeLabel(change.path)}`;
+      item.append(label);
+      const preview = document.createElement("span"); preview.className = "project-version-preview";
+      preview.textContent = `目前：${projectVersionPreview(change.current_preview)} → 還原為：${projectVersionPreview(change.saved_preview)}`;
+      item.append(preview);
+      list.append(item);
+    });
+    if (!contentChanges.length && !partial) { const empty = document.createElement("li"); empty.textContent = "沒有需要直接還原的剪輯內容。"; list.append(empty); }
+    detail.append(list);
+    if (resetCategories.size) {
+      const reset = document.createElement("p"); reset.className = "project-version-reset-summary";
+      reset.textContent = `還原後，${Array.from(resetCategories).join("／")}需重新確認。`;
+      detail.append(reset);
+    }
+    if (partial) { const note = document.createElement("p"); note.textContent = `差異過長，目前僅顯示 ${shownChanges.length} 項剪輯內容。`; detail.append(note); }
+    const actions = document.createElement("div"); actions.className = "project-version-detail-actions"; const restore = document.createElement("button"); restore.type = "button"; restore.className = "button button-primary"; restore.textContent = "還原此版本"; restore.disabled = projectVersionsBusy() || projectVersionsMutationInFlight; restore.addEventListener("click", () => openProjectVersionRestore(response)); actions.append(restore); detail.append(actions);
+  } catch (error) {
+    if (generation === projectVersionsDetailGeneration) {
+      elements["project-version-detail"].textContent = projectVersionErrorMessage(error, "讀取差異");
+    }
+  }
+}
+
+function openProjectVersionRestore(response) {
+  if (projectVersionsCapacity?.restore_backup_available === false) { setProjectVersionsStatus("版本容量已滿，無法建立還原前備份，因此不能還原。系統不會自動清理版本。", true); return; }
+  if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
+  projectVersionsPendingRestore = { version: response.version, tokens: versionTokens(response.current) };
+  elements["project-version-restore-name"].textContent = `要還原：「${response.version?.name || "此版本"}」`;
+  elements["project-version-restore-status"].textContent = ""; elements["project-version-restore-dialog"].showModal();
+}
+
+async function saveProjectVersion(event) {
+  event.preventDefault();
+  if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
+  const name = elements["project-version-name"].value.trim(); if (!name) return;
+  projectVersionsMutationInFlight = true;
+  elements["project-version-save"].disabled = true;
+  setProjectVersionsStatus("正在儲存命名版本…");
+  try {
+    await request("/api/project-versions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, ...versionTokens(projectVersionsCurrent) }),
+    });
+    elements["project-version-name"].value = "";
+    await loadProjectVersions();
+    setProjectVersionsStatus("版本已儲存。");
+  } catch (error) {
+    setProjectVersionsStatus(projectVersionErrorMessage(error, "儲存版本"), true);
+  } finally {
+    projectVersionsMutationInFlight = false;
+    if (elements["project-versions-dialog"].open && projectVersionsPayload) {
+      renderProjectVersions(projectVersionsPayload);
+    }
+  }
+}
+
+let projectVersionsCurrent = null;
+let projectVersionsCapacity = null;
+let projectVersionsPayload = null;
+async function restoreProjectVersion() {
+  if (!projectVersionsPendingRestore || projectVersionsMutationInFlight) return;
+  projectVersionsMutationInFlight = true; const dialog = elements["project-version-restore-dialog"]; dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  try { const result = await request(`/api/project-versions/${encodeURIComponent(projectVersionsPendingRestore.version.version_id)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...projectVersionsPendingRestore.tokens, confirm_restore: true }) }); if (!result?.reload_required) throw new Error("伺服器未確認還原完成"); window.location.replace(window.location.href); }
+  catch (error) {
+    elements["project-version-restore-status"].textContent = projectVersionErrorMessage(error, "還原版本");
+    elements["project-version-restore-status"].classList.add("is-error");
+    dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  }
+  finally { projectVersionsMutationInFlight = false; }
 }
 
 function setSaveState(label, mode = "dirty") {
@@ -6546,6 +6797,22 @@ function renderAll() {
 function bindEvents() {
   fxPreviewInstallCatalogBreakpointListener();
   elements["save-button"].addEventListener("click", () => saveState(true));
+  elements["project-versions-open"].addEventListener("click", async (event) => {
+    projectVersionsTrigger = event.currentTarget;
+    if (projectVersionsBusy()) { showToast(projectVersionsBusyMessage(), "error"); return; }
+    elements["project-versions-dialog"].showModal();
+    projectVersionsSelected = null; projectVersionsPendingRestore = null;
+    elements["project-version-detail"].hidden = true; elements["project-version-detail-empty"].hidden = false;
+    await loadProjectVersions();
+  });
+  elements["project-versions-close"].addEventListener("click", () => { if (!projectVersionsMutationInFlight) elements["project-versions-dialog"].close(); });
+  elements["project-version-save-form"].addEventListener("submit", saveProjectVersion);
+  elements["project-version-restore-cancel"].addEventListener("click", () => { if (!projectVersionsMutationInFlight) elements["project-version-restore-dialog"].close(); });
+  elements["project-version-restore-confirm"].addEventListener("click", restoreProjectVersion);
+  ["project-versions-dialog", "project-version-restore-dialog"].forEach((id) => {
+    elements[id].addEventListener("cancel", (event) => { if (projectVersionsMutationInFlight) event.preventDefault(); });
+  });
+  elements["project-versions-dialog"].addEventListener("close", () => { projectVersionsGeneration += 1; projectVersionsDetailGeneration += 1; projectVersionsSelected = null; projectVersionsTrigger?.focus(); });
   elements["render-button"].addEventListener("click", () => startRender("preview"));
   elements["render-final"].addEventListener("click", () => startRender("final"));
   elements["render-batch-final"].addEventListener("click", startBatchRender);
@@ -6909,6 +7176,14 @@ function bindEvents() {
   });
   window.addEventListener("resize", () => { renderPreviewOverlays(true); renderTimeline(); fxPreviewSpotlightRenderOverlay(); });
   window.addEventListener("keydown", (event) => {
+    if (elements["project-versions-dialog"]?.open || elements["project-version-restore-dialog"]?.open) {
+      const tag = document.activeElement?.tagName;
+      const isEditable = ["INPUT", "TEXTAREA"].includes(tag) || document.activeElement?.isContentEditable;
+      if (isEditable || (tag === "BUTTON" && event.code === "Space")) return;
+      if ((event.metaKey || event.ctrlKey) && ["s", "z"].includes(event.key.toLowerCase())) event.preventDefault();
+      if (event.code === "Space") event.preventDefault();
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
       event.preventDefault();
       saveState(true);
