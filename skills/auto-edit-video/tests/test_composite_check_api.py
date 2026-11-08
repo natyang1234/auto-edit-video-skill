@@ -193,6 +193,10 @@ def test_normalized_time_map_rejects_output_gaps_but_allows_source_gaps(
     (
         lambda receipt: receipt.update(media_sha256="c" * 64),
         lambda receipt: receipt.update(source_sha256="c" * 64),
+        lambda receipt: receipt.update(status=[]),
+        lambda receipt: receipt.update(engines={"faces": [], "ocr": "macos-vision"}),
+        lambda receipt: receipt.update(engines={"faces": "opencv-yunet", "ocr": {}}),
+        lambda receipt: receipt.update(findings=[{"kind": {}}]),
         lambda receipt: receipt["samples"][1].update(source_at=3.5),
         lambda receipt: receipt.update(extra="not-public"),
         lambda receipt: receipt.update(sample_count=9),

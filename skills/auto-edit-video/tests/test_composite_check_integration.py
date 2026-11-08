@@ -283,3 +283,72 @@ def test_invalid_canvas_after_shadow_creation_still_cleans_owned_scratch(
     assert error.value.code == "timeline_render_failed"
     assert not any(cache.glob("timeline-project-*"))
     assert not any(cache.glob(".timeline-owner-*.lock"))
+
+
+def test_reference_system_exit_is_advisory_and_preserves_valid_full_video(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = project / "source/source.mp4"
+    cache = project / "working/fx-preview/renderer-cache"
+    output = project / "working/fx-preview/runtime/out.mp4"
+    source.parent.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    output.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    snapshot = {
+        "manifest": {"source": {"duration_s": 2.0}},
+        "state": {
+            "canvas": {"width": 1080, "height": 1920, "fit": "contain"},
+            "segments": [{"source_start": 0.0, "source_end": 2.0}],
+            "asset_digests": {},
+            "overlays": [],
+        },
+    }
+    dependencies = {
+        "source": {"relative": "source/source.mp4", "sha256": source_sha},
+        "timeline_project_inputs": {},
+    }
+    calls = 0
+
+    def render_then_exit(_shadow, destination, _quality, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            Path(destination).write_bytes(b"valid-full-video")
+            return
+        raise SystemExit("optional reference renderer unavailable")
+
+    with (
+        mock.patch.object(timeline, "render_project", side_effect=render_then_exit),
+        mock.patch.object(timeline, "referenced_asset_digests", return_value={}),
+        mock.patch.object(timeline, "editor_state_revision", return_value="c" * 64),
+        mock.patch.object(render, "media_ok", return_value=True),
+    ):
+        result = render.timeline_preview(
+            project,
+            cache,
+            output,
+            snapshot,
+            0.0,
+            1.0,
+            dependencies,
+            scratch_owner="f" * 32,
+        )
+
+    assert calls == 2
+    assert output.read_bytes() == b"valid-full-video"
+    assert result["composition_check"]["status"] == "unmeasured"
+    assert result["composition_check"]["elapsed_s"] == 0.0
+    assert result["composition_check"]["findings"] == [
+        {"kind": "reference_unavailable"}
+    ]
+    assert not any(cache.glob("timeline-project-*"))
+    assert not any(cache.glob(".timeline-owner-*.lock"))
+
+
+def test_analysis_elapsed_is_zero_before_analysis_and_capped_without_sleep() -> None:
+    assert render._bounded_analysis_elapsed(None) == 0.0
+    with mock.patch.object(render.time, "monotonic", return_value=200.5):
+        assert render._bounded_analysis_elapsed(100.0) == 60.0

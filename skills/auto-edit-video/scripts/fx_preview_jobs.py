@@ -433,12 +433,14 @@ def _sanitize_composition_check(
     }
     if not isinstance(value, dict) or set(value) != top_keys:
         return fallback
+    status_value = value.get("status")
     if (
         value.get("version") != 1
         or value.get("scope") != scope
         or value.get("scope") not in _COMPOSITION_SCOPES
         or value.get("measurement") != "sampled-local-frames"
-        or value.get("status") not in _COMPOSITION_STATUSES
+        or not isinstance(status_value, str)
+        or status_value not in _COMPOSITION_STATUSES
         or value.get("source_sha256") != source_sha256
         or value.get("media_sha256") != media_sha256
     ):
@@ -476,11 +478,15 @@ def _sanitize_composition_check(
     ):
         return fallback
     engines = value.get("engines")
+    face_engine = engines.get("faces") if isinstance(engines, dict) else None
+    ocr_engine = engines.get("ocr") if isinstance(engines, dict) else None
     if (
         not isinstance(engines, dict)
         or set(engines) != {"faces", "ocr"}
-        or engines.get("faces") not in _COMPOSITION_FACE_ENGINES
-        or engines.get("ocr") not in _COMPOSITION_OCR_ENGINES
+        or not isinstance(face_engine, str)
+        or face_engine not in _COMPOSITION_FACE_ENGINES
+        or not isinstance(ocr_engine, str)
+        or ocr_engine not in _COMPOSITION_OCR_ENGINES
     ):
         return fallback
     samples: list[dict[str, Any]] = []
@@ -536,10 +542,12 @@ def _sanitize_composition_check(
     findings: list[dict[str, Any]] = []
     finding_keys = {"kind", "output_at", "source_at", "subject_box", "text_box"}
     for finding in raw_findings:
+        finding_kind = finding.get("kind") if isinstance(finding, dict) else None
         if (
             not isinstance(finding, dict)
             or not set(finding).issubset(finding_keys)
-            or finding.get("kind") not in _COMPOSITION_FINDINGS
+            or not isinstance(finding_kind, str)
+            or finding_kind not in _COMPOSITION_FINDINGS
         ):
             return fallback
         has_output = "output_at" in finding
@@ -578,7 +586,7 @@ def _sanitize_composition_check(
         "analysis_incomplete",
         "full_timeline_required",
     }
-    status = value["status"]
+    status = status_value
     incomplete = sanitized_measured_count != sample_count
     unavailable_engine = engines != {
         "faces": "opencv-yunet", "ocr": "macos-vision"
