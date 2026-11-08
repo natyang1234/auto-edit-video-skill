@@ -333,16 +333,25 @@ def validate(overlay: dict[str, Any], state: dict[str, Any] | None = None) -> li
             errors.append(f"fx overlay {oid}: manual spotlight_path cannot also select an automatic subject")
         else:
             try:
-                overlay["spotlight_path"] = fx_preview_contract.normalize_spotlight_path(
+                normalized_path = fx_preview_contract.normalize_spotlight_path(
                     overlay.get("spotlight_path"),
                     start=overlay.get("start"),
                     end=overlay.get("end"),
                 )
+                first_at = normalized_path["keyframes"][0]["source_at"]
+                last_at = normalized_path["keyframes"][-1]["source_at"]
+                if overlay.get("start") != first_at or overlay.get("end") != last_at:
+                    errors.append(
+                        f"fx overlay {oid}: 手動 spotlight_path 的 start/end "
+                        "必須先正規化為 3 位小數，且與路徑端點完全一致"
+                    )
+                else:
+                    overlay["spotlight_path"] = normalized_path
             except fx_preview_contract.FxPreviewContractError as exc:
                 errors.append(f"fx overlay {oid}: {exc.message}")
     try:
         span = float(overlay.get("end", 0)) - float(overlay.get("start", 0))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         span = 0.0
     if False and effect.get("needs_video") and effect.get("media_max") and span > float(effect["media_max"]) + 1e-6:
         errors.append(f"fx overlay {oid}: effect {code} can run at most {effect['media_max']} s (it transforms the clip)")

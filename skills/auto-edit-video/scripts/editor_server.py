@@ -3744,7 +3744,7 @@ def validate_editor_state(state: Any, duration_s: float) -> list[str]:
                 or end > duration_s + 0.05
             ):
                 errors.append(f"overlay {overlay_id or index} has invalid timing")
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             errors.append(f"overlay {overlay_id or index} timing must be numeric")
         overlay_text = str(overlay.get("text", ""))
         if len(overlay_text) > 1000:

@@ -218,7 +218,10 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
             )
 
             target = page.locator("#spotlight-source-click-target")
-            self.assertEqual(target.get_attribute("tabindex"), "-1")
+            self.assertEqual(target.evaluate("el => el.tagName"), "DIV")
+            self.assertIsNone(target.get_attribute("tabindex"))
+            self.assertIsNone(target.get_attribute("role"))
+            self.assertIsNone(target.get_attribute("aria-label"))
             self.assertEqual(target.get_attribute("aria-hidden"), "true")
 
             # The source hit target remains a pointer-only affordance.  Walk
@@ -299,11 +302,125 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
                 page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").count(),
                 before + 1,
             )
+            self.assertNotEqual(page.evaluate("() => document.activeElement?.id"), "spotlight-source-click-target")
+            page.keyboard.press("Enter")
+            page.keyboard.press("Space")
+            self.assertEqual(
+                page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").count(),
+                before + 1,
+            )
             self.assertTrue(
                 page.evaluate(
                     "() => fxPreviewDraft.spotlight_path.keyframes.some(point => Math.abs(point.source_at - 0.7) < 0.001)"
                 )
             )
+            browser.close()
+
+    def test_manual_edge_contracts_for_empty_cap_marker_and_python_rounding(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            rounding = page.evaluate("""() => [
+                fxPreviewCanonicalNumber(0.0625, 3),
+                fxPreviewCanonicalNumber(2.0005, 3),
+                fxPreviewCanonicalBounds(1.0004, 2.0004).end,
+                fxPreviewCanonicalNumber(0.1234565, 6),
+                fxPreviewCanonicalNumber(0.1234555, 6),
+            ]""")
+            expected_rounding = [
+                round(0.0625, 3),
+                round(2.0005, 3),
+                round(round(1.0004, 3) + round(2.0004, 3), 3),
+                round(0.1234565, 6),
+                round(0.1234555, 6),
+            ]
+            self.assertEqual(rounding, expected_rounding)
+
+            # Empty add fields use explicit defaults, while an empty update is
+            # invalid and leaves the selected path point unchanged.
+            page.locator("#spotlight-point-time").fill("")
+            page.locator("#spotlight-point-x").fill("")
+            page.locator("#spotlight-point-y").fill("")
+            page.evaluate("() => { const v = document.querySelector('#fx-preview-source-video'); v.currentTime = 0.7; v.dispatchEvent(new Event('timeupdate')); }")
+            page.locator("#spotlight-add-point").click()
+            added = page.evaluate("() => fxPreviewDraft.spotlight_path.keyframes.find(p => p.source_at === 0.7)")
+            self.assertEqual(added, {"source_at": 0.7, "x": 0.5, "y": 0.5})
+            before = page.evaluate("() => structuredClone(fxPreviewDraft.spotlight_path.keyframes[fxPreviewSpotlightSelectedIndex])")
+            page.locator("#spotlight-point-x").fill("")
+            page.locator("#spotlight-update-point").click()
+            self.assertEqual(page.evaluate("() => fxPreviewDraft.spotlight_path.keyframes[fxPreviewSpotlightSelectedIndex]"), before)
+            self.assertIn("有限數字", page.locator("#spotlight-validation").inner_text())
+
+            cap = page.evaluate("""() => {
+                const path = fxPreviewDraft.spotlight_path.keyframes;
+                const start = fxPreviewSpotlightBounds().start;
+                const end = fxPreviewSpotlightBounds().end;
+                path.splice(0, path.length, ...Array.from({length: 64}, (_, i) => ({source_at: i / 50, x: .2, y: .3})));
+                const replacement = fxPreviewSpotlightAddPoint(path[10].source_at, .8, .7);
+                const afterReplacement = path.length;
+                const rejected = fxPreviewSpotlightAddPoint(end + .001, .6, .6);
+                return {replacement, afterReplacement, rejected, finalCount: path.length, point: path[10]};
+            }""")
+            self.assertEqual(cap, {"replacement": True, "afterReplacement": 64, "rejected": False, "finalCount": 64, "point": {"source_at": cap["point"]["source_at"], "x": 0.8, "y": 0.7}})
+
+            marker_sizes = []
+            for width, height in ((390, 900), (1100, 900), (1440, 900), (1440, 390)):
+                page.set_viewport_size({"width": width, "height": height})
+                page.wait_for_timeout(50)
+                marker_sizes.append(page.evaluate("""() => {
+                    const marker = document.querySelector('#spotlight-path-markers ellipse');
+                    const box = marker.getBoundingClientRect();
+                    return {tag: marker.tagName, width: box.width, height: box.height};
+                }"""))
+            self.assertTrue(all(item["tag"] == "ellipse" for item in marker_sizes))
+            self.assertTrue(all(abs(item["width"] - 12) < 0.2 and abs(item["height"] - 12) < 0.2 for item in marker_sizes), marker_sizes)
+            browser.close()
+
+    def test_row_empty_is_incomplete_and_native_bad_input_is_not_an_add_default(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            row_time = page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").first.locator("input").nth(0)
+            row_time.focus()
+            page.keyboard.press("ControlOrMeta+A")
+            page.keyboard.press("Backspace")
+            page.keyboard.press("Tab")
+            page.wait_for_function("() => !Number.isFinite(fxPreviewDraft.spotlight_path.keyframes[0].source_at)")
+            self.assertTrue(page.locator("#fx-preview-confirm").is_disabled())
+            self.assertIn("關鍵點", page.locator("#spotlight-validation").inner_text())
+            self.assertEqual(page.evaluate("() => document.activeElement?.getAttribute('aria-label')"), row_time.locator("xpath=following-sibling::input[1]").get_attribute("aria-label"))
+            row_time.focus()
+            page.keyboard.type("0")
+            page.keyboard.press("Tab")
+            page.wait_for_function("() => fxPreviewDraft.spotlight_path.keyframes[0].source_at === 0")
+
+            for selector in ("#spotlight-point-time", "#spotlight-point-x", "#spotlight-point-y"):
+                page.locator(selector).fill("0.5")
+            bad = page.locator("#spotlight-point-time")
+            bad.focus()
+            page.keyboard.press("ControlOrMeta+A")
+            page.keyboard.type("-")
+            self.assertEqual(bad.evaluate("el => ({value: el.value, badInput: el.validity.badInput})"), {"value": "", "badInput": True})
+            before = page.evaluate("() => structuredClone(fxPreviewDraft.spotlight_path.keyframes)")
+            page.locator("#spotlight-add-point").click()
+            self.assertEqual(page.evaluate("() => fxPreviewDraft.spotlight_path.keyframes"), before)
+            self.assertIn("有限數字", page.locator("#spotlight-validation").inner_text())
             browser.close()
 
     def test_manual_hold_resets_when_selecting_another_effect(self):
@@ -487,6 +604,97 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
             page.locator("#manual-spotlight-timing-open").click()
             page.locator("#fx-preview-dialog[open]").wait_for()
             page.wait_for_function("() => fxPreviewDraft?.code === 'P5'")
+            page.locator("#fx-preview-cancel").click()
+            page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
+            browser.close()
+
+    def test_saved_manual_reopen_clears_editor_reset_but_preserves_pending_add_values(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function("() => fxPreviewDraft?.spotlight_path?.keyframes?.length === 2")
+
+            # Leave a real, non-default editor value in the closed dialog so a
+            # later saved-manual reopen can prove that lifecycle cleanup clears it.
+            for selector, value in (
+                ("#spotlight-point-time", "0.900"),
+                ("#spotlight-point-x", "0.123456"),
+                ("#spotlight-point-y", "0.654321"),
+            ):
+                page.locator(selector).fill(value)
+            page.locator("#spotlight-add-point").click()
+            page.locator("#fx-preview-cancel").click()
+            page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
+
+            page.evaluate("""() => {
+                const overlay = {
+                    id: 'saved-manual-reopen-regression', type: 'fx', start: 0.2, end: 1.2,
+                    text: '聚光燈', emphasis: [], visible: true, locked: false, z_index: 25,
+                    style: {x: 50, y: 50, width: 100, animation: 'none'},
+                    code: 'P5', values: {}, placement: '', scheme: '', font_ids: {},
+                    spotlight_path: {version: 1, interpolation: 'smoothstep', keyframes: [
+                        {source_at: 0.2, x: 0.5, y: 0.5},
+                        {source_at: 1.2, x: 0.5, y: 0.5},
+                    ]}, provenance: 'browser test', highlight_id: null,
+                };
+                state.overlays.push(overlay);
+                state.review = state.review || {};
+                selectedOverlayId = overlay.id;
+                state.review.selected_overlay_id = overlay.id;
+                renderAll();
+            }""")
+            page.locator("#manual-spotlight-timing-open").click()
+            page.locator("#fx-preview-dialog[open]").wait_for()
+            page.wait_for_function("() => fxPreviewDraft?.code === 'P5'")
+
+            reopened = page.evaluate("""() => ({
+                selected: fxPreviewSpotlightSelectedIndex,
+                time: document.querySelector('#spotlight-point-time').value,
+                x: document.querySelector('#spotlight-point-x').value,
+                y: document.querySelector('#spotlight-point-y').value,
+            })""")
+            self.assertEqual(reopened, {"selected": -1, "time": "", "x": "", "y": ""})
+
+            # Render paths must not erase values the user has typed while no
+            # point is selected; these are still pending values for Add.
+            pending = {"#spotlight-point-time": "0.901", "#spotlight-point-x": "0.210000", "#spotlight-point-y": "0.790000"}
+            for selector, value in pending.items():
+                page.locator(selector).fill(value)
+            page.evaluate("""() => {
+                fxPreviewSpotlightRenderPanel({renderList: false});
+                fxPreviewRenderDialog();
+            }""")
+            self.assertEqual(
+                {selector: page.locator(selector).input_value() for selector in pending},
+                pending,
+            )
+
+            # With genuinely blank fields, Add uses the actual source currentTime
+            # and canonicalizes only that time; X/Y remain the documented center.
+            for selector in pending:
+                page.locator(selector).fill("")
+            page.evaluate("""() => {
+                const source = document.querySelector('#fx-preview-source-video');
+                source.currentTime = 0.7336;
+                source.dispatchEvent(new Event('timeupdate'));
+            }""")
+            page.locator("#spotlight-add-point").click()
+            added = page.evaluate("""() => {
+                const source = document.querySelector('#fx-preview-source-video');
+                const expected = fxPreviewCanonicalNumber(source.currentTime, 3);
+                const point = fxPreviewDraft.spotlight_path.keyframes.find(item => item.source_at === expected);
+                return {sourceTime: source.currentTime, expected, point};
+            }""")
+            self.assertEqual(added["point"], {"source_at": added["expected"], "x": 0.5, "y": 0.5})
+
             page.locator("#fx-preview-cancel").click()
             page.locator("#fx-preview-dialog:not([open])").wait_for(state="hidden")
             browser.close()
