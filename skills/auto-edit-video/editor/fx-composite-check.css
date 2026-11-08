@@ -1,0 +1,123 @@
+/* P5 complete-picture diagnostics. Keep this scoped so the approved paper/
+   darkroom surface and the original shared stylesheet remain untouched. */
+.fx-preview-layout-check-note,
+.fx-preview-composition-check-kicker,
+.fx-preview-composition-check-samples {
+  margin: 0 0 8px;
+  color: oklch(76% .025 73);
+  font-size: .76rem;
+  line-height: 1.45;
+}
+
+.fx-preview-composition-check {
+  margin-top: 12px;
+  padding: 13px 0 2px;
+  border-top: 1px solid var(--stage-line);
+}
+
+.fx-preview-composition-check-head,
+.fx-preview-layout-check-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.fx-preview-composition-check-head .fx-preview-subheading,
+.fx-preview-layout-check-head .fx-preview-subheading {
+  margin: 0;
+}
+
+.fx-preview-composition-check-status {
+  flex: none;
+  padding: 4px 8px;
+  border: 1px solid oklch(70% .05 75 / .72);
+  color: var(--amber);
+  font-size: .72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.fx-preview-composition-check[data-status="pass"] .fx-preview-composition-check-status {
+  border-color: oklch(72% .09 145 / .72);
+  color: oklch(82% .12 145);
+}
+
+.fx-preview-composition-check[data-status="warn"] .fx-preview-composition-check-status {
+  border-color: oklch(70% .14 45 / .8);
+  color: oklch(84% .12 70);
+}
+
+.fx-preview-composition-check[data-status="unmeasured"] .fx-preview-composition-check-status {
+  border-color: oklch(68% .04 75 / .72);
+  color: oklch(78% .02 75);
+}
+
+.fx-preview-composition-check-summary {
+  margin: 8px 0 4px;
+  color: var(--paper-0);
+  font-size: .86rem;
+  line-height: 1.5;
+}
+
+.fx-preview-composition-check-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 10px;
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0;
+  list-style: none;
+  scrollbar-gutter: stable;
+}
+
+.fx-preview-composition-check-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--vermilion);
+  background: oklch(24% .024 55 / .72);
+  color: var(--paper-0);
+  font-size: .78rem;
+  line-height: 1.4;
+}
+
+.fx-preview-composition-check-list li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fx-preview-composition-check-list .button {
+  flex: none;
+  min-height: 40px;
+  padding: 6px 10px;
+  white-space: nowrap;
+}
+
+.fx-preview-composition-check-list .button:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.fx-preview-composition-check-switch {
+  margin-top: 4px;
+  min-height: 42px;
+}
+
+@media (max-width: 760px) {
+  .fx-preview-composition-check-list {
+    max-height: 210px;
+  }
+
+  .fx-preview-composition-check-list li {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .fx-preview-composition-check-list .button {
+    width: 100%;
+  }
+}

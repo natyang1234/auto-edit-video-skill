@@ -8,6 +8,7 @@ The API owns process groups, authorization and path containment.
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import json
 import os
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,8 @@ import text_fit
 
 MAX_SECONDS = 4.0
 MAX_REQUEST_JSON_BYTES = 16 * 1024 * 1024
+MAX_COMPOSITE_RESULT_BYTES = 512 * 1024
+COMPOSITE_CHECK_TIMEOUT_S = 15.0
 RENDERER_MAINTENANCE_LOCK = ".renderer-maintenance.lock"
 
 
@@ -303,6 +307,180 @@ def file_digest(path: Path) -> str:
     return h.hexdigest()
 
 
+def _composition_unmeasured(
+    *,
+    scope: str,
+    source_sha256: str,
+    media_sha256: str,
+    frame_size: dict[str, int],
+    finding: str,
+    elapsed_s: float = 0.0,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "scope": scope,
+        "measurement": "sampled-local-frames",
+        "status": "unmeasured",
+        "source_sha256": source_sha256,
+        "media_sha256": media_sha256,
+        "frame_size": {
+            "width": int(frame_size["width"]),
+            "height": int(frame_size["height"]),
+        },
+        "sample_count": 0,
+        "measured_count": 0,
+        "elapsed_s": round(max(0.0, float(elapsed_s)), 3),
+        "engines": {"faces": "unavailable", "ocr": "unavailable"},
+        "samples": [],
+        "findings": [{"kind": finding}],
+    }
+
+
+def _read_bounded_json(path: Path, maximum: int) -> Any:
+    info = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_size <= 0
+        or info.st_size > maximum
+    ):
+        raise ValueError("optional diagnostic result is unsafe")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _run_composition_check(
+    *,
+    composite: Path,
+    reference: Path | None,
+    source: Path,
+    time_map: list[dict[str, float]],
+    scratch: Path,
+    source_sha256: str,
+    expected_text: bool,
+    scope: str,
+    frame_size: dict[str, int],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    media_sha256 = file_digest(composite)
+    fallback_finding = "reference_unavailable" if reference is None else "analysis_incomplete"
+    fallback = _composition_unmeasured(
+        scope=scope,
+        source_sha256=source_sha256,
+        media_sha256=media_sha256,
+        frame_size=frame_size,
+        finding=fallback_finding,
+    )
+    worker = Path(__file__).with_name("composite_check_worker.py").resolve()
+    face_model = (
+        Path(__file__).resolve().parents[1]
+        / "assets/models/yunet/face_detection_yunet_2026may.onnx"
+    )
+    if reference is None or not worker.is_file() or not face_model.is_file():
+        return fallback
+    scratch.mkdir(mode=0o700, parents=True, exist_ok=False)
+    request_path = scratch / "request.json"
+    result_path = scratch / "result.json"
+    atomic_json(
+        request_path,
+        {
+            "composite": str(composite),
+            "reference": str(reference),
+            "source": str(source),
+            "time_map": time_map,
+            "face_model": str(face_model),
+            "scratch": str(scratch),
+            "source_sha256": source_sha256,
+            "expected_text": bool(expected_text),
+            "scope": scope,
+        },
+    )
+    try:
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(worker),
+                "--request",
+                str(request_path),
+                "--result",
+                str(result_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=COMPOSITE_CHECK_TIMEOUT_S,
+            check=False,
+        )
+        if process.returncode != 0:
+            return fallback
+        payload = _read_bounded_json(result_path, MAX_COMPOSITE_RESULT_BYTES)
+        receipt = payload.get("composition_check") if isinstance(payload, dict) else None
+        return receipt if isinstance(receipt, dict) else fallback
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, subprocess.SubprocessError):
+        fallback["elapsed_s"] = round(time.monotonic() - started, 3)
+        return fallback
+
+
+def _timeline_time_map(
+    segments: list[tuple[float, float]], sample_start: float, duration: float
+) -> list[dict[str, float]]:
+    result: list[dict[str, float]] = []
+    output_at = 0.0
+    for segment_start, segment_end in segments:
+        left = max(sample_start, segment_start)
+        right = min(sample_start + duration, segment_end)
+        if right <= left:
+            continue
+        length = right - left
+        result.append(
+            {
+                "source_start_s": round(left, 6),
+                "source_end_s": round(right, 6),
+                "output_start_s": round(output_at, 6),
+                "output_end_s": round(output_at + length, 6),
+            }
+        )
+        output_at += length
+    return result
+
+
+def _reference_snapshot(
+    snapshot: dict[str, Any], shadow: Path, timeline: Any
+) -> dict[str, Any]:
+    reference = copy.deepcopy(snapshot)
+    state = reference.get("state")
+    if not isinstance(state, dict):
+        raise ValueError("reference snapshot state is invalid")
+    state["overlays"] = []
+    state["asset_digests"] = timeline.referenced_asset_digests(shadow, state)
+    revision = timeline.editor_state_revision(state)
+    state["revision"] = revision
+    reference["state_revision"] = revision
+    reference["state"] = state
+    reference["render_id"] = "fx-preview-reference"
+    return reference
+
+
+def _timeline_expected_text(
+    state: dict[str, Any], layout_reports: dict[str, Any], sample_start: float, duration: float
+) -> bool:
+    if layout_reports:
+        return True
+    for overlay in state.get("overlays", []):
+        if not isinstance(overlay, dict) or overlay.get("visible") is False:
+            continue
+        if overlay.get("type") not in {"caption", "text", "fx"}:
+            continue
+        try:
+            start = float(overlay.get("start"))
+            end = float(overlay.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if end > sample_start and start < sample_start + duration:
+            return True
+    return False
+
+
 def _safe_relative_parts(relative: str) -> tuple[str, ...]:
     if not isinstance(relative, str):
         raise PreviewError("invalid_request", "預覽依賴路徑格式無效")
@@ -545,6 +723,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     # Source gaps removed by the edit are adjacent on the final axis, so a
     # source 3..7 window spanning a removed 5..6 becomes one 3-second output.
     start, end = windows[0][0], windows[-1][1]
+    time_map = _timeline_time_map(segments, sample_start, duration)
     key = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
     # render_project creates captions/graphic intermediates.  Never let a preview
     # write them into the live project: clone immutable inputs into the preview
@@ -605,7 +784,15 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     # worker's finally block from running.  Only the validated MP4 crosses into
     # runtime, under the manager-owned job filename.
     full = shadow / "working" / "fx-preview-output.mp4"
+    reference = shadow / "working" / "fx-preview-reference.mp4"
     layout_reports: dict[str, Any] = {}
+    canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
+    frame_size = {
+        "width": int(canvas.get("width", 1080)),
+        "height": int(canvas.get("height", 1920)),
+    }
+    source_sha256 = str((dependencies.get("source") or {}).get("sha256") or "")
+    composition_check: dict[str, Any] | None = None
     target_material = dependencies.get("material")
     expected_broll = None
     observed_broll = False
@@ -669,7 +856,53 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
         if expected_broll is not None and not observed_broll:
             raise PreviewError("broll_render_unverified", "B1 預覽未包含已選素材")
         layout_path = shadow / "working" / "fx_text_layout.json"
-        layout_reports = json.loads(layout_path.read_text()) if layout_path.is_file() else {}
+        raw_layout_reports = json.loads(layout_path.read_text()) if layout_path.is_file() else {}
+        layout_reports = copy.deepcopy(raw_layout_reports) if isinstance(raw_layout_reports, dict) else {}
+        progress("validating", "正在驗證時間軸預覽")
+        if not media_ok(full, end - start):
+            raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
+        full_sha256 = file_digest(full)
+        optional_started = time.monotonic()
+        try:
+            reference_data = _reference_snapshot(snapshot, shadow, timeline)
+            atomic_json(path, reference_data)
+            timeline.render_project(
+                shadow,
+                reference,
+                "preview",
+                snapshot_path=path,
+                preview_fx_quality=quality,
+                preview_output_window=(start, end - start),
+                preview_progress=lambda phase: progress(
+                    phase, "正在準備完整畫面診斷參考"
+                ),
+            )
+            if not media_ok(reference, end - start):
+                raise ValueError("reference video did not validate")
+            composition_check = _run_composition_check(
+                composite=full,
+                reference=reference,
+                source=shadow / str((dependencies.get("source") or {}).get("relative") or ""),
+                time_map=time_map,
+                scratch=shadow / "working" / "composite-check",
+                source_sha256=source_sha256,
+                expected_text=_timeline_expected_text(
+                    state, layout_reports, sample_start, duration
+                ),
+                scope="full-timeline",
+                frame_size=frame_size,
+            )
+        except Exception:
+            composition_check = _composition_unmeasured(
+                scope="full-timeline",
+                source_sha256=source_sha256,
+                media_sha256=full_sha256,
+                frame_size=frame_size,
+                finding="reference_unavailable",
+                elapsed_s=time.monotonic() - optional_started,
+            )
+        if file_digest(full) != full_sha256:
+            raise PreviewError("output_invalid", "時間軸預覽在診斷期間發生變更")
         # A template can move the source person after the FX DOM was measured.
         # Do not recycle full-source face coordinates as final composite evidence.
         for report in layout_reports.values():
@@ -681,9 +914,6 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
             report["findings"].append({"kind": "composite_subject_measurement_unavailable"})
             report["status"] = "warn"
         atomic_json(cache / f"timeline-{key}-text-layout.json", layout_reports)
-        progress("validating", "正在驗證時間軸預覽")
-        if not media_ok(full, end - start):
-            raise PreviewError("output_invalid", "時間軸預覽 MP4 未完整解碼")
         os.replace(full, output)
     except PreviewError:
         raise
@@ -710,14 +940,8 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
                 os.close(lease_fd)
             finally:
                 os.close(cache_fd)
-    time_map, out_at = [], 0.0
-    for seg_start, seg_end in segments:
-        left, right = max(sample_start, seg_start), min(sample_start + duration, seg_end)
-        if right > left:
-            length = right - left
-            time_map.append({"source_start_s": left, "source_end_s": right, "output_start_s": round(out_at, 3), "output_end_s": round(out_at + length, 3)})
-            out_at += length
     return {"render_duration_s": round(end - start, 3), "time_map": time_map,
+            "composition_check": composition_check,
             "text_layout": {"version": 2, "measurement": "composition-dom" if layout_reports else "unavailable",
                             "status": "warn" if not layout_reports or any((r or {}).get("status") != "pass" for r in layout_reports.values()) else "pass",
                             "analysis_scope": "individual-fx-layout", "face_measurement": "unavailable", "layers": layout_reports, "findings": [dict(f, layer_id=k) for k,r in layout_reports.items() for f in (r or {}).get("findings", [])]}}
@@ -850,6 +1074,13 @@ def _render(data: dict[str, Any]) -> dict[str, Any]:
         tmp.unlink(missing_ok=True)
         raise PreviewError("output_invalid", "預覽 MP4 未完整解碼或格式不相容")
     os.replace(tmp, output)
+    composition_check = _composition_unmeasured(
+        scope="single-effect",
+        source_sha256=str((dependencies.get("source") or {}).get("sha256") or ""),
+        media_sha256=file_digest(output),
+        frame_size={"width": 1080, "height": 1920},
+        finding="full_timeline_required",
+    )
     # The alpha MOV and HyperFrames lab are per-effect intermediates (often
     # hundreds of MB). The reusable person/mask pair lives next to this key
     # directory, so remove only the workspace after publishing the MP4.
@@ -865,6 +1096,7 @@ def _render(data: dict[str, Any]) -> dict[str, Any]:
             "quality": requested_quality, "render_duration_s": duration,
             "time_map": [{"source_start_s": sample_start, "source_end_s": sample_start + duration,
                           "output_start_s": 0.0, "output_end_s": duration}], "text_layout": text_layout,
+            "composition_check": composition_check,
             "subject_track": rendered.get("spotlight"), "cached": bool(rendered.get("cached")), "effect_seconds": rendered.get("seconds")}
 
 
