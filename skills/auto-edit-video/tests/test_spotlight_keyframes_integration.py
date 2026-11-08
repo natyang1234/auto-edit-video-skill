@@ -10,6 +10,8 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +52,61 @@ def isolated_compose():
     compose = fx_overlay._compose()
     assert configured_path / "tools/compose.py" == Path(compose.__file__).resolve()
     return compose
+
+
+def make_one_frame_source(
+    tmp_path: Path, *, name: str, fps: str, expected_duration: float
+) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("requires local ffmpeg and ffprobe")
+
+    source = tmp_path / name
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=black:s=32x32:r={fps}",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    probe = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=r_frame_rate,time_base,duration:format=duration",
+            "-of",
+            "json",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    metadata = json.loads(probe.stdout)
+    assert float(metadata["format"]["duration"]) == pytest.approx(
+        expected_duration
+    )
+    assert float(metadata["streams"][0]["duration"]) == pytest.approx(
+        expected_duration
+    )
+    return source
 
 
 def test_isolated_compose_exposes_the_agreed_optional_keyword() -> None:
@@ -225,6 +282,124 @@ def test_submillisecond_raw_end_mismatch_logs_fallback_instead_of_escaping(
             "reason": "spotlight_path_invalid",
         }
     }
+
+
+def assert_manual_source_clipping_fails_closed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    source: Path,
+    end: float,
+    expected_error: str,
+) -> None:
+    compose = isolated_compose()
+    project = tmp_path / "project"
+    work = project / "working/fx"
+    work.mkdir(parents=True)
+    person = work / "person.webm"
+    mask = work / "mask.mp4"
+    person.write_bytes(b"person-fixture")
+    mask.write_bytes(b"mask-fixture")
+    start = 0.001
+    overlay = {
+        "id": "manual-source-clipping",
+        "type": "fx",
+        "code": "P5",
+        "start": start,
+        "end": end,
+        "values": {},
+        "placement": "",
+        "scheme": "",
+        "font_ids": {},
+        "style": {"opacity": 1.0},
+        "spotlight_path": {
+            "version": 1,
+            "interpolation": "smoothstep",
+            "keyframes": [
+                {"source_at": start, "x": 0.25, "y": 0.3},
+                {"source_at": end, "x": 0.75, "y": 0.4},
+            ],
+        },
+    }
+    catalog = {
+        "effects": [
+            {
+                "code": "P5",
+                "needs_person": True,
+                "block": "fx-spotlight",
+            }
+        ]
+    }
+    with patch.object(fx_overlay, "available", return_value=True), patch.object(
+        fx_overlay, "catalog", return_value=catalog
+    ), patch.object(
+        fx_overlay, "_person_assets", return_value=(person, mask)
+    ), patch.object(
+        fx_overlay, "families_for", return_value=[]
+    ), patch.object(
+        fx_overlay, "font_files_for", return_value={}
+    ), patch.object(
+        compose, "probe", wraps=compose.probe
+    ) as probe_spy, patch.object(
+        compose,
+        "_spotlight_track",
+        side_effect=AssertionError("source clipping must fail before spotlight tracking"),
+    ), patch.object(
+        compose.cs,
+        "load_theme",
+        side_effect=AssertionError("source clipping must fail before theme/render work"),
+    ):
+        rendered = fx_overlay.render_for_timeline(
+            project,
+            overlay,
+            source,
+            None,
+            canvas=(1080, 1920),
+            fit="cover",
+        )
+
+    assert rendered is None
+    assert probe_spy.call_count == 1
+    logged = json.loads(capsys.readouterr().err)
+    assert logged["fx_fallback"]["layer"] == "manual-source-clipping"
+    assert logged["fx_fallback"]["code"] == "P5"
+    assert expected_error in logged["fx_fallback"]["error"]
+
+
+def test_manual_window_past_source_end_becomes_main_fallback_before_shared_render_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = make_one_frame_source(
+        tmp_path,
+        name="one-frame-0635.mp4",
+        fps="2000/127",
+        expected_duration=0.0635,
+    )
+    assert_manual_source_clipping_fails_closed(
+        tmp_path,
+        capsys,
+        source=source,
+        end=0.065,
+        expected_error="手動聚光燈時窗超出原片長",
+    )
+
+
+def test_manual_submillisecond_clip_becomes_main_fallback_before_shared_render_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = make_one_frame_source(
+        tmp_path,
+        name="one-frame-1095.mp4",
+        fps="2000/219",
+        expected_duration=0.1095,
+    )
+    assert_manual_source_clipping_fails_closed(
+        tmp_path,
+        capsys,
+        source=source,
+        end=0.110,
+        expected_error="手動聚光燈時窗會因原片長裁短",
+    )
 
 
 def test_effective_render_window_is_identical_for_real_main_and_shared_validators() -> None:

@@ -2207,10 +2207,36 @@ function fxPreviewCanonicalNumber(value, decimals, label = "數值") {
     || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
     throw new Error(`${label}必須是有限數字`);
   }
-  const factor = 10 ** decimals;
-  const rounded = Math.round(value * factor) / factor;
+  // Python's contract uses IEEE-754 round-half-to-even.  Do the division in
+  // integer space so a scaled double never introduces a second rounding step.
+  const bits = new DataView(new ArrayBuffer(8));
+  bits.setFloat64(0, value, false);
+  const high = bits.getUint32(0, false);
+  const low = bits.getUint32(4, false);
+  const negative = Boolean(high >>> 31);
+  const exponentBits = (high >>> 20) & 0x7ff;
+  const fraction = (BigInt(high & 0xfffff) << 32n) | BigInt(low);
+  let numerator = exponentBits === 0 ? fraction : (1n << 52n) | fraction;
+  let exponent = exponentBits === 0 ? -1074 : exponentBits - 1023 - 52;
+  numerator *= 10n ** BigInt(decimals);
+  let denominator = 1n;
+  if (exponent >= 0) numerator <<= BigInt(exponent);
+  else denominator <<= BigInt(-exponent);
+  let quotient = numerator / denominator;
+  const remainder = numerator % denominator;
+  const comparison = remainder * 2n - denominator;
+  if (comparison > 0n || (comparison === 0n && quotient % 2n !== 0n)) quotient += 1n;
+  const digits = quotient.toString().padStart(decimals + 1, "0");
+  const text = `${negative ? "-" : ""}${digits.slice(0, -decimals)}.${digits.slice(-decimals)}`;
+  const rounded = Number(text);
   if (!Number.isFinite(rounded)) throw new Error(`${label}超出可安全處理範圍`);
   return Object.is(rounded, -0) || rounded === 0 ? 0 : rounded;
+}
+
+function fxPreviewCanonicalBounds(startValue, durationValue) {
+  const start = fxPreviewCanonicalNumber(Number(startValue), 3, "套用起點");
+  const duration = fxPreviewCanonicalNumber(Number(durationValue), 3, "套用時長");
+  return { start, duration, end: fxPreviewCanonicalNumber(start + duration, 3, "套用終點") };
 }
 
 function fxPreviewSpotlightPathError(message, incomplete = false) {
@@ -2286,7 +2312,12 @@ function fxPreviewValidateSpotlightPath(path, start, end, { allowIncomplete = fa
 function fxPreviewSpotlightPathForDraft(draft = fxPreviewDraft, { allowIncomplete = true } = {}) {
   if (!draft || draft.code !== "P5" || draft.spotlight_mode !== "manual") return { ok: true, value: null, error: "" };
   const apply = draft.apply_window || {};
-  return fxPreviewValidateSpotlightPath(draft.spotlight_path, apply.start_s, Number(apply.start_s) + Number(apply.duration_s), { allowIncomplete });
+  try {
+    const bounds = fxPreviewCanonicalBounds(apply.start_s, apply.duration_s);
+    return fxPreviewValidateSpotlightPath(draft.spotlight_path, bounds.start, bounds.end, { allowIncomplete });
+  } catch (error) {
+    return fxPreviewSpotlightPathError(error.message, false);
+  }
 }
 
 function fxPreviewSpotlightInterpolation(path, sourceAt) {
@@ -2307,8 +2338,8 @@ function fxPreviewSpotlightInterpolation(path, sourceAt) {
 function fxPreviewEnsureManualPath(draft = fxPreviewDraft) {
   if (!draft || draft.code !== "P5") return null;
   const apply = draft.apply_window || {};
-  const start = fxPreviewCanonicalNumber(Number(apply.start_s) || 0, 3, "套用起點");
-  const end = fxPreviewCanonicalNumber(start + (Number(apply.duration_s) || 0.1), 3, "套用終點");
+  const bounds = fxPreviewCanonicalBounds(apply.start_s, apply.duration_s);
+  const { start, end } = bounds;
   const subject = draft.subject && typeof draft.subject === "object"
     && Number.isFinite(Number(draft.subject.x)) && Number.isFinite(Number(draft.subject.y))
     ? { x: Math.max(0, Math.min(1, Number(draft.subject.x))), y: Math.max(0, Math.min(1, Number(draft.subject.y))) }
@@ -3052,10 +3083,11 @@ function fxPreviewSourceTimeForEffectTime(effectTime) {
 
 function fxPreviewSpotlightBounds(draft = fxPreviewDraft) {
   const apply = draft?.apply_window || {};
-  const start = Number(apply.start_s);
-  const durationValue = Number(apply.duration_s);
-  if (!Number.isFinite(start) || !Number.isFinite(durationValue)) return null;
-  return { start, end: start + durationValue };
+  try {
+    return fxPreviewCanonicalBounds(apply.start_s, apply.duration_s);
+  } catch (_error) {
+    return null;
+  }
 }
 
 function fxPreviewSpotlightSetValidation(message, tone = "") {
@@ -3194,12 +3226,14 @@ function fxPreviewSpotlightRenderOverlay() {
   const safePoints = points.filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
   line.setAttribute("d", safePoints.map((point, index) => `${index ? "L" : "M"} ${Math.max(0, Math.min(1, Number(point.x))).toFixed(6)} ${Math.max(0, Math.min(1, Number(point.y))).toFixed(6)}`).join(" "));
   markers.replaceChildren(...safePoints.map((point, index) => {
-    const marker = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "ellipse");
     marker.classList.add("spotlight-path-marker");
     if (index === fxPreviewSpotlightSelectedIndex) marker.classList.add("is-selected");
     marker.setAttribute("cx", String(Math.max(0, Math.min(1, Number(point.x)))));
     marker.setAttribute("cy", String(Math.max(0, Math.min(1, Number(point.y)))));
-    marker.setAttribute("r", index === fxPreviewSpotlightSelectedIndex ? ".028" : ".021");
+    const radius = index === fxPreviewSpotlightSelectedIndex ? 8 : 6;
+    marker.setAttribute("rx", String(radius / content.width));
+    marker.setAttribute("ry", String(radius / content.height));
     marker.setAttribute("aria-hidden", "true");
     return marker;
   }));
@@ -3292,7 +3326,7 @@ function fxPreviewSpotlightRenderList() {
       fxPreviewSpotlightSeek(Number(point.source_at));
     });
     const onChange = (field, input) => {
-      const value = Number(input.value);
+      const value = input.value.trim() === "" ? NaN : Number(input.value);
       fxPreviewSpotlightHoldMedia();
       // Commit only after the native number editor finishes (blur/Tab or
       // Enter). Rebuilding the list during a keypress destroys the focused
@@ -3379,10 +3413,7 @@ function fxPreviewSpotlightAddPoint(sourceAt, x, y) {
   fxPreviewSpotlightHoldMedia();
   if (!fxPreviewDraft?.spotlight_path) fxPreviewEnsureManualPath(fxPreviewDraft);
   const points = fxPreviewDraft.spotlight_path.keyframes;
-  if (!Array.isArray(points) || points.length >= FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES) {
-    fxPreviewSpotlightSetValidation(`關鍵點最多 ${FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES} 個。`, "error");
-    return false;
-  }
+  if (!Array.isArray(points)) return false;
   let canonical;
   try {
     canonical = {
@@ -3398,8 +3429,12 @@ function fxPreviewSpotlightAddPoint(sourceAt, x, y) {
     fxPreviewSpotlightSetValidation("X 與 Y 必須介於 0 與 1。", "error");
     return false;
   }
-  fxPreviewDraft.__spotlightDefaultFixed = false;
   const existing = points.findIndex((point) => Number(point.source_at) === canonical.source_at);
+  if (existing < 0 && points.length >= FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES) {
+    fxPreviewSpotlightSetValidation(`關鍵點最多 ${FX_PREVIEW_SPOTLIGHT_MAX_KEYFRAMES} 個。`, "error");
+    return false;
+  }
+  fxPreviewDraft.__spotlightDefaultFixed = false;
   if (existing >= 0) {
     points[existing] = canonical;
     fxPreviewSpotlightSelectedIndex = existing;
@@ -3415,10 +3450,14 @@ function fxPreviewSpotlightAddPoint(sourceAt, x, y) {
 
 function fxPreviewSpotlightAddEditorPoint() {
   if (!fxPreviewDraft?.spotlight_path) fxPreviewEnsureManualPath(fxPreviewDraft);
-  const time = Number(elements["spotlight-point-time"]?.value);
-  const x = Number(elements["spotlight-point-x"]?.value);
-  const y = Number(elements["spotlight-point-y"]?.value);
-  fxPreviewSpotlightAddPoint(Number.isFinite(time) ? time : fxPreviewSpotlightCurrentSourceTime(), Number.isFinite(x) ? x : 0.5, Number.isFinite(y) ? y : 0.5);
+  const inputs = ["spotlight-point-time", "spotlight-point-x", "spotlight-point-y"].map((id) => elements[id]);
+  const values = inputs.map((input) => input.value.trim() === "" ? null : Number(input.value));
+  if (inputs.some((input) => input.validity.badInput)
+    || values.some((value) => value !== null && !Number.isFinite(value))) {
+    fxPreviewSpotlightSetValidation("時間、X、Y 若填寫必須是有限數字。", "error");
+    return;
+  }
+  fxPreviewSpotlightAddPoint(values[0] ?? fxPreviewSpotlightCurrentSourceTime(), values[1] ?? 0.5, values[2] ?? 0.5);
 }
 
 function fxPreviewSpotlightUpdateEditorPoint() {
@@ -3429,9 +3468,8 @@ function fxPreviewSpotlightUpdateEditorPoint() {
     fxPreviewSpotlightSetValidation("請先選取一個關鍵點。", "error");
     return;
   }
-  const sourceAt = Number(elements["spotlight-point-time"].value);
-  const x = Number(elements["spotlight-point-x"].value);
-  const y = Number(elements["spotlight-point-y"].value);
+  const raw = ["spotlight-point-time", "spotlight-point-x", "spotlight-point-y"].map((id) => elements[id].value);
+  const [sourceAt, x, y] = raw.map((value) => value.trim() === "" ? NaN : Number(value));
   if (![sourceAt, x, y].every(Number.isFinite)) {
     fxPreviewSpotlightSetValidation("時間、X、Y 都必須是有限數字。", "error");
     return;
@@ -4920,7 +4958,7 @@ async function openFxPreviewDialog(trigger = document.activeElement, replaceOver
   fxPreviewConfirmed = false;
   fxPreviewTrigger = trigger instanceof HTMLElement ? trigger : document.activeElement;
   fxPreviewReplaceOverlayId = replaceOverlayId || null;
-  fxPreviewSpotlightSelectedIndex = -1;
+  fxPreviewSpotlightSelect(-1, { renderList: false });
   fxPreviewManualSourceHold = false;
   fxPreviewManualInteractionToken += 1;
   fxPreviewSetManualHoldNotice(false);
@@ -5118,7 +5156,7 @@ function cleanupFxPreviewDialog() {
   const trigger = fxPreviewTrigger;
   fxPreviewDraft = null;
   fxPreviewReplaceOverlayId = null;
-  fxPreviewSpotlightSelectedIndex = -1;
+  fxPreviewSpotlightSelect(-1, { renderList: false });
   fxPreviewManualSourceHold = false;
   fxPreviewManualInteractionToken += 1;
   fxPreviewSetManualHoldNotice(false);

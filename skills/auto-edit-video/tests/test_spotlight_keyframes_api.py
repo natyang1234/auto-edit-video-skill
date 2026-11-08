@@ -400,3 +400,51 @@ def test_persisted_state_revalidates_path_and_invalidates_revision(api) -> None:
     status, invalid = api._json_request("PUT", "/api/editor-state", state)
     assert status == 422, invalid
     assert any("完整套用範圍" in item for item in invalid["errors"])
+
+
+def test_persisted_manual_huge_bound_returns_422_without_mutating_state(api) -> None:
+    manual = _submit_ready(api, _request(api, manual_path()))
+    status, confirmed = api._json_request(
+        "POST",
+        f"/api/fx-previews/{manual['job']['id']}/confirm",
+        {"expected_revision": api.revision},
+    )
+    assert status == 200, confirmed
+    baseline_revision = confirmed["revision"]
+    baseline_state = confirmed["state"]
+    assert baseline_state["overlays"][-1]["spotlight_path"] == manual_path()
+    state_path = api.project / "working/editor_state.json"
+    baseline_bytes = state_path.read_bytes()
+
+    invalid_state = json.loads(json.dumps(baseline_state))
+    invalid_state["x_expected_revision"] = baseline_revision
+    invalid_state["overlays"][-1]["start"] = -(10**1000)
+    status, invalid = api._json_request("PUT", "/api/editor-state", invalid_state)
+
+    assert status == 422, invalid
+    assert invalid["ok"] is False
+    assert any("效果開始時間必須是有限數字" in item for item in invalid["errors"])
+    assert any("timing must be numeric" in item for item in invalid["errors"])
+    assert state_path.read_bytes() == baseline_bytes
+
+    status, current = api._json_request("GET", "/api/project")
+    assert status == 200, current
+    assert current["state"]["revision"] == baseline_revision
+    assert current["state"]["overlays"][-1]["spotlight_path"] == manual_path()
+
+    healthy_state = current["state"]
+    healthy_state["x_expected_revision"] = baseline_revision
+    healthy_state["overlays"][-1]["spotlight_path"]["keyframes"][-1]["x"] = 0.7
+    status, saved = api._json_request("PUT", "/api/editor-state", healthy_state)
+    assert status == 200, saved
+    assert saved["revision"] != baseline_revision
+
+    status, healthy = api._json_request("GET", "/api/project")
+    assert status == 200, healthy
+    assert healthy["state"]["revision"] == saved["revision"]
+    assert (
+        healthy["state"]["overlays"][-1]["spotlight_path"]["keyframes"][-1][
+            "x"
+        ]
+        == 0.7
+    )

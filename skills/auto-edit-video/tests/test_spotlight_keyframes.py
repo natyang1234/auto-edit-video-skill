@@ -363,6 +363,129 @@ def test_persisted_fx_validation_canonicalizes_manual_path_and_rejects_other_cod
         assert any("only P5" in error for error in fx_overlay.validate(overlay))
 
 
+def test_persisted_manual_path_rejects_noncanonical_overlay_bounds_before_render() -> None:
+    path = manual_path(start=1.001, end=3.0)
+    overlay = {
+        "id": "fx-manual-noncanonical-bounds",
+        "type": "fx",
+        "code": "P5",
+        "start": 1.0006,
+        "end": 3.0004,
+        "values": {},
+        "placement": "",
+        "scheme": "",
+        "font_ids": {},
+        "style": {"opacity": 1},
+        "spotlight_path": path,
+    }
+    catalog = {
+        "effects": [{"code": "P5", "available": True, "vars": []}],
+        "schemes": [],
+    }
+    with patch.object(fx_overlay, "available", return_value=True), patch.object(
+        fx_overlay, "catalog", return_value=catalog
+    ):
+        errors = fx_overlay.validate(overlay)
+
+    assert errors == [
+        "fx overlay fx-manual-noncanonical-bounds: 手動 spotlight_path 的 "
+        "start/end 必須先正規化為 3 位小數，且與路徑端點完全一致"
+    ]
+    assert overlay["spotlight_path"] is path
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("start", True),
+        ("start", "4"),
+        ("end", math.nan),
+        ("end", math.inf),
+        ("start", -(10**1000)),
+    ],
+)
+def test_persisted_manual_path_rejects_untrusted_overlay_bounds(
+    field: str, bad: object
+) -> None:
+    overlay = {
+        "id": "fx-manual-invalid-bounds",
+        "type": "fx",
+        "code": "P5",
+        "start": 4.0,
+        "end": 6.0,
+        "values": {},
+        "placement": "",
+        "scheme": "",
+        "font_ids": {},
+        "style": {"opacity": 1},
+        "spotlight_path": manual_path(),
+    }
+    overlay[field] = bad
+    catalog = {
+        "effects": [{"code": "P5", "available": True, "vars": []}],
+        "schemes": [],
+    }
+    with patch.object(fx_overlay, "available", return_value=True), patch.object(
+        fx_overlay, "catalog", return_value=catalog
+    ):
+        errors = fx_overlay.validate(overlay)
+
+    assert errors
+    assert any("必須是有限數字" in error for error in errors)
+
+
+def test_persisted_manual_path_rejects_untrusted_path_schema() -> None:
+    path = {**manual_path(), "future": True}
+    overlay = {
+        "id": "fx-manual-invalid-schema",
+        "type": "fx",
+        "code": "P5",
+        "start": 4.0,
+        "end": 6.0,
+        "values": {},
+        "placement": "",
+        "scheme": "",
+        "font_ids": {},
+        "style": {"opacity": 1},
+        "spotlight_path": path,
+    }
+    catalog = {
+        "effects": [{"code": "P5", "available": True, "vars": []}],
+        "schemes": [],
+    }
+    with patch.object(fx_overlay, "available", return_value=True), patch.object(
+        fx_overlay, "catalog", return_value=catalog
+    ):
+        errors = fx_overlay.validate(overlay)
+
+    assert errors == [
+        "fx overlay fx-manual-invalid-schema: 手動聚光路徑欄位不符合 API 規格"
+    ]
+
+
+def test_nonmanual_persisted_overlay_keeps_existing_submillisecond_bounds_behavior() -> None:
+    overlay = {
+        "id": "fx-automatic-submillisecond-bounds",
+        "type": "fx",
+        "code": "P5",
+        "start": 1.0006,
+        "end": 3.0004,
+        "values": {},
+        "placement": "",
+        "scheme": "",
+        "font_ids": {},
+        "style": {"opacity": 1},
+    }
+    catalog = {
+        "effects": [{"code": "P5", "available": True, "vars": []}],
+        "schemes": [],
+    }
+    with patch.object(fx_overlay, "available", return_value=True), patch.object(
+        fx_overlay, "catalog", return_value=catalog
+    ):
+        assert fx_overlay.validate(overlay) == []
+
+
 def test_style_preset_whitelist_rejects_project_specific_temporal_path() -> None:
     with pytest.raises(style_presets.StylePresetError):
         style_presets.normalize_fx_settings(
