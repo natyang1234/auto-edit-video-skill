@@ -136,6 +136,93 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             self.assertEqual(page.locator("#fx-preview-composition-check-list button").count(), 0)
             browser.close()
 
+    def test_issue_jumps_preserve_interior_cut_boundary_and_last_endpoint_after_sync(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
+            self.open_ready_preview(page)
+
+            def sample(output_at, source_at):
+                return {
+                    "output_at": output_at,
+                    "source_at": source_at,
+                    "measured": True,
+                    "source_face_count": 1,
+                    "reference_face_count": 1,
+                    "visible_face_count": 1,
+                    "text_box_count": 1,
+                }
+
+            def finding(output_at, source_at):
+                return {
+                    "kind": "text_subject_overlap",
+                    "output_at": output_at,
+                    "source_at": source_at,
+                    "subject_box": {"x": 20, "y": 30, "width": 80, "height": 90},
+                    "text_box": {"x": 24, "y": 36, "width": 70, "height": 20},
+                }
+
+            receipt = {
+                "version": 1,
+                "scope": "full-timeline",
+                "measurement": "sampled-local-frames",
+                "status": "unmeasured",
+                "source_sha256": "a" * 64,
+                "media_sha256": "b" * 64,
+                "frame_size": {"width": 360, "height": 640},
+                "sample_count": 3,
+                "measured_count": 3,
+                "elapsed_s": 0.4,
+                "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+                "samples": [sample(0.9, 1.3), sample(0.8, 1.2), sample(1.6, 2.0)],
+                "findings": [finding(0.9, 1.3), finding(0.8, 1.2), finding(1.6, 2.0)],
+            }
+            self.install_job(page, receipt, job_id="composition-boundary-sync")
+            button_data = page.locator("#fx-preview-composition-check-list button[data-output-at]").evaluate_all(
+                "buttons => buttons.map(button => ({text: button.textContent, aria: button.getAttribute('aria-label')}))"
+            )
+            self.assertEqual(len(button_data), 3)
+            for item in button_data:
+                self.assertTrue(item["aria"].startswith(item["text"]), item)
+                self.assertIn("預覽", item["aria"], item)
+
+            def jump_and_settle(output_at):
+                page.locator(
+                    f'#fx-preview-composition-check-list button[data-output-at="{output_at}"]'
+                ).click()
+                page.wait_for_timeout(120)
+                # Exercise the normal media handlers after the click; this is
+                # deliberately a DOM/media sync check, not a mapping-only call.
+                page.evaluate("""() => {
+                    const source = document.querySelector('#fx-preview-source-video');
+                    const effect = document.querySelector('#fx-preview-video');
+                    source.dispatchEvent(new Event('seeking'));
+                    effect.dispatchEvent(new Event('seeking'));
+                    source.dispatchEvent(new Event('timeupdate'));
+                    effect.dispatchEvent(new Event('timeupdate'));
+                }""")
+                page.wait_for_timeout(180)
+                return page.evaluate("""() => ({
+                    source: document.querySelector('#fx-preview-source-video').currentTime,
+                    effect: document.querySelector('#fx-preview-video').currentTime,
+                })""")
+
+            interior = jump_and_settle("0.9")
+            boundary = jump_and_settle("0.8")
+            last_endpoint = jump_and_settle("1.6")
+
+            self.assertAlmostEqual(interior["source"], 1.3, delta=0.08, msg=interior)
+            self.assertAlmostEqual(interior["effect"], 0.9, delta=0.08, msg=interior)
+            self.assertAlmostEqual(boundary["source"], 1.2, delta=0.08, msg=boundary)
+            self.assertAlmostEqual(boundary["effect"], 0.8, delta=0.08, msg=boundary)
+            self.assertGreaterEqual(boundary["source"], 1.12, boundary)
+            self.assertAlmostEqual(last_endpoint["source"], 2.0, delta=0.08, msg=last_endpoint)
+            self.assertAlmostEqual(last_endpoint["effect"], 1.6, delta=0.08, msg=last_endpoint)
+            browser.close()
+
     def test_nullable_visible_media_setter_clears_both_diagnostic_panels(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:
