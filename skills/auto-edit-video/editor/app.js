@@ -2797,12 +2797,12 @@ function fxPreviewUpdateWindowControls() {
 }
 
 function fxPreviewSetVisibleMedia(job) {
-  fxPreviewVisibleMediaToken += 1;
-  fxPreviewVisibleJob = job ? deepCopy(job) : null;
   if (!job) {
-    fxPreviewVisibleMeta = null;
+    fxPreviewClearVisibleMedia();
     return;
   }
+  fxPreviewVisibleMediaToken += 1;
+  fxPreviewVisibleJob = deepCopy(job);
   const renderDuration = fxPreviewFiniteNumber(job.render_duration_s);
   fxPreviewVisibleMeta = {
     render_duration_s: renderDuration,
