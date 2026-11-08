@@ -2590,7 +2590,7 @@ function fxPreviewCompositionReceipt(raw, job) {
     elapsed_s: elapsed !== null && elapsed >= 0 ? elapsed : null,
     engines: enginesValid ? engines : {},
     samples,
-    findings: findingsShapeValid ? findings : [],
+    findings: baseValid && findingsShapeValid ? findings : [],
     reason,
   };
 }
@@ -2685,6 +2685,8 @@ function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisible
   const fullTimelineRequired = check.findings.some((finding) => finding.kind === "full_timeline_required");
   if (check.status === "pass") {
     summary.textContent = `抽樣 ${check.sample_count} 個時間點，未發現明顯文字遮住人物；不代表每一格都已檢查。`;
+  } else if (check.reason) {
+    summary.textContent = check.reason;
   } else if (scopeSingle && fullTimelineRequired) {
     summary.textContent = "單一效果預覽不是完整時間軸，尚未完成完整畫面檢查。";
   } else if (check.status === "warn") {
