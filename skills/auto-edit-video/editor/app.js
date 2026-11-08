@@ -2480,19 +2480,23 @@ function fxPreviewCompositionReceipt(raw, job) {
   };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fallback;
   const receipt = deepCopy(raw);
-  const unknownReceiptKeys = Object.keys(receipt).some((key) => !FX_PREVIEW_COMPOSITION_RECEIPT_KEYS.has(key));
+  const receiptKeys = Object.keys(receipt);
+  const receiptShapeValid = receiptKeys.length === FX_PREVIEW_COMPOSITION_RECEIPT_KEYS.size
+    && receiptKeys.every((key) => FX_PREVIEW_COMPOSITION_RECEIPT_KEYS.has(key));
   const inferredScope = job?.preview_options?.mode === "single"
     ? "single-effect" : job?.preview_options?.mode === "timeline" ? "full-timeline" : "";
   const scopeFieldValid = receipt.scope === "full-timeline" || receipt.scope === "single-effect";
   const scope = scopeFieldValid
     ? receipt.scope : inferredScope;
   const measurement = receipt.measurement === "sampled-local-frames" ? receipt.measurement : "";
-  const status = ["pass", "warn", "unmeasured"].includes(receipt.status) ? receipt.status : "unmeasured";
+  const statusFieldValid = ["pass", "warn", "unmeasured"].includes(receipt.status);
+  const status = statusFieldValid ? receipt.status : "unmeasured";
   const frameSize = receipt.frame_size && typeof receipt.frame_size === "object" && !Array.isArray(receipt.frame_size)
     ? { width: fxPreviewFiniteNumber(receipt.frame_size.width), height: fxPreviewFiniteNumber(receipt.frame_size.height) }
     : null;
   const frameShapeValid = Boolean(receipt.frame_size && typeof receipt.frame_size === "object"
     && !Array.isArray(receipt.frame_size)
+    && Object.keys(receipt.frame_size).length === FX_PREVIEW_COMPOSITION_FRAME_KEYS.size
     && Object.keys(receipt.frame_size).every((key) => FX_PREVIEW_COMPOSITION_FRAME_KEYS.has(key)));
   const frameValid = Boolean(frameSize && Number.isInteger(frameSize.width) && Number.isInteger(frameSize.height)
     && frameSize.width > 0 && frameSize.height > 0 && frameSize.width <= 16384 && frameSize.height <= 16384);
@@ -2507,8 +2511,11 @@ function fxPreviewCompositionReceipt(raw, job) {
   const rawSamples = Array.isArray(receipt.samples) ? receipt.samples : [];
   const samplesShapeValid = rawSamples.length <= 8 && rawSamples.every((sample) => (
     sample && typeof sample === "object" && !Array.isArray(sample)
+    && Object.keys(sample).length === FX_PREVIEW_COMPOSITION_SAMPLE_KEYS.size
     && Object.keys(sample).every((key) => FX_PREVIEW_COMPOSITION_SAMPLE_KEYS.has(key))
   ));
+  const rawMeasuredValuesValid = rawSamples.every((sample) => typeof sample?.measured === "boolean");
+  const rawMeasuredCount = rawSamples.reduce((count, sample) => count + (sample?.measured === true ? 1 : 0), 0);
   const samples = rawSamples.slice(0, 8).map((sample) => ({
     output_at: fxPreviewFiniteNumber(sample?.output_at),
     source_at: fxPreviewFiniteNumber(sample?.source_at),
@@ -2529,10 +2536,12 @@ function fxPreviewCompositionReceipt(raw, job) {
     && Object.keys(finding).every((key) => FX_PREVIEW_COMPOSITION_FINDING_KEYS.has(key))
     && FX_PREVIEW_COMPOSITION_FINDING_KINDS.has(finding.kind)
     && (finding.kind !== "text_subject_overlap"
-      || (Object.prototype.hasOwnProperty.call(finding, "subject_box")
+      || (Object.prototype.hasOwnProperty.call(finding, "output_at")
+        && Object.prototype.hasOwnProperty.call(finding, "source_at")
+        && Object.prototype.hasOwnProperty.call(finding, "subject_box")
         && Object.prototype.hasOwnProperty.call(finding, "text_box")))
   ));
-  const findings = rawFindings.slice(0, 32).map((finding) => {
+  const findings = findingsShapeValid ? rawFindings.slice(0, 32).map((finding) => {
     const item = { kind: finding.kind };
     for (const key of ["output_at", "source_at"]) {
       if (Object.prototype.hasOwnProperty.call(finding, key)) item[key] = fxPreviewFiniteNumber(finding[key]);
@@ -2541,7 +2550,7 @@ function fxPreviewCompositionReceipt(raw, job) {
       if (Object.prototype.hasOwnProperty.call(finding, key)) item[key] = deepCopy(finding[key]);
     }
     return item;
-  });
+  }) : [];
   const samplePairsValid = samplesShapeValid && samples.every((sample) => (
     sample.output_at !== null && sample.source_at !== null
     && fxPreviewCompositionMapPair(sample.output_at, sample.source_at, job)
@@ -2556,24 +2565,40 @@ function fxPreviewCompositionReceipt(raw, job) {
     (!Object.prototype.hasOwnProperty.call(finding, "subject_box") || fxPreviewCompositionBoxValid(finding.subject_box, frameSize))
     && (!Object.prototype.hasOwnProperty.call(finding, "text_box") || fxPreviewCompositionBoxValid(finding.text_box, frameSize))
   ));
-  const sourceSha = String(receipt.source_sha256 || "");
-  const mediaSha = String(receipt.media_sha256 || "");
+  const sourceSha = typeof receipt.source_sha256 === "string" ? receipt.source_sha256 : "";
+  const mediaSha = typeof receipt.media_sha256 === "string" ? receipt.media_sha256 : "";
   const shaValid = FX_PREVIEW_COMPOSITION_SHA_RE.test(sourceSha)
     && FX_PREVIEW_COMPOSITION_SHA_RE.test(mediaSha)
     && sourceSha !== "0".repeat(64) && mediaSha !== "0".repeat(64);
   const countsValid = sampleCount !== null && measuredCount !== null && measuredCount <= sampleCount
-    && sampleCount === rawSamples.length;
-  const baseValid = !unknownReceiptKeys && receipt.version === 1 && scopeFieldValid && Boolean(scope) && Boolean(measurement)
-    && frameShapeValid && frameValid && elapsed !== null && elapsed >= 0 && enginesValid && countsValid
-    && samplesShapeValid && sampleValuesValid && samplePairsValid && findingsShapeValid && timedFindingsValid && boxesValid;
+    && sampleCount === rawSamples.length && rawMeasuredValuesValid && measuredCount === rawMeasuredCount;
+  const measuredSamplesConservative = samples.every((sample) => sample.measured === true
+    && sample.source_face_count !== null && sample.source_face_count > 0
+    && sample.reference_face_count !== null && sample.reference_face_count > 0
+    && sample.visible_face_count !== null && sample.visible_face_count > 0);
+  const measuredSampleCountsValid = samples.every((sample) => !sample.measured || (
+    sample.source_face_count !== null && sample.source_face_count > 0
+    && sample.reference_face_count !== null && sample.reference_face_count > 0
+    && sample.visible_face_count !== null && sample.visible_face_count > 0
+  ));
+  const baseValid = receiptShapeValid && receipt.version === 1 && scopeFieldValid && Boolean(scope)
+    && Boolean(measurement) && statusFieldValid && frameShapeValid && frameValid && shaValid
+    && elapsed !== null && elapsed >= 0 && elapsed <= 60 && enginesValid && countsValid
+    && Array.isArray(receipt.samples) && Array.isArray(receipt.findings)
+    && samplesShapeValid && sampleValuesValid && samplePairsValid && findingsShapeValid
+    && timedFindingsValid && boxesValid && measuredSampleCountsValid;
   const passValid = baseValid && shaValid && scope === "full-timeline" && status === "pass"
     && sampleCount > 0 && measuredCount === sampleCount && samples.length === sampleCount
-    && samples.every((sample) => sample.measured === true && sample.source_face_count !== null
-      && sample.reference_face_count !== null && sample.visible_face_count !== null && sample.text_box_count !== null)
+    && measuredSamplesConservative
     && findings.length === 0;
+  const warnValid = baseValid && status === "warn" && sampleCount > 0
+    && measuredCount === sampleCount && measuredSamplesConservative && findings.length > 0
+    && findings.every((finding) => finding.kind === "text_subject_overlap");
+  const trustedStatus = baseValid && (status === "unmeasured" || (status === "pass" && passValid)
+    || (status === "warn" && warnValid));
   let safeStatus = status;
   let reason = "";
-  if (!baseValid || (status === "pass" && !passValid)) {
+  if (!trustedStatus) {
     safeStatus = "unmeasured";
     reason = "完整畫面檢查結果不完整，無法可靠判定";
   }
@@ -2587,10 +2612,10 @@ function fxPreviewCompositionReceipt(raw, job) {
     frame_size: frameValid ? frameSize : null,
     sample_count: countsValid ? sampleCount : null,
     measured_count: countsValid ? measuredCount : null,
-    elapsed_s: elapsed !== null && elapsed >= 0 ? elapsed : null,
+    elapsed_s: elapsed !== null && elapsed >= 0 && elapsed <= 60 ? elapsed : null,
     engines: enginesValid ? engines : {},
     samples,
-    findings: baseValid && findingsShapeValid ? findings : [],
+    findings: trustedStatus ? findings : [],
     reason,
   };
 }
