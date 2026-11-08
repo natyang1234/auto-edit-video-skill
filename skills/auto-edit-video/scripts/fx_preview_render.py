@@ -377,13 +377,18 @@ def _run_composition_check(
         frame_size=frame_size,
         finding=fallback_finding,
     )
+
+    def failed_receipt() -> dict[str, Any]:
+        fallback["elapsed_s"] = _bounded_analysis_elapsed(started)
+        return fallback
+
     worker = Path(__file__).with_name("composite_check_worker.py").resolve()
     face_model = (
         Path(__file__).resolve().parents[1]
         / "assets/models/yunet/face_detection_yunet_2026may.onnx"
     )
     if reference is None or not worker.is_file() or not face_model.is_file():
-        return fallback
+        return failed_receipt()
     scratch.mkdir(mode=0o700, parents=True, exist_ok=False)
     request_path = scratch / "request.json"
     result_path = scratch / "result.json"
@@ -418,13 +423,12 @@ def _run_composition_check(
             check=False,
         )
         if process.returncode != 0:
-            return fallback
+            return failed_receipt()
         payload = _read_bounded_json(result_path, MAX_COMPOSITE_RESULT_BYTES)
         receipt = payload.get("composition_check") if isinstance(payload, dict) else None
-        return receipt if isinstance(receipt, dict) else fallback
+        return receipt if isinstance(receipt, dict) else failed_receipt()
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, subprocess.SubprocessError):
-        fallback["elapsed_s"] = round(time.monotonic() - started, 3)
-        return fallback
+        return failed_receipt()
 
 
 def _timeline_time_map(

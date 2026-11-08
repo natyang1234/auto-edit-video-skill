@@ -94,6 +94,97 @@ def test_composite_child_timeout_is_hard_and_advisory(tmp_path: Path) -> None:
     assert scratch.is_dir()
 
 
+@pytest.mark.parametrize(
+    "failure_mode,clock_values,expected_elapsed",
+    (
+        ("nonzero", (100.0, 102.5), 2.5),
+        ("missing", (100.0, 105.0), 5.0),
+        ("invalid", (100.0, 200.5), 60.0),
+    ),
+)
+def test_composite_child_failures_report_bounded_real_elapsed(
+    tmp_path: Path,
+    failure_mode: str,
+    clock_values: tuple[float, float],
+    expected_elapsed: float,
+) -> None:
+    composite = tmp_path / "composite.mp4"
+    reference = tmp_path / "reference.mp4"
+    source = tmp_path / "source.mp4"
+    composite.write_bytes(b"finished-video")
+    reference.write_bytes(b"reference-video")
+    source.write_bytes(b"source-video")
+
+    def child_result(command, **_kwargs):
+        result_path = Path(command[command.index("--result") + 1])
+        if failure_mode == "invalid":
+            result_path.write_text("{", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 1 if failure_mode == "nonzero" else 0)
+
+    with (
+        mock.patch.object(render.time, "monotonic", side_effect=clock_values),
+        mock.patch.object(render.subprocess, "run", side_effect=child_result),
+    ):
+        receipt = render._run_composition_check(
+            composite=composite,
+            reference=reference,
+            source=source,
+            time_map=[
+                {
+                    "source_start_s": 0.0,
+                    "source_end_s": 1.0,
+                    "output_start_s": 0.0,
+                    "output_end_s": 1.0,
+                }
+            ],
+            scratch=tmp_path / "scratch",
+            source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            expected_text=False,
+            scope="full-timeline",
+            frame_size={"width": 1080, "height": 1920},
+        )
+
+    assert receipt["status"] == "unmeasured"
+    assert receipt["elapsed_s"] == expected_elapsed
+    assert receipt["findings"] == [{"kind": "analysis_incomplete"}]
+
+
+def test_composite_child_success_receipt_elapsed_is_untouched(tmp_path: Path) -> None:
+    composite = tmp_path / "composite.mp4"
+    reference = tmp_path / "reference.mp4"
+    source = tmp_path / "source.mp4"
+    composite.write_bytes(b"finished-video")
+    reference.write_bytes(b"reference-video")
+    source.write_bytes(b"source-video")
+    expected = {"status": "unmeasured", "elapsed_s": 7.75, "findings": []}
+
+    def child_result(command, **_kwargs):
+        result_path = Path(command[command.index("--result") + 1])
+        result_path.write_text(
+            json.dumps({"ok": True, "composition_check": expected}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0)
+
+    with (
+        mock.patch.object(render.time, "monotonic", return_value=100.0),
+        mock.patch.object(render.subprocess, "run", side_effect=child_result),
+    ):
+        receipt = render._run_composition_check(
+            composite=composite,
+            reference=reference,
+            source=source,
+            time_map=[],
+            scratch=tmp_path / "scratch",
+            source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            expected_text=False,
+            scope="full-timeline",
+            frame_size={"width": 1080, "height": 1920},
+        )
+
+    assert receipt == expected
+
+
 def test_timeline_reference_uses_same_shadow_and_preserves_full_layout(
     tmp_path: Path,
 ) -> None:

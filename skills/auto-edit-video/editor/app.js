@@ -44,6 +44,7 @@ let fxPreviewJob = null;
 // separate from the job that is running (and eventually confirmable).
 let fxPreviewVisibleJob = null;
 let fxPreviewVisibleMeta = null;
+let fxPreviewCompositionRenderKey = "";
 // Metadata callbacks can arrive after a different comparison candidate has
 // become current. Every visible-media replacement advances this token so an
 // old event cannot seek the newly selected video pair.
@@ -2363,6 +2364,7 @@ const FX_PREVIEW_COMPOSITION_ENGINE_KEYS = new Set(["faces", "ocr"]);
 const FX_PREVIEW_COMPOSITION_FRAME_KEYS = new Set(["width", "height"]);
 const FX_PREVIEW_COMPOSITION_BOX_KEYS = new Set(["x", "y", "width", "height"]);
 const FX_PREVIEW_COMPOSITION_SHA_RE = /^[0-9a-f]{64}$/;
+const FX_PREVIEW_COMPOSITION_COUNT_MAX = 10000;
 const FX_PREVIEW_COMPOSITION_UNMEASURED = "完整畫面檢查：目前無法可靠量測，請看預覽確認。";
 
 function fxPreviewFiniteNumber(value) {
@@ -2511,10 +2513,10 @@ function fxPreviewCompositionReceipt(raw, job) {
     output_at: fxPreviewFiniteNumber(sample?.output_at),
     source_at: fxPreviewFiniteNumber(sample?.source_at),
     measured: sample?.measured === true,
-    source_face_count: fxPreviewNonNegativeInteger(sample?.source_face_count, 64),
-    reference_face_count: fxPreviewNonNegativeInteger(sample?.reference_face_count, 64),
-    visible_face_count: fxPreviewNonNegativeInteger(sample?.visible_face_count, 64),
-    text_box_count: fxPreviewNonNegativeInteger(sample?.text_box_count, 128),
+    source_face_count: fxPreviewNonNegativeInteger(sample?.source_face_count, FX_PREVIEW_COMPOSITION_COUNT_MAX),
+    reference_face_count: fxPreviewNonNegativeInteger(sample?.reference_face_count, FX_PREVIEW_COMPOSITION_COUNT_MAX),
+    visible_face_count: fxPreviewNonNegativeInteger(sample?.visible_face_count, FX_PREVIEW_COMPOSITION_COUNT_MAX),
+    text_box_count: fxPreviewNonNegativeInteger(sample?.text_box_count, FX_PREVIEW_COMPOSITION_COUNT_MAX),
   }));
   const sampleValuesValid = samples.every((sample) => (
     sample.output_at !== null && sample.source_at !== null && typeof sample.measured === "boolean"
@@ -2601,6 +2603,30 @@ function fxPreviewCompositionStatusLabel(status) {
   return status === "pass" ? "抽樣通過" : status === "warn" ? "有提醒" : "未量測";
 }
 
+function fxPreviewCompositionRenderSignature(check, job, scopeSingle, canSwitch) {
+  const options = job?.preview_options && typeof job.preview_options === "object"
+    ? job.preview_options : {};
+  return JSON.stringify({
+    check,
+    visible_media_token: fxPreviewVisibleMediaToken,
+    visible_job_id: String(fxPreviewVisibleJob?.id || ""),
+    job: {
+      id: String(job?.id || ""),
+      media_url: typeof job?.media_url === "string" ? job.media_url : "",
+      render_duration_s: fxPreviewFiniteNumber(job?.render_duration_s),
+      time_map: fxPreviewCompositionMapSegments(job),
+      mode: typeof options.mode === "string" ? options.mode : "",
+      quality: typeof options.quality === "string" ? options.quality : "",
+    },
+    eligibility: {
+      comparison_active: fxCompareActive,
+      draft_mode: String(fxPreviewDraft?.preview_options?.mode || ""),
+      scope_single: scopeSingle,
+      can_switch: canSwitch,
+    },
+  });
+}
+
 function fxPreviewCompositionJumpToIssue(outputAt, sourceAt, job, token) {
   if (token !== fxPreviewVisibleMediaToken || String(fxPreviewVisibleJob?.id || "") !== String(job?.id || "")) return;
   const pair = fxPreviewCompositionMapPair(outputAt, sourceAt, job, true);
@@ -2627,7 +2653,26 @@ function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisible
   const list = elements["fx-preview-composition-check-list"];
   const switchButton = elements["fx-preview-composition-switch-timeline"];
   if (!panel || !statusNode || !summary || !samples || !list || !switchButton) return;
-  panel.hidden = !job;
+  if (!job) {
+    fxPreviewCompositionRenderKey = "";
+    panel.hidden = true;
+    panel.removeAttribute("data-status");
+    statusNode.textContent = "";
+    summary.textContent = "";
+    samples.textContent = "";
+    list.replaceChildren();
+    switchButton.hidden = true;
+    switchButton.disabled = false;
+    return;
+  }
+  const check = fxPreviewCompositionReceipt(rawCheck, job);
+  const scopeSingle = check.scope === "single-effect"
+    || (check.scope === "" && !fxCompareActive && fxPreviewDraft?.preview_options?.mode === "single");
+  const canSwitch = scopeSingle && !fxCompareActive && fxPreviewDraft?.preview_options?.mode !== "timeline";
+  const renderKey = fxPreviewCompositionRenderSignature(check, job, scopeSingle, canSwitch);
+  if (renderKey === fxPreviewCompositionRenderKey) return;
+  fxPreviewCompositionRenderKey = renderKey;
+  panel.hidden = false;
   panel.removeAttribute("data-status");
   statusNode.textContent = "";
   summary.textContent = "";
@@ -2635,12 +2680,8 @@ function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisible
   list.replaceChildren();
   switchButton.hidden = true;
   switchButton.disabled = false;
-  if (!job) return;
-  const check = fxPreviewCompositionReceipt(rawCheck, job);
   panel.dataset.status = check.status;
   statusNode.textContent = fxPreviewCompositionStatusLabel(check.status);
-  const scopeSingle = check.scope === "single-effect"
-    || (check.scope === "" && !fxCompareActive && fxPreviewDraft?.preview_options?.mode === "single");
   const fullTimelineRequired = check.findings.some((finding) => finding.kind === "full_timeline_required");
   if (check.status === "pass") {
     summary.textContent = `抽樣 ${check.sample_count} 個時間點，未發現明顯文字遮住人物；不代表每一格都已檢查。`;
@@ -2706,7 +2747,6 @@ function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisible
     item.textContent = "抽樣結果需要人工看預覽確認。";
     list.append(item);
   }
-  const canSwitch = scopeSingle && !fxCompareActive && fxPreviewDraft?.preview_options?.mode !== "timeline";
   switchButton.hidden = !canSwitch;
   switchButton.disabled = fxCompareActive;
 }
