@@ -27,6 +27,10 @@ ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".m4v"})
 MATERIAL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+SPOTLIGHT_PATH_KEYS = frozenset({"version", "interpolation", "keyframes"})
+SPOTLIGHT_KEYFRAME_KEYS = frozenset({"source_at", "x", "y"})
+SPOTLIGHT_PATH_MIN_KEYFRAMES = 2
+SPOTLIGHT_PATH_MAX_KEYFRAMES = 64
 
 
 class FxPreviewContractError(ValueError):
@@ -86,6 +90,190 @@ def normalize_fx_opacity(value: Any) -> float:
     return 0.0 if opacity == 0.0 else opacity
 
 
+def _spotlight_number(value: Any, *, digits: int, label: str) -> float:
+    """Canonicalize one untrusted path number without bool/string coercion."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", f"{label}必須是有限數字"
+        )
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", f"{label}必須是有限數字"
+        ) from exc
+    if not math.isfinite(number):
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", f"{label}必須是有限數字"
+        )
+    number = round(number, digits)
+    return 0.0 if number == 0.0 else number
+
+
+def normalize_spotlight_path(
+    value: Any,
+    *,
+    start: Any,
+    end: Any,
+) -> dict[str, Any]:
+    """Validate and canonicalize a P5 manual trajectory on source time.
+
+    The exact-key schema and post-rounding timestamp checks are deliberate:
+    cache/confirm/final identities must not disagree about visually equivalent
+    values, duplicate keyframes, or hidden future fields.
+    """
+    if not isinstance(value, dict) or set(value) != SPOTLIGHT_PATH_KEYS:
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", "手動聚光路徑欄位不符合 API 規格"
+        )
+    version = value.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", "手動聚光路徑版本必須是 1"
+        )
+    if value.get("interpolation") != "smoothstep":
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", "手動聚光路徑只支援 smoothstep"
+        )
+    raw_keyframes = value.get("keyframes")
+    if (
+        not isinstance(raw_keyframes, list)
+        or not SPOTLIGHT_PATH_MIN_KEYFRAMES
+        <= len(raw_keyframes)
+        <= SPOTLIGHT_PATH_MAX_KEYFRAMES
+    ):
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", "手動聚光路徑必須包含 2 到 64 個定位點"
+        )
+    canonical_start = _spotlight_number(start, digits=3, label="效果開始時間")
+    canonical_end = _spotlight_number(end, digits=3, label="效果結束時間")
+    if canonical_end <= canonical_start:
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", "手動聚光路徑的效果時間無效"
+        )
+    keyframes: list[dict[str, float]] = []
+    previous_at: float | None = None
+    for index, raw in enumerate(raw_keyframes):
+        if not isinstance(raw, dict) or set(raw) != SPOTLIGHT_KEYFRAME_KEYS:
+            raise FxPreviewContractError(
+                "spotlight_path_invalid", "每個手動聚光定位點只能包含 source_at、x、y"
+            )
+        source_at = _spotlight_number(
+            raw.get("source_at"), digits=3, label=f"第 {index + 1} 個定位時間"
+        )
+        x = _spotlight_number(raw.get("x"), digits=6, label=f"第 {index + 1} 個 x")
+        y = _spotlight_number(raw.get("y"), digits=6, label=f"第 {index + 1} 個 y")
+        if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+            raise FxPreviewContractError(
+                "spotlight_path_invalid", "手動聚光位置必須介於 0 到 1"
+            )
+        if source_at < canonical_start or source_at > canonical_end:
+            raise FxPreviewContractError(
+                "spotlight_path_invalid", "手動聚光定位時間必須位於完整套用範圍內"
+            )
+        if previous_at is not None and source_at <= previous_at:
+            raise FxPreviewContractError(
+                "spotlight_path_invalid", "手動聚光定位時間正規化後必須嚴格遞增且不可重複"
+            )
+        keyframes.append({"source_at": source_at, "x": x, "y": y})
+        previous_at = source_at
+    if (
+        keyframes[0]["source_at"] != canonical_start
+        or keyframes[-1]["source_at"] != canonical_end
+    ):
+        raise FxPreviewContractError(
+            "spotlight_path_invalid", "手動聚光路徑必須精確涵蓋完整套用範圍的起點與終點"
+        )
+    return {
+        "version": 1,
+        "interpolation": "smoothstep",
+        "keyframes": keyframes,
+    }
+
+
+def spotlight_path_sha256(value: Any, *, start: Any, end: Any) -> str:
+    return canonical_sha256(normalize_spotlight_path(value, start=start, end=end))
+
+
+def sanitize_subject_track_summary(
+    value: Any,
+    *,
+    overlay: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Project a renderer track receipt to a bounded, non-path public summary.
+
+    Manual jobs fail closed unless the renderer receipt binds the exact
+    canonical path.  Automatic receipts remain backward compatible when an
+    older test renderer supplies no tracking metadata, while real metadata is
+    still strictly bounded and sanitized.
+    """
+    manual_path = overlay.get("spotlight_path")
+    manual = manual_path is not None
+    expected_path: dict[str, Any] | None = None
+    expected_sha: str | None = None
+    if manual:
+        expected_path = normalize_spotlight_path(
+            manual_path, start=overlay.get("start"), end=overlay.get("end")
+        )
+        expected_sha = canonical_sha256(expected_path)
+    if value is None and not manual:
+        return None
+    if not isinstance(value, dict):
+        raise FxPreviewContractError(
+            "subject_track_invalid", "聚光追蹤收據格式無效"
+        )
+    raw_version = value.get("version")
+    if not isinstance(raw_version, str):
+        raise FxPreviewContractError(
+            "subject_track_invalid", "聚光追蹤收據版本無效"
+        )
+    version = str(raw_version)
+    if not version or len(version) > 64 or not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        raise FxPreviewContractError(
+            "subject_track_invalid", "聚光追蹤收據版本無效"
+        )
+    if manual:
+        raw_count = value.get("keyframe_count")
+        if (
+            value.get("mode") != "manual"
+            or value.get("status") != "manual"
+            or value.get("interpolation") != "smoothstep"
+            or isinstance(raw_count, bool)
+            or not isinstance(raw_count, int)
+            or raw_count != len(expected_path["keyframes"])
+            or value.get("path_sha256") != expected_sha
+        ):
+            raise FxPreviewContractError(
+                "subject_track_mismatch", "手動聚光追蹤收據與已凍結路徑不一致"
+            )
+        return {
+            "version": 1,
+            "mode": "manual",
+            "status": "manual",
+            "interpolation": "smoothstep",
+            "keyframe_count": len(expected_path["keyframes"]),
+            "path_sha256": expected_sha,
+        }
+    status = value.get("status")
+    if status not in {"tracked", "lost", "fallback"}:
+        raise FxPreviewContractError(
+            "subject_track_invalid", "自動聚光追蹤狀態無效"
+        )
+    points = value.get("points", [])
+    if not isinstance(points, list) or len(points) > 10000:
+        raise FxPreviewContractError(
+            "subject_track_invalid", "自動聚光追蹤定位數量無效"
+        )
+    return {
+        "version": 1,
+        "mode": "automatic",
+        "status": status,
+        "interpolation": "automatic",
+        "keyframe_count": len(points),
+        "path_sha256": None,
+    }
+
+
 def _finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FxPreviewContractError("window_invalid", f"{label}必須是有限數字")
@@ -95,7 +283,8 @@ def _finite_number(value: Any, label: str) -> float:
         raise FxPreviewContractError("window_invalid", f"{label}必須是有限數字") from exc
     if not math.isfinite(number):
         raise FxPreviewContractError("window_invalid", f"{label}必須是有限數字")
-    return round(number, 3)
+    number = round(number, 3)
+    return 0.0 if number == 0.0 else number
 
 
 def normalize_window(value: Any, *, label: str = "時間窗") -> dict[str, float]:
@@ -506,7 +695,7 @@ def visual_overlay_projection(overlay: Any) -> dict[str, Any]:
         raise FxPreviewContractError("overlay_invalid", "FX 圖層格式無效")
     keys = (
         "code", "start", "end", "values", "placement", "scheme", "font_ids",
-        "style", "visible", "subject", "text_fit", "material",
+        "style", "visible", "subject", "spotlight_path", "text_fit", "material",
     )
     return {key: overlay[key] for key in keys if key in overlay}
 
@@ -575,6 +764,21 @@ def validate_renderer_request(
         if isinstance(manifest_snapshot.get("source"), dict)
         else None,
     )
+    if "spotlight_path" in overlay:
+        if overlay.get("code") != "P5":
+            raise FxPreviewContractError(
+                "invalid_request", "只有 P5 可以使用手動聚光路徑"
+            )
+        if overlay.get("subject") is not None:
+            raise FxPreviewContractError(
+                "invalid_request", "手動聚光路徑不能同時使用自動主角選取"
+            )
+        try:
+            overlay["spotlight_path"] = normalize_spotlight_path(
+                overlay.get("spotlight_path"), start=start, end=end
+            )
+        except FxPreviewContractError as exc:
+            raise FxPreviewContractError("invalid_request", exc.message) from exc
     if options["mode"] == "timeline":
         timeline_snapshot = payload.get("timeline_snapshot")
         if (

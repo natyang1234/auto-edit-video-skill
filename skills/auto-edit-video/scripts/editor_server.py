@@ -4142,7 +4142,20 @@ class EditorServer(ThreadingHTTPServer):
         else:
             # Snapshot-only identity: deterministic, non-persistent and
             # deliberately excluded from the single-effect visual cache key.
-            frozen_overlay["id"] = "fx-preview-candidate"
+            identity = fx_preview_contract.canonical_sha256(
+                fx_preview_contract.visual_overlay_projection(frozen_overlay)
+            )[:16]
+            candidate_id = f"fx-preview-candidate-{identity}"
+            used_ids = {
+                str(item.get("id"))
+                for item in overlays
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+            suffix = 1
+            while candidate_id in used_ids:
+                candidate_id = f"fx-preview-candidate-{identity}-{suffix}"
+                suffix += 1
+            frozen_overlay["id"] = candidate_id
             overlays.append(frozen_overlay)
         try:
             frozen_state["asset_digests"] = referenced_asset_digests(
@@ -4154,6 +4167,7 @@ class EditorServer(ThreadingHTTPServer):
         return {
             "schema_version": 1,
             "render_id": "fx-preview",
+            "candidate_overlay_id": frozen_overlay["id"],
             "created_at": now_utc(),
             "quality": "preview",
             "project_id": frozen_manifest.get("project_id"),
@@ -6191,6 +6205,9 @@ class EditorHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self.serve_file(thumb)
+            return
+        if path == "/spotlight-keyframes.css":
+            self.serve_file(EDITOR_DIR / "spotlight-keyframes.css")
             return
         static_name = "index.html" if path in {"/", "/index.html"} else path.removeprefix("/")
         if "/" in static_name or static_name.startswith("."):

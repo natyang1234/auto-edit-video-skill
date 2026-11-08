@@ -816,6 +816,8 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     target_material = dependencies.get("material")
     expected_broll = None
     observed_broll = False
+    selected_subject_track: dict[str, Any] | None = None
+    candidate_overlay_id = snapshot.get("candidate_overlay_id")
     try:
         # Keep validating the frozen canvas early, but bind diagnostics to the
         # encoded MP4 dimensions observed below.  The renderer may intentionally
@@ -852,10 +854,21 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
         original_fx_render = fx_overlay.render_for_timeline
 
         def audited_fx_render(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
-            nonlocal observed_broll
+            nonlocal observed_broll, selected_subject_track
             overlay = args[1] if len(args) > 1 and isinstance(args[1], dict) else {}
             kwargs["progress"] = lambda phase: progress(phase, "正在準備效果與圖層")
-            rendered = original_fx_render(*args, **kwargs)
+            try:
+                rendered = original_fx_render(*args, **kwargs)
+            except fx_overlay.ManualSpotlightUnsupportedError as exc:
+                raise PreviewError("spotlight_path_unsupported", str(exc)) from exc
+            if overlay.get("id") == candidate_overlay_id:
+                if rendered is None:
+                    selected_subject_track = None
+                else:
+                    raw_track = rendered.get("spotlight")
+                    selected_subject_track = (
+                        copy.deepcopy(raw_track) if isinstance(raw_track, dict) else None
+                    )
             if expected_broll is not None and overlay.get("id") == expected_broll.get("id"):
                 if rendered is None:
                     raise PreviewError("broll_render_failed", "B1 預覽素材渲染失敗")
@@ -981,6 +994,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
             finally:
                 os.close(cache_fd)
     return {"render_duration_s": round(end - start, 6), "time_map": time_map,
+            "subject_track": selected_subject_track,
             "composition_check": composition_check,
             "text_layout": {"version": 2, "measurement": "composition-dom" if layout_reports else "unavailable",
                             "status": "warn" if not layout_reports or any((r or {}).get("status") != "pass" for r in layout_reports.values()) else "pass",
@@ -1086,6 +1100,8 @@ def _render(data: dict[str, Any]) -> dict[str, Any]:
                                                    progress=lambda phase: progress(phase, "正在準備效果"))
     except fx_overlay.SubjectTrackingError as exc:
         raise PreviewError("subject_tracking_lost", str(exc)) from exc
+    except fx_overlay.ManualSpotlightUnsupportedError as exc:
+        raise PreviewError("spotlight_path_unsupported", str(exc)) from exc
     if rendered is None:
         reason = "person_unavailable" if effect.get("needs_person") or code == "P5" else "render_failed"
         raise PreviewError(reason, "此時窗無法取得可用人物去背" if reason == "person_unavailable" else "特效渲染失敗")

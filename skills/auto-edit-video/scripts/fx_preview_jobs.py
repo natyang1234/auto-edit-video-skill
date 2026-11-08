@@ -50,7 +50,7 @@ TERMINAL_TTL_S = 30 * 60
 CACHE_IDLE_TTL_S = 24 * 60 * 60
 CACHE_MAX_ITEMS = 32
 CACHE_MAX_BYTES = 512 * 1024 * 1024
-RENDER_CONTRACT_VERSION = "fx-preview-render-v2"
+RENDER_CONTRACT_VERSION = "fx-preview-render-v3-spotlight-path"
 TIMELINE_SCRATCH_RE = re.compile(
     r"^timeline-project-([0-9a-f]{32})-[0-9a-f]{16}-[A-Za-z0-9_-]+$"
 )
@@ -1259,7 +1259,7 @@ class FxPreviewJobManager:
             candidate,
             {
                 "code", "window", "apply_window", "values", "placement",
-                "scheme", "font_ids", "subject", "text_fit", "material",
+                "scheme", "font_ids", "subject", "spotlight_path", "text_fit", "material",
             },
             {"code", "window", "values", "placement", "scheme", "font_ids"},
             "candidate",
@@ -1362,6 +1362,26 @@ class FxPreviewJobManager:
                     raise FxPreviewJobError(422, "subject_invalid", "主角位置必須介於 0 到 1")
                 normalized_subject[axis] = round(numeric_value, 6)
             subject = normalized_subject
+        spotlight_path: dict[str, Any] | None = None
+        if "spotlight_path" in candidate:
+            if code != "P5":
+                raise FxPreviewJobError(
+                    422, "spotlight_path_invalid", "只有 P5 可以使用手動聚光路徑"
+                )
+            if subject is not None:
+                raise FxPreviewJobError(
+                    422,
+                    "spotlight_path_invalid",
+                    "手動聚光路徑不能同時使用自動主角選取",
+                )
+            try:
+                spotlight_path = fx_preview_contract.normalize_spotlight_path(
+                    candidate.get("spotlight_path"),
+                    start=start,
+                    end=round(start + duration, 3),
+                )
+            except fx_preview_contract.FxPreviewContractError as exc:
+                raise FxPreviewJobError(422, exc.code, exc.message) from exc
 
         material_binding: dict[str, str] | None = None
         if code == "B1":
@@ -1390,6 +1410,8 @@ class FxPreviewJobManager:
         }
         if code == "P5":
             candidate_fields["subject"] = subject
+            if spotlight_path is not None:
+                candidate_fields["spotlight_path"] = spotlight_path
         if material_binding is not None:
             candidate_fields["material"] = material_binding
         overlay = {
@@ -1425,6 +1447,9 @@ class FxPreviewJobManager:
             # Preserve server-owned stacking, visibility, lock, linkage, style
             # and metadata while freezing only candidate-owned FX controls.
             overlay = deepcopy(existing)
+        # Mode/code changes must never inherit a project-specific manual path.
+        # A manual candidate adds its newly validated path back below.
+        overlay.pop("spotlight_path", None)
         overlay.update(candidate_fields)
         style = overlay.get("style") if isinstance(overlay.get("style"), dict) else {}
         try:
@@ -1974,6 +1999,7 @@ class FxPreviewJobManager:
             cache_media,
             cache_receipt,
             cache_key,
+            overlay=overlay,
             source_sha256=source_identity["sha256"],
             sample_window=sample_window,
             preview_options=preview_options,
@@ -2036,6 +2062,7 @@ class FxPreviewJobManager:
         receipt_path: Path,
         cache_key: str,
         *,
+        overlay: dict[str, Any],
         source_sha256: str,
         sample_window: dict[str, float],
         preview_options: dict[str, str],
@@ -2122,6 +2149,12 @@ class FxPreviewJobManager:
             render_duration_s=duration,
             time_map=time_map,
         )
+        try:
+            subject_track = fx_preview_contract.sanitize_subject_track_summary(
+                receipt.get("subject_track"), overlay=overlay
+            )
+        except fx_preview_contract.FxPreviewContractError:
+            return None
         now = time.time()
         try:
             os.utime(media.name, (now, now), dir_fd=cache_fd, follow_symlinks=False)
@@ -2136,6 +2169,7 @@ class FxPreviewJobManager:
             "time_map": time_map,
             "text_layout": _sanitize_text_layout(receipt.get("text_layout")),
             "composition_check": composition_check,
+            "subject_track": subject_track,
         }
 
     @staticmethod
@@ -2361,6 +2395,7 @@ class FxPreviewJobManager:
                     "output_invalid": "FX 預覽輸出未通過媒體驗證",
                     "invalid_request": "本機 FX 預覽工作收到無效資料",
                     "subject_tracking_lost": "選取的主角已失去追蹤，請換取樣時窗或重新選人",
+                    "spotlight_path_unsupported": "目前固定的聚光燈 renderer 不支援手動路徑，請重新載入相容版本",
                 }
                 with self._lock:
                     self._finish_failed(job_id, safe_code, safe_messages.get(safe_code, "FX 預覽產生失敗"))
@@ -2486,6 +2521,18 @@ class FxPreviewJobManager:
                 render_duration_s=render_duration,
                 time_map=time_map,
             )
+            try:
+                subject_track = fx_preview_contract.sanitize_subject_track_summary(
+                    result.get("subject_track"), overlay=overlay
+                )
+            except fx_preview_contract.FxPreviewContractError:
+                with self._lock:
+                    self._finish_failed(
+                        job_id,
+                        "worker_contract_invalid",
+                        "聚光追蹤收據與已凍結候選不一致",
+                    )
+                return
             receipt = {
                 "schema_version": 1,
                 "cache_key": job["cache_key"],
@@ -2498,6 +2545,7 @@ class FxPreviewJobManager:
                 "time_map": time_map,
                 "text_layout": text_layout,
                 "composition_check": composition_check,
+                "subject_track": subject_track,
                 "created_at": time.time(),
             }
             self._touch_renderer_cache()
@@ -2539,6 +2587,7 @@ class FxPreviewJobManager:
                             "time_map": time_map,
                             "text_layout": text_layout,
                             "composition_check": composition_check,
+                            "subject_track": subject_track,
                         },
                         "error": None,
                     }
@@ -2922,6 +2971,8 @@ class FxPreviewJobManager:
                 public["text_layout"] = deepcopy(media["text_layout"])
             if media.get("composition_check") is not None:
                 public["composition_check"] = deepcopy(media["composition_check"])
+            if media.get("subject_track") is not None:
+                public["subject_track"] = deepcopy(media["subject_track"])
         if isinstance(job.get("error"), dict):
             public["error"] = dict(job["error"])
         return public
