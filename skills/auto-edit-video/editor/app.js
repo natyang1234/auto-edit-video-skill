@@ -202,7 +202,8 @@ function cacheElements() {
     "spotlight-manual-editor", "spotlight-seek-start", "spotlight-seek-end", "spotlight-current-time",
     "spotlight-point-time", "spotlight-point-x", "spotlight-point-y", "spotlight-add-point",
     "spotlight-update-point", "spotlight-delete-point", "spotlight-reconcile", "spotlight-reconcile-start",
-    "spotlight-reconcile-end", "spotlight-keyframe-list", "spotlight-validation",
+    "spotlight-reconcile-end", "spotlight-keyframe-list", "spotlight-validation", "spotlight-crop-note",
+    "manual-spotlight-timing-note", "manual-spotlight-timing-open",
     "fx-preview-layout-check", "fx-preview-layout-check-heading", "fx-preview-layout-check-toggle",
     "fx-preview-layout-check-summary", "fx-preview-layout-check-list",
     "fx-preview-composition-check", "fx-preview-composition-check-heading", "fx-preview-composition-check-status",
@@ -2320,12 +2321,23 @@ function fxPreviewEnsureManualPath(draft = fxPreviewDraft) {
         { source_at: end, x: fxPreviewCanonicalNumber(subject.x, 6, "X"), y: fxPreviewCanonicalNumber(subject.y, 6, "Y") },
       ],
     };
+    draft.__spotlightDefaultFixed = !(draft.subject && typeof draft.subject === "object"
+      && Number.isFinite(Number(draft.subject.x)) && Number.isFinite(Number(draft.subject.y)));
   }
   return draft.spotlight_path;
 }
 
 function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart = 0) {
   if (!effect) return null;
+  const explicitSpotlightMode = seed?.spotlight_mode === "manual" || seed?.spotlight_mode === "automatic"
+    ? seed.spotlight_mode
+    : seed?.__spotlightModeOverride === "manual" || seed?.__spotlightModeOverride === "automatic"
+      ? seed.__spotlightModeOverride
+      : null;
+  const inheritedSpotlightPath = seed?.spotlight_path || overlay?.spotlight_path || null;
+  const spotlightMode = effect.code === "P5"
+    ? (explicitSpotlightMode || (inheritedSpotlightPath ? "manual" : "automatic"))
+    : null;
   const seedWindow = seed?.window || {};
   const start = Number.isFinite(Number(seedWindow.start_s))
     ? Number(seedWindow.start_s)
@@ -2363,18 +2375,23 @@ function fxPreviewBuildDraft(effect, seed = null, overlay = null, fallbackStart 
     opacity: fxPreviewValidOpacity(seed?.opacity) ? seed.opacity : fxPreviewValidOpacity(overlay?.style?.opacity) ? overlay.style.opacity : 1,
     font_ids: { ...priorFonts },
     subject: seed?.subject ?? overlay?.subject ?? null,
-    spotlight_mode: effect.code === "P5"
-      && (seed?.spotlight_mode === "manual" || seed?.spotlight_path || overlay?.spotlight_path) ? "manual" : "automatic",
-    spotlight_path: effect.code === "P5"
+    spotlight_mode: effect.code === "P5" ? spotlightMode : "automatic",
+    spotlight_path: effect.code === "P5" && spotlightMode === "manual"
       ? (seed?.spotlight_path ? deepCopy(seed.spotlight_path) : overlay?.spotlight_path ? deepCopy(overlay.spotlight_path) : null)
       : null,
+    // Keep an explicit P5 mode choice while browsing other effects.  This is
+    // draft-only metadata; request bodies still include only the documented
+    // candidate fields.  In particular, explicit automatic mode must not
+    // resurrect a replacement overlay's old manual path on re-select.
+    __spotlightModeOverride: explicitSpotlightMode || (effect.code === "P5" ? spotlightMode : null),
     text_fit: seed?.text_fit !== false,
     material: seed?.material || null,
     preview_options: { mode: seed?.preview_options?.mode === "timeline" ? "timeline" : "single", quality: seed?.preview_options?.quality === "standard" ? "standard" : "draft" },
   };
-  if (effect.code !== "P5") {
+  if (effect.code !== "P5" || spotlightMode !== "manual") {
     delete draft.spotlight_mode;
     delete draft.spotlight_path;
+    if (effect.code === "P5") draft.spotlight_mode = "automatic";
   }
   return draft;
 }
@@ -3038,14 +3055,82 @@ function fxPreviewSpotlightSetValidation(message, tone = "") {
   node.classList.toggle("is-success", tone === "success");
 }
 
+function fxPreviewSpotlightSourceDimensions() {
+  const video = elements["fx-preview-source-video"];
+  const source = projectPayload?.manifest?.source || projectPayload?.source || {};
+  const width = Number(video?.videoWidth) || Number(source.width) || 0;
+  const height = Number(video?.videoHeight) || Number(source.height) || 0;
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
+function fxPreviewSpotlightOutputCropState(points = [], source = fxPreviewSpotlightSourceDimensions()) {
+  const canvas = state?.canvas || projectPayload?.manifest?.canvas || projectPayload?.canvas || {};
+  const outputWidth = Number(canvas.width) || 1080;
+  const outputHeight = Number(canvas.height) || 1920;
+  const fit = canvas.fit || "cover";
+  if (!source || !(outputWidth > 0 && outputHeight > 0) || !["cover", "contain"].includes(fit)) {
+    return { known: false, source, outputWidth, outputHeight, fit };
+  }
+  const scale = fit === "contain"
+    ? Math.min(outputWidth / source.width, outputHeight / source.height)
+    : Math.max(outputWidth / source.width, outputHeight / source.height);
+  if (!(scale > 0) || !Number.isFinite(scale)) return { known: false, source, outputWidth, outputHeight, fit };
+  const visibleLeft = Math.max(0, (source.width * scale - outputWidth) / (2 * scale));
+  const visibleTop = Math.max(0, (source.height * scale - outputHeight) / (2 * scale));
+  const visibleRight = Math.min(source.width, visibleLeft + outputWidth / scale);
+  const visibleBottom = Math.min(source.height, visibleTop + outputHeight / scale);
+  const outside = points.some((point) => {
+    const x = Number(point?.x);
+    const y = Number(point?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    const sourceX = Math.max(0, Math.min(1, x)) * source.width;
+    const sourceY = Math.max(0, Math.min(1, y)) * source.height;
+    const epsilon = 1e-6;
+    return sourceX < visibleLeft - epsilon || sourceX > visibleRight + epsilon
+      || sourceY < visibleTop - epsilon || sourceY > visibleBottom + epsilon;
+  });
+  return {
+    known: true,
+    source,
+    outputWidth,
+    outputHeight,
+    fit,
+    visible: { left: visibleLeft, top: visibleTop, right: visibleRight, bottom: visibleBottom },
+    outside,
+  };
+}
+
+function fxPreviewSpotlightRenderCropNote(points = null) {
+  const note = elements["spotlight-crop-note"];
+  if (!note) return;
+  const manual = fxPreviewDraft?.code === "P5" && fxPreviewDraft.spotlight_mode === "manual";
+  if (!manual) {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  const pathPoints = points || (Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes)
+    ? fxPreviewDraft.spotlight_path.keyframes : []);
+  const crop = fxPreviewSpotlightOutputCropState(pathPoints);
+  note.hidden = false;
+  if (!crop.known) {
+    note.textContent = "輸出裁切範圍尚待原影片尺寸載入；請依原片／效果預覽確認。";
+  } else if (crop.outside) {
+    note.textContent = "有位置在輸出裁切區外，聚光燈可能看不到。";
+  } else {
+    note.textContent = "目前關鍵點都在輸出可見範圍內。";
+  }
+}
+
 function fxPreviewSpotlightContentRect() {
   const video = elements["fx-preview-source-video"];
   const stage = elements["spotlight-source-stage"];
   if (!video || !stage) return null;
   const stageRect = stage.getBoundingClientRect();
   const videoRect = video.getBoundingClientRect();
-  const width = Number(video.videoWidth) || Number(projectPayload?.manifest?.source?.width) || 0;
-  const height = Number(video.videoHeight) || Number(projectPayload?.manifest?.source?.height) || 0;
+  const dimensions = fxPreviewSpotlightSourceDimensions();
+  const width = dimensions?.width || 0;
+  const height = dimensions?.height || 0;
   if (!(videoRect.width > 0 && videoRect.height > 0 && width > 0 && height > 0)) return null;
   const videoRatio = width / height;
   const boxRatio = videoRect.width / videoRect.height;
@@ -3072,6 +3157,7 @@ function fxPreviewSpotlightRenderOverlay() {
   const manual = draft?.code === "P5" && draft.spotlight_mode === "manual";
   const points = manual && Array.isArray(draft?.spotlight_path?.keyframes) ? draft.spotlight_path.keyframes : [];
   const content = fxPreviewSpotlightContentRect();
+  fxPreviewSpotlightRenderCropNote(points);
   if (clickTarget) {
     clickTarget.hidden = !activeP5 || !content;
     if (content) {
@@ -3125,7 +3211,7 @@ function fxPreviewSpotlightRenderCurrentTime() {
   fxPreviewSpotlightRenderOverlay();
 }
 
-function fxPreviewSpotlightSelect(index) {
+function fxPreviewSpotlightSelect(index, { renderList = true } = {}) {
   const points = Array.isArray(fxPreviewDraft?.spotlight_path?.keyframes) ? fxPreviewDraft.spotlight_path.keyframes : [];
   fxPreviewSpotlightSelectedIndex = Number.isInteger(index) && index >= 0 && index < points.length ? index : -1;
   const point = fxPreviewSpotlightSelectedIndex >= 0 ? points[fxPreviewSpotlightSelectedIndex] : null;
@@ -3138,7 +3224,7 @@ function fxPreviewSpotlightSelect(index) {
     elements["spotlight-point-x"].value = "";
     elements["spotlight-point-y"].value = "";
   }
-  fxPreviewSpotlightRenderList();
+  if (renderList) fxPreviewSpotlightRenderList();
   fxPreviewSpotlightRenderOverlay();
 }
 
@@ -3175,28 +3261,43 @@ function fxPreviewSpotlightRenderList() {
       fxPreviewSpotlightSelect(index);
       fxPreviewSpotlightSeek(Number(point.source_at));
     });
-    const onInput = (field, input) => {
+    const onChange = (field, input) => {
       const value = Number(input.value);
       fxPreviewSpotlightHoldMedia();
-      fxPreviewSpotlightSelect(index);
+      // Commit only after the native number editor finishes (blur/Tab or
+      // Enter). Rebuilding the list during a keypress destroys the focused
+      // input and drops the rest of a multi-digit value.
       if (!Number.isFinite(value)) fxPreviewDraft.spotlight_path.keyframes[index][field] = NaN;
       else fxPreviewDraft.spotlight_path.keyframes[index][field] = value;
-      fxPreviewDraftChanged();
+      fxPreviewSpotlightSelect(index, { renderList: false });
+      fxPreviewDraftChanged({ renderSpotlightList: false });
     };
-    time.addEventListener("input", () => onInput("source_at", time));
-    x.addEventListener("input", () => onInput("x", x));
-    y.addEventListener("input", () => onInput("y", y));
+    [
+      ["source_at", time],
+      ["x", x],
+      ["y", y],
+    ].forEach(([field, input]) => {
+      input.addEventListener("input", () => fxPreviewSpotlightHoldMedia());
+      input.addEventListener("change", () => onChange(field, input));
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          input.blur();
+        }
+      });
+    });
     row.append(time, x, y, goto, select);
     return row;
   }));
 }
 
-function fxPreviewSpotlightRenderPanel() {
+function fxPreviewSpotlightRenderPanel({ renderList = true } = {}) {
   const panel = elements["spotlight-keyframes-panel"];
   if (!panel) return;
   const isP5 = fxPreviewDraft?.code === "P5";
   panel.hidden = !isP5;
   if (!isP5) {
+    fxPreviewSpotlightRenderCropNote([]);
     fxPreviewSpotlightRenderOverlay();
     return;
   }
@@ -3216,9 +3317,17 @@ function fxPreviewSpotlightRenderPanel() {
       && (Number(points[0].source_at) !== fxPreviewCanonicalNumber(bounds.start, 3, "套用起點")
         || Number(points[points.length - 1].source_at) !== fxPreviewCanonicalNumber(bounds.end, 3, "套用終點"));
     reconcile.hidden = !endpointMismatch;
-    if (result.ok) fxPreviewSpotlightSetValidation(`有效路徑：${points.length} 點；位置會在相鄰點間平滑移動，不會超出座標範圍。`, "success");
+    const fixedPosition = points.length >= 2
+      && points.every((point) => Math.abs(Number(point?.x) - Number(points[0]?.x)) < 1e-9
+        && Math.abs(Number(point?.y) - Number(points[0]?.y)) < 1e-9);
+    const fixedNote = fixedPosition
+      ? `目前所有點位相同（固定位置${fxPreviewDraft.__spotlightDefaultFixed
+        && Math.abs(Number(points[0]?.x) - 0.5) < 1e-9
+        && Math.abs(Number(points[0]?.y) - 0.5) < 1e-9 ? "；中心預設" : ""}），可在原片點擊或編輯任一點後變更。`
+      : "";
+    if (result.ok) fxPreviewSpotlightSetValidation(`${fixedNote}${fixedNote ? " " : ""}有效路徑：${points.length} 點；位置會在相鄰點間平滑移動，不會超出座標範圍。`, "success");
     else fxPreviewSpotlightSetValidation(result.error, "error");
-    fxPreviewSpotlightRenderList();
+    if (renderList) fxPreviewSpotlightRenderList();
     fxPreviewSpotlightRenderCurrentTime();
   } else {
     fxPreviewSpotlightSetValidation("自動模式不攜帶手動路徑。", "");
@@ -3258,6 +3367,7 @@ function fxPreviewSpotlightAddPoint(sourceAt, x, y) {
     fxPreviewSpotlightSetValidation("X 與 Y 必須介於 0 與 1。", "error");
     return false;
   }
+  fxPreviewDraft.__spotlightDefaultFixed = false;
   const existing = points.findIndex((point) => Number(point.source_at) === canonical.source_at);
   if (existing >= 0) {
     points[existing] = canonical;
@@ -3301,6 +3411,7 @@ function fxPreviewSpotlightUpdateEditorPoint() {
       x: fxPreviewCanonicalNumber(x, 6, "關鍵點 X"),
       y: fxPreviewCanonicalNumber(y, 6, "關鍵點 Y"),
     };
+    fxPreviewDraft.__spotlightDefaultFixed = false;
   } catch (error) {
     fxPreviewSpotlightSetValidation(error.message, "error");
     return;
@@ -3317,6 +3428,7 @@ function fxPreviewSpotlightDeletePoint() {
     return;
   }
   points.splice(fxPreviewSpotlightSelectedIndex, 1);
+  fxPreviewDraft.__spotlightDefaultFixed = false;
   fxPreviewSpotlightSelectedIndex = Math.min(fxPreviewSpotlightSelectedIndex, points.length - 1);
   fxPreviewSpotlightSelect(fxPreviewSpotlightSelectedIndex);
   fxPreviewDraftChanged();
@@ -3342,24 +3454,22 @@ function fxPreviewSetSpotlightMode(mode) {
   if (!fxPreviewDraft || fxPreviewDraft.code !== "P5") return;
   if (mode === "manual") {
     fxPreviewDraft.spotlight_mode = "manual";
-    const manualPath = fxPreviewEnsureManualPath(fxPreviewDraft);
-    // Keep the legacy auto seed in the draft so switching back to automatic
-    // remains a valid P5 request.  Manual POSTs omit subject explicitly.
-    if (!fxPreviewDraft.subject && manualPath?.keyframes?.[0]) {
-      fxPreviewDraft.subject = {
-        x: manualPath.keyframes[0].x,
-        y: manualPath.keyframes[0].y,
-      };
-    }
+    fxPreviewDraft.__spotlightModeOverride = "manual";
+    fxPreviewEnsureManualPath(fxPreviewDraft);
+    // Manual POSTs omit subject explicitly.  A manual path must never become
+    // an implicit automatic-person selection when the user switches back.
     fxPreviewSpotlightSelectedIndex = Array.isArray(fxPreviewDraft.spotlight_path?.keyframes) ? 0 : -1;
     fxPreviewSpotlightHoldMedia();
   } else {
     fxPreviewDraft.spotlight_mode = "automatic";
+    fxPreviewDraft.__spotlightModeOverride = "automatic";
     // Automatic mode deliberately carries no temporal path.  Keep the legacy
     // subject selection only; the backend infers manual mode from path presence.
     delete fxPreviewDraft.spotlight_path;
+    delete fxPreviewDraft.__spotlightDefaultFixed;
     fxPreviewSpotlightSelectedIndex = -1;
     fxPreviewManualSourceHold = false;
+    fxPreviewManualInteractionToken += 1;
   }
   fxPreviewSpotlightRenderPanel();
   fxPreviewDraftChanged();
@@ -4692,13 +4802,13 @@ async function fxPreviewPoll(statusUrl, generation, signature) {
   }
 }
 
-function fxPreviewDraftChanged() {
+function fxPreviewDraftChanged({ renderSpotlightList = true } = {}) {
   if (fxCompareRoundLocked()) {
     fxPreviewSetStatus("比較已開始；請先丟棄本輪再修改候選。", "error");
     return;
   }
   fxPreviewUpdateWindowControls();
-  fxPreviewSpotlightRenderPanel();
+  fxPreviewSpotlightRenderPanel({ renderList: renderSpotlightList });
   fxPreviewPersistDraft();
   fxPreviewInvalidateAndSchedule();
 }
@@ -4707,8 +4817,15 @@ function fxPreviewSelectEffect(code) {
   if (fxCompareRoundLocked()) return;
   const effect = fxEffectByCode(code);
   if (!effect) return;
+  const previousCode = fxPreviewDraft?.code || "";
   const overlay = fxPreviewReplaceOverlay();
   fxPreviewDraft = fxPreviewBuildDraft(effect, fxPreviewDraft, overlay, fxPreviewSourceStart());
+  if (previousCode && previousCode !== effect.code) {
+    // Manual source interaction belongs to the previous effect.  A newly
+    // selected effect must be allowed to resume normal playback/sync.
+    fxPreviewManualSourceHold = false;
+    fxPreviewManualInteractionToken += 1;
+  }
   fxPreviewRememberRecent(effect.code);
   fxPreviewPersistDraft();
   fxPreviewRenderDialog();
@@ -4807,6 +4924,7 @@ async function openFxPreviewDialog(trigger = document.activeElement, replaceOver
       // never let a portable/brand preset transfer it across projects.
       delete fxPreviewDraft.spotlight_path;
       fxPreviewDraft.spotlight_mode = "automatic";
+      fxPreviewDraft.__spotlightModeOverride = "automatic";
     }
   }
   fxPreviewDraftSignature = fxPreviewSignature();
@@ -5167,6 +5285,9 @@ function openFxFontPop(anchor, role, current, pick) {
 function renderInspector() {
   const audioEvent = currentAudioEvent();
   if (audioEvent) {
+    elements["manual-spotlight-timing-note"].hidden = true;
+    elements["overlay-start"].disabled = false;
+    elements["overlay-end"].disabled = false;
     elements["inspector-empty"].hidden = true;
     elements["layer-form"].hidden = true;
     renderAudioEventInspector(audioEvent);
@@ -5175,6 +5296,7 @@ function renderInspector() {
   elements["audio-event-form"].hidden = true;
   const overlay = currentOverlay();
   if (!overlay) {
+    elements["manual-spotlight-timing-note"].hidden = true;
     elements["inspector-empty"].hidden = false;
     elements["layer-form"].hidden = true;
     return;
@@ -5195,6 +5317,11 @@ function renderInspector() {
   elements["overlay-text"].value = overlay.text || "";
   elements["overlay-start"].value = overlay.start;
   elements["overlay-end"].value = overlay.end;
+  const manualSpotlightTiming = fxType && overlay.code === "P5"
+    && overlay.spotlight_path && typeof overlay.spotlight_path === "object";
+  elements["overlay-start"].disabled = manualSpotlightTiming;
+  elements["overlay-end"].disabled = manualSpotlightTiming;
+  elements["manual-spotlight-timing-note"].hidden = !manualSpotlightTiming;
   populateFontSelect(style);
   elements["font-family"].closest("label").hidden = assetType || designCard;
   elements["font-size"].value = style.font_size || 58;
@@ -5297,8 +5424,12 @@ function updateOverlayFromForm() {
   if (!overlay) return;
   if (overlay.type === "fx") {
     // An effect block is full-frame and keeps its own text; the form only owns timing and visibility.
-    overlay.start = Number(elements["overlay-start"].value);
-    overlay.end = Math.max(overlay.start + 0.2, Number(elements["overlay-end"].value));
+    const manualSpotlightTiming = overlay.code === "P5"
+      && overlay.spotlight_path && typeof overlay.spotlight_path === "object";
+    if (!manualSpotlightTiming) {
+      overlay.start = Number(elements["overlay-start"].value);
+      overlay.end = Math.max(overlay.start + 0.2, Number(elements["overlay-end"].value));
+    }
     overlay.visible = elements["overlay-visible"].checked;
     markDirty("圖層變更，儲存中…");
     renderLayoutWarning();
@@ -6476,6 +6607,11 @@ function bindEvents() {
     event.preventDefault();
     const overlay = currentOverlay();
     openFxPreviewDialog(event.currentTarget, overlay?.type === "fx" ? overlay.id : null);
+  });
+  elements["manual-spotlight-timing-open"].addEventListener("click", (event) => {
+    const overlay = currentOverlay();
+    if (!overlay || overlay.type !== "fx" || overlay.code !== "P5" || !overlay.spotlight_path) return;
+    openFxPreviewDialog(event.currentTarget, overlay.id, "P5");
   });
   elements["fx-search"].addEventListener("input", () => { const overlay = currentOverlay(); if (overlay?.type === "fx") renderFxPanel(overlay); });
   elements["fx-preview-search"].addEventListener("input", fxPreviewRenderCatalog);
