@@ -132,6 +132,112 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             self.assertEqual(page.locator("#fx-preview-composition-check-list button").count(), 0)
             browser.close()
 
+    def test_nullable_visible_media_setter_clears_both_diagnostic_panels(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            result = page.evaluate(
+                """() => {
+                    const receipt = {
+                        version: 1,
+                        scope: 'full-timeline',
+                        measurement: 'sampled-local-frames',
+                        status: 'warn',
+                        source_sha256: 'a'.repeat(64),
+                        media_sha256: 'b'.repeat(64),
+                        frame_size: {width: 360, height: 640},
+                        sample_count: 1,
+                        measured_count: 1,
+                        elapsed_s: 0.4,
+                        engines: {faces: 'opencv-yunet', ocr: 'macos-vision'},
+                        samples: [{output_at: 0.9, source_at: 1.3, measured: true,
+                            source_face_count: 1, reference_face_count: 1,
+                            visible_face_count: 1, text_box_count: 1}],
+                        findings: [{kind: 'visibility_uncertain', output_at: 0.9, source_at: 1.3}],
+                    };
+                    const job = {
+                        id: 'composition-clear-regression', state: 'ready', media_url: '/media/source',
+                        render_duration_s: 1.6,
+                        preview_options: {mode: 'timeline', quality: 'standard'},
+                        time_map: [
+                            {output_start_s: 0, output_end_s: .8, source_start_s: 0, source_end_s: .8},
+                            {output_start_s: .8, output_end_s: 1.6, source_start_s: 1.2, source_end_s: 2},
+                        ],
+                        text_layout: {
+                            version: 2, measurement: 'composition_dom', status: 'warn',
+                            face_measurement: 'opencv-yunet', findings: [{kind: 'text_too_small'}],
+                        },
+                        composition_check: receipt,
+                    };
+                    const snapshot = () => ({
+                        compositionHidden: document.querySelector('#fx-preview-composition-check').hidden,
+                        compositionStatus: document.querySelector('#fx-preview-composition-check').dataset.status || null,
+                        compositionSummary: document.querySelector('#fx-preview-composition-check-summary').textContent,
+                        compositionSamples: document.querySelector('#fx-preview-composition-check-samples').textContent,
+                        compositionButtons: document.querySelectorAll(
+                            '#fx-preview-composition-check-list button[data-source-at]'
+                        ).length,
+                        compositionList: document.querySelector('#fx-preview-composition-check-list').textContent,
+                        layoutHidden: document.querySelector('#fx-preview-layout-check').hidden,
+                        layoutSummary: document.querySelector('#fx-preview-layout-check-summary').textContent,
+                        layoutItems: document.querySelectorAll('#fx-preview-layout-check-list li').length,
+                        layoutToggleHidden: document.querySelector('#fx-preview-layout-check-toggle').hidden,
+                    });
+                    fxPreviewSetVisibleMedia(job);
+                    const before = snapshot();
+                    const detachedButton = document.querySelector(
+                        '#fx-preview-composition-check-list button[data-source-at]'
+                    );
+                    const tokenBeforeClear = fxPreviewVisibleMediaToken;
+                    fxPreviewSetVisibleMedia(null);
+                    const afterClear = snapshot();
+                    detachedButton?.click();
+                    const afterDetachedClick = snapshot();
+                    const tokenAfterClear = fxPreviewVisibleMediaToken;
+                    fxPreviewSetVisibleMedia(job);
+                    return {
+                        before,
+                        afterClear,
+                        afterDetachedClick,
+                        restored: snapshot(),
+                        tokenDelta: tokenAfterClear - tokenBeforeClear,
+                        visibleJob: fxPreviewVisibleJob?.id || null,
+                        visibleMeta: Boolean(fxPreviewVisibleMeta),
+                    };
+                }"""
+            )
+            self.assertEqual(result["before"]["compositionStatus"], "warn")
+            self.assertFalse(result["before"]["compositionHidden"])
+            self.assertEqual(result["before"]["compositionButtons"], 1)
+            self.assertEqual(result["before"]["layoutSummary"], "特效排版：有 1 項提醒")
+            self.assertFalse(result["before"]["layoutHidden"])
+            self.assertFalse(result["before"]["layoutToggleHidden"])
+
+            cleared = result["afterClear"]
+            self.assertTrue(cleared["compositionHidden"])
+            self.assertIsNone(cleared["compositionStatus"])
+            self.assertEqual(cleared["compositionSummary"], "")
+            self.assertEqual(cleared["compositionSamples"], "")
+            self.assertEqual(cleared["compositionButtons"], 0)
+            self.assertEqual(cleared["compositionList"], "")
+            self.assertTrue(cleared["layoutHidden"])
+            self.assertEqual(cleared["layoutSummary"], "")
+            self.assertEqual(cleared["layoutItems"], 0)
+            self.assertTrue(cleared["layoutToggleHidden"])
+            self.assertEqual(result["afterDetachedClick"], cleared)
+            self.assertEqual(result["tokenDelta"], 1)
+
+            self.assertEqual(result["restored"]["compositionStatus"], "warn")
+            self.assertFalse(result["restored"]["compositionHidden"])
+            self.assertEqual(result["restored"]["compositionButtons"], 1)
+            self.assertEqual(result["restored"]["layoutSummary"], "特效排版：有 1 項提醒")
+            self.assertFalse(result["restored"]["layoutHidden"])
+            self.assertEqual(result["visibleJob"], "composition-clear-regression")
+            self.assertTrue(result["visibleMeta"])
+            browser.close()
+
     def test_unknown_receipt_cannot_render_pass_and_single_action_is_hidden_in_comparison(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:

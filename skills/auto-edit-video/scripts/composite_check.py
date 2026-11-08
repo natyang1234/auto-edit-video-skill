@@ -20,6 +20,7 @@ MAX_SAMPLES = 8
 MAX_FINDINGS = 32
 SMALL_PREVIEW_SECONDS = 2.5
 TEXT_OVERLAP_FRACTION = 0.15
+OCR_MIN_CONFIDENCE = 0.5
 VISIBLE_FACE_IOU = 0.25
 _TIME_EPSILON = 1e-6
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -435,6 +436,9 @@ def _vision_ocr_boxes(frame_path: Path, width: int, height: int) -> tuple[str, l
             continue
         text = line.get("text")
         if not isinstance(text, str) or not text.strip():
+            continue
+        confidence = _finite(line.get("confidence"))
+        if confidence is None or not 0.0 <= confidence <= 1.0 or confidence < OCR_MIN_CONFIDENCE:
             continue
         raw_box = line.get("box")
         if not isinstance(raw_box, Mapping):

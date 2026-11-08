@@ -536,3 +536,39 @@ def test_one_successful_ocr_keeps_engine_named_but_failed_samples_unknown(tmp_pa
     assert receipt["status"] == "unmeasured"
     assert 0 < receipt["measured_count"] < receipt["sample_count"]
     assert any(item["kind"] == "ocr_unavailable" for item in receipt["findings"])
+
+
+def test_vision_ocr_requires_finite_confidence_at_or_above_boundary(monkeypatch, tmp_path):
+    class _Vision:
+        @staticmethod
+        def recognize_text(_path, timeout_s):
+            return [
+                {"text": "boundary", "confidence": 0.5, "box": {"x": 0.1, "y": 0.2, "width": 0.2, "height": 0.1}},
+                {"text": "high", "confidence": 0.9, "box": {"x": 0.3, "y": 0.2, "width": 0.2, "height": 0.1}},
+                {"text": "low", "confidence": 0.49, "box": {"x": 0.5, "y": 0.2, "width": 0.2, "height": 0.1}},
+                {"text": "missing", "box": {"x": 0.7, "y": 0.2, "width": 0.2, "height": 0.1}},
+                {"text": "nan", "confidence": float("nan"), "box": {"x": 0.1, "y": 0.4, "width": 0.2, "height": 0.1}},
+                {"text": "string", "confidence": "0.9", "box": {"x": 0.3, "y": 0.4, "width": 0.2, "height": 0.1}},
+            ]
+
+    monkeypatch.setitem(sys.modules, "vision_ocr", _Vision)
+    status, boxes = composite_check._vision_ocr_boxes(tmp_path / "frame.png", 100, 100)
+    assert status == "ok"
+    assert len(boxes) == 2
+    assert [box["x"] for box in boxes] == [10.0, 30.0]
+
+
+def test_vision_ocr_low_confidence_only_is_successful_empty(monkeypatch, tmp_path):
+    class _Vision:
+        @staticmethod
+        def recognize_text(_path, timeout_s):
+            return [{
+                "text": "noise",
+                "confidence": 0.1,
+                "box": {"x": 0.1, "y": 0.2, "width": 0.2, "height": 0.1},
+            }]
+
+    monkeypatch.setitem(sys.modules, "vision_ocr", _Vision)
+    status, boxes = composite_check._vision_ocr_boxes(tmp_path / "frame.png", 100, 100)
+    assert status == "empty"
+    assert boxes == []
