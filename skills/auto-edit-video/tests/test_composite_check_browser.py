@@ -407,6 +407,86 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             self.assertTrue(result["panelHidden"])
             browser.close()
 
+    def test_invalid_receipt_has_no_actions_but_valid_unmeasured_findings_can_seek(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
+            self.open_ready_preview(page)
+            receipt = {
+                "version": 1,
+                "scope": "full-timeline",
+                "measurement": "sampled-local-frames",
+                "status": "unmeasured",
+                "source_sha256": "a" * 64,
+                "media_sha256": "b" * 64,
+                "frame_size": {"width": 360, "height": 640},
+                "sample_count": 1,
+                "measured_count": 0,
+                "elapsed_s": 0.4,
+                "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+                "samples": [{
+                    "output_at": 0.9, "source_at": 1.3, "measured": False,
+                    "source_face_count": 1, "reference_face_count": 1,
+                    "visible_face_count": 0, "text_box_count": 0,
+                }],
+                "findings": [
+                    {"kind": "visibility_uncertain", "output_at": 0.9, "source_at": 1.3},
+                    {"kind": "ocr_unavailable", "output_at": 0.9, "source_at": 1.3},
+                ],
+            }
+            self.install_job(page, receipt, job_id="composition-valid-unmeasured")
+            panel = page.locator("#fx-preview-composition-check")
+            valid_button = panel.locator("button[data-source-at]")
+            self.assertEqual(panel.get_attribute("data-status"), "unmeasured")
+            self.assertEqual(valid_button.count(), 1)
+            self.assertIn("00:01.300", valid_button.inner_text())
+            valid_button.click()
+            page.wait_for_function(
+                "() => Math.abs(document.querySelector('#fx-preview-source-video').currentTime - 1.3) < .12 && "
+                "Math.abs(document.querySelector('#fx-preview-video').currentTime - .9) < .12"
+            )
+
+            invalid = page.evaluate(
+                """() => {
+                    const job = structuredClone(fxPreviewVisibleJob);
+                    const valid = structuredClone(fxPreviewVisibleMeta.composition_check);
+                    const badBox = structuredClone(valid);
+                    badBox.findings = [{
+                        kind: 'text_subject_overlap', output_at: .9, source_at: 1.3,
+                        subject_box: {x: 350, y: 20, width: 40, height: 40},
+                        text_box: {x: 20, y: 20, width: 40, height: 20},
+                    }];
+                    const unknownKey = structuredClone(valid);
+                    unknownKey.future_field = 'not-allowed';
+                    const invalidSamplePair = structuredClone(valid);
+                    invalidSamplePair.samples[0].source_at = 1.0;
+                    return [badBox, unknownKey, invalidSamplePair].map(receipt => {
+                        fxPreviewRenderCompositionCheck(receipt, job);
+                        return {
+                            status: document.querySelector('#fx-preview-composition-check').dataset.status,
+                            buttons: document.querySelectorAll(
+                                '#fx-preview-composition-check-list button[data-source-at]'
+                            ).length,
+                            summary: document.querySelector(
+                                '#fx-preview-composition-check-summary'
+                            ).textContent,
+                            listText: document.querySelector(
+                                '#fx-preview-composition-check-list'
+                            ).textContent,
+                        };
+                    });
+                }"""
+            )
+            for result in invalid:
+                self.assertEqual(result["status"], "unmeasured")
+                self.assertEqual(result["buttons"], 0)
+                self.assertIn("結果不完整", result["summary"])
+                self.assertEqual(result["listText"], "")
+            browser.close()
+
     def test_old_issue_and_late_metadata_cannot_move_new_candidate(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:

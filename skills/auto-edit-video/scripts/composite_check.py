@@ -284,14 +284,14 @@ class _FindingCollector:
                         "width": round(parsed[2], 4),
                         "height": round(parsed[3], 4),
                     }
-        if len(self.items) < MAX_FINDINGS - 1:
+        if len(self.items) < MAX_FINDINGS:
             self.items.append(clean)
         else:
             self.overflowed = True
 
     def finalize(self) -> list[dict[str, Any]]:
         if self.overflowed:
-            self.items.append({"kind": "analysis_incomplete"})
+            return [*self.items[: MAX_FINDINGS - 1], {"kind": "analysis_incomplete"}]
         return self.items[:MAX_FINDINGS]
 
 
@@ -483,6 +483,7 @@ def _base_receipt(
     samples: Iterable[Mapping[str, Any]] = (),
     findings: Iterable[Mapping[str, Any]] = (),
     status: str = "unmeasured",
+    engines: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     sample_list = [dict(item) for item in samples][:MAX_SAMPLES]
     finding_list = [dict(item) for item in findings][:MAX_FINDINGS]
@@ -490,6 +491,15 @@ def _base_receipt(
     width, height = _frame_size(*frame_size)
     safe_scope = scope if scope in {"full-timeline", "single-effect"} else "full-timeline"
     safe_status = status if status in {"pass", "warn", "unmeasured"} else "unmeasured"
+    safe_engines = {
+        "faces": "unavailable",
+        "ocr": "unavailable",
+    }
+    if isinstance(engines, Mapping):
+        for key in safe_engines:
+            value = engines.get(key)
+            if value in {"opencv-yunet", "macos-vision", "unavailable"}:
+                safe_engines[key] = value
     return {
         "version": 1,
         "scope": safe_scope,
@@ -501,7 +511,7 @@ def _base_receipt(
         "sample_count": len(sample_list),
         "measured_count": measured_count,
         "elapsed_s": round(max(0.0, float(elapsed_s)), 3),
-        "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+        "engines": safe_engines,
         "samples": sample_list,
         "findings": finding_list,
     }
@@ -625,6 +635,8 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
     readers: list[_VideoReader] = []
     samples: list[dict[str, Any]] = []
     frame_size = (1, 1)
+    face_probe_succeeded = False
+    ocr_probe_succeeded = False
     try:
         if scratch_path is None:
             findings.add({"kind": "analysis_incomplete"})
@@ -695,6 +707,7 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
                 source_ok, source_boxes = detector.detect(source_frame)
                 reference_ok, reference_boxes_raw = detector.detect(reference_frame)
                 visible_ok, visible_boxes = detector.detect(composite_frame)
+                face_probe_succeeded = face_probe_succeeded or source_ok or reference_ok or visible_ok
                 reference_boxes = [
                     scaled
                     for box in reference_boxes_raw
@@ -732,6 +745,7 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
                     try:
                         if bool(cv2_module.imwrite(str(frame_file), composite_frame)):
                             ocr_status, text_boxes = _vision_ocr_boxes(frame_file, frame_size[0], frame_size[1])
+                            ocr_probe_succeeded = ocr_probe_succeeded or ocr_status in {"ok", "empty"}
                         else:
                             ocr_status = "failed"
                     except Exception:
@@ -807,5 +821,9 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
         samples=samples,
         findings=finalized_findings,
         status=status,
+        engines={
+            "faces": "opencv-yunet" if face_probe_succeeded else "unavailable",
+            "ocr": "macos-vision" if ocr_probe_succeeded else "unavailable",
+        },
     )
 

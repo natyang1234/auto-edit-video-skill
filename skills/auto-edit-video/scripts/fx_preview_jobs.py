@@ -158,6 +158,10 @@ _COMPOSITION_FINDINGS = {
 }
 _COMPOSITION_FACE_ENGINES = {"opencv-yunet", "unavailable"}
 _COMPOSITION_OCR_ENGINES = {"macos-vision", "unavailable"}
+_COMPOSITION_SAFE_FALLBACK_FINDINGS = {
+    "visibility_uncertain", "source_subject_unmeasured", "ocr_unavailable",
+    "reference_unavailable", "analysis_incomplete", "full_timeline_required",
+}
 
 
 def _bounded_text(value: Any, maximum: int = 160) -> str | None:
@@ -343,12 +347,27 @@ def _composition_fallback(
     source_sha256: str,
     media_sha256: str,
     frame_size: dict[str, int],
+    value: Any = None,
+    preserve_reason: bool = False,
 ) -> dict[str, Any]:
     finding = (
         "full_timeline_required"
         if scope == "single-effect"
         else "analysis_incomplete"
     )
+    elapsed = (
+        _bounded_number(value.get("elapsed_s"), minimum=0, maximum=60)
+        if isinstance(value, dict)
+        else None
+    )
+    if preserve_reason and scope != "single-effect" and isinstance(value, dict):
+        raw_findings = value.get("findings")
+        if isinstance(raw_findings, list):
+            for candidate in raw_findings:
+                kind = candidate.get("kind") if isinstance(candidate, dict) else None
+                if isinstance(kind, str) and kind in _COMPOSITION_SAFE_FALLBACK_FINDINGS:
+                    finding = kind
+                    break
     return {
         "version": 1,
         "scope": scope,
@@ -359,7 +378,7 @@ def _composition_fallback(
         "frame_size": dict(frame_size),
         "sample_count": 0,
         "measured_count": 0,
-        "elapsed_s": 0.0,
+        "elapsed_s": elapsed if elapsed is not None else 0.0,
         "engines": {"faces": "unavailable", "ocr": "unavailable"},
         "samples": [],
         "findings": [{"kind": finding}],
@@ -425,6 +444,7 @@ def _sanitize_composition_check(
         source_sha256=source_sha256,
         media_sha256=media_sha256,
         frame_size=frame_size,
+        value=value,
     )
     top_keys = {
         "version", "scope", "measurement", "status", "source_sha256",
@@ -433,6 +453,23 @@ def _sanitize_composition_check(
     }
     if not isinstance(value, dict) or set(value) != top_keys:
         return fallback
+    raw_size = value.get("frame_size")
+    binding_trusted = (
+        value.get("source_sha256") == source_sha256
+        and value.get("media_sha256") == media_sha256
+        and isinstance(raw_size, dict)
+        and set(raw_size) == {"width", "height"}
+        and raw_size == frame_size
+    )
+    if binding_trusted:
+        fallback = _composition_fallback(
+            scope=scope,
+            source_sha256=source_sha256,
+            media_sha256=media_sha256,
+            frame_size=frame_size,
+            value=value,
+            preserve_reason=True,
+        )
     status_value = value.get("status")
     if (
         value.get("version") != 1
@@ -445,7 +482,6 @@ def _sanitize_composition_check(
         or value.get("media_sha256") != media_sha256
     ):
         return fallback
-    raw_size = value.get("frame_size")
     if (
         not isinstance(raw_size, dict)
         or set(raw_size) != {"width", "height"}
@@ -1786,8 +1822,15 @@ class FxPreviewJobManager:
         return identities
 
     @staticmethod
-    def _composition_analysis_identities() -> dict[str, Any]:
+    def _composition_analysis_identities(
+        model_path: Path | None = None,
+    ) -> dict[str, Any]:
         scripts = Path(__file__).resolve().parent
+        if model_path is None:
+            model_path = (
+                scripts.parent
+                / "assets/models/yunet/face_detection_yunet_2026may.onnx"
+            )
         files: dict[str, str | None] = {}
         for name in (
             "composite_check.py",
@@ -1807,6 +1850,13 @@ class FxPreviewJobManager:
 
         return {
             "files": files,
+            "models": {
+                "yunet": (
+                    _file_sha256(model_path)
+                    if _regular_nonsymlink(model_path)
+                    else None
+                )
+            },
             "native": {
                 "python": platform.python_version(),
                 "macos": platform.mac_ver()[0] or None,

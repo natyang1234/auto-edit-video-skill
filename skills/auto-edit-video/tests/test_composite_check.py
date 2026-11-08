@@ -264,6 +264,14 @@ def _fake_overlap_receipt(tmp_path, monkeypatch, mode):
             pass
 
         def detect(self, _frame):
+            if mode == "capacity":
+                return True, [
+                    {"x": 5, "y": 20, "width": 15, "height": 20},
+                    {"x": 25, "y": 20, "width": 15, "height": 20},
+                    {"x": 45, "y": 20, "width": 15, "height": 20},
+                    {"x": 65, "y": 20, "width": 15, "height": 20},
+                    {"x": 85, "y": 20, "width": 10, "height": 20},
+                ]
             if mode == "overflow":
                 return True, [
                     {"x": 5, "y": 20, "width": 15, "height": 20},
@@ -278,7 +286,15 @@ def _fake_overlap_receipt(tmp_path, monkeypatch, mode):
         def imwrite(_path, _frame):
             return True
 
-    if mode == "overflow":
+    if mode == "capacity":
+        text_boxes = [
+            {"x": 5, "y": 20, "width": 10, "height": 10},
+            {"x": 25, "y": 20, "width": 10, "height": 10},
+            {"x": 45, "y": 20, "width": 10, "height": 10},
+            {"x": 65, "y": 20, "width": 10, "height": 10},
+            {"x": 85, "y": 20, "width": 8, "height": 10},
+        ]
+    elif mode == "overflow":
         text_boxes = [
             {"x": 5, "y": 20, "width": 10, "height": 10},
             {"x": 30, "y": 20, "width": 10, "height": 10},
@@ -350,11 +366,173 @@ def test_many_overlap_lines_keep_one_strongest_box_per_face_and_sample(tmp_path,
     assert all(finding["kind"] == "text_subject_overlap" for finding in receipt["findings"])
 
 
-def test_genuine_finding_capacity_overflow_stays_unmeasured(tmp_path, monkeypatch):
+def test_32_findings_fit_capacity_and_remain_warn(tmp_path, monkeypatch):
     receipt = _fake_overlap_receipt(tmp_path, monkeypatch, "overflow")
-    assert receipt["status"] == "unmeasured"
+    assert receipt["status"] == "warn"
     assert receipt["sample_count"] == 8
     assert receipt["measured_count"] == 8
     assert all(sample["reference_face_count"] == 4 for sample in receipt["samples"])
+    assert sum(item["kind"] == "text_subject_overlap" for item in receipt["findings"]) == 32
+    assert all(item["kind"] == "text_subject_overlap" for item in receipt["findings"])
+
+
+def test_33rd_finding_still_marks_real_capacity_overflow(tmp_path, monkeypatch):
+    receipt = _fake_overlap_receipt(tmp_path, monkeypatch, "capacity")
+    assert receipt["status"] == "unmeasured"
+    assert receipt["sample_count"] == 8
+    assert receipt["measured_count"] == 8
+    assert all(sample["reference_face_count"] == 5 for sample in receipt["samples"])
     assert sum(item["kind"] == "text_subject_overlap" for item in receipt["findings"]) == 31
-    assert {item["kind"] for item in receipt["findings"]} >= {"analysis_incomplete"}
+    assert receipt["findings"][-1] == {"kind": "analysis_incomplete"}
+
+
+def test_finding_collector_capacity_and_finalize_are_idempotent():
+    collector = composite_check._FindingCollector()
+    finding = {"kind": "analysis_incomplete"}
+    for _ in range(composite_check.MAX_FINDINGS):
+        collector.add(finding)
+    exact = collector.finalize()
+    assert len(exact) == composite_check.MAX_FINDINGS
+    assert all(item == finding for item in exact)
+    collector.add(finding)
+    overflow = collector.finalize()
+    assert overflow == collector.finalize()
+    assert len(overflow) == composite_check.MAX_FINDINGS
+    assert overflow[-1] == finding
+
+
+def _fake_capability_receipt(
+    tmp_path,
+    monkeypatch,
+    *,
+    cv2_available=True,
+    detector_failed=False,
+    ocr_results=(("empty", []),),
+    expected_text=False,
+):
+    class _Frame:
+        shape = (100, 100, 3)
+
+    class _Reader:
+        width = 100
+        height = 100
+
+        def __init__(self, _path, _cv2):
+            pass
+
+        def read(self, _timestamp):
+            return _Frame()
+
+        def close(self):
+            pass
+
+    class _Detector:
+        failed = detector_failed
+
+        def __init__(self, _model, _cv2):
+            pass
+
+        def detect(self, _frame):
+            if self.failed:
+                return False, []
+            return True, [{"x": 20, "y": 20, "width": 40, "height": 40}]
+
+    class _CV2:
+        @staticmethod
+        def imwrite(_path, _frame):
+            return True
+
+    source = tmp_path / "source.mp4"
+    composite = tmp_path / "composite.mp4"
+    reference = tmp_path / "reference.mp4"
+    source.write_bytes(b"ordinary source fixture")
+    composite.write_bytes(b"ordinary composite fixture")
+    reference.write_bytes(b"ordinary reference fixture")
+    monkeypatch.setattr(composite_check, "_load_cv2", lambda: _CV2() if cv2_available else None)
+    monkeypatch.setattr(composite_check, "_VideoReader", _Reader)
+    monkeypatch.setattr(composite_check, "_YuNetProbe", _Detector)
+    sequence = list(ocr_results)
+    calls = []
+
+    def fake_ocr(_path, _width, _height):
+        index = min(len(calls), len(sequence) - 1)
+        calls.append(index)
+        return sequence[index]
+
+    monkeypatch.setattr(composite_check, "_vision_ocr_boxes", fake_ocr)
+    return composite_check.analyze(
+        {
+            "composite": composite,
+            "reference": reference,
+            "source": source,
+            "time_map": [{
+                "source_start_s": 0.0,
+                "source_end_s": 1.0,
+                "output_start_s": 0.0,
+                "output_end_s": 1.0,
+            }],
+            "face_model": tmp_path / "face.onnx",
+            "scratch": tmp_path / "scratch",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "expected_text": expected_text,
+            "scope": "full-timeline",
+        }
+    )
+
+
+def test_engine_receipt_reports_unavailable_capabilities_without_cv2(tmp_path, monkeypatch):
+    receipt = _fake_capability_receipt(tmp_path, monkeypatch, cv2_available=False)
+    assert receipt["engines"] == {"faces": "unavailable", "ocr": "unavailable"}
+    assert receipt["status"] == "unmeasured"
+
+
+def test_engine_receipt_marks_detector_failure_but_ocr_empty_call_usable(tmp_path, monkeypatch):
+    receipt = _fake_capability_receipt(
+        tmp_path,
+        monkeypatch,
+        detector_failed=True,
+        ocr_results=(("empty", []),),
+        expected_text=False,
+    )
+    assert receipt["engines"] == {"faces": "unavailable", "ocr": "macos-vision"}
+    assert receipt["status"] == "unmeasured"
+
+
+def test_engine_receipt_keeps_faces_named_when_ocr_never_succeeds(tmp_path, monkeypatch):
+    receipt = _fake_capability_receipt(
+        tmp_path,
+        monkeypatch,
+        ocr_results=(("failed", []),),
+        expected_text=False,
+    )
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "unavailable"}
+    assert receipt["status"] == "unmeasured"
+    assert any(item["kind"] == "ocr_unavailable" for item in receipt["findings"])
+
+
+def test_successful_empty_ocr_is_usable_when_text_is_not_expected(tmp_path, monkeypatch):
+    receipt = _fake_capability_receipt(
+        tmp_path,
+        monkeypatch,
+        ocr_results=(("empty", []),),
+        expected_text=False,
+    )
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "macos-vision"}
+    assert receipt["status"] == "pass"
+    assert receipt["measured_count"] == receipt["sample_count"] == 5
+
+
+def test_one_successful_ocr_keeps_engine_named_but_failed_samples_unknown(tmp_path, monkeypatch):
+    receipt = _fake_capability_receipt(
+        tmp_path,
+        monkeypatch,
+        ocr_results=(
+            ("ok", [{"x": 20, "y": 20, "width": 10, "height": 10}]),
+            ("failed", []),
+        ),
+        expected_text=True,
+    )
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "macos-vision"}
+    assert receipt["status"] == "unmeasured"
+    assert 0 < receipt["measured_count"] < receipt["sample_count"]
+    assert any(item["kind"] == "ocr_unavailable" for item in receipt["findings"])

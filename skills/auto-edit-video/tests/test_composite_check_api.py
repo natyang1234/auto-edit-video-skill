@@ -142,6 +142,41 @@ def test_complete_text_overlap_warn_remains_warn() -> None:
     assert clean["findings"] == receipt["findings"]
 
 
+def test_bound_malformed_receipt_preserves_only_safe_elapsed_and_reason() -> None:
+    receipt, binding = _bound_receipt()
+    receipt.update(
+        status=[],
+        elapsed_s=12.5,
+        findings=[
+            {
+                "kind": "reference_unavailable",
+                "output_at": 0.5,
+                "source_at": 1.5,
+                "subject_box": {"x": 1, "y": 1, "width": 2, "height": 2},
+            }
+        ],
+    )
+
+    clean = jobs._sanitize_composition_check(receipt, **binding)
+
+    assert clean["status"] == "unmeasured"
+    assert clean["elapsed_s"] == 12.5
+    assert clean["findings"] == [{"kind": "reference_unavailable"}]
+    assert clean["samples"] == []
+    assert clean["source_sha256"] == binding["source_sha256"]
+    assert clean["media_sha256"] == binding["media_sha256"]
+    assert clean["frame_size"] == binding["frame_size"]
+
+    receipt["media_sha256"] = "c" * 64
+    clean = jobs._sanitize_composition_check(receipt, **binding)
+    assert clean["elapsed_s"] == 12.5
+    assert clean["findings"] == [{"kind": "analysis_incomplete"}]
+
+    receipt["elapsed_s"] = "12.5"
+    clean = jobs._sanitize_composition_check(receipt, **binding)
+    assert clean["elapsed_s"] == 0.0
+
+
 @pytest.mark.parametrize("first_output_start,second_output_start", ((0.2, 1.2), (0.0, 1.2)))
 def test_normalized_time_map_rejects_output_gaps_but_allows_source_gaps(
     first_output_start: float, second_output_start: float
@@ -337,6 +372,30 @@ def test_composition_dependency_identity_includes_optional_code_and_native_versi
     }
     assert identity["files"]["composite_check_worker.py"]
     assert identity["files"]["vision_ocr.py"]
+    assert set(identity["models"]) == {"yunet"}
+    assert identity["models"]["yunet"]
     assert set(identity["native"]) == {
         "python", "macos", "opencv", "pyobjc_core", "pyobjc_vision"
+    }
+
+
+def test_yunet_model_bytes_and_missing_state_change_dependency_identity(
+    tmp_path,
+) -> None:
+    model = tmp_path / "yunet.onnx"
+    model.write_bytes(b"ordinary-model-a")
+    first = jobs.FxPreviewJobManager._composition_analysis_identities(model)
+    first_hash = jobs._canonical_sha256(first)
+
+    model.write_bytes(b"ordinary-model-b")
+    second = jobs.FxPreviewJobManager._composition_analysis_identities(model)
+    assert second["models"]["yunet"] != first["models"]["yunet"]
+    assert jobs._canonical_sha256(second) != first_hash
+
+    model.unlink()
+    missing = jobs.FxPreviewJobManager._composition_analysis_identities(model)
+    assert missing["models"]["yunet"] is None
+    assert jobs._canonical_sha256(missing) not in {
+        first_hash,
+        jobs._canonical_sha256(second),
     }
