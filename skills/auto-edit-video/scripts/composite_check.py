@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import math
 import numbers
+import queue
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -21,6 +23,7 @@ MAX_FINDINGS = 32
 SMALL_PREVIEW_SECONDS = 2.5
 TEXT_OVERLAP_FRACTION = 0.15
 OCR_MIN_CONFIDENCE = 0.5
+OCR_TIMEOUT_S = 1.5
 VISIBLE_FACE_IOU = 0.25
 _TIME_EPSILON = 1e-6
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -422,13 +425,45 @@ class _YuNetProbe:
             return False, []
 
 
+def _vision_ocr_lines_bounded(frame_path: Path) -> list[dict[str, Any]] | None:
+    """Return Vision OCR lines, or ``None`` if its native call misses the deadline.
+
+    This bridge deliberately calls vision_ocr's private synchronous entry point
+    in one daemon thread.  It is only safe because this analyzer already runs
+    inside the renderer's disposable composition worker process: an overrun
+    native Vision call cannot keep that process alive after its receipt is
+    returned.  The caller disables all later OCR attempts after a failure, so
+    one analysis owns at most one lingering daemon.
+    """
+    result: queue.Queue[tuple[bool, list[dict[str, Any]] | None]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            import vision_ocr  # type: ignore
+
+            lines = vision_ocr._recognize_sync(frame_path, ("zh-Hant", "en-US"))
+            result.put_nowait((True, lines if isinstance(lines, list) else []))
+        except Exception:
+            result.put_nowait((False, None))
+
+    # Do not join this thread: Vision can be stuck in a native request.  The
+    # disposable composition worker owns its lifetime; the queue remains local.
+    worker = threading.Thread(target=run, name="composite-vision-ocr", daemon=True)
+    worker.start()
+    try:
+        succeeded, lines = result.get(timeout=OCR_TIMEOUT_S)
+    except queue.Empty:
+        return None
+    return lines if succeeded and isinstance(lines, list) else None
+
+
 def _vision_ocr_boxes(frame_path: Path, width: int, height: int) -> tuple[str, list[dict[str, float]]]:
     """Return ``ok``, ``empty`` or ``failed`` without exposing recognized text."""
     try:
-        import vision_ocr  # type: ignore
-
-        lines = vision_ocr.recognize_text(frame_path, timeout_s=1.5)
+        lines = _vision_ocr_lines_bounded(frame_path)
     except Exception:
+        return "failed", []
+    if lines is None:
         return "failed", []
     boxes: list[dict[str, float]] = []
     for line in lines if isinstance(lines, list) else []:
@@ -641,6 +676,7 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
     frame_size = (1, 1)
     face_probe_succeeded = False
     ocr_probe_succeeded = False
+    ocr_disabled = False
     try:
         if scratch_path is None:
             findings.add({"kind": "analysis_incomplete"})
@@ -744,7 +780,7 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
 
                 ocr_status = "failed"
                 text_boxes: list[dict[str, float]] = []
-                if scratch is not None:
+                if scratch is not None and not ocr_disabled:
                     frame_file = scratch / f"composite-check-{index:02d}.png"
                     try:
                         if bool(cv2_module.imwrite(str(frame_file), composite_frame)):
@@ -759,6 +795,11 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
                             frame_file.unlink(missing_ok=True)
                         except OSError:
                             pass
+                if ocr_status == "failed":
+                    # A native OCR timeout cannot be safely cancelled.  Keep
+                    # processing face evidence, but never add a second daemon
+                    # to this disposable composition worker.
+                    ocr_disabled = True
                 expected_text = _expected_text_at(request.get("expected_text"), index)
                 if ocr_status == "failed" or (ocr_status == "empty" and expected_text):
                     findings.add({"kind": "ocr_unavailable", "output_at": output_at, "source_at": source_at})
