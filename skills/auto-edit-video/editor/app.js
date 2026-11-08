@@ -2506,8 +2506,10 @@ function fxPreviewCompositionReceipt(raw, job) {
   const engines = receipt.engines && typeof receipt.engines === "object" && !Array.isArray(receipt.engines)
     ? { faces: receipt.engines.faces, ocr: receipt.engines.ocr }
     : {};
-  const enginesValid = engines.faces === "opencv-yunet" && engines.ocr === "macos-vision"
+  const enginesValid = ["opencv-yunet", "unavailable"].includes(engines.faces)
+    && ["macos-vision", "unavailable"].includes(engines.ocr)
     && Object.keys(receipt.engines || {}).every((key) => FX_PREVIEW_COMPOSITION_ENGINE_KEYS.has(key));
+  const enginesAvailable = enginesValid && engines.faces === "opencv-yunet" && engines.ocr === "macos-vision";
   const rawSamples = Array.isArray(receipt.samples) ? receipt.samples : [];
   const samplesShapeValid = rawSamples.length <= 8 && rawSamples.every((sample) => (
     sample && typeof sample === "object" && !Array.isArray(sample)
@@ -2589,10 +2591,10 @@ function fxPreviewCompositionReceipt(raw, job) {
     && timedFindingsValid && boxesValid && measuredSampleCountsValid;
   const passValid = baseValid && shaValid && scope === "full-timeline" && status === "pass"
     && sampleCount > 0 && measuredCount === sampleCount && samples.length === sampleCount
-    && measuredSamplesConservative
+    && measuredSamplesConservative && enginesAvailable
     && findings.length === 0;
   const warnValid = baseValid && status === "warn" && sampleCount > 0
-    && measuredCount === sampleCount && measuredSamplesConservative && findings.length > 0
+    && measuredCount === sampleCount && measuredSamplesConservative && enginesAvailable && findings.length > 0
     && findings.every((finding) => finding.kind === "text_subject_overlap");
   const trustedStatus = baseValid && (status === "unmeasured" || (status === "pass" && passValid)
     || (status === "warn" && warnValid));
@@ -2725,7 +2727,7 @@ function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisible
   samples.textContent = check.sample_count === null
     ? "抽樣數量未能確認。"
     : `抽樣 ${check.sample_count} 個時間點 · 完成量測 ${check.measured_count ?? "—"} 個`
-      + (check.elapsed_s === null ? "" : ` · 檢查耗時 ${check.elapsed_s.toFixed(1)} 秒`);
+      + (check.elapsed_s === null ? "" : ` · 辨識耗時 ${check.elapsed_s.toFixed(1)} 秒（不含預覽合成時間）`);
   const token = fxPreviewVisibleMediaToken;
   const visibleJob = deepCopy(job);
   const timedGroups = new Map();
