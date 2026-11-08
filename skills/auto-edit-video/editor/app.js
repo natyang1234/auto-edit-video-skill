@@ -309,6 +309,7 @@ function projectVersionErrorMessage(error, action) {
     validation_error: "輸入內容不符合版本名稱規則，請檢查後再試。",
     version_capacity_reserved: "版本容量已保留給還原前備份，目前不能新增命名版本。",
     version_capacity_exhausted: "版本容量已滿，無法執行此操作。系統不會自動清理版本。",
+    version_storage_unavailable: "版本資料目前無法安全讀寫，請先重新讀取版本清單再試。",
     version_recovery_required: "版本紀錄需要安全復原，請先處理後再試。",
   };
   return messages[code] || `${action}失敗，請稍後重新查看版本。`;
@@ -316,6 +317,8 @@ function projectVersionErrorMessage(error, action) {
 
 function projectVersionChangeLabel(path) {
   const value = String(path || "").replace(/^\/state(?=\/|$)/, "");
+  const segmentTime = value.match(/^\/segments\/(\d+)\/(source_start|source_end)$/);
+  if (segmentTime) return `第${Number(segmentTime[1]) + 1}段${segmentTime[2] === "source_start" ? "開始時間" : "結束時間"}`;
   if (/^\/overlays\/\d+\/(text|content)$/.test(value)) return "圖層文字";
   if (/^\/overlays\/\d+\/(style|layout)/.test(value)) return "圖層樣式與位置";
   if (/spotlight|subject.*(?:x|y)|manual_path/i.test(value)) return "聚光燈位置";
@@ -341,25 +344,34 @@ function projectVersionPreview(value) {
   return JSON.stringify(parsed);
 }
 
-function projectVersionResetCategory(change) {
+function projectVersionChangePreview(change, value) {
+  const preview = projectVersionPreview(value);
+  if (/^\/state\/highlights\/\d+\/review_status$/.test(String(change?.path || ""))) {
+    return ({ approved: "已核可", pending: "待確認", rejected: "已拒絕" })[preview] || preview;
+  }
+  return preview;
+}
+
+function projectVersionMetadataChange(change, approvalResets) {
   const path = String(change?.path || "");
-  const gate = path.match(/^\/manifest\/approvals\/([^/]+)/)?.[1];
-  const gateLabels = {
+  if (/^\/state\/segments\/\d+\/id$/.test(path)) return true;
+  if (/^\/manifest\/(?:approvals|stages)(?:\/|$)/.test(path)) return true;
+  if (/^\/manifest\/updated_at(?:\/|$)/.test(path)) return true;
+  if (/^\/(?:rights_assertion|state\/rights)(?:\/|$)/.test(path)) return true;
+  if (/^\/state\/highlights\/\d+\/review_status$/.test(path)
+    && projectVersionPreview(change.current_preview) === "approved"
+    && projectVersionPreview(change.saved_preview) === "pending") return approvalResets.has("highlight_selection");
+  return false;
+}
+
+function projectVersionResetLabels(approvalResets) {
+  const labels = {
     destructive_edit: "剪接",
     highlight_selection: "精華片段",
     timeline: "時間軸",
     final: "輸出",
   };
-  if (gate) return gateLabels[gate] || "其他核可";
-  if (/^\/(?:rights_assertion|state\/rights)\//.test(path)) return "素材權利";
-  const stage = path.match(/^\/manifest\/stages\/([^/]+)/)?.[1];
-  const stageLabels = { edit_review: "剪接", highlight_plan: "精華片段", timeline_review: "時間軸", render: "輸出", qa: "輸出" };
-  if (stage) return stageLabels[stage] || "其他核可";
-  if (/^\/manifest\/updated_at(?:\/|$)/.test(path)) return "其他核可";
-  if (/^\/state\/highlights\/\d+\/review_status$/.test(path)
-    && projectVersionPreview(change.current_preview) === "approved"
-    && projectVersionPreview(change.saved_preview) === "pending") return "精華片段";
-  return "";
+  return Array.from(approvalResets, (gate) => labels[gate] || "其他核可");
 }
 
 function setProjectVersionSelection(versionId) {
@@ -376,11 +388,18 @@ function renderProjectVersions(payload) {
   projectVersionsCurrent = payload?.current || projectVersionsCurrent;
   projectVersionsCapacity = payload?.capacity || projectVersionsCapacity;
   const capacity = payload?.capacity || {};
-  elements["project-versions-capacity"].textContent = `已使用 ${Number(capacity.used || 0)}/${Number(capacity.max || 0)} 個版本`;
+  const used = Number(capacity.used || 0);
+  const maximum = Number(capacity.max || 0);
+  let capacityText = `已使用 ${used}/${maximum} 個版本。`;
+  if (capacity.restore_backup_available === false) {
+    capacityText += "已無空位建立還原前自動備份，暫時無法還原；系統不會自動清理版本。";
+  } else if (capacity.named_save_available === false) {
+    capacityText += "保留的空位僅供還原前自動備份，暫時不能新增命名版本。";
+  }
+  elements["project-versions-capacity"].textContent = capacityText;
   const saveDisabled = projectVersionsBusy() || projectVersionsMutationInFlight || capacity.named_save_available === false;
   elements["project-version-save"].disabled = saveDisabled;
   elements["project-version-name"].disabled = projectVersionsMutationInFlight;
-  if (capacity.named_save_available === false) setProjectVersionsStatus("命名版本容量已滿，無法再儲存。", true);
   const list = elements["project-versions-list"];
   list.replaceChildren();
   if (!versions.length) { const empty = document.createElement("p"); empty.textContent = "尚無可還原版本。"; list.append(empty); return; }
@@ -418,12 +437,15 @@ async function loadProjectVersionDetail(version) {
     if (generation !== projectVersionsDetailGeneration || !elements["project-versions-dialog"].open || projectVersionsSelected?.version_id !== version.version_id) return;
     const detail = elements["project-version-detail"]; detail.replaceChildren();
     const changes = Array.isArray(response?.diff?.changes) ? response.diff.changes : [];
+    const approvalResets = new Set(
+      (Array.isArray(response?.diff?.approval_resets) ? response.diff.approval_resets : [])
+        .map((gate) => String(gate))
+    );
     const contentChanges = [];
-    const resetCategories = new Set();
     changes.forEach((change) => {
-      const reset = projectVersionResetCategory(change);
-      if (reset) resetCategories.add(reset); else contentChanges.push(change);
+      if (!projectVersionMetadataChange(change, approvalResets)) contentChanges.push(change);
     });
+    const resetLabels = projectVersionResetLabels(approvalResets);
     const title = document.createElement("h4");
     title.textContent = response?.version?.name || "選定版本";
     detail.append(title);
@@ -435,7 +457,7 @@ async function loadProjectVersionDetail(version) {
     } else if (partial) {
       summary.textContent = `目前顯示 ${shownChanges.length} 項剪輯內容；差異尚未完整顯示。`;
     } else {
-      summary.textContent = `剪輯內容 ${contentChanges.length} 項差異${resetCategories.size ? `；另有 ${resetCategories.size} 項重新確認提醒。` : "。"}`;
+      summary.textContent = `剪輯內容 ${contentChanges.length} 項差異${resetLabels.length ? `；另有 ${resetLabels.length} 項重新確認提醒。` : "。"}`;
     }
     detail.append(summary);
     const contentTitle = document.createElement("h5"); contentTitle.textContent = "剪輯內容"; detail.append(contentTitle);
@@ -447,18 +469,19 @@ async function loadProjectVersionDetail(version) {
       label.textContent = `${kind}：${projectVersionChangeLabel(change.path)}`;
       item.append(label);
       const preview = document.createElement("span"); preview.className = "project-version-preview";
-      preview.textContent = `目前：${projectVersionPreview(change.current_preview)} → 還原為：${projectVersionPreview(change.saved_preview)}`;
+      preview.textContent = `目前：${projectVersionChangePreview(change, change.current_preview)} → 還原為：${projectVersionChangePreview(change, change.saved_preview)}`;
       item.append(preview);
       list.append(item);
     });
     if (!contentChanges.length && !partial) { const empty = document.createElement("li"); empty.textContent = "沒有需要直接還原的剪輯內容。"; list.append(empty); }
     detail.append(list);
-    if (resetCategories.size) {
+    if (resetLabels.length) {
       const reset = document.createElement("p"); reset.className = "project-version-reset-summary";
-      reset.textContent = `還原後，${Array.from(resetCategories).join("／")}需重新確認。`;
+      reset.textContent = `還原後，${resetLabels.join("／")}需重新確認。`;
       detail.append(reset);
     }
     if (partial) { const note = document.createElement("p"); note.textContent = `差異過長，目前僅顯示 ${shownChanges.length} 項剪輯內容。`; detail.append(note); }
+    const verification = document.createElement("p"); verification.textContent = "還原時會重新驗證來源影片與素材；若已變更，將停止還原。"; detail.append(verification);
     const actions = document.createElement("div"); actions.className = "project-version-detail-actions"; const restore = document.createElement("button"); restore.type = "button"; restore.className = "button button-primary"; restore.textContent = "還原此版本"; restore.disabled = projectVersionsBusy() || projectVersionsMutationInFlight; restore.addEventListener("click", () => openProjectVersionRestore(response)); actions.append(restore); detail.append(actions);
   } catch (error) {
     if (generation === projectVersionsDetailGeneration) {
@@ -472,7 +495,7 @@ function openProjectVersionRestore(response) {
   if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
   projectVersionsPendingRestore = { version: response.version, tokens: versionTokens(response.current) };
   elements["project-version-restore-name"].textContent = `要還原：「${response.version?.name || "此版本"}」`;
-  elements["project-version-restore-status"].textContent = ""; elements["project-version-restore-dialog"].showModal();
+  elements["project-version-restore-status"].textContent = "還原時會重新驗證來源影片與素材；若已變更，將停止還原。"; elements["project-version-restore-dialog"].showModal();
 }
 
 async function saveProjectVersion(event) {

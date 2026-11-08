@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -226,6 +228,71 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertEqual(status, 201, saved)
         return saved
 
+    def restore_with_post_commit_cleanup_failure(
+        self, *, fail_marker_rebuild: bool
+    ) -> tuple[int, dict[str, object], dict[str, str], int]:
+        saved = self.create_version("post-commit cleanup target")
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        journal_path = self.server.project_dir / project_versions.JOURNAL_REL
+        real_replace = project_versions._atomic_replace_exact
+        real_fsync_directory = project_versions._fsync_directory
+        journal_writes = 0
+        cleanup_failed = False
+        committed_target_hashes: dict[str, str] = {}
+
+        def observe_journal_writes(path: Path, raw: bytes) -> None:
+            nonlocal journal_writes, committed_target_hashes
+            if path == journal_path:
+                journal_writes += 1
+                payload = json.loads(raw.decode("utf-8"))
+                if payload.get("phase") == "committed":
+                    committed_target_hashes = {
+                        relative: item["sha256"]
+                        for relative, item in payload["targets"].items()
+                    }
+                if fail_marker_rebuild and journal_writes == 3:
+                    raise OSError("synthetic committed marker rebuild failure")
+            real_replace(path, raw)
+
+        def fail_cleanup_fsync_once(path: Path) -> None:
+            nonlocal cleanup_failed
+            if (
+                journal_writes >= 2
+                and not os.path.lexists(journal_path)
+                and not cleanup_failed
+            ):
+                cleanup_failed = True
+                raise OSError("synthetic final journal cleanup fsync failure")
+            real_fsync_directory(path)
+
+        with (
+            patch.object(
+                project_versions,
+                "_atomic_replace_exact",
+                side_effect=observe_journal_writes,
+            ),
+            patch.object(
+                project_versions,
+                "_fsync_directory",
+                side_effect=fail_cleanup_fsync_once,
+            ),
+        ):
+            status, result = self.request(
+                "POST",
+                f"/api/project-versions/{saved['version']['version_id']}/restore",
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertTrue(cleanup_failed)
+        self.assertEqual(set(committed_target_hashes), set(project_versions.TARGET_ORDER))
+        return status, result, committed_target_hashes, journal_writes
+
     def test_save_diff_restore_backup_and_restart_persistence(self) -> None:
         saved = self.create_version()
         version_id = saved["version"]["version_id"]
@@ -437,9 +504,9 @@ class ProjectVersionsApiTests(unittest.TestCase):
         saved = self.create_version()
         version_id = saved["version"]["version_id"]
         (self.project / "source/original.mov").write_bytes(b"changed-source-bytes")
-        status, listing = self.request("GET", "/api/project-versions")
-        self.assertEqual(status, 200)
-        current = listing["current"]
+        status, detail = self.request("GET", f"/api/project-versions/{version_id}")
+        self.assertEqual(status, 200, detail)
+        current = detail["current"]
         status, result = self.request(
             "POST",
             f"/api/project-versions/{version_id}/restore",
@@ -545,8 +612,11 @@ class ProjectVersionsApiTests(unittest.TestCase):
         plan = json.loads((self.project / "working/highlight_plan.json").read_text())
         plan["non_authority_note"] = "changed bytes, same declared revision"
         self.write_json("working/highlight_plan.json", plan)
-        status, listing = self.request("GET", "/api/project-versions")
-        current = listing["current"]
+        status, detail = self.request(
+            "GET", f"/api/project-versions/{saved['version']['version_id']}"
+        )
+        self.assertEqual(status, 200, detail)
+        current = detail["current"]
         status, result = self.request(
             "POST",
             f"/api/project-versions/{saved['version']['version_id']}/restore",
@@ -646,7 +716,7 @@ class ProjectVersionsApiTests(unittest.TestCase):
                 },
             )
         self.assertEqual(status, 503, result)
-        self.assertEqual(result["reason"], "version_recovery_required")
+        self.assertEqual(result["reason"], "version_storage_unavailable")
         self.assertEqual((self.project / "working/editor_state.json").read_bytes(), before_state)
         self.assertEqual((self.project / "project.json").read_bytes(), before_manifest)
         self.assertEqual(
@@ -654,6 +724,135 @@ class ProjectVersionsApiTests(unittest.TestCase):
         )
         self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
         self.assertEqual(len(project_versions.ProjectVersionStore(self.project).list_records()), 1)
+
+    def test_partial_backup_write_failure_leaves_store_healthy_and_authority_unchanged(self) -> None:
+        saved = self.create_version("partial backup target")
+        before = {
+            relative: (self.project / relative).read_bytes()
+            for relative in (
+                "project.json",
+                "working/rights_assertion.json",
+                "working/editor_state.json",
+            )
+        }
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        real_write = os.write
+        writes = 0
+
+        def partial_then_fail(descriptor: int, data: bytes | memoryview) -> int:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                return real_write(descriptor, bytes(data[:17]))
+            raise OSError("synthetic partial backup write")
+
+        with patch.object(project_versions.os, "write", side_effect=partial_then_fail):
+            status, result = self.request(
+                "POST",
+                f"/api/project-versions/{saved['version']['version_id']}/restore",
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_storage_unavailable")
+        self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+        for relative, expected in before.items():
+            self.assertEqual((self.project / relative).read_bytes(), expected, relative)
+        records = project_versions.ProjectVersionStore(self.project).list_records()
+        self.assertEqual([item["version_id"] for item in records], [saved["version"]["version_id"]])
+        self.assertFalse(
+            any(
+                project_versions.RECORD_TEMP_RE.fullmatch(path.name)
+                for path in (self.project / project_versions.RECORDS_REL).iterdir()
+            )
+        )
+
+    def test_post_backup_source_drift_keeps_backup_without_writing_authority(self) -> None:
+        saved = self.create_version("post-backup drift target")
+        before = {
+            relative: (self.project / relative).read_bytes()
+            for relative in (
+                "project.json",
+                "working/rights_assertion.json",
+                "working/editor_state.json",
+            )
+        }
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        original_capture = editor_server.EditorHandler._capture_project_version
+
+        def capture_then_drift(handler, store, **kwargs):
+            record = original_capture(handler, store, **kwargs)
+            if kwargs.get("kind") == "auto_before_restore":
+                (self.project / "source/original.mov").write_bytes(b"post-backup drift")
+            return record
+
+        with patch.object(
+            editor_server.EditorHandler,
+            "_capture_project_version",
+            new=capture_then_drift,
+        ):
+            status, result = self.request(
+                "POST",
+                f"/api/project-versions/{saved['version']['version_id']}/restore",
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "source_changed")
+        self.assertEqual(len(project_versions.ProjectVersionStore(self.project).list_records()), 2)
+        self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+        for relative, expected in before.items():
+            self.assertEqual((self.project / relative).read_bytes(), expected, relative)
+
+    def test_source_full_hash_count_is_zero_for_detail_and_two_phase_for_restore(self) -> None:
+        saved = self.create_version("source hash count")
+        version_id = saved["version"]["version_id"]
+        source_path = (self.project / "source/original.mov").resolve()
+        real_hash = editor_server.file_sha256
+
+        detail_paths: list[Path] = []
+
+        def detail_hash(path: Path) -> str:
+            detail_paths.append(path.resolve())
+            return real_hash(path)
+
+        with patch.object(editor_server, "file_sha256", side_effect=detail_hash):
+            status, detail = self.request("GET", f"/api/project-versions/{version_id}")
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(detail_paths.count(source_path), 0)
+
+        restore_paths: list[Path] = []
+
+        def restore_hash(path: Path) -> str:
+            restore_paths.append(path.resolve())
+            return real_hash(path)
+
+        current = detail["current"]
+        with patch.object(editor_server, "file_sha256", side_effect=restore_hash):
+            status, restored = self.request(
+                "POST",
+                f"/api/project-versions/{version_id}/restore",
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertEqual(status, 200, restored)
+        self.assertEqual(restore_paths.count(source_path), 2)
 
     def test_capacity_exhaustion_refuses_restore_before_any_authority_write(self) -> None:
         saved = self.create_version("capacity target")
@@ -710,6 +909,352 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertEqual(status, 409, result)
         self.assertEqual(result["reason"], "asset_changed")
         self.assertEqual(len(store.list_records()), 1)
+
+    def test_detail_is_diff_only_while_restore_maps_dependency_and_io_errors(self) -> None:
+        saved = self.create_version("diff versus eligibility")
+        version_path = f"/api/project-versions/{saved['version']['version_id']}"
+        restore_path = f"{version_path}/restore"
+        authority_before = {
+            relative: (self.project / relative).read_bytes()
+            for relative in (
+                "project.json",
+                "working/rights_assertion.json",
+                "working/editor_state.json",
+            )
+        }
+
+        manifest = json.loads((self.project / "project.json").read_text())
+        manifest["source"] = []
+        self.write_json("project.json", manifest)
+        status, result = self.request("GET", version_path)
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "unsupported_snapshot")
+
+        self.write_json("project.json", self.manifest)
+        self.write_json("working/highlight_plan.json", ["not", "a", "mapping"])
+        status, detail = self.request("GET", version_path)
+        self.assertEqual(status, 200, detail)
+        current = detail["current"]
+        status, result = self.request(
+            "POST",
+            restore_path,
+            {
+                "expected_state_digest": current["state_digest"],
+                "expected_render_revision": current["render_revision"],
+                "expected_manifest_digest": current["manifest_digest"],
+                "confirm_restore": True,
+            },
+        )
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "dependency_changed")
+
+        self.write_json("working/highlight_plan.json", self.plan)
+        plan_path = self.project / "working/highlight_plan.json"
+        path_type = type(plan_path)
+        real_read_text = path_type.read_text
+
+        def fail_plan_read(path: Path, *args, **kwargs):
+            if path.resolve() == plan_path.resolve():
+                raise OSError("synthetic plan read failure")
+            return real_read_text(path, *args, **kwargs)
+
+        with patch.object(path_type, "read_text", new=fail_plan_read):
+            status, detail = self.request("GET", version_path)
+            self.assertEqual(status, 200, detail)
+            current = detail["current"]
+            status, result = self.request(
+                "POST",
+                restore_path,
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_storage_unavailable")
+
+        with patch.object(
+            editor_server,
+            "file_sha256",
+            side_effect=OSError("synthetic source read failure"),
+        ):
+            status, detail = self.request("GET", version_path)
+            self.assertEqual(status, 200, detail)
+            current = detail["current"]
+            status, result = self.request(
+                "POST",
+                restore_path,
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_storage_unavailable")
+        self.assertNotIn("synthetic", json.dumps(result))
+        self.assertEqual(len(project_versions.ProjectVersionStore(self.project).list_records()), 1)
+        self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+        for relative, expected in authority_before.items():
+            self.assertEqual((self.project / relative).read_bytes(), expected, relative)
+
+    def test_create_maps_malformed_source_plan_and_hash_io_without_writing(self) -> None:
+        def create_body(name: str) -> dict[str, object]:
+            status, listing = self.request("GET", "/api/project-versions")
+            self.assertEqual(status, 200, listing)
+            current = listing["current"]
+            return {
+                "name": name,
+                "expected_state_digest": current["state_digest"],
+                "expected_render_revision": current["render_revision"],
+                "expected_manifest_digest": current["manifest_digest"],
+            }
+
+        manifest = json.loads((self.project / "project.json").read_text())
+        manifest["source"] = []
+        self.write_json("project.json", manifest)
+        status, result = self.request(
+            "POST", "/api/project-versions", create_body("bad source")
+        )
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "source_changed")
+
+        self.write_json("project.json", self.manifest)
+        self.write_json("working/highlight_plan.json", ["not", "a", "mapping"])
+        status, result = self.request(
+            "POST", "/api/project-versions", create_body("bad plan")
+        )
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "dependency_changed")
+
+        self.write_json("working/highlight_plan.json", self.plan)
+        body = create_body("hash io")
+        with patch.object(
+            editor_server,
+            "file_sha256",
+            side_effect=OSError("synthetic source read failure"),
+        ):
+            status, result = self.request("POST", "/api/project-versions", body)
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_storage_unavailable")
+        self.assertNotIn("synthetic", json.dumps(result))
+        self.assertEqual(project_versions.ProjectVersionStore(self.project).list_records(), [])
+        self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+
+    def test_detail_rejects_malformed_authority_manifest_and_corrupt_record_as_json(self) -> None:
+        saved = self.create_version("closed detail inputs")
+        detail_path = f"/api/project-versions/{saved['version']['version_id']}"
+        manifest = json.loads((self.project / "project.json").read_text())
+        manifest["approvals"] = []
+        self.write_json("project.json", manifest)
+        status, result = self.request("GET", detail_path)
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["reason"], "unsupported_snapshot")
+
+        self.write_json("project.json", self.manifest)
+        record_path = (
+            self.project
+            / project_versions.RECORDS_REL
+            / f"{saved['version']['version_id']}.json"
+        )
+        record_path.write_bytes(b"{truncated")
+        status, result = self.request("GET", detail_path)
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_recovery_required")
+
+    def test_restore_requires_exact_fields_and_literal_true_confirmation(self) -> None:
+        saved = self.create_version("restore validation")
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        valid = {
+            "expected_state_digest": current["state_digest"],
+            "expected_render_revision": current["render_revision"],
+            "expected_manifest_digest": current["manifest_digest"],
+            "confirm_restore": True,
+        }
+        cases = {
+            "false": {**valid, "confirm_restore": False},
+            "missing": {
+                key: value for key, value in valid.items() if key != "confirm_restore"
+            },
+            "extra": {**valid, "unexpected": "field"},
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label):
+                status, result = self.request(
+                    "POST",
+                    f"/api/project-versions/{saved['version']['version_id']}/restore",
+                    body,
+                )
+                self.assertEqual(status, 422, result)
+                self.assertEqual(result["reason"], "validation_error")
+        self.assertEqual(len(project_versions.ProjectVersionStore(self.project).list_records()), 1)
+        self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+
+    def test_mid_restore_http_failure_blocks_writes_then_restart_rolls_forward(self) -> None:
+        saved = self.create_version("journal HTTP recovery")
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        original_replace = project_versions._atomic_replace_exact
+        writes = 0
+
+        def fail_after_manifest(path: Path, raw: bytes) -> None:
+            nonlocal writes
+            writes += 1
+            original_replace(path, raw)
+            if writes == 2:
+                raise OSError("synthetic interruption after manifest")
+
+        with patch.object(
+            project_versions,
+            "_atomic_replace_exact",
+            side_effect=fail_after_manifest,
+        ):
+            status, result = self.request(
+                "POST",
+                f"/api/project-versions/{saved['version']['version_id']}/restore",
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_recovery_required")
+        self.assertTrue((self.project / project_versions.JOURNAL_REL).exists())
+
+        status, blocked_get = self.request("GET", "/api/project")
+        self.assertEqual(status, 503, blocked_get)
+        self.assertEqual(blocked_get["reason"], "version_recovery_required")
+        status, blocked_write = self.request(
+            "POST",
+            "/api/project-versions",
+            {
+                "name": "must remain blocked",
+                "expected_state_digest": current["state_digest"],
+                "expected_render_revision": current["render_revision"],
+                "expected_manifest_digest": current["manifest_digest"],
+            },
+        )
+        self.assertEqual(status, 503, blocked_write)
+        self.assertEqual(blocked_write["reason"], "version_recovery_required")
+        self.assertEqual(len(project_versions.ProjectVersionStore(self.project).list_records()), 2)
+
+        self.restart_server()
+        self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        state = json.loads((self.project / "working/editor_state.json").read_text())
+        rights = json.loads((self.project / "working/rights_assertion.json").read_text())
+        manifest = json.loads((self.project / "project.json").read_text())
+        self.assertEqual(state["rights"], {"asserted": False, "assertion_revision": None})
+        self.assertEqual(rights, project_versions.empty_rights_assertion())
+        self.assertTrue(all(not item["approved"] for item in manifest["approvals"].values()))
+
+    def test_post_commit_cleanup_failure_rebuilds_marker_and_restart_cleans_it(self) -> None:
+        status, result, target_hashes, journal_writes = (
+            self.restore_with_post_commit_cleanup_failure(fail_marker_rebuild=False)
+        )
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_recovery_required")
+        self.assertEqual(journal_writes, 3)
+        journal_path = self.server.project_dir / project_versions.JOURNAL_REL
+        self.assertTrue(journal_path.exists())
+        journal, _targets = project_versions._read_journal(self.server.project_dir)
+        self.assertEqual(journal["phase"], "committed")
+        self.assertTrue(self.server.project_version_recovery_latched)
+        for relative, expected in target_hashes.items():
+            self.assertEqual(
+                hashlib.sha256((self.server.project_dir / relative).read_bytes()).hexdigest(),
+                expected,
+                relative,
+            )
+
+        status, blocked_get = self.request("GET", "/api/project")
+        self.assertEqual(status, 503, blocked_get)
+        self.assertEqual(blocked_get["reason"], "version_recovery_required")
+        status, blocked_put = self.request(
+            "PUT", "/api/editor-state", {"schema_version": 2}
+        )
+        self.assertEqual(status, 503, blocked_put)
+        self.assertEqual(blocked_put["reason"], "version_recovery_required")
+        status, health = self.request("GET", "/api/health")
+        self.assertEqual(status, 200, health)
+
+        self.restart_server()
+        self.assertFalse(journal_path.exists())
+        self.assertFalse(self.server.project_version_recovery_latched)
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+
+    def test_post_commit_marker_rebuild_failure_uses_process_latch(self) -> None:
+        status, result, target_hashes, journal_writes = (
+            self.restore_with_post_commit_cleanup_failure(fail_marker_rebuild=True)
+        )
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_recovery_required")
+        self.assertEqual(journal_writes, 3)
+        journal_path = self.server.project_dir / project_versions.JOURNAL_REL
+        self.assertFalse(journal_path.exists())
+        self.assertTrue(self.server.project_version_recovery_latched)
+        for relative, expected in target_hashes.items():
+            self.assertEqual(
+                hashlib.sha256((self.server.project_dir / relative).read_bytes()).hexdigest(),
+                expected,
+                relative,
+            )
+
+        status, blocked_get = self.request("GET", "/api/project")
+        self.assertEqual(status, 503, blocked_get)
+        self.assertEqual(blocked_get["reason"], "version_recovery_required")
+        status, blocked_put = self.request(
+            "PUT", "/api/editor-state", {"schema_version": 2}
+        )
+        self.assertEqual(status, 503, blocked_put)
+        self.assertEqual(blocked_put["reason"], "version_recovery_required")
+        status, health = self.request("GET", "/api/health")
+        self.assertEqual(status, 200, health)
+
+    def test_server_startup_refuses_corrupt_or_unrecoverable_restore_journal(self) -> None:
+        saved = self.create_version("startup refusal backup")
+        source_store = project_versions.ProjectVersionStore(self.project)
+        source_record = source_store.load(saved["version"]["version_id"])
+        targets = {
+            relative: (self.project / relative).read_bytes()
+            for relative in project_versions.TARGET_ORDER
+        }
+
+        corrupt_project = Path(self.temp.name) / "corrupt-startup-project"
+        shutil.copytree(self.project, corrupt_project)
+        project_versions._atomic_replace_exact(
+            corrupt_project / project_versions.JOURNAL_REL,
+            b"{not valid json\n",
+        )
+        with self.assertRaises(project_versions.ProjectVersionRecoveryError):
+            EditorServer(("127.0.0.1", 0), corrupt_project)
+        self.assertTrue((corrupt_project / project_versions.JOURNAL_REL).exists())
+
+        missing_backup_project = Path(self.temp.name) / "missing-backup-startup-project"
+        shutil.copytree(self.project, missing_backup_project)
+        journal = project_versions._journal_payload(source_record, targets)
+        project_versions._atomic_replace_exact(
+            missing_backup_project / project_versions.JOURNAL_REL,
+            project_versions.json_bytes(journal),
+        )
+        (
+            missing_backup_project
+            / project_versions.RECORDS_REL
+            / f"{saved['version']['version_id']}.json"
+        ).unlink()
+        with self.assertRaises(project_versions.ProjectVersionRecoveryError):
+            EditorServer(("127.0.0.1", 0), missing_backup_project)
+        self.assertTrue((missing_backup_project / project_versions.JOURNAL_REL).exists())
 
     def test_invalid_opaque_id_returns_json_not_found(self) -> None:
         status, payload = self.request("GET", "/api/project-versions/not-an-id")

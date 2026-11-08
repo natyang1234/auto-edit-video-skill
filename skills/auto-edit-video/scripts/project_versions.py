@@ -27,6 +27,7 @@ MAX_RECORDS = 100
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 MAX_JOURNAL_BYTES = 128 * 1024 * 1024
 VERSION_ID_RE = re.compile(r"pv_[0-9a-f]{32}")
+RECORD_TEMP_RE = re.compile(r"\.pv-record-[0-9a-f]{32}\.tmp")
 
 RESTORABLE_STATE_FIELDS = frozenset(
     {
@@ -562,7 +563,26 @@ class ProjectVersionStore:
         if self.records_dir.is_symlink() or not self.records_dir.is_dir():
             raise ProjectVersionError(503, "version_recovery_required", "版本儲存區格式不安全")
         records: list[dict[str, Any]] = []
+        removed_temporary = False
         for entry in sorted(os.scandir(self.records_dir), key=lambda item: item.name):
+            if RECORD_TEMP_RE.fullmatch(entry.name) is not None:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                    if (
+                        entry.is_symlink()
+                        or not stat.S_ISREG(info.st_mode)
+                        or stat.S_IMODE(info.st_mode) & 0o077
+                    ):
+                        raise ValueError("unsafe project-version temporary file")
+                    os.unlink(entry.path)
+                    removed_temporary = True
+                except (OSError, ValueError) as exc:
+                    raise ProjectVersionError(
+                        503,
+                        "version_storage_unavailable",
+                        "版本暫存記錄無法安全清理",
+                    ) from exc
+                continue
             match = re.fullmatch(r"(pv_[0-9a-f]{32})\.json", entry.name)
             if match is None or entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                 raise ProjectVersionError(
@@ -571,6 +591,15 @@ class ProjectVersionStore:
                     "版本儲存區包含無法驗證的記錄",
                 )
             records.append(self.load(match.group(1)))
+        if removed_temporary:
+            try:
+                _fsync_directory(self.records_dir)
+            except OSError as exc:
+                raise ProjectVersionError(
+                    503,
+                    "version_storage_unavailable",
+                    "版本暫存記錄清理結果無法確認",
+                ) from exc
         if len(records) > MAX_RECORDS:
             raise ProjectVersionError(503, "version_recovery_required", "版本數量超出安全上限")
         return sorted(records, key=lambda item: (item["created_at"], item["version_id"]), reverse=True)
@@ -644,15 +673,17 @@ class ProjectVersionStore:
             raw = json_bytes(record)
             if len(raw) > MAX_RECORD_BYTES:
                 raise ProjectVersionError(409, "unsupported_snapshot", "版本內容超出安全上限")
+            temporary = self.records_dir / f".pv-record-{uuid.uuid4().hex}.tmp"
+            descriptor = -1
+            published = False
+            temporary_created = False
             try:
                 descriptor = os.open(
-                    path,
+                    temporary,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                     0o600,
                 )
-            except FileExistsError:
-                continue
-            try:
+                temporary_created = True
                 view = memoryview(raw)
                 while view:
                     written = os.write(descriptor, view)
@@ -660,9 +691,52 @@ class ProjectVersionStore:
                         raise OSError("version record write made no progress")
                     view = view[written:]
                 os.fsync(descriptor)
-            finally:
                 os.close(descriptor)
-            _fsync_directory(self.records_dir)
+                descriptor = -1
+
+                # A hard link publishes the already-fsynced inode atomically
+                # without ever replacing an existing immutable record.
+                os.link(temporary, path, follow_symlinks=False)
+                published = True
+                _fsync_directory(self.records_dir)
+            except FileExistsError:
+                # Only the final id collision is retryable. A temporary-name
+                # collision is not expected with a server-generated UUID and
+                # is surfaced instead of risking an ambiguous publication.
+                if descriptor >= 0:
+                    os.close(descriptor)
+                    descriptor = -1
+                if temporary_created:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if temporary_created and os.path.lexists(path):
+                    continue
+                raise
+            except BaseException:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                    descriptor = -1
+                # The reserved temporary name is never a formal record. Keep
+                # a complete published final record even if directory fsync
+                # fails; cleanup is limited to this pre-publication alias.
+                if temporary_created:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+            try:
+                temporary.unlink()
+                _fsync_directory(self.records_dir)
+            except OSError:
+                # The final link is complete and immutable. Never remove it to
+                # make cleanup look successful; list_records can safely clean
+                # a reserved leftover temporary alias on the next request.
+                raise
+            if not published:
+                raise OSError("version record was not published")
             return self.load(version_id)
         raise OSError("could not allocate a unique version id")
 
@@ -738,6 +812,40 @@ def _verify_targets(project_dir: Path, journal: dict[str, Any]) -> None:
             raise OSError("restore target verification failed")
 
 
+def _cleanup_committed_restore_journal(
+    journal_path: Path, committed_raw: bytes
+) -> None:
+    """Durably remove a committed marker or re-establish it once and gate."""
+    cleanup_error: Exception
+    try:
+        journal_path.unlink()
+    except Exception as exc:
+        if os.path.lexists(journal_path):
+            raise ProjectVersionRecoveryError(
+                "committed restore journal cleanup failed; marker retained"
+            ) from exc
+        cleanup_error = exc
+    else:
+        try:
+            _fsync_directory(journal_path.parent)
+            return
+        except Exception as exc:
+            cleanup_error = exc
+
+    # The three authority targets are already exact and committed. Never roll
+    # them back. Make one bounded attempt to restore a durable committed marker
+    # so restart can verify those targets and retry cleanup.
+    try:
+        _atomic_replace_exact(journal_path, committed_raw)
+    except Exception as rebuild_error:
+        raise ProjectVersionRecoveryError(
+            "committed restore journal cleanup failed and marker rebuild failed"
+        ) from rebuild_error
+    raise ProjectVersionRecoveryError(
+        "committed restore journal cleanup failed; marker rebuilt"
+    ) from cleanup_error
+
+
 def execute_restore(
     project_dir: Path,
     auto_record: dict[str, Any],
@@ -751,19 +859,33 @@ def execute_restore(
     journal_raw = json_bytes(journal)
     if len(journal_raw) > MAX_JOURNAL_BYTES:
         raise ValueError("restore journal exceeds the bounded size")
-    _atomic_replace_exact(journal_path, journal_raw)
+    try:
+        _atomic_replace_exact(journal_path, journal_raw)
+    except Exception as exc:
+        # If publication reached the fixed journal path, every later writer
+        # must enter recovery even when the final directory fsync reported an
+        # error. A pre-publication failure leaves no journal and is retryable.
+        if os.path.lexists(journal_path):
+            raise ProjectVersionRecoveryError(
+                "project version restore journal publication is uncertain"
+            ) from exc
+        raise
     try:
         for relative in TARGET_ORDER:
             _atomic_replace_exact(project_dir / relative, targets[relative])
         _verify_targets(project_dir, journal)
         journal["phase"] = "committed"
-        _atomic_replace_exact(journal_path, json_bytes(journal))
-        journal_path.unlink()
-        _fsync_directory(journal_path.parent)
+        committed_raw = json_bytes(journal)
+        _atomic_replace_exact(journal_path, committed_raw)
+        _cleanup_committed_restore_journal(journal_path, committed_raw)
+    except ProjectVersionRecoveryError:
+        raise
     except Exception as exc:
-        raise ProjectVersionRecoveryError(
-            "project version restore could not complete; journal retained"
-        ) from exc
+        if os.path.lexists(journal_path):
+            raise ProjectVersionRecoveryError(
+                "project version restore could not complete; journal retained"
+            ) from exc
+        raise
 
 
 def recover_restore_transaction(project_dir: Path) -> None:
@@ -778,15 +900,21 @@ def recover_restore_transaction(project_dir: Path) -> None:
         backup = store.load(journal["automatic_backup"]["version_id"])
         if backup["record_digest"] != journal["automatic_backup"]["record_digest"]:
             raise ValueError("restore journal backup digest does not match")
-        if journal["phase"] == "prepared":
+        original_phase = journal["phase"]
+        if original_phase == "prepared":
             for relative in TARGET_ORDER:
                 _atomic_replace_exact(project_dir / relative, targets[relative])
         _verify_targets(project_dir, journal)
-        journal_path.unlink()
-        _fsync_directory(journal_path.parent)
+        journal["phase"] = "committed"
+        committed_raw = json_bytes(journal)
+        if original_phase != "committed":
+            _atomic_replace_exact(journal_path, committed_raw)
+        _cleanup_committed_restore_journal(journal_path, committed_raw)
+    except ProjectVersionRecoveryError:
+        raise
     except Exception as exc:
         raise ProjectVersionRecoveryError(
-            "project version restore recovery failed; journal retained"
+            "project version restore recovery failed; recovery remains required"
         ) from exc
 
 

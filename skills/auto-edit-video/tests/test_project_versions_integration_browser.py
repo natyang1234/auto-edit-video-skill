@@ -15,25 +15,24 @@ from typing import Any
 from unittest.mock import patch
 
 
-# The runner must select the installed style-profile tree before this module is
-# imported.  Keeping that path outside the test prevents repository-wide test
-# collection from silently binding to one machine's evidence tree.
-if not os.environ.get("EDIT_STYLE_PROFILES_SKILL_DIR"):
-    raise RuntimeError("EDIT_STYLE_PROFILES_SKILL_DIR must be set by the test runner")
-
-TESTS_DIR = Path(__file__).resolve().parent
-SCRIPTS_DIR = TESTS_DIR.parent / "scripts"
-if str(TESTS_DIR) not in sys.path:
-    sys.path.insert(0, str(TESTS_DIR))
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-
-import test_editor_browser as base  # noqa: E402
-import editor_server  # noqa: E402
-
-
-CHROME = base.CHROME
-sync_playwright = base.sync_playwright
+# Discovery must skip cleanly when the explicitly approved renderer is absent;
+# in that case do not import the editor modules and silently bind to shared.
+STYLE_PROFILES_DIR = os.environ.get("EDIT_STYLE_PROFILES_SKILL_DIR")
+base = None
+editor_server = None
+CHROME = Path()
+sync_playwright = None
+if STYLE_PROFILES_DIR:
+    TESTS_DIR = Path(__file__).resolve().parent
+    SCRIPTS_DIR = TESTS_DIR.parent / "scripts"
+    if str(TESTS_DIR) not in sys.path:
+        sys.path.insert(0, str(TESTS_DIR))
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+    import test_editor_browser as base  # noqa: E402
+    import editor_server  # noqa: E402
+    CHROME = base.CHROME
+    sync_playwright = base.sync_playwright
 
 
 class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
@@ -46,6 +45,8 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if not STYLE_PROFILES_DIR:
+            raise unittest.SkipTest("EDIT_STYLE_PROFILES_SKILL_DIR is required for the P7 real-browser integration test")
         if not sync_playwright or not CHROME.is_file():
             raise unittest.SkipTest("Playwright Chrome is unavailable")
 
@@ -208,7 +209,24 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
         # this only prevents an absent initial state file from disguising the
         # first named save as a successful version operation.
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
-        editor_server.default_editor_state(self.project, manifest)
+        initial_state = editor_server.default_editor_state(self.project, manifest)
+        initial_state["segments"] = [
+            {"id": "segment-0000a001", "source_start": 0.0, "source_end": 0.85, "origin": "manual"},
+            {"id": "segment-0000a002", "source_start": 1.05, "source_end": min(1.9, duration), "origin": "manual"},
+        ]
+        initial_state["overlays"].append(
+            {
+                "id": "fx-manual-p5-a", "type": "fx", "code": "P5", "start": 0.25,
+                "end": 1.25, "values": {}, "placement": "", "scheme": "", "font_ids": {},
+                "text": "手動聚光燈路徑", "style": {"opacity": 0.75}, "visible": True, "locked": False, "z_index": 30,
+                "spotlight_path": {"version": 1, "interpolation": "smoothstep", "keyframes": [
+                    {"source_at": 0.25, "x": 0.2, "y": 0.3},
+                    {"source_at": 1.25, "x": 0.8, "y": 0.45},
+                ]},
+            }
+        )
+        initial_state["revision"] = editor_server.editor_state_revision(initial_state)
+        self._write_json("working/editor_state.json", initial_state)
 
         self._source_before = self._fingerprint_source()
         self._env_patch = patch.dict(
@@ -281,6 +299,45 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
         state = json.loads((self.project / "working/editor_state.json").read_text(encoding="utf-8"))
         manifest = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
         return state, manifest
+
+    def _edit_segments_and_manual_p5_via_api(self, page: Any) -> dict[str, Any]:
+        """Make B's timeline edit through the authenticated product API, never disk writes."""
+        result = page.evaluate(
+            """
+            async () => {
+              const project = await (await fetch('/api/project', {cache: 'no-store'})).json();
+              const state = project.state;
+              state.segments = [
+                {id: 'segment-0000b001', source_start: 0.15, source_end: 0.95, origin: 'manual'},
+                {id: 'segment-0000b002', source_start: 1.15, source_end: 1.95, origin: 'manual'},
+              ];
+              const effect = state.overlays.find((item) => item.id === 'fx-manual-p5-a');
+              effect.spotlight_path = {version: 1, interpolation: 'smoothstep', keyframes: [
+                {source_at: 0.25, x: 0.35, y: 0.35}, {source_at: 1.25, x: 0.65, y: 0.6},
+              ]};
+              state.x_expected_revision = state.revision;
+              const response = await fetch('/api/editor-state', {
+                method: 'PUT', headers: {'Content-Type': 'application/json', 'X-Auto-Edit-CSRF': project.csrf_token},
+                body: JSON.stringify(state),
+              });
+              return {status: response.status, body: await response.json()};
+            }
+            """
+        )
+        self.assertEqual(result["status"], 200, result)
+        self.assertTrue(result["body"].get("ok"), result)
+        return result
+
+    def _assert_manual_p5_ui(self, page: Any, expected_x: str) -> None:
+        row = page.locator(".layer-row").filter(has_text="手動聚光燈路徑")
+        row.click()
+        self.assertIn("FX · P5", page.locator("#selected-type").inner_text())
+        page.locator("#manual-spotlight-timing-open").click()
+        page.locator("#fx-preview-dialog[open]").wait_for(timeout=30_000)
+        self.assertEqual(page.locator("#fx-preview-grid [data-fx-code='P5']").get_attribute("aria-checked"), "true")
+        self.assertTrue(page.locator("#spotlight-mode-manual").is_checked())
+        self.assertEqual(page.locator("#spotlight-keyframe-list input[aria-label='第 2 點 X 座標']").input_value(), expected_x)
+        page.locator("#fx-preview-close").click()
 
     def _save_state_manifest_evidence(self, label: str, expected_text: str) -> None:
         state, manifest = self._read_state_manifest()
@@ -637,6 +694,17 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                 self.assertIn("P7 synthetic source B", caption_texts_b)
                 self.assertNotIn("P7 synthetic source A", caption_texts_b)
 
+                stage("edit-b-segments-and-manual-p5-via-api")
+                api_edit_b = self._edit_segments_and_manual_p5_via_api(page)
+                self._write_evidence_json("http/editor-state-B-timeline-edit.json", api_edit_b)
+                state_b, _manifest_b = self._read_state_manifest()
+                self.assertEqual([item["id"] for item in state_b["segments"]], ["segment-0000b001", "segment-0000b002"])
+                p5_b = next(item for item in state_b["overlays"] if item.get("id") == "fx-manual-p5-a")
+                self.assertEqual(p5_b["spotlight_path"]["keyframes"][-1]["x"], 0.65)
+                page.reload(wait_until="domcontentloaded")
+                self._wait_initialized(page)
+                self._assert_manual_p5_ui(page, "0.65")
+
                 stage("save-version-b")
                 self._open_versions(page)
                 save_b, version_b = self._save_named_version(page, "P7 Version B")
@@ -803,6 +871,10 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
 
                 state_restored, manifest_restored = self._read_state_manifest()
                 self.assertEqual(self._fingerprint_source(), self._source_before)
+                self.assertEqual([item["id"] for item in state_restored["segments"]], ["segment-0000a001", "segment-0000a002"])
+                restored_p5 = next(item for item in state_restored["overlays"] if item.get("id") == "fx-manual-p5-a")
+                self.assertEqual(restored_p5["spotlight_path"]["keyframes"][-1]["x"], 0.8)
+                self._assert_manual_p5_ui(page, "0.8")
                 self.assertFalse((state_restored.get("rights") or {}).get("asserted"))
                 rights = json.loads((self.project / "working/rights_assertion.json").read_text(encoding="utf-8"))
                 self.assertFalse(rights.get("asserted", False))
