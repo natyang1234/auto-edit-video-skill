@@ -259,6 +259,76 @@ def test_manual_subject_track_summary_rejects_mismatched_renderer_receipt(
     assert raised.value.code == expected_code
 
 
+def test_public_manual_subject_track_summary_validates_exact_cache_shape() -> None:
+    path = manual_path()
+    overlay = {"code": "P5", "start": 4.0, "end": 6.0, "spotlight_path": path}
+    summary = {
+        "version": 1,
+        "mode": "manual",
+        "status": "manual",
+        "interpolation": "smoothstep",
+        "keyframe_count": 2,
+        "path_sha256": contract.spotlight_path_sha256(path, start=4.0, end=6.0),
+    }
+    assert contract.validate_public_subject_track_summary(
+        summary, overlay=overlay
+    ) == summary
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("version", True),
+        ("version", "1"),
+        ("mode", "automatic"),
+        ("status", "tracked"),
+        ("interpolation", "automatic"),
+        ("keyframe_count", 2.0),
+        ("keyframe_count", 3),
+        ("path_sha256", "0" * 64),
+    ],
+)
+def test_public_manual_subject_track_summary_rejects_tampering(
+    field: str, bad: object
+) -> None:
+    path = manual_path()
+    overlay = {"code": "P5", "start": 4.0, "end": 6.0, "spotlight_path": path}
+    summary = {
+        "version": 1,
+        "mode": "manual",
+        "status": "manual",
+        "interpolation": "smoothstep",
+        "keyframe_count": 2,
+        "path_sha256": contract.spotlight_path_sha256(path, start=4.0, end=6.0),
+    }
+    summary[field] = bad
+    with pytest.raises(contract.FxPreviewContractError):
+        contract.validate_public_subject_track_summary(summary, overlay=overlay)
+
+
+def test_public_automatic_subject_track_summary_is_bounded_and_p5_only() -> None:
+    summary = {
+        "version": 1,
+        "mode": "automatic",
+        "status": "tracked",
+        "interpolation": "automatic",
+        "keyframe_count": 2,
+        "path_sha256": None,
+    }
+    overlay = {"code": "P5", "start": 4.0, "end": 6.0}
+    assert contract.validate_public_subject_track_summary(
+        summary, overlay=overlay
+    ) == summary
+    with pytest.raises(contract.FxPreviewContractError):
+        contract.validate_public_subject_track_summary(
+            {**summary, "mask_path": "/private/mask.mp4"}, overlay=overlay
+        )
+    with pytest.raises(contract.FxPreviewContractError):
+        contract.validate_public_subject_track_summary(
+            summary, overlay={**overlay, "code": "T3"}
+        )
+
+
 def test_persisted_fx_validation_canonicalizes_manual_path_and_rejects_other_codes() -> None:
     path = manual_path()
     path["keyframes"][0].update({"source_at": 4.0004, "x": -0.0})

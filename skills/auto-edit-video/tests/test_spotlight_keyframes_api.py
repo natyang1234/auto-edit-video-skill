@@ -37,6 +37,15 @@ if spotlight_path is not None:
         "points":[{"t":0,"x":1,"y":2}],
         "private_mask":"/must/not/leak",
     }
+elif req["overlay"].get("code") == "P5":
+    subject_track={
+        "version":"spotlight-track-v3-automatic",
+        "mode":"automatic",
+        "status":"tracked",
+        "interpolation":"automatic",
+        "points":[{"t":0,"x":0.2,"y":0.3},{"t":1,"x":0.4,"y":0.5}],
+        "private_mask":"/must/not/leak",
+    }
 payload=json.dumps({'''
     script = _api_fixture.FAST_RENDERER.replace(before, insert, 1)
     return script.replace(
@@ -228,15 +237,64 @@ def test_timeline_snapshot_names_and_selects_only_the_manual_candidate(api) -> N
     assert matches[0]["id"] != confirmed["overlay_id"]
 
 
-def test_manual_cache_receipt_mismatch_is_not_reused(api) -> None:
+def test_identical_manual_request_reuses_cache_without_rendering(api) -> None:
     request = _request(api, manual_path())
     first = _submit_ready(api, request)
+    assert first["job"]["cache_hit"] is False
+
+    status, cached = api._json_request("POST", "/api/fx-previews", request)
+    assert status == 200, cached
+    assert cached["job"]["state"] == "ready"
+    assert cached["job"]["cache_hit"] is True
+    assert not (
+        {"preparing", "rendering", "validating"}
+        & set(cached["job"]["phase_timings_s"])
+    )
+    assert cached["job"]["subject_track"] == first["job"]["subject_track"]
+
+
+def test_identical_automatic_request_with_track_metadata_reuses_cache(api) -> None:
+    request = api._candidate("P5")
+    request["candidate"]["subject"] = {"x": 0.2, "y": 0.3}
+    first = _submit_ready(api, request)
+    assert first["job"]["cache_hit"] is False
+    assert first["job"]["subject_track"] == {
+        "version": 1,
+        "mode": "automatic",
+        "status": "tracked",
+        "interpolation": "automatic",
+        "keyframe_count": 2,
+        "path_sha256": None,
+    }
+
+    status, cached = api._json_request("POST", "/api/fx-previews", request)
+    assert status == 200, cached
+    assert cached["job"]["state"] == "ready"
+    assert cached["job"]["cache_hit"] is True
+    assert cached["job"]["subject_track"] == first["job"]["subject_track"]
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("path_sha256", "0" * 64),
+        ("status", "tracked"),
+        ("version", True),
+        ("keyframe_count", 3),
+    ],
+)
+def test_manual_cache_receipt_mismatch_is_not_reused(api, field, bad) -> None:
+    request = _request(api, manual_path())
+    first = _submit_ready(api, request)
+    status, positive = api._json_request("POST", "/api/fx-previews", request)
+    assert status == 200, positive
+    assert positive["job"]["cache_hit"] is True
     with api.server.fx_preview_jobs._lock:
         job = api.server.fx_preview_jobs._jobs[first["job"]["id"]]
         cache_key = job["cache_key"]
     receipt_path = api.server.fx_preview_jobs.cache_dir / f"{cache_key}.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["subject_track"]["path_sha256"] = "0" * 64
+    receipt["subject_track"][field] = bad
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     status, created = api._json_request("POST", "/api/fx-previews", request)

@@ -338,6 +338,10 @@
               <label class="field"><span>開始（秒）</span><input id="overlay-start" type="number" min="0" step="0.01"></label>
               <label class="field"><span>結束（秒）</span><input id="overlay-end" type="number" min="0.01" step="0.01"></label>
             </div>
+            <div class="spotlight-reconcile" id="manual-spotlight-timing-note" hidden>
+              <p>已保存的手動 P5 端點必須和手動路徑一致；請回到 P5 預覽調整套用時間，並明確對齊端點後再套用。</p>
+              <button class="button button-secondary compact-button" id="manual-spotlight-timing-open" type="button">在 P5 預覽調整套用時間</button>
+            </div>
 
             <label class="field field-full">
               <span>字體</span>
@@ -788,6 +792,7 @@
                 </div>
                 <ol class="spotlight-keyframe-list" id="spotlight-keyframe-list" aria-label="手動路徑關鍵點"></ol>
                 <p class="spotlight-validation" id="spotlight-validation" role="status" aria-live="polite"></p>
+                <p class="spotlight-crop-note" id="spotlight-crop-note" role="status" aria-live="polite"></p>
               </div>
             </section>
             <div class="fx-preview-draft-notice" id="fx-preview-draft-notice" hidden role="status">

@@ -2150,7 +2150,7 @@ class FxPreviewJobManager:
             time_map=time_map,
         )
         try:
-            subject_track = fx_preview_contract.sanitize_subject_track_summary(
+            subject_track = fx_preview_contract.validate_public_subject_track_summary(
                 receipt.get("subject_track"), overlay=overlay
             )
         except fx_preview_contract.FxPreviewContractError:

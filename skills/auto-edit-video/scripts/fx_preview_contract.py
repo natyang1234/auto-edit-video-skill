@@ -274,6 +274,92 @@ def sanitize_subject_track_summary(
     }
 
 
+def validate_public_subject_track_summary(
+    value: Any,
+    *,
+    overlay: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the bounded subject-track shape stored in cache receipts.
+
+    Renderer output must continue through ``sanitize_subject_track_summary``.
+    Cache receipts contain that function's already-public projection, so cache
+    reads validate its exact schema instead of treating it as raw renderer
+    output again.
+    """
+    manual_path = overlay.get("spotlight_path")
+    manual = manual_path is not None
+    if value is None:
+        if manual:
+            raise FxPreviewContractError(
+                "subject_track_mismatch", "手動聚光追蹤收據與已凍結路徑不一致"
+            )
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "mode",
+        "status",
+        "interpolation",
+        "keyframe_count",
+        "path_sha256",
+    }:
+        raise FxPreviewContractError(
+            "subject_track_invalid", "聚光追蹤公開收據格式無效"
+        )
+    if type(value.get("version")) is not int or value["version"] != 1:
+        raise FxPreviewContractError(
+            "subject_track_invalid", "聚光追蹤公開收據版本無效"
+        )
+    raw_count = value.get("keyframe_count")
+    if type(raw_count) is not int or not 0 <= raw_count <= 10000:
+        raise FxPreviewContractError(
+            "subject_track_invalid", "聚光追蹤公開收據定位數量無效"
+        )
+    if overlay.get("code") != "P5":
+        raise FxPreviewContractError(
+            "subject_track_mismatch", "聚光追蹤公開收據與候選特效不一致"
+        )
+    if manual:
+        expected_path = normalize_spotlight_path(
+            manual_path, start=overlay.get("start"), end=overlay.get("end")
+        )
+        expected_sha = canonical_sha256(expected_path)
+        if (
+            value.get("mode") != "manual"
+            or value.get("status") != "manual"
+            or value.get("interpolation") != "smoothstep"
+            or raw_count != len(expected_path["keyframes"])
+            or value.get("path_sha256") != expected_sha
+        ):
+            raise FxPreviewContractError(
+                "subject_track_mismatch", "手動聚光追蹤收據與已凍結路徑不一致"
+            )
+        return {
+            "version": 1,
+            "mode": "manual",
+            "status": "manual",
+            "interpolation": "smoothstep",
+            "keyframe_count": raw_count,
+            "path_sha256": expected_sha,
+        }
+    if (
+        value.get("mode") != "automatic"
+        or value.get("status") not in {"tracked", "lost", "fallback"}
+        or value.get("interpolation") != "automatic"
+        or value.get("path_sha256") is not None
+    ):
+        raise FxPreviewContractError(
+            "subject_track_mismatch", "自動聚光追蹤收據與候選特效不一致"
+        )
+    return {
+        "version": 1,
+        "mode": "automatic",
+        "status": value["status"],
+        "interpolation": "automatic",
+        "keyframe_count": raw_count,
+        "path_sha256": None,
+    }
+
+
 def _finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FxPreviewContractError("window_invalid", f"{label}必須是有限數字")
