@@ -182,6 +182,85 @@ def test_manual_path_fails_clearly_before_calling_legacy_renderer(
     assert called is False
 
 
+def test_submillisecond_raw_end_mismatch_logs_fallback_instead_of_escaping(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    isolated_compose()
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "source.mp4"
+    source.write_bytes(b"source")
+    overlay = {
+        "id": "manual-boundary-mismatch",
+        "type": "fx",
+        "code": "P5",
+        "start": 1.0006,
+        "end": 3.0004,
+        "spotlight_path": {
+            "version": 1,
+            "interpolation": "smoothstep",
+            "keyframes": [
+                {"source_at": 1.001, "x": 0.25, "y": 0.3},
+                {"source_at": 2.0, "x": 0.5, "y": 0.35},
+                {"source_at": 3.0, "x": 0.75, "y": 0.4},
+            ],
+        },
+    }
+
+    rendered = fx_overlay.render_for_timeline(
+        project,
+        overlay,
+        source,
+        None,
+        canvas=(1080, 1920),
+        fit="cover",
+    )
+
+    assert rendered is None
+    logged = json.loads(capsys.readouterr().err)
+    assert logged == {
+        "fx_fallback": {
+            "layer": "manual-boundary-mismatch",
+            "code": "P5",
+            "reason": "spotlight_path_invalid",
+        }
+    }
+
+
+def test_effective_render_window_is_identical_for_real_main_and_shared_validators() -> None:
+    compose = isolated_compose()
+    start = 1.0006
+    raw_end = 3.0004
+    duration = round(raw_end - start, 3)
+    effective_end = round(start + duration, 3)
+    path = {
+        "version": 1,
+        "interpolation": "smoothstep",
+        "keyframes": [
+            {"source_at": 1.001, "x": 0.25, "y": 0.3},
+            {"source_at": 2.0, "x": 0.5, "y": 0.35},
+            {"source_at": 3.001, "x": 0.75, "y": 0.4},
+        ],
+    }
+
+    main_path = contract.normalize_spotlight_path(
+        path, start=start, end=effective_end
+    )
+    shared_path = compose.st.canonicalize_manual_path(
+        main_path, start, effective_end
+    )
+    shared_track = compose.st.manual_track(
+        shared_path, 1920, 1080, start, duration, "cover"
+    )
+
+    assert effective_end == 3.001
+    assert shared_path == main_path
+    assert shared_track["status"] == "manual"
+    assert shared_track["apply_start"] == 1.001
+    assert shared_track["apply_end"] == effective_end
+    assert shared_track["path_sha256"] == compose.st.manual_path_sha256(main_path)
+
+
 @pytest.mark.parametrize("quality", ["draft", "final"])
 def test_preview_and_final_forward_identical_full_apply_source_path(
     tmp_path: Path, quality: str
