@@ -487,8 +487,9 @@ def render_for_timeline(project_dir: Path, overlay: dict[str, Any], source: Path
             _log({"layer": overlay.get("id"), "code": code, "reason": "invalid manual spotlight mode"})
             return None
         try:
+            effective_end = round(start + dur, 3)
             overlay["spotlight_path"] = fx_preview_contract.normalize_spotlight_path(
-                overlay.get("spotlight_path"), start=start, end=end
+                overlay.get("spotlight_path"), start=start, end=effective_end
             )
         except fx_preview_contract.FxPreviewContractError as exc:
             _log({"layer": overlay.get("id"), "code": code, "reason": exc.code})

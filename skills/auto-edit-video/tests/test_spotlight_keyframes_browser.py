@@ -201,6 +201,111 @@ class SpotlightKeyframesBrowserTests(unittest.TestCase):
             )
             browser.close()
 
+    def test_source_hit_target_is_mouse_only_and_keyboard_controls_edit_path(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME), headless=True, args=["--mute-audio"]
+            )
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.set_default_timeout(5000)
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            self.mock_preview_api(page)
+            self._open_p5(page)
+            page.locator("#spotlight-mode-manual").check()
+            page.wait_for_function(
+                "() => document.querySelector('#spotlight-source-click-target')?.getBoundingClientRect().width > 0"
+            )
+
+            target = page.locator("#spotlight-source-click-target")
+            self.assertEqual(target.get_attribute("tabindex"), "-1")
+            self.assertEqual(target.get_attribute("aria-hidden"), "true")
+
+            # The source hit target remains a pointer-only affordance.  Walk
+            # the real tab sequence from the preceding source preview control;
+            # keyboard focus must never land on the target.
+            page.locator("#fx-preview-resync").focus()
+            tabbed_ids = []
+            for _ in range(10):
+                page.keyboard.press("Tab")
+                tabbed_ids.append(page.evaluate("() => document.activeElement?.id"))
+            self.assertNotIn("spotlight-source-click-target", tabbed_ids)
+
+            # Check Chromium's accessibility tree as well as DOM attributes:
+            # aria-hidden must remove the pointer-only target from the
+            # advertised keyboard/action tree.
+            cdp = page.context.new_cdp_session(page)
+            document = cdp.send("DOM.getDocument", {"depth": -1})
+            node_id = cdp.send(
+                "DOM.querySelector",
+                {
+                    "nodeId": document["root"]["nodeId"],
+                    "selector": "#spotlight-source-click-target",
+                },
+            )["nodeId"]
+            ax_nodes = cdp.send(
+                "Accessibility.getPartialAXTree",
+                {"nodeId": node_id, "fetchRelatives": False},
+            )["nodes"]
+            self.assertTrue(ax_nodes, "source hit target missing from AX inspection")
+            self.assertTrue(ax_nodes[0]["ignored"], ax_nodes[0])
+
+            # Numeric controls and action buttons are the keyboard route for
+            # editing.  Use actual keyboard text entry plus Enter activation
+            # to update, add, and delete a point.
+            row = page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").first
+            inputs = row.locator("input")
+            for field, value in zip((inputs.nth(0), inputs.nth(1), inputs.nth(2)), ("0.000", "0.250000", "0.350000")):
+                field.focus()
+                page.keyboard.press("ControlOrMeta+A")
+                page.keyboard.type(value)
+            page.locator("#spotlight-update-point").focus()
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => fxPreviewDraft.spotlight_path.keyframes[0].x === 0.25"
+            )
+            self.assertEqual(page.evaluate("() => fxPreviewDraft.spotlight_path.keyframes[0].y"), 0.35)
+
+            for selector, value in (
+                ("#spotlight-point-time", "1.000"),
+                ("#spotlight-point-x", "0.750000"),
+                ("#spotlight-point-y", "0.250000"),
+            ):
+                field = page.locator(selector)
+                field.focus()
+                page.keyboard.press("ControlOrMeta+A")
+                page.keyboard.type(value)
+            page.locator("#spotlight-add-point").focus()
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => document.querySelectorAll('#spotlight-keyframe-list .spotlight-keyframe-row').length === 3"
+            )
+            page.locator("#spotlight-delete-point").focus()
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => document.querySelectorAll('#spotlight-keyframe-list .spotlight-keyframe-row').length === 2"
+            )
+
+            # Pointer activation still adds a point from the source content
+            # rectangle after the keyboard-only edit path.
+            page.evaluate(
+                "() => { const video = document.querySelector('#fx-preview-source-video'); video.currentTime = 0.7; video.dispatchEvent(new Event('timeupdate')); }"
+            )
+            before = page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").count()
+            box = target.bounding_box()
+            self.assertIsNotNone(box)
+            target.click(position={"x": box["width"] * 0.25, "y": box["height"] * 0.4})
+            self.assertEqual(
+                page.locator("#spotlight-keyframe-list .spotlight-keyframe-row").count(),
+                before + 1,
+            )
+            self.assertTrue(
+                page.evaluate(
+                    "() => fxPreviewDraft.spotlight_path.keyframes.some(point => Math.abs(point.source_at - 0.7) < 0.001)"
+                )
+            )
+            browser.close()
+
     def test_manual_hold_resets_when_selecting_another_effect(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:
