@@ -1,5 +1,8 @@
 import sys
 import hashlib
+import subprocess
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -541,7 +544,7 @@ def test_one_successful_ocr_keeps_engine_named_but_failed_samples_unknown(tmp_pa
 def test_vision_ocr_requires_finite_confidence_at_or_above_boundary(monkeypatch, tmp_path):
     class _Vision:
         @staticmethod
-        def recognize_text(_path, timeout_s):
+        def _recognize_sync(_path, _languages):
             return [
                 {"text": "boundary", "confidence": 0.5, "box": {"x": 0.1, "y": 0.2, "width": 0.2, "height": 0.1}},
                 {"text": "high", "confidence": 0.9, "box": {"x": 0.3, "y": 0.2, "width": 0.2, "height": 0.1}},
@@ -561,7 +564,7 @@ def test_vision_ocr_requires_finite_confidence_at_or_above_boundary(monkeypatch,
 def test_vision_ocr_low_confidence_only_is_successful_empty(monkeypatch, tmp_path):
     class _Vision:
         @staticmethod
-        def recognize_text(_path, timeout_s):
+        def _recognize_sync(_path, _languages):
             return [{
                 "text": "noise",
                 "confidence": 0.1,
@@ -572,3 +575,112 @@ def test_vision_ocr_low_confidence_only_is_successful_empty(monkeypatch, tmp_pat
     status, boxes = composite_check._vision_ocr_boxes(tmp_path / "frame.png", 100, 100)
     assert status == "empty"
     assert boxes == []
+
+
+def test_vision_ocr_timeout_returns_without_waiting_for_mocked_native_call(monkeypatch, tmp_path):
+    class _Vision:
+        @staticmethod
+        def _recognize_sync(_path, _languages):
+            time.sleep(0.05)
+            return []
+
+    monkeypatch.setitem(sys.modules, "vision_ocr", _Vision)
+    monkeypatch.setattr(composite_check, "OCR_TIMEOUT_S", 0.01)
+    started = time.perf_counter()
+    status, boxes = composite_check._vision_ocr_boxes(tmp_path / "frame.png", 100, 100)
+    elapsed = time.perf_counter() - started
+    assert (status, boxes) == ("failed", [])
+    assert elapsed < 0.04
+    time.sleep(0.06)  # Let the test daemon finish before pytest moves on.
+
+
+def test_blocked_ocr_daemon_does_not_keep_isolated_python_child_alive():
+    scripts = Path(composite_check.__file__).parent
+    program = textwrap.dedent(
+        f"""
+        import sys, time, types
+        sys.path.insert(0, {str(scripts)!r})
+        import composite_check
+        composite_check.OCR_TIMEOUT_S = 0.02
+        vision = types.ModuleType('vision_ocr')
+        def blocked(_path, _languages):
+            time.sleep(30)
+            return []
+        vision._recognize_sync = blocked
+        sys.modules['vision_ocr'] = vision
+        assert composite_check._vision_ocr_boxes(__import__('pathlib').Path('frame.png'), 1, 1) == ('failed', [])
+        print('child-exited')
+        """
+    )
+    started = time.perf_counter()
+    run = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=3)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "child-exited"
+    assert time.perf_counter() - started < 1.0
+
+
+def test_failed_ocr_is_attempted_once_but_face_measurements_continue(tmp_path, monkeypatch):
+    class _Frame:
+        shape = (100, 100, 3)
+
+    class _Reader:
+        width = 100
+        height = 100
+
+        def __init__(self, _path, _cv2):
+            pass
+
+        def read(self, _timestamp):
+            return _Frame()
+
+        def close(self):
+            pass
+
+    class _Detector:
+        failed = False
+
+        def __init__(self, _model, _cv2):
+            pass
+
+        def detect(self, _frame):
+            return True, [{"x": 20, "y": 20, "width": 40, "height": 40}]
+
+    class _CV2:
+        @staticmethod
+        def imwrite(_path, _frame):
+            return True
+
+    source = tmp_path / "source.mp4"
+    composite = tmp_path / "composite.mp4"
+    reference = tmp_path / "reference.mp4"
+    for path in (source, composite, reference):
+        path.write_bytes(b"fixture")
+    calls = []
+
+    def failed_ocr(_path, _width, _height):
+        calls.append(1)
+        return "failed", []
+
+    monkeypatch.setattr(composite_check, "_load_cv2", lambda: _CV2())
+    monkeypatch.setattr(composite_check, "_VideoReader", _Reader)
+    monkeypatch.setattr(composite_check, "_YuNetProbe", _Detector)
+    monkeypatch.setattr(composite_check, "_vision_ocr_boxes", failed_ocr)
+    receipt = composite_check.analyze(
+        {
+            "composite": composite,
+            "reference": reference,
+            "source": source,
+            "time_map": [{"source_start_s": 0, "source_end_s": 1, "output_start_s": 0, "output_end_s": 1}],
+            "face_model": tmp_path / "face.onnx",
+            "scratch": tmp_path / "scratch",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "expected_text": False,
+            "scope": "full-timeline",
+        }
+    )
+    assert calls == [1]
+    assert receipt["status"] == "unmeasured"
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "unavailable"}
+    assert receipt["measured_count"] == 0
+    assert all(sample["source_face_count"] == sample["reference_face_count"] == sample["visible_face_count"] == 1 for sample in receipt["samples"])
+    assert {item["kind"] for item in receipt["findings"]} >= {"ocr_unavailable"}
