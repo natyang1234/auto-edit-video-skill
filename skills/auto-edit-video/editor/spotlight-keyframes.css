@@ -71,7 +71,8 @@
 
 .spotlight-keyframes-panel[hidden],
 .spotlight-manual-editor[hidden],
-.spotlight-reconcile[hidden] { display: none !important; }
+.spotlight-reconcile[hidden],
+.spotlight-manual-hold-notice[hidden] { display: none !important; }
 
 .spotlight-panel-heading,
 .spotlight-time-toolbar,
@@ -124,6 +125,9 @@
 .spotlight-manual-editor { display: grid; gap: 10px; min-width: 0; }
 .spotlight-time-toolbar { justify-content: flex-start; flex-wrap: wrap; }
 .spotlight-time-toolbar output { flex: 1 1 9rem; min-width: 0; color: var(--paper-0, #fbf7ef); font: 700 .78rem/1.3 ui-monospace, Menlo, monospace; text-align: center; }
+.spotlight-manual-hold-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px; border: 1px solid oklch(73% .11 72 / .65); background: oklch(28% .035 61); color: var(--paper-0, #fbf7ef); }
+.spotlight-manual-hold-notice p { flex: 1 1 14rem; min-width: 0; margin: 0; }
+.spotlight-manual-hold-notice .button { min-height: 44px; }
 .spotlight-point-editor { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-width: 0; }
 .spotlight-point-editor .field { min-width: 0; }
 .spotlight-point-editor .field input { width: 100%; min-height: 44px; box-sizing: border-box; }
