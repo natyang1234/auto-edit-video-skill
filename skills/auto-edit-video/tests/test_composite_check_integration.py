@@ -77,7 +77,7 @@ def test_composite_child_timeout_is_hard_and_advisory(tmp_path: Path) -> None:
     with mock.patch.object(
         render.subprocess,
         "run",
-        side_effect=subprocess.TimeoutExpired(["composite-check"], 15),
+        side_effect=subprocess.TimeoutExpired(["composite-check"], 30),
     ) as run:
         receipt = render._run_composition_check(
             composite=composite,
@@ -104,7 +104,7 @@ def test_composite_child_timeout_is_hard_and_advisory(tmp_path: Path) -> None:
     assert receipt["media_sha256"] == hashlib.sha256(
         composite.read_bytes()
     ).hexdigest()
-    assert run.call_args.kwargs["timeout"] == 15.0
+    assert run.call_args.kwargs["timeout"] == 30.0
     assert "start_new_session" not in run.call_args.kwargs
     assert scratch.is_dir()
     sanitized = jobs._sanitize_composition_check(
@@ -569,6 +569,136 @@ def test_wrong_frame_binding_still_loses_advisory_reason() -> None:
 
     assert sanitized["frame_size"] == {"width": 540, "height": 960}
     assert sanitized["findings"] == [{"kind": "analysis_incomplete"}]
+
+
+def _measured_overlap_receipt(status: str, scope: str) -> dict:
+    source_sha = "a" * 64
+    media_sha = "b" * 64
+    return {
+        "version": 1,
+        "scope": scope,
+        "measurement": "sampled-local-frames",
+        "status": status,
+        "source_sha256": source_sha,
+        "media_sha256": media_sha,
+        "frame_size": {"width": 1080, "height": 1920},
+        "sample_count": 1,
+        "measured_count": 1,
+        "elapsed_s": 1.0,
+        "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+        "samples": [
+            {
+                "output_at": 0.5,
+                "source_at": 1.5,
+                "measured": True,
+                "source_face_count": 1,
+                "reference_face_count": 1,
+                "visible_face_count": 1,
+                "text_box_count": 1,
+            }
+        ],
+        "findings": [
+            {
+                "kind": "text_subject_overlap",
+                "output_at": 0.5,
+                "source_at": 1.5,
+                "subject_box": {"x": 10, "y": 20, "width": 100, "height": 100},
+                "text_box": {"x": 20, "y": 30, "width": 80, "height": 20},
+            }
+        ],
+    }
+
+
+def _sanitize_bound_receipt(receipt: dict, scope: str) -> dict:
+    sanitized = jobs._sanitize_composition_check(
+        receipt,
+        scope=scope,
+        source_sha256="a" * 64,
+        media_sha256="b" * 64,
+        frame_size={"width": 1080, "height": 1920},
+        render_duration_s=1.0,
+        time_map=[
+            {
+                "source_start_s": 1.0,
+                "source_end_s": 2.0,
+                "output_start_s": 0.0,
+                "output_end_s": 1.0,
+            }
+        ],
+    )
+    return sanitized
+
+
+@pytest.mark.parametrize("status", ("pass", "warn", "unmeasured"))
+def test_single_effect_receipt_is_always_canonical_unavailable(
+    status: str,
+) -> None:
+    sanitized = _sanitize_bound_receipt(
+        _measured_overlap_receipt(status, "single-effect"),
+        "single-effect",
+    )
+
+    assert sanitized == {
+        "version": 1,
+        "scope": "single-effect",
+        "measurement": "sampled-local-frames",
+        "status": "unmeasured",
+        "source_sha256": "a" * 64,
+        "media_sha256": "b" * 64,
+        "frame_size": {"width": 1080, "height": 1920},
+        "sample_count": 0,
+        "measured_count": 0,
+        "elapsed_s": 1.0,
+        "engines": {"faces": "unavailable", "ocr": "unavailable"},
+        "samples": [],
+        "findings": [{"kind": "full_timeline_required"}],
+    }
+
+
+def test_legitimate_single_effect_fallback_is_unchanged() -> None:
+    receipt = render._composition_unmeasured(
+        scope="single-effect",
+        source_sha256="a" * 64,
+        media_sha256="b" * 64,
+        frame_size={"width": 1080, "height": 1920},
+        finding="full_timeline_required",
+    )
+    assert _sanitize_bound_receipt(receipt, "single-effect") == receipt
+
+
+def test_malformed_single_effect_binding_cannot_claim_trusted_pass() -> None:
+    receipt = _measured_overlap_receipt("pass", "single-effect")
+    receipt.update(
+        source_sha256="c" * 64,
+        media_sha256="d" * 64,
+        frame_size={"width": 1, "height": 1},
+    )
+    sanitized = _sanitize_bound_receipt(receipt, "single-effect")
+
+    assert sanitized["status"] == "unmeasured"
+    assert sanitized["source_sha256"] == "a" * 64
+    assert sanitized["media_sha256"] == "b" * 64
+    assert sanitized["frame_size"] == {"width": 1080, "height": 1920}
+    assert sanitized["sample_count"] == 0
+    assert sanitized["measured_count"] == 0
+    assert sanitized["samples"] == []
+    assert sanitized["findings"] == [{"kind": "full_timeline_required"}]
+
+
+def test_full_timeline_overlap_warn_remains_measured_and_timed() -> None:
+    sanitized = _sanitize_bound_receipt(
+        _measured_overlap_receipt("warn", "full-timeline"),
+        "full-timeline",
+    )
+
+    assert sanitized["status"] == "warn"
+    assert sanitized["scope"] == "full-timeline"
+    assert sanitized["measured_count"] == 1
+    assert sanitized["samples"][0]["output_at"] == 0.5
+    assert sanitized["samples"][0]["source_at"] == 1.5
+    assert sanitized["findings"][0]["kind"] == "text_subject_overlap"
+    assert sanitized["findings"][0]["output_at"] == 0.5
+    assert sanitized["findings"][0]["source_at"] == 1.5
 
 
 def test_analysis_elapsed_is_zero_before_analysis_and_capped_without_sleep() -> None:

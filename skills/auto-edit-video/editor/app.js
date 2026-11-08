@@ -2583,17 +2583,25 @@ function fxPreviewCompositionReceipt(raw, job) {
     && sample.reference_face_count !== null && sample.reference_face_count > 0
     && sample.visible_face_count !== null && sample.visible_face_count > 0
   ));
+  const singleScopeValid = scope !== "single-effect" || (
+    status === "unmeasured" && sampleCount === 0 && measuredCount === 0
+    && samples.length === 0 && engines.faces === "unavailable" && engines.ocr === "unavailable"
+    && findings.length === 1 && findings[0].kind === "full_timeline_required"
+    && !["output_at", "source_at", "subject_box", "text_box"].some((key) => (
+      Object.prototype.hasOwnProperty.call(findings[0], key)
+    ))
+  );
   const baseValid = receiptShapeValid && receipt.version === 1 && scopeFieldValid && scopeMatchesJob && Boolean(scope)
     && Boolean(measurement) && statusFieldValid && frameShapeValid && frameValid && shaValid
     && elapsed !== null && elapsed >= 0 && elapsed <= 60 && enginesValid && countsValid
     && Array.isArray(receipt.samples) && Array.isArray(receipt.findings)
     && samplesShapeValid && sampleValuesValid && samplePairsValid && findingsShapeValid
-    && timedFindingsValid && boxesValid && measuredSampleCountsValid;
+    && timedFindingsValid && boxesValid && measuredSampleCountsValid && singleScopeValid;
   const passValid = baseValid && shaValid && scope === "full-timeline" && status === "pass"
     && sampleCount > 0 && measuredCount === sampleCount && samples.length === sampleCount
     && measuredSamplesConservative && enginesAvailable
     && findings.length === 0;
-  const warnValid = baseValid && status === "warn" && sampleCount > 0
+  const warnValid = baseValid && scope === "full-timeline" && status === "warn" && sampleCount > 0
     && measuredCount === sampleCount && measuredSamplesConservative && enginesAvailable && findings.length > 0
     && findings.every((finding) => finding.kind === "text_subject_overlap");
   const trustedStatus = baseValid && (status === "unmeasured" || (status === "pass" && passValid)
