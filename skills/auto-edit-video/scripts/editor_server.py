@@ -6221,6 +6221,7 @@ class EditorHandler(BaseHTTPRequestHandler):
         state: dict[str, Any],
         manifest: dict[str, Any],
         verified_source_binding: dict[str, str] | None = None,
+        inventory: project_versions.ProjectVersionInventory | None = None,
     ) -> dict[str, Any]:
         snapshot, snapshot_render, source, assets, dependencies = project_version_snapshot(
             self.server.project_dir,
@@ -6242,6 +6243,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             source_binding=source,
             asset_bindings=assets,
             dependency_bindings=dependencies,
+            inventory=inventory,
         )
 
     def _restore_candidate(
@@ -6315,13 +6317,14 @@ class EditorHandler(BaseHTTPRequestHandler):
         try:
             _state, _manifest, current = self._project_version_context()
             store = project_versions.ProjectVersionStore(self.server.project_dir)
-            records = store.list_records()
+            inventory = store.inventory()
+            records = inventory.records
             self.send_json(
                 {
                     "ok": True,
                     "versions": [project_versions.metadata(item) for item in records],
                     "current": current,
-                    "capacity": store.capacity(),
+                    "capacity": store.capacity(inventory),
                 }
             )
         except project_versions.ProjectVersionError as exc:
@@ -6362,16 +6365,17 @@ class EditorHandler(BaseHTTPRequestHandler):
                 for key, value in state.items()
                 if key in project_versions.RESTORABLE_STATE_FIELDS
             }
+            current_rights_assertion = read_json(
+                self.server.project_dir / RIGHTS_REL,
+                project_versions.empty_rights_assertion(),
+            )
             current_authority = {
                 "state": current_state,
                 "manifest": {
                     "approvals": copy.deepcopy(manifest.get("approvals") or {}),
                     "stages": copy.deepcopy(manifest.get("stages") or {}),
                 },
-                "rights_assertion": read_json(
-                    self.server.project_dir / RIGHTS_REL,
-                    project_versions.empty_rights_assertion(),
-                ),
+                "rights_assertion": current_rights_assertion,
             }
             saved_authority = {
                 "state": {
@@ -6388,6 +6392,22 @@ class EditorHandler(BaseHTTPRequestHandler):
             diff = project_versions.diff_values(current_authority, saved_authority)
             diff["approval_resets"] = invalidated
             diff["direction"] = {"from": "current", "to": "saved"}
+            current_state_rights = current_state.get("rights")
+            external_items = (
+                current_rights_assertion.get("items")
+                if isinstance(current_rights_assertion, dict)
+                else None
+            )
+            diff["rights_assertion_reset"] = bool(
+                isinstance(current_state_rights, dict)
+                and current_state_rights.get("asserted") is True
+            ) or bool(
+                isinstance(external_items, list)
+                and any(
+                    isinstance(item, dict) and item.get("asserted") is True
+                    for item in external_items
+                )
+            )
             self.send_json(
                 {
                     "ok": True,
@@ -6424,12 +6444,14 @@ class EditorHandler(BaseHTTPRequestHandler):
             self._require_project_version_cas(body, current)
             serial_acquired = self._acquire_project_version_quiescence()
             store = project_versions.ProjectVersionStore(self.server.project_dir)
+            inventory = store.inventory()
             record = self._capture_project_version(
                 store,
                 name=body["name"],
                 kind="named",
                 state=state,
                 manifest=manifest,
+                inventory=inventory,
             )
             self.send_json(
                 {
@@ -6474,7 +6496,15 @@ class EditorHandler(BaseHTTPRequestHandler):
             self._require_project_version_cas(body, current)
             serial_acquired = self._acquire_project_version_quiescence()
             store = project_versions.ProjectVersionStore(self.server.project_dir)
-            record = store.load(version_id)
+            inventory = store.inventory()
+            record = next(
+                (item for item in inventory.records if item["version_id"] == version_id),
+                None,
+            )
+            if record is None:
+                raise project_versions.ProjectVersionError(
+                    404, "version_not_found", "找不到指定版本"
+                )
             if record.get("project_id") != manifest.get("project_id"):
                 raise project_versions.ProjectVersionError(
                     409, "unsupported_snapshot", "版本不屬於目前專案"
@@ -6487,7 +6517,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 manifest,
                 verified_source_binding=pre_backup_source,
             )
-            capacity = store.capacity()
+            capacity = store.capacity(inventory)
             if not capacity["restore_backup_available"]:
                 raise project_versions.ProjectVersionError(
                     507,
@@ -6501,6 +6531,7 @@ class EditorHandler(BaseHTTPRequestHandler):
                 state=state,
                 manifest=manifest,
                 verified_source_binding=pre_backup_source,
+                inventory=inventory,
             )
 
             # Re-read every CAS and external binding after the durable backup.

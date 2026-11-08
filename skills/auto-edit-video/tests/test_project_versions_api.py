@@ -311,6 +311,7 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertIn("/state/highlights/0/review_status", paths)
         self.assertIn("/state/publishing/cover/output", paths)
         self.assertIn("/rights_assertion/items/0", paths)
+        self.assertTrue(detail["diff"]["rights_assertion_reset"])
 
         current = detail["current"]
         status, restored = self.request(
@@ -1065,6 +1066,124 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertEqual(status, 503, result)
         self.assertEqual(result["reason"], "version_recovery_required")
 
+    def test_detail_exposes_untruncated_rights_reset_semantics(self) -> None:
+        saved = self.create_version("rights reset semantics")
+        detail_path = f"/api/project-versions/{saved['version']['version_id']}"
+        rights = {
+            "schema_version": 1,
+            "items": [
+                {
+                    "asserted": True,
+                    "asset_sha256": "f" * 64,
+                    "asserted_by": "fixture-person",
+                    "metadata": "x" * 300,
+                }
+            ],
+            "revision": "e" * 64,
+        }
+        self.write_json("working/rights_assertion.json", rights)
+
+        status, detail = self.request("GET", detail_path)
+        self.assertEqual(status, 200, detail)
+        removed = next(
+            item
+            for item in detail["diff"]["changes"]
+            if item["path"] == "/rights_assertion/items/0"
+        )
+        self.assertTrue(removed["current_preview"].endswith("…"))
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(removed["current_preview"])
+        self.assertTrue(detail["diff"]["rights_assertion_reset"])
+
+        state = json.loads((self.project / "working/editor_state.json").read_text())
+        state["rights"] = {"asserted": False, "assertion_revision": None}
+        self.write_json("working/editor_state.json", state)
+        rights["items"][0]["asserted"] = False
+        rights["revision"] = "d" * 64
+        self.write_json("working/rights_assertion.json", rights)
+        status, detail = self.request("GET", detail_path)
+        self.assertEqual(status, 200, detail)
+        self.assertFalse(detail["diff"]["rights_assertion_reset"])
+
+    def test_request_local_inventory_scans_once_and_never_hides_corruption(self) -> None:
+        saved = self.create_version("request inventory")
+        real_list_records = project_versions.ProjectVersionStore.list_records
+        scans: list[str] = []
+
+        def tracked_list(store: project_versions.ProjectVersionStore) -> list[dict[str, object]]:
+            scans.append(str(store.project_dir))
+            return real_list_records(store)
+
+        with patch.object(
+            project_versions.ProjectVersionStore,
+            "list_records",
+            autospec=True,
+            side_effect=tracked_list,
+        ):
+            status, first = self.request("GET", "/api/project-versions")
+            self.assertEqual(status, 200, first)
+            self.assertEqual(len(scans), 1)
+            status, second = self.request("GET", "/api/project-versions")
+            self.assertEqual(status, 200, second)
+            self.assertEqual(len(scans), 2)
+
+            current = second["current"]
+            status, restored = self.request(
+                "POST",
+                f"/api/project-versions/{saved['version']['version_id']}/restore",
+                {
+                    "expected_state_digest": current["state_digest"],
+                    "expected_render_revision": current["render_revision"],
+                    "expected_manifest_digest": current["manifest_digest"],
+                    "confirm_restore": True,
+                },
+            )
+            self.assertEqual(status, 200, restored)
+            self.assertEqual(len(scans), 3)
+
+        record_path = (
+            self.project
+            / project_versions.RECORDS_REL
+            / f"{saved['version']['version_id']}.json"
+        )
+        record_path.write_bytes(b"{truncated")
+        status, result = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result["reason"], "version_recovery_required")
+
+    def test_unsafe_record_permissions_have_explicit_manual_repair_path(self) -> None:
+        saved = self.create_version("permission repair")
+        version_id = saved["version"]["version_id"]
+        record_path = (
+            self.project / project_versions.RECORDS_REL / f"{version_id}.json"
+        )
+        original = record_path.read_bytes()
+        for mode in (0o644, 0o200):
+            with self.subTest(mode=f"{mode:04o}"):
+                record_path.chmod(mode)
+                status, result = self.request("GET", "/api/project-versions")
+                self.assertEqual(status, 503, result)
+                self.assertEqual(
+                    result["reason"], "version_permissions_repair_required"
+                )
+                self.assertEqual(result["record_id"], version_id)
+                self.assertEqual(result["expected_mode"], "0600")
+                self.assertEqual(result["current_mode"], f"{mode:04o}")
+                self.assertEqual(
+                    result["relative_path"],
+                    f"working/project_versions/records/{version_id}.json",
+                )
+                self.assertEqual(result["repair_action"], "restrict_to_owner")
+                self.assertNotIn(
+                    str(self.project), json.dumps(result, ensure_ascii=False)
+                )
+
+                record_path.chmod(0o600)
+                status, listing = self.request("GET", "/api/project-versions")
+                self.assertEqual(status, 200, listing)
+                self.assertEqual(len(listing["versions"]), 1)
+                self.assertEqual(record_path.read_bytes(), original)
+
     def test_restore_requires_exact_fields_and_literal_true_confirmation(self) -> None:
         saved = self.create_version("restore validation")
         status, listing = self.request("GET", "/api/project-versions")
@@ -1094,6 +1213,33 @@ class ProjectVersionsApiTests(unittest.TestCase):
                 self.assertEqual(result["reason"], "validation_error")
         self.assertEqual(len(project_versions.ProjectVersionStore(self.project).list_records()), 1)
         self.assertFalse((self.project / project_versions.JOURNAL_REL).exists())
+
+    def test_create_rejects_unicode_controls_and_line_separators(self) -> None:
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        for name in (
+            "A\u0085B",
+            "A\u009fB",
+            "A\u2028B",
+            "A\u2029B",
+            "A\u2028",
+            "\u2029A",
+        ):
+            with self.subTest(name=name.encode("unicode_escape").decode("ascii")):
+                status, result = self.request(
+                    "POST",
+                    "/api/project-versions",
+                    {
+                        "name": name,
+                        "expected_state_digest": current["state_digest"],
+                        "expected_render_revision": current["render_revision"],
+                        "expected_manifest_digest": current["manifest_digest"],
+                    },
+                )
+                self.assertEqual(status, 422, result)
+                self.assertEqual(result["reason"], "validation_error")
+        self.assertEqual(project_versions.ProjectVersionStore(self.project).list_records(), [])
 
     def test_mid_restore_http_failure_blocks_writes_then_restart_rolls_forward(self) -> None:
         saved = self.create_version("journal HTTP recovery")

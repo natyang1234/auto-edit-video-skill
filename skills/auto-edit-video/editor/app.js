@@ -310,6 +310,7 @@ function projectVersionErrorMessage(error, action) {
     version_capacity_reserved: "版本容量已保留給還原前備份，目前不能新增命名版本。",
     version_capacity_exhausted: "版本容量已滿，無法執行此操作。系統不會自動清理版本。",
     version_storage_unavailable: "版本資料目前無法安全讀寫，請先重新讀取版本清單再試。",
+    version_permissions_repair_required: "版本檔案的分享權限已變更。請在專案資料夾的 working/project_versions/records 中，將該版本檔設為僅本人可讀寫，再重新讀取清單。請勿刪除版本。",
     version_recovery_required: "版本紀錄需要安全復原，請先處理後再試。",
   };
   return messages[code] || `${action}失敗，請稍後重新查看版本。`;
@@ -446,6 +447,7 @@ async function loadProjectVersionDetail(version) {
       if (!projectVersionMetadataChange(change, approvalResets)) contentChanges.push(change);
     });
     const resetLabels = projectVersionResetLabels(approvalResets);
+    if (response?.diff?.rights_assertion_reset === true) resetLabels.push("素材權利");
     const title = document.createElement("h4");
     title.textContent = response?.version?.name || "選定版本";
     detail.append(title);
@@ -495,7 +497,7 @@ function openProjectVersionRestore(response) {
   if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
   projectVersionsPendingRestore = { version: response.version, tokens: versionTokens(response.current) };
   elements["project-version-restore-name"].textContent = `要還原：「${response.version?.name || "此版本"}」`;
-  elements["project-version-restore-status"].textContent = "還原時會重新驗證來源影片與素材；若已變更，將停止還原。"; elements["project-version-restore-dialog"].showModal();
+  elements["project-version-restore-status"].textContent = "還原時會重新驗證來源影片與素材；若已變更，將停止還原。"; elements["project-version-restore-status"].classList.remove("is-error"); elements["project-version-restore-dialog"].showModal();
 }
 
 async function saveProjectVersion(event) {
