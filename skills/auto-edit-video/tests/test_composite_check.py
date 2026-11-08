@@ -1,5 +1,6 @@
 import sys
 import hashlib
+import json
 import subprocess
 import threading
 import textwrap
@@ -706,27 +707,105 @@ def test_vision_ocr_timeout_returns_without_waiting_for_mocked_native_call(monke
         assert completed.wait(1)
 
 
-def test_blocked_ocr_daemon_does_not_keep_isolated_python_child_alive():
+def test_blocked_ocr_in_isolated_analyze_returns_unknown_with_face_measurements(tmp_path):
     scripts = Path(composite_check.__file__).parent
     program = textwrap.dedent(
-        f"""
-        import sys, time, types
-        sys.path.insert(0, {str(scripts)!r})
+        """
+        import hashlib, json, sys, time, types
+        from pathlib import Path
+        sys.path.insert(0, __SCRIPTS__)
         import composite_check
-        composite_check.OCR_TIMEOUT_S = 0.02
+
+        root = Path(__ROOT__)
+        source = root / "source.mp4"
+        composite = root / "composite.mp4"
+        reference = root / "reference.mp4"
+        for path in (source, composite, reference):
+            path.write_bytes(b"fixture")
+
+        class _Frame:
+            shape = (100, 100, 3)
+
+        class _CV2:
+            @staticmethod
+            def imwrite(_path, _frame):
+                return True
+
+        class _Reader:
+            width = 100
+            height = 100
+
+            def __init__(self, _path, _cv2):
+                pass
+
+            def read(self, _timestamp):
+                return _Frame()
+
+            def close(self):
+                pass
+
+        class _Detector:
+            failed = False
+
+            def __init__(self, _model, _cv2):
+                pass
+
+            def detect(self, _frame):
+                return True, [
+                    {"x": 5, "y": 10, "width": 10, "height": 10},
+                    {"x": 20, "y": 10, "width": 10, "height": 10},
+                    {"x": 35, "y": 10, "width": 10, "height": 10},
+                    {"x": 50, "y": 10, "width": 10, "height": 10},
+                    {"x": 65, "y": 10, "width": 10, "height": 10},
+                ]
+
+        composite_check._load_cv2 = lambda: _CV2()
+        composite_check._VideoReader = _Reader
+        composite_check._YuNetProbe = _Detector
         vision = types.ModuleType('vision_ocr')
         def blocked(_path, _languages):
             time.sleep(30)
             return []
         vision._recognize_sync = blocked
         sys.modules['vision_ocr'] = vision
-        assert composite_check._vision_ocr_boxes(__import__('pathlib').Path('frame.png'), 1, 1) == ('failed', [])
-        print('child-exited')
+        receipt = composite_check.analyze({
+            "composite": composite,
+            "reference": reference,
+            "source": source,
+            "time_map": [{
+                "source_start_s": 0.0,
+                "source_end_s": 1.0,
+                "output_start_s": 0.0,
+                "output_end_s": 1.0,
+            }],
+            "face_model": root / "face.onnx",
+            "scratch": root / "scratch",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "expected_text": True,
+            "scope": "full-timeline",
+        })
+        print(json.dumps(receipt, sort_keys=True))
         """
+    ).replace("__SCRIPTS__", repr(str(scripts))).replace("__ROOT__", repr(str(tmp_path)))
+    command = [sys.executable, "-c", program]
+    run = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, (
+        f"command={command!r}\nstdout={run.stdout!r}\nstderr={run.stderr!r}"
     )
-    run = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=3)
-    assert run.returncode == 0, run.stderr
-    assert run.stdout.strip() == "child-exited"
+    receipt = json.loads(run.stdout)
+    assert receipt["status"] == "unmeasured"
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "unavailable"}
+    assert receipt["sample_count"] == 5
+    assert receipt["measured_count"] == 0
+    assert all(
+        sample["source_face_count"]
+        == sample["reference_face_count"]
+        == sample["visible_face_count"]
+        == 5
+        and sample["text_box_count"] == 0
+        for sample in receipt["samples"]
+    )
+    assert any(item["kind"] == "ocr_unavailable" for item in receipt["findings"])
 
 
 def test_failed_ocr_is_attempted_once_but_face_measurements_continue(tmp_path, monkeypatch):

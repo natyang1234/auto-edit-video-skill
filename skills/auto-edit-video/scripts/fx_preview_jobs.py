@@ -446,6 +446,8 @@ def _sanitize_composition_check(
         frame_size=frame_size,
         value=value,
     )
+    if scope == "single-effect":
+        return fallback
     top_keys = {
         "version", "scope", "measurement", "status", "source_sha256",
         "media_sha256", "frame_size", "sample_count", "measured_count",
@@ -631,7 +633,8 @@ def _sanitize_composition_check(
         finding["kind"] in capability_findings for finding in findings
     )
     legitimate_warn = bool(
-        sample_count
+        scope == "full-timeline"
+        and sample_count
         and not incomplete
         and not unavailable_engine
         and findings

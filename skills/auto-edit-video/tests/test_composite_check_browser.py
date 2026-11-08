@@ -11,6 +11,7 @@ sys.path.insert(0, str(TESTS))
 
 import test_editor_browser as _editor_browser  # noqa: E402
 import test_fx_preview_browser as _fx_preview_browser  # noqa: E402
+from fx_preview_jobs import _sanitize_composition_check  # noqa: E402
 from fx_preview_render import _composition_unmeasured  # noqa: E402
 
 
@@ -433,6 +434,270 @@ class CompositeCheckBrowserTests(unittest.TestCase):
                 "findings": [], "buttons": 0, "switchHidden": True,
             })
             browser.close()
+
+    def test_warn_requires_full_timeline_and_composition_check_has_single_live_region(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            timeline_warn = {
+                "version": 1,
+                "scope": "full-timeline",
+                "measurement": "sampled-local-frames",
+                "status": "warn",
+                "source_sha256": "a" * 64,
+                "media_sha256": "b" * 64,
+                "frame_size": {"width": 360, "height": 640},
+                "sample_count": 1,
+                "measured_count": 1,
+                "elapsed_s": 0.4,
+                "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+                "samples": [{
+                    "output_at": 0.9,
+                    "source_at": 0.9,
+                    "measured": True,
+                    "source_face_count": 1,
+                    "reference_face_count": 1,
+                    "visible_face_count": 1,
+                    "text_box_count": 1,
+                }],
+                "findings": [{
+                    "kind": "text_subject_overlap",
+                    "output_at": 0.9,
+                    "source_at": 0.9,
+                    "subject_box": {"x": 20, "y": 30, "width": 80, "height": 90},
+                    "text_box": {"x": 24, "y": 36, "width": 70, "height": 20},
+                }],
+            }
+            single_warn = copy.deepcopy(timeline_warn)
+            single_warn["scope"] = "single-effect"
+            single_unavailable = _composition_unmeasured(
+                scope="single-effect",
+                source_sha256="a" * 64,
+                media_sha256="b" * 64,
+                frame_size={"width": 360, "height": 640},
+                finding="full_timeline_required",
+                elapsed_s=0.4,
+            )
+
+            def render(receipt, *, mode, job_id):
+                return page.evaluate(
+                    """({receipt, mode, jobId}) => {
+                        fxCompareActive = false;
+                        const job = {
+                            id: jobId,
+                            state: 'ready',
+                            media_url: '/media/source',
+                            render_duration_s: 1.6,
+                            preview_options: {mode, quality: 'standard'},
+                            time_map: [{
+                                output_start_s: 0,
+                                output_end_s: 1.6,
+                                source_start_s: 0,
+                                source_end_s: 1.6,
+                            }],
+                            composition_check: receipt,
+                        };
+                        fxPreviewSetVisibleMedia(job);
+                        const panel = document.querySelector('#fx-preview-composition-check');
+                        const check = fxPreviewCompositionReceipt(receipt, job);
+                        return {
+                            status: check.status,
+                            reason: check.reason,
+                            findings: check.findings,
+                            summary: document.querySelector('#fx-preview-composition-check-summary').textContent,
+                            buttons: panel.querySelectorAll('button[data-source-at]').length,
+                            switchHidden: document.querySelector('#fx-preview-composition-switch-timeline').hidden,
+                            badgeLive: document.querySelector('#fx-preview-composition-check-status').getAttribute('aria-live'),
+                            summaryRole: document.querySelector('#fx-preview-composition-check-summary').getAttribute('role'),
+                            summaryLive: document.querySelector('#fx-preview-composition-check-summary').getAttribute('aria-live'),
+                            liveNodes: [...panel.querySelectorAll('[aria-live]')].map(node => ({
+                                id: node.id,
+                                value: node.getAttribute('aria-live'),
+                            })),
+                        };
+                    }""",
+                    {"receipt": receipt, "mode": mode, "jobId": job_id},
+                )
+
+            timeline = render(timeline_warn, mode="timeline", job_id="warn-timeline")
+            rejected_single = render(single_warn, mode="single", job_id="warn-single")
+            unavailable_single = render(single_unavailable, mode="single", job_id="unavailable-single")
+
+            self.assertEqual(timeline["status"], "warn")
+            self.assertEqual(timeline["findings"], [{
+                "kind": "text_subject_overlap",
+                "output_at": 0.9,
+                "source_at": 0.9,
+                "subject_box": {"x": 20, "y": 30, "width": 80, "height": 90},
+                "text_box": {"x": 24, "y": 36, "width": 70, "height": 20},
+            }])
+            self.assertEqual(timeline["buttons"], 1)
+            self.assertTrue(timeline["switchHidden"])
+
+            fixed_reason = "完整畫面檢查結果不完整，無法可靠判定"
+            self.assertEqual(rejected_single["status"], "unmeasured")
+            self.assertEqual(rejected_single["reason"], fixed_reason)
+            self.assertEqual(rejected_single["findings"], [])
+            self.assertEqual(rejected_single["buttons"], 0)
+            self.assertFalse(rejected_single["switchHidden"])
+            self.assertIn(fixed_reason, rejected_single["summary"])
+
+            self.assertEqual(unavailable_single["status"], "unmeasured")
+            self.assertEqual(unavailable_single["reason"], "")
+            self.assertEqual(unavailable_single["findings"], [{"kind": "full_timeline_required"}])
+            self.assertEqual(unavailable_single["buttons"], 0)
+            self.assertFalse(unavailable_single["switchHidden"])
+            self.assertIn("單一效果預覽不是完整時間軸", unavailable_single["summary"])
+
+            for state in (timeline, rejected_single, unavailable_single):
+                self.assertIsNone(state["badgeLive"])
+                self.assertEqual(state["summaryRole"], "status")
+                self.assertEqual(state["summaryLive"], "polite")
+                self.assertEqual(state["liveNodes"], [{
+                    "id": "fx-preview-composition-check-summary",
+                    "value": "polite",
+                }])
+            browser.close()
+
+    def test_single_receipt_contract_accepts_server_fallback_only(self):
+        host, port = self.server.server_address
+        source_sha = "a" * 64
+        media_sha = "b" * 64
+        frame_size = {"width": 360, "height": 640}
+        time_map = [{
+            "output_start_s": 0,
+            "output_end_s": 1.6,
+            "source_start_s": 0,
+            "source_end_s": 1.6,
+        }]
+        raw_single_warn = {
+            "version": 1,
+            "scope": "single-effect",
+            "measurement": "sampled-local-frames",
+            "status": "warn",
+            "source_sha256": source_sha,
+            "media_sha256": media_sha,
+            "frame_size": frame_size,
+            "sample_count": 1,
+            "measured_count": 1,
+            "elapsed_s": 0.4,
+            "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+            "samples": [{
+                "output_at": 0.9,
+                "source_at": 0.9,
+                "measured": True,
+                "source_face_count": 1,
+                "reference_face_count": 1,
+                "visible_face_count": 1,
+                "text_box_count": 1,
+            }],
+            "findings": [{
+                "kind": "text_subject_overlap",
+                "output_at": 0.9,
+                "source_at": 0.9,
+                "subject_box": {"x": 20, "y": 30, "width": 80, "height": 90},
+                "text_box": {"x": 24, "y": 36, "width": 70, "height": 20},
+            }],
+        }
+        server_fallback = _sanitize_composition_check(
+            raw_single_warn,
+            scope="single-effect",
+            source_sha256=source_sha,
+            media_sha256=media_sha,
+            frame_size=frame_size,
+            render_duration_s=1.6,
+            time_map=time_map,
+        )
+        self.assertEqual(server_fallback["status"], "unmeasured")
+        self.assertEqual(server_fallback["sample_count"], 0)
+        self.assertEqual(server_fallback["measured_count"], 0)
+        self.assertEqual(server_fallback["samples"], [])
+        self.assertEqual(server_fallback["engines"], {"faces": "unavailable", "ocr": "unavailable"})
+        self.assertEqual(server_fallback["findings"], [{"kind": "full_timeline_required"}])
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+
+            def render(receipt, *, mode, job_id):
+                return page.evaluate(
+                    """({receipt, mode, jobId}) => {
+                        fxCompareActive = false;
+                        const job = {
+                            id: jobId,
+                            state: 'ready',
+                            media_url: '/media/source',
+                            render_duration_s: 1.6,
+                            preview_options: {mode, quality: 'standard'},
+                            time_map: [{
+                                output_start_s: 0,
+                                output_end_s: 1.6,
+                                source_start_s: 0,
+                                source_end_s: 1.6,
+                            }],
+                            composition_check: receipt,
+                        };
+                        fxPreviewSetVisibleMedia(job);
+                        const panel = document.querySelector('#fx-preview-composition-check');
+                        const check = fxPreviewCompositionReceipt(receipt, job);
+                        return {
+                            status: check.status,
+                            reason: check.reason,
+                            findings: check.findings,
+                            buttons: panel.querySelectorAll('button[data-source-at]').length,
+                            switchHidden: document.querySelector('#fx-preview-composition-switch-timeline').hidden,
+                        };
+                    }""",
+                    {"receipt": receipt, "mode": mode, "jobId": job_id},
+                )
+
+            server = render(server_fallback, mode="single", job_id="server-single-fallback")
+            tampered = {}
+            for status in ("warn", "pass", "unmeasured"):
+                receipt = copy.deepcopy(raw_single_warn)
+                receipt["status"] = status
+                tampered[status] = render(receipt, mode="single", job_id=f"tampered-single-{status}")
+
+            full_timeline_warn = copy.deepcopy(raw_single_warn)
+            full_timeline_warn["scope"] = "full-timeline"
+            full_warn = render(full_timeline_warn, mode="timeline", job_id="valid-full-warn")
+
+            full_unknown = copy.deepcopy(full_timeline_warn)
+            full_unknown["status"] = "unmeasured"
+            full_unknown["findings"] = [{"kind": "visibility_uncertain", "output_at": 0.9, "source_at": 0.9}]
+            unknown = render(full_unknown, mode="timeline", job_id="valid-full-unknown")
+            browser.close()
+
+        self.assertEqual(server, {
+            "status": "unmeasured",
+            "reason": "",
+            "findings": [{"kind": "full_timeline_required"}],
+            "buttons": 0,
+            "switchHidden": False,
+        })
+        fixed_reason = "完整畫面檢查結果不完整，無法可靠判定"
+        for status in ("warn", "pass", "unmeasured"):
+            self.assertEqual(tampered[status], {
+                "status": "unmeasured",
+                "reason": fixed_reason,
+                "findings": [],
+                "buttons": 0,
+                "switchHidden": False,
+            }, status)
+        self.assertEqual(full_warn["status"], "warn")
+        self.assertEqual(full_warn["buttons"], 1)
+        self.assertTrue(full_warn["switchHidden"])
+        self.assertEqual(unknown["status"], "unmeasured")
+        self.assertEqual(unknown["findings"], [{
+            "kind": "visibility_uncertain",
+            "output_at": 0.9,
+            "source_at": 0.9,
+        }])
+        self.assertEqual(unknown["buttons"], 1)
+        self.assertTrue(unknown["switchHidden"])
 
     def test_unknown_receipt_cannot_render_pass_and_single_action_is_hidden_in_comparison(self):
         host, port = self.server.server_address
