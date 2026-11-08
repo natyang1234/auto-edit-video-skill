@@ -787,16 +787,16 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
     reference = shadow / "working" / "fx-preview-reference.mp4"
     layout_reports: dict[str, Any] = {}
     canvas = state.get("canvas") if isinstance(state.get("canvas"), dict) else {}
-    frame_size = {
-        "width": int(canvas.get("width", 1080)),
-        "height": int(canvas.get("height", 1920)),
-    }
     source_sha256 = str((dependencies.get("source") or {}).get("sha256") or "")
     composition_check: dict[str, Any] | None = None
     target_material = dependencies.get("material")
     expected_broll = None
     observed_broll = False
     try:
+        frame_size = {
+            "width": int(canvas.get("width", 1080)),
+            "height": int(canvas.get("height", 1920)),
+        }
         if isinstance(target_material, dict):
             for candidate in state.get("overlays", []):
                 if (
@@ -940,7 +940,7 @@ def timeline_preview(project: Path, cache: Path, output: Path, snapshot: dict[st
                 os.close(lease_fd)
             finally:
                 os.close(cache_fd)
-    return {"render_duration_s": round(end - start, 3), "time_map": time_map,
+    return {"render_duration_s": round(end - start, 6), "time_map": time_map,
             "composition_check": composition_check,
             "text_layout": {"version": 2, "measurement": "composition-dom" if layout_reports else "unavailable",
                             "status": "warn" if not layout_reports or any((r or {}).get("status") != "pass" for r in layout_reports.values()) else "pass",

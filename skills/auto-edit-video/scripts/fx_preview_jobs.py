@@ -1986,7 +1986,11 @@ class FxPreviewJobManager:
             receipt = self._read_json_at(cache_fd, receipt_path.name, MAX_RESULT_JSON_BYTES)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             return None
-        if not isinstance(receipt, dict) or receipt.get("cache_key") != cache_key:
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema_version") != 1
+            or receipt.get("cache_key") != cache_key
+        ):
             return None
         expected = receipt.get("sha256")
         if not isinstance(expected, str) or SHA256_RE.fullmatch(expected) is None:
@@ -1995,12 +1999,31 @@ class FxPreviewJobManager:
             actual, media_info = self._sha256_at(cache_fd, media.name)
         except OSError:
             return None
-        if media_info.st_size <= 0 or media_info.st_size > MAX_PREVIEW_BYTES or actual != expected:
+        declared_bytes = receipt.get("bytes")
+        if (
+            media_info.st_size <= 0
+            or media_info.st_size > MAX_PREVIEW_BYTES
+            or actual != expected
+            or isinstance(declared_bytes, bool)
+            or not isinstance(declared_bytes, int)
+            or declared_bytes != media_info.st_size
+        ):
             return None
         try:
             self._assert_storage_safe("working", "root", "cache")
-            duration = float(receipt.get("duration_s"))
+            raw_duration = receipt.get("duration_s")
+            if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+                return None
+            duration = float(raw_duration)
+            if (
+                not math.isfinite(duration)
+                or duration <= 0
+                or duration > float(sample_window["duration_s"]) + 0.05
+            ):
+                return None
             metadata = self.artifact_validator(media, duration)
+            if not isinstance(metadata, dict):
+                return None
             self._assert_storage_safe("working", "root", "cache")
         except (TypeError, ValueError, OSError, subprocess.SubprocessError):
             return None
@@ -2013,10 +2036,18 @@ class FxPreviewJobManager:
             )
         except (KeyError, TypeError, ValueError):
             return None
-        actual_frame_size = {
-            "width": int(metadata.get("width", frame_size["width"])),
-            "height": int(metadata.get("height", frame_size["height"])),
-        }
+        try:
+            actual_frame_size = {
+                "width": int(metadata.get("width", frame_size["width"])),
+                "height": int(metadata.get("height", frame_size["height"])),
+            }
+            if any(
+                not 0 < actual_frame_size[key] <= 16384
+                for key in ("width", "height")
+            ):
+                return None
+        except (TypeError, ValueError):
+            return None
         composition_check = _sanitize_composition_check(
             receipt.get("composition_check"),
             scope=(
@@ -2358,7 +2389,7 @@ class FxPreviewJobManager:
                 or numeric_render_duration > float(sample_window["duration_s"]) + 0.05
             ):
                 raise ValueError("renderer duration is invalid")
-            render_duration = round(numeric_render_duration, 3)
+            render_duration = round(numeric_render_duration, 6)
             time_map = self._normalized_time_map(
                 result.get("time_map"),
                 sample_window,
@@ -2399,7 +2430,10 @@ class FxPreviewJobManager:
                 "cache_key": job["cache_key"],
                 "sha256": digest,
                 "bytes": size,
-                "duration_s": metadata.get("duration_s", render_duration),
+                # Cache and public bindings use the renderer's canonical
+                # timeline duration. The artifact validator already checked
+                # the frame-quantized container duration within media tolerance.
+                "duration_s": render_duration,
                 "time_map": time_map,
                 "text_layout": text_layout,
                 "composition_check": composition_check,
