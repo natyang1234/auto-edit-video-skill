@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -107,6 +108,20 @@ class ProjectVersionRecoveryError(RuntimeError):
     """A retained restore journal cannot be safely completed."""
 
 
+class UnsafeFilePermissionsError(ValueError):
+    def __init__(self, mode: int):
+        super().__init__("file permissions are not owner-only read/write")
+        self.mode = mode
+
+
+class ProjectVersionInventory:
+    """A validated, request-local view of one store's immutable records."""
+
+    def __init__(self, owner_key: object, records: list[dict[str, Any]]):
+        self._owner_key = owner_key
+        self.records = tuple(records)
+
+
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -135,9 +150,10 @@ def validate_name(value: Any) -> str:
     if not isinstance(value, str):
         raise ProjectVersionError(422, "validation_error", "版本名稱必須是文字")
     name = value.strip()
-    if not 1 <= len(name) <= 80 or any(
-        ord(character) < 32 or ord(character) == 127 for character in name
-    ):
+    if any(
+        unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+        for character in value
+    ) or not 1 <= len(name) <= 80:
         raise ProjectVersionError(
             422,
             "validation_error",
@@ -382,15 +398,31 @@ def _assert_owned_parents(project_dir: Path, path: Path, *, create: bool) -> Non
 
 
 def _read_regular(path: Path, maximum: int) -> bytes:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except PermissionError as open_error:
+        # Diagnostic only: a write-only owner mode can prevent open() before
+        # fstat() reaches the explicit permission classification. Never use
+        # this path to read, write, follow links, or claim content validity.
+        try:
+            path_info = path.lstat()
+        except OSError:
+            raise open_error
+        mode = stat.S_IMODE(path_info.st_mode)
+        if (
+            stat.S_ISREG(path_info.st_mode)
+            and path_info.st_size <= maximum
+            and mode != 0o600
+        ):
+            raise UnsafeFilePermissionsError(mode) from open_error
+        raise
     try:
         info = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_size > maximum
-            or stat.S_IMODE(info.st_mode) & 0o077
-        ):
+        if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
             raise ValueError("unsafe file")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != 0o600:
+            raise UnsafeFilePermissionsError(mode)
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -439,6 +471,7 @@ class ProjectVersionStore:
     def __init__(self, project_dir: Path):
         self.project_dir = project_dir.resolve()
         self.records_dir = self.project_dir / RECORDS_REL
+        self._inventory_key = object()
 
     def _record_path(self, version_id: str) -> Path:
         if VERSION_ID_RE.fullmatch(version_id) is None:
@@ -542,6 +575,19 @@ class ProjectVersionStore:
             raise ProjectVersionError(404, "version_not_found", "找不到指定版本") from exc
         except ProjectVersionError:
             raise
+        except UnsafeFilePermissionsError as exc:
+            raise ProjectVersionError(
+                503,
+                "version_permissions_repair_required",
+                "版本記錄的分享權限不安全，請設為僅本人可讀寫後重試",
+                details={
+                    "record_id": version_id,
+                    "expected_mode": "0600",
+                    "current_mode": f"{exc.mode:04o}",
+                    "relative_path": (RECORDS_REL / f"{version_id}.json").as_posix(),
+                    "repair_action": "restrict_to_owner",
+                },
+            ) from exc
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProjectVersionError(
                 503,
@@ -604,8 +650,25 @@ class ProjectVersionStore:
             raise ProjectVersionError(503, "version_recovery_required", "版本數量超出安全上限")
         return sorted(records, key=lambda item: (item["created_at"], item["version_id"]), reverse=True)
 
-    def capacity(self) -> dict[str, Any]:
-        used = len(self.list_records())
+    def inventory(self) -> ProjectVersionInventory:
+        return ProjectVersionInventory(self._inventory_key, self.list_records())
+
+    def _inventory_records(
+        self, inventory: ProjectVersionInventory | None
+    ) -> tuple[dict[str, Any], ...]:
+        if inventory is None:
+            inventory = self.inventory()
+        if (
+            not isinstance(inventory, ProjectVersionInventory)
+            or inventory._owner_key is not self._inventory_key
+        ):
+            raise ValueError("project-version inventory belongs to another store")
+        return inventory.records
+
+    def capacity(
+        self, inventory: ProjectVersionInventory | None = None
+    ) -> dict[str, Any]:
+        used = len(self._inventory_records(inventory))
         return {
             "used": used,
             "max": MAX_RECORDS,
@@ -625,8 +688,9 @@ class ProjectVersionStore:
         source_binding: dict[str, Any],
         asset_bindings: dict[str, str],
         dependency_bindings: dict[str, Any],
+        inventory: ProjectVersionInventory | None = None,
     ) -> dict[str, Any]:
-        records = self.list_records()
+        records = self._inventory_records(inventory)
         used = len(records)
         if kind == "named" and used >= 99:
             raise ProjectVersionError(

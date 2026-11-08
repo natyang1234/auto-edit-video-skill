@@ -24,13 +24,16 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
 
     def setUp(self):
         base.EditorBrowserSmokeTests.setUp(self)
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is unavailable")
         evidence_root = Path(os.environ.get("P7_UI_STUB_EVIDENCE_DIR", self.project / "qa/p7-ui-stub"))
         evidence_root.mkdir(parents=True, exist_ok=True)
         self._stub_evidence_dir = evidence_root
         # The fixture's source binding is a real SHA of the generated video,
         # not the old fake-source shortcut used by some browser tests.
         source = self.project / "source/source.mp4"
-        rendered = subprocess.run([shutil.which("ffmpeg"), "-y", "-f", "lavfi", "-i", "smptebars=s=360x640:d=2", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source)], text=True, capture_output=True)
+        rendered = subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "smptebars=s=360x640:d=2", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source)], text=True, capture_output=True)
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         manifest_path = self.project / "project.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -84,6 +87,8 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     reset_changes = [
                         {"path": "/manifest/approvals/timeline/note", "kind": "changed", "saved_preview": '"Invalidated note"', "current_preview": "null"},
                         {"path": "/rights_assertion/revision", "kind": "changed", "saved_preview": '"' + "a" * 64 + '"', "current_preview": '"' + "b" * 64 + '"'},
+                        {"path": "/rights_assertion/items/0", "kind": "removed", "saved_preview": "null", "current_preview": '{"asserted":true,"asset":"' + "x" * 180 + '"}'},
+                        {"path": "/state/rights/asserted", "kind": "changed", "saved_preview": "false", "current_preview": "true"},
                     ]
                     if version["version_id"] == "b":
                         b_detail_requests[0] += 1
@@ -92,7 +97,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     if version["version_id"] == "b" and b_detail_requests[0] > 1:
                         changes = reset_changes[:1]
                         truncated = True
-                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": ["timeline"], "changes": changes}}
+                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": ["timeline"], "rights_assertion_reset": not (version["version_id"] == "b" and b_detail_requests[0] > 1), "changes": changes}}
                     if version["version_id"] == "a/b":
                         held_details.setdefault("a", (route, payload)); return
                     route.fulfill(json=payload); return
@@ -104,6 +109,9 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     return
                 if body.get("name") == "錯誤版本":
                     route.fulfill(status=422, json={"ok": False, "error": "validation_error", "error_code": "validation_error"})
+                    return
+                if body.get("name") == "權限版本":
+                    route.fulfill(status=503, json={"ok": False, "error": "version_permissions_repair_required", "error_code": "version_permissions_repair_required", "details": {"record_id": "pv_0123456789abcdef0123456789abcdef", "expected_mode": "0600", "current_mode": "0644", "relative_path": "working/project_versions/records/pv_0123456789abcdef0123456789abcdef.json", "repair_action": "restrict_to_owner"}})
                     return
                 else:
                     route.fulfill(status=201, json={"ok": True, "version": versions[0], "current": current})
@@ -138,8 +146,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertIn("第2段結束時間", detail_text)
             self.assertIn("還原為：segment-0000a002", detail_text)
             self.assertNotIn("目前：segment-0000b002", detail_text)
-            self.assertIn("時間軸需重新確認", detail_text)
-            self.assertNotIn("素材權利需重新確認", detail_text)
+            self.assertIn("時間軸／素材權利需重新確認", detail_text)
             self.assertNotIn("Invalidated note", detail_text)
             self.assertNotIn("a" * 64, detail_text)
             self.assertLess(detail_text.index("剪輯內容"), detail_text.index("重新確認"))
@@ -153,6 +160,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('版本名稱規則')")
             self.assertNotIn("validation_error", page.locator("#project-versions-status").inner_text())
+            page.locator("#project-version-name").fill("權限版本")
+            page.locator("#project-version-save").click()
+            page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('分享權限已變更')")
+            permission_text = page.locator("#project-versions-status").inner_text()
+            self.assertIn("working/project_versions/records", permission_text)
+            self.assertIn("請勿刪除版本", permission_text)
+            self.assertNotIn("/Users/", permission_text)
             page.locator("#project-version-name").fill("版本 A")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('已儲存')")
@@ -162,7 +176,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             page.locator("#project-version-name").fill("版本 B")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('已儲存')")
-            self.assertEqual(sum(path == "/api/project-versions" for path, _body in posts), 3)
+            self.assertEqual(sum(path == "/api/project-versions" for path, _body in posts), 4)
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             page.locator("#project-version-restore-dialog[open]").wait_for()
             self.assertIn("還原時會重新驗證來源影片與素材；若已變更，將停止還原。", page.locator("#project-version-restore-status").inner_text())
@@ -177,6 +191,9 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertTrue(page.locator("#project-version-restore-dialog[open]").is_visible())
             page.locator("#project-version-restore-cancel").click()
             self.assertTrue(page.locator("#project-versions-dialog[open]").is_visible())
+            page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
+            self.assertFalse(page.locator("#project-version-restore-status").evaluate("el => el.classList.contains('is-error')"))
+            page.locator("#project-version-restore-cancel").click()
             page.locator("#project-versions-close").click()
             self.assertEqual(page.evaluate("() => document.activeElement.id"), "project-versions-open")
             capacity.update({"used": 100, "named_save_available": False, "restore_backup_available": False})
@@ -186,6 +203,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             metadata_only_text = page.locator("#project-version-detail").inner_text()
             self.assertIn("目前顯示 0 項剪輯內容", metadata_only_text)
             self.assertNotIn("沒有需要直接還原的剪輯內容", metadata_only_text)
+            self.assertNotIn("素材權利需重新確認", metadata_only_text)
             page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
             self.assertFalse(page.locator("#project-version-restore-dialog").evaluate("el => el.open"))
             self.assertIn("不會自動清理", page.locator("#project-versions-capacity").inner_text())

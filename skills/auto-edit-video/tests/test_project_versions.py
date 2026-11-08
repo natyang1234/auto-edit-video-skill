@@ -106,6 +106,23 @@ class ProjectVersionUnitTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "unsupported_snapshot")
         self.assertEqual(caught.exception.details["unsupported_fields"], ["future_authority"])
 
+    def test_name_rejects_unicode_controls_and_line_separators(self) -> None:
+        for value in (
+            "A\u0085B",
+            "A\u009fB",
+            "A\u2028B",
+            "A\u2029B",
+            "A\u2028",
+            "\u2029A",
+        ):
+            with self.subTest(value=value.encode("unicode_escape").decode("ascii")):
+                with self.assertRaises(project_versions.ProjectVersionError) as caught:
+                    project_versions.validate_name(value)
+                self.assertEqual(caught.exception.status, 422)
+                self.assertEqual(caught.exception.code, "validation_error")
+
+        self.assertEqual(project_versions.validate_name("版本 A — 安全"), "版本 A — 安全")
+
     def test_record_is_immutable_integrity_checked_and_corruption_is_not_hidden(self) -> None:
         store = project_versions.ProjectVersionStore(self.project)
         record = self.create_record(store)
@@ -359,10 +376,39 @@ class ProjectVersionUnitTests(unittest.TestCase):
         store = project_versions.ProjectVersionStore(self.project)
         record = self.create_record(store)
         path = store.records_dir / f"{record['version_id']}.json"
-        path.chmod(0o644)
-        with self.assertRaises(project_versions.ProjectVersionError) as permissive:
-            store.load(record["version_id"])
-        self.assertEqual(permissive.exception.code, "version_recovery_required")
+        original = path.read_bytes()
+        for mode in (0o644, 0o200):
+            with self.subTest(mode=f"{mode:04o}"):
+                path.chmod(mode)
+                with self.assertRaises(project_versions.ProjectVersionError) as permissive:
+                    store.load(record["version_id"])
+                self.assertEqual(permissive.exception.status, 503)
+                self.assertEqual(
+                    permissive.exception.code, "version_permissions_repair_required"
+                )
+                self.assertEqual(
+                    permissive.exception.details,
+                    {
+                        "record_id": record["version_id"],
+                        "expected_mode": "0600",
+                        "current_mode": f"{mode:04o}",
+                        "relative_path": (
+                            f"working/project_versions/records/{record['version_id']}.json"
+                        ),
+                        "repair_action": "restrict_to_owner",
+                    },
+                )
+
+                # Product code never repairs permissions. A fixture-only manual
+                # repair proves recovery without changing the record bytes.
+                path.chmod(0o600)
+                self.assertEqual(store.load(record["version_id"]), record)
+                self.assertEqual(path.read_bytes(), original)
+
+        with patch.object(project_versions.os, "open", side_effect=PermissionError()):
+            with self.assertRaises(project_versions.ProjectVersionError) as unreadable_0600:
+                store.load(record["version_id"])
+        self.assertEqual(unreadable_0600.exception.code, "version_recovery_required")
 
     def test_oversize_journal_is_rejected_before_prepared_write(self) -> None:
         store = project_versions.ProjectVersionStore(self.project)
