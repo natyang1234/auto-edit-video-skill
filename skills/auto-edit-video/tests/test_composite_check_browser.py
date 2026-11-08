@@ -269,6 +269,144 @@ class CompositeCheckBrowserTests(unittest.TestCase):
             self.assertFalse(switch.is_visible())
             browser.close()
 
+    def test_identical_compare_poll_preserves_focus_and_count_bounds_match_server(self):
+        host, port = self.server.server_address
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
+            page = browser.new_page(viewport={"width": 1100, "height": 900})
+            page.goto(f"http://{host}:{port}/", wait_until="networkidle")
+            _fx_preview_browser.FxPreviewBrowserTests.mock_preview_api(self, page)
+            self.open_ready_preview(page)
+            receipt = {
+                "version": 1,
+                "scope": "full-timeline",
+                "measurement": "sampled-local-frames",
+                "status": "warn",
+                "source_sha256": "a" * 64,
+                "media_sha256": "b" * 64,
+                "frame_size": {"width": 360, "height": 640},
+                "sample_count": 1,
+                "measured_count": 1,
+                "elapsed_s": 0.4,
+                "engines": {"faces": "opencv-yunet", "ocr": "macos-vision"},
+                "samples": [{
+                    "output_at": 0.9, "source_at": 1.3, "measured": True,
+                    "source_face_count": 1, "reference_face_count": 1,
+                    "visible_face_count": 1, "text_box_count": 1,
+                }],
+                "findings": [{"kind": "visibility_uncertain", "output_at": 0.9, "source_at": 1.3}],
+            }
+            self.install_job(page, receipt, job_id="composition-focus-stable")
+            result = page.evaluate(
+                """async () => {
+                    const list = document.querySelector('#fx-preview-composition-check-list');
+                    const panel = document.querySelector('#fx-preview-composition-check');
+                    const observeRender = async action => {
+                        const records = [];
+                        const observer = new MutationObserver(items => records.push(...items));
+                        observer.observe(panel, {subtree: true, childList: true, characterData: true});
+                        action();
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        observer.disconnect();
+                        return records.length;
+                    };
+
+                    fxCompareActive = true;
+                    fxCompareRender();
+                    const stableBefore = list.querySelector('button[data-source-at]');
+                    stableBefore.focus();
+                    const stableMutations = await observeRender(() => fxCompareRender());
+                    const stableAfter = list.querySelector('button[data-source-at]');
+                    const stableFocusPreserved = document.activeElement === stableAfter;
+
+                    const bindingJob = structuredClone(fxPreviewVisibleJob);
+                    const highCounts = structuredClone(fxPreviewVisibleMeta.composition_check);
+                    highCounts.status = 'pass';
+                    highCounts.findings = [];
+                    Object.assign(highCounts.samples[0], {
+                        source_face_count: 65,
+                        reference_face_count: 65,
+                        visible_face_count: 65,
+                        text_box_count: 129,
+                    });
+                    const maximumCounts = structuredClone(highCounts);
+                    Object.assign(maximumCounts.samples[0], {
+                        source_face_count: 10000,
+                        reference_face_count: 10000,
+                        visible_face_count: 10000,
+                        text_box_count: 10000,
+                    });
+                    const tooHighStatuses = [
+                        'source_face_count', 'reference_face_count', 'visible_face_count', 'text_box_count',
+                    ].map(key => {
+                        const candidate = structuredClone(highCounts);
+                        candidate.samples[0][key] = 10001;
+                        return fxPreviewCompositionReceipt(candidate, bindingJob).status;
+                    });
+
+                    fxPreviewVisibleMeta.composition_check.findings = [
+                        {kind: 'visibility_uncertain', output_at: 1.0, source_at: 1.4},
+                    ];
+                    const beforeReceiptChange = stableAfter;
+                    const receiptMutations = await observeRender(() => fxCompareRender());
+                    const afterReceiptChange = list.querySelector('button[data-source-at]');
+
+                    const beforeJobChange = afterReceiptChange;
+                    fxPreviewVisibleJob.id = 'composition-focus-changed';
+                    await observeRender(() => fxCompareRender());
+                    const afterJobChange = list.querySelector('button[data-source-at]');
+
+                    const beforeTokenChange = afterJobChange;
+                    fxPreviewVisibleMediaToken += 1;
+                    await observeRender(() => fxCompareRender());
+                    const afterTokenChange = list.querySelector('button[data-source-at]');
+
+                    const beforeEligibilityChange = afterTokenChange;
+                    fxCompareActive = false;
+                    await observeRender(() => fxCompareRender());
+                    const afterEligibilityChange = list.querySelector('button[data-source-at]');
+
+                    fxPreviewClearVisibleMedia();
+                    return {
+                        stable: {
+                            sameButton: stableBefore === stableAfter,
+                            focusPreserved: stableFocusPreserved,
+                            mutations: stableMutations,
+                        },
+                        receiptChange: {
+                            replaced: beforeReceiptChange !== afterReceiptChange,
+                            mutations: receiptMutations,
+                            text: afterReceiptChange?.textContent || '',
+                        },
+                        jobChanged: beforeJobChange !== afterJobChange,
+                        tokenChanged: beforeTokenChange !== afterTokenChange,
+                        eligibilityChanged: beforeEligibilityChange !== afterEligibilityChange,
+                        highCountStatus: fxPreviewCompositionReceipt(highCounts, bindingJob).status,
+                        maximumCountStatus: fxPreviewCompositionReceipt(maximumCounts, bindingJob).status,
+                        tooHighStatuses,
+                        keyCleared: fxPreviewCompositionRenderKey === '',
+                        panelHidden: panel.hidden,
+                    };
+                }"""
+            )
+            self.assertEqual(result["stable"], {
+                "sameButton": True,
+                "focusPreserved": True,
+                "mutations": 0,
+            })
+            self.assertTrue(result["receiptChange"]["replaced"])
+            self.assertGreater(result["receiptChange"]["mutations"], 0)
+            self.assertIn("00:01.400", result["receiptChange"]["text"])
+            self.assertTrue(result["jobChanged"])
+            self.assertTrue(result["tokenChanged"])
+            self.assertTrue(result["eligibilityChanged"])
+            self.assertEqual(result["highCountStatus"], "pass")
+            self.assertEqual(result["maximumCountStatus"], "pass")
+            self.assertEqual(result["tooHighStatuses"], ["unmeasured"] * 4)
+            self.assertTrue(result["keyCleared"])
+            self.assertTrue(result["panelHidden"])
+            browser.close()
+
     def test_old_issue_and_late_metadata_cannot_move_new_candidate(self):
         host, port = self.server.server_address
         with sync_playwright() as playwright:

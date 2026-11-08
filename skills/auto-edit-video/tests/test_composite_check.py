@@ -1,4 +1,5 @@
 import sys
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -237,3 +238,123 @@ def test_reference_text_overlap_is_reported_even_when_final_face_is_covered(tmp_
     assert "text_subject_overlap" in kinds
     assert "visibility_uncertain" in kinds
     assert receipt["status"] == "unmeasured"
+
+
+def _fake_overlap_receipt(tmp_path, monkeypatch, mode):
+    class _Frame:
+        shape = (100, 100, 3)
+
+    class _Reader:
+        width = 100
+        height = 100
+
+        def __init__(self, _path, _cv2):
+            pass
+
+        def read(self, _timestamp):
+            return _Frame()
+
+        def close(self):
+            pass
+
+    class _Detector:
+        failed = False
+
+        def __init__(self, _model, _cv2):
+            pass
+
+        def detect(self, _frame):
+            if mode == "overflow":
+                return True, [
+                    {"x": 5, "y": 20, "width": 15, "height": 20},
+                    {"x": 30, "y": 20, "width": 15, "height": 20},
+                    {"x": 55, "y": 20, "width": 15, "height": 20},
+                    {"x": 80, "y": 20, "width": 15, "height": 20},
+                ]
+            return True, [{"x": 20, "y": 20, "width": 40, "height": 40}]
+
+    class _CV2:
+        @staticmethod
+        def imwrite(_path, _frame):
+            return True
+
+    if mode == "overflow":
+        text_boxes = [
+            {"x": 5, "y": 20, "width": 10, "height": 10},
+            {"x": 30, "y": 20, "width": 10, "height": 10},
+            {"x": 55, "y": 20, "width": 10, "height": 10},
+            {"x": 80, "y": 20, "width": 10, "height": 10},
+        ]
+    else:
+        text_boxes = [
+            {"x": 0, "y": 20, "width": 30, "height": 30},
+            {"x": 10, "y": 25, "width": 35, "height": 25},
+            {"x": 25, "y": 25, "width": 30, "height": 30},
+            {"x": 40, "y": 30, "width": 40, "height": 20},
+        ]
+    source = tmp_path / "source.mp4"
+    composite = tmp_path / "composite.mp4"
+    reference = tmp_path / "reference.mp4"
+    source.write_bytes(b"ordinary source fixture")
+    composite.write_bytes(b"ordinary composite fixture")
+    reference.write_bytes(b"ordinary reference fixture")
+    monkeypatch.setattr(composite_check, "_load_cv2", lambda: _CV2())
+    monkeypatch.setattr(composite_check, "_VideoReader", _Reader)
+    monkeypatch.setattr(composite_check, "_YuNetProbe", _Detector)
+    monkeypatch.setattr(
+        composite_check,
+        "_vision_ocr_boxes",
+        lambda _path, _width, _height: ("ok", text_boxes),
+    )
+    return composite_check.analyze(
+        {
+            "composite": composite,
+            "reference": reference,
+            "source": source,
+            "time_map": [{
+                "source_start_s": 0.0,
+                "source_end_s": 4.0,
+                "output_start_s": 0.0,
+                "output_end_s": 4.0,
+            }],
+            "face_model": tmp_path / "face.onnx",
+            "scratch": tmp_path / "scratch",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "expected_text": True,
+            "scope": "full-timeline",
+        }
+    )
+
+
+def test_many_overlap_lines_keep_one_strongest_box_per_face_and_sample(tmp_path, monkeypatch):
+    receipt = _fake_overlap_receipt(tmp_path, monkeypatch, "warn")
+    assert receipt["status"] == "warn"
+    assert receipt["sample_count"] == 8
+    assert receipt["measured_count"] == 8
+    assert receipt["engines"] == {"faces": "opencv-yunet", "ocr": "macos-vision"}
+    assert all(
+        sample["source_face_count"] == 1
+        and sample["reference_face_count"] == 1
+        and sample["visible_face_count"] == 1
+        and sample["text_box_count"] == 4
+        and sample["measured"]
+        for sample in receipt["samples"]
+    )
+    overlaps = [
+        finding
+        for finding in receipt["findings"]
+        if finding["kind"] == "text_subject_overlap"
+    ]
+    assert len(overlaps) == 8
+    assert all(overlap["text_box"] == {"x": 25.0, "y": 25.0, "width": 30.0, "height": 30.0} for overlap in overlaps)
+    assert all(finding["kind"] == "text_subject_overlap" for finding in receipt["findings"])
+
+
+def test_genuine_finding_capacity_overflow_stays_unmeasured(tmp_path, monkeypatch):
+    receipt = _fake_overlap_receipt(tmp_path, monkeypatch, "overflow")
+    assert receipt["status"] == "unmeasured"
+    assert receipt["sample_count"] == 8
+    assert receipt["measured_count"] == 8
+    assert all(sample["reference_face_count"] == 4 for sample in receipt["samples"])
+    assert sum(item["kind"] == "text_subject_overlap" for item in receipt["findings"]) == 31
+    assert {item["kind"] for item in receipt["findings"]} >= {"analysis_incomplete"}

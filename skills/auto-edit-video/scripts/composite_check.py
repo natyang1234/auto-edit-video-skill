@@ -220,6 +220,20 @@ def rect_intersection_fraction(subject: Any, text: Any) -> float:
     return intersection / smaller if smaller > 0 else 0.0
 
 
+def _strongest_text_overlap(
+    subject: Mapping[str, Any], text_boxes: Iterable[Mapping[str, Any]]
+) -> Mapping[str, Any] | None:
+    """Keep one deterministic representative text box for one subject/sample."""
+    strongest: Mapping[str, Any] | None = None
+    strongest_fraction = -1.0
+    for text_box in text_boxes:
+        fraction = rect_intersection_fraction(subject, text_box)
+        if fraction >= TEXT_OVERLAP_FRACTION and fraction > strongest_fraction:
+            strongest = text_box
+            strongest_fraction = fraction
+    return strongest
+
+
 def normalized_intersection(subject: Any, text: Any) -> float:
     """Readable alias for the conservative text-over-subject rule."""
     return rect_intersection_fraction(subject, text)
@@ -733,15 +747,15 @@ def analyze(request: dict[str, Any]) -> dict[str, Any]:
                 sample["text_box_count"] = len(text_boxes)
                 if reference_boxes and text_boxes:
                     for subject_box in reference_boxes:
-                        for text_box in text_boxes:
-                            if rect_intersection_fraction(subject_box, text_box) >= TEXT_OVERLAP_FRACTION:
-                                findings.add({
-                                    "kind": "text_subject_overlap",
-                                    "output_at": output_at,
-                                    "source_at": source_at,
-                                    "subject_box": subject_box,
-                                    "text_box": text_box,
-                                })
+                        text_box = _strongest_text_overlap(subject_box, text_boxes)
+                        if text_box is not None:
+                            findings.add({
+                                "kind": "text_subject_overlap",
+                                "output_at": output_at,
+                                "source_at": source_at,
+                                "subject_box": subject_box,
+                                "text_box": text_box,
+                            })
                 sample["measured"] = bool(
                     source_ok
                     and reference_ok
