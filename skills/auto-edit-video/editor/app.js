@@ -2428,9 +2428,15 @@ function fxPreviewCompositionMapPair(outputAt, sourceAt, job, requireMetadata = 
 function fxPreviewCompositionMapOutput(outputAt, job) {
   const output = fxPreviewFiniteNumber(outputAt);
   if (output === null || output < 0) return null;
-  const segment = fxPreviewCompositionMapSegments(job).find((item) => (
-    output >= item.outputStart - 0.012 && output <= item.outputEnd + 0.012
-  ));
+  const segments = fxPreviewCompositionMapSegments(job);
+  const boundaryEpsilon = 1e-6;
+  const segment = segments.find((item, index) => {
+    const isLast = index === segments.length - 1;
+    return output >= item.outputStart - 0.012
+      && (isLast
+        ? output <= item.outputEnd + 0.012
+        : output < item.outputEnd - boundaryEpsilon);
+  });
   if (!segment) return null;
   const progress = Math.max(0, Math.min(1, (output - segment.outputStart) / (segment.outputEnd - segment.outputStart)));
   return segment.sourceStart + progress * (segment.sourceEnd - segment.sourceStart);
@@ -2768,7 +2774,7 @@ function fxPreviewRenderCompositionCheck(rawCheck = null, job = fxPreviewVisible
       button.type = "button";
       button.className = "button button-secondary";
       button.textContent = `查看原片時間 ${formatTime(entry.sourceAt)}`;
-      button.setAttribute("aria-label", `查看原片 ${formatTime(entry.sourceAt)}（預覽 ${formatTime(entry.outputAt)}）`);
+      button.setAttribute("aria-label", `${button.textContent}（預覽 ${formatTime(entry.outputAt)}）`);
       button.dataset.outputAt = String(entry.outputAt);
       button.dataset.sourceAt = String(entry.sourceAt);
       button.addEventListener("focus", () => button.scrollIntoView({ block: "nearest" }));
