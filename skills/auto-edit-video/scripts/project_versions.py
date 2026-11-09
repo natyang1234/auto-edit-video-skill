@@ -174,6 +174,19 @@ def validate_name(value: Any) -> str:
     return name
 
 
+def _valid_optional_utc_iso_timestamp(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return False
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timezone.utc.utcoffset(parsed)
+
+
 def sanitize_state(state: Any) -> dict[str, Any]:
     if not isinstance(state, dict):
         raise ProjectVersionError(409, "unsupported_snapshot", "目前編輯內容格式無效")
@@ -234,6 +247,7 @@ def sanitize_state(state: Any) -> dict[str, Any]:
                 "reviewer",
                 "approved_at",
                 "checked_at",
+                "resolved_at",
             }:
                 raise ProjectVersionError(
                     409,
@@ -241,11 +255,25 @@ def sanitize_state(state: Any) -> dict[str, Any]:
                     "字幕語意審核包含尚未支援的欄位",
                 )
             status_value = semantic.get("status")
-            if status_value not in {"checked", "approved", "pending", "rejected"}:
+            if not isinstance(status_value, str) or status_value not in {
+                "checked",
+                "approved",
+                "pending",
+                "rejected",
+                "resolved_manual",
+            }:
                 raise ProjectVersionError(
                     409,
                     "unsupported_snapshot",
                     "字幕語意審核狀態無法安全還原",
+                )
+            if "resolved_at" in semantic and not _valid_optional_utc_iso_timestamp(
+                semantic["resolved_at"]
+            ):
+                raise ProjectVersionError(
+                    409,
+                    "unsupported_snapshot",
+                    "字幕語意審核時間無法安全還原",
                 )
             if status_value in {"checked", "approved"}:
                 semantic["status"] = "pending"
@@ -281,6 +309,7 @@ def sanitize_state(state: Any) -> dict[str, Any]:
             "body",
             "hashtags",
             "cover",
+            "generator",
         }:
             raise ProjectVersionError(
                 409, "unsupported_snapshot", "發布草稿包含尚未支援的欄位"
@@ -288,6 +317,15 @@ def sanitize_state(state: Any) -> dict[str, Any]:
         title = str(publishing.get("title") or "")
         body = str(publishing.get("body") or "")
         hashtags = copy.deepcopy(publishing.get("hashtags") or [])
+        if (
+            "generator" in publishing
+            and publishing["generator"] != "deterministic-transcript-draft-v1"
+        ):
+            raise ProjectVersionError(
+                409,
+                "unsupported_snapshot",
+                "發布草稿產生器無法安全還原",
+            )
         cover = publishing.get("cover") if isinstance(publishing.get("cover"), dict) else {}
         if publishing.get("cover") is not None and not isinstance(publishing.get("cover"), dict):
             raise ProjectVersionError(
@@ -313,6 +351,8 @@ def sanitize_state(state: Any) -> dict[str, Any]:
                 "output": None,
             },
         }
+        if publishing.get("generator") == "deterministic-transcript-draft-v1":
+            snapshot["publishing"]["generator"] = publishing["generator"]
     elif publishing is not None:
         raise ProjectVersionError(
             409, "unsupported_snapshot", "發布草稿格式無法安全還原"

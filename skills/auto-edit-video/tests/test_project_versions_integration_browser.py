@@ -377,6 +377,47 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
         self.assertTrue(result["body"].get("ok"), result)
         return result
 
+    def _put_pending_semantic_candidate_fixture(self, page: Any) -> dict[str, Any]:
+        """Install a pending candidate through the authenticated fixture API."""
+        result = page.evaluate(
+            """
+            async () => {
+              const projectResponse = await fetch('/api/project', {cache: 'no-store'});
+              const project = await projectResponse.json();
+              const state = project.state;
+              const caption = state.overlays.find((item) => item.type === 'caption');
+              if (!caption) throw new Error('compatibility fixture needs a caption');
+              const original = caption.text;
+              caption.semantic_review = {
+                status: 'pending',
+                unit_id: 'segment-0000a001',
+                candidates: [{source: original, replacement: 'P7 semantic corrected'}],
+                reviewer: 'temporary-fixture-only',
+                approved_at: null,
+                checked_at: null,
+              };
+              state.x_expected_revision = state.revision;
+              const response = await fetch('/api/editor-state', {
+                method: 'PUT',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Auto-Edit-CSRF': project.csrf_token,
+                },
+                body: JSON.stringify(state),
+              });
+              return {
+                status: response.status,
+                body: await response.json(),
+                original,
+              };
+            }
+            """
+        )
+        self.assertEqual(result["status"], 200, result)
+        self.assertTrue(result["body"].get("ok"), result)
+        self.assertEqual(result.get("original"), "P7 synthetic source A")
+        return result
+
     def _assert_manual_p5_ui(self, page: Any, expected_x: str) -> None:
         row = page.locator(".layer-row").filter(has_text="手動聚光燈路徑")
         row.click()
@@ -1298,6 +1339,379 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                         - auto_before_loss,
                         "authority_reset": True,
                         "post_reload_edit_and_undo_preserved_a": True,
+                    },
+                )
+
+                stage("state-compat-generate-copy")
+                page.locator("#publish-tab").click()
+                page.locator("#publish-panel:not([hidden])").wait_for(timeout=30_000)
+                with page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and response.url.endswith("/api/copy-draft")
+                    and response.status == 200,
+                    timeout=90_000,
+                ) as copy_info:
+                    with page.expect_response(
+                        lambda response: response.request.method == "PUT"
+                        and response.url.endswith("/api/editor-state")
+                        and response.status == 200,
+                        timeout=90_000,
+                    ) as copy_save_info:
+                        page.locator("#generate-copy").click()
+                copy_response = copy_info.value
+                copy_payload = copy_response.json()
+                self.assertTrue(copy_payload.get("ok"), copy_payload)
+                self.assertEqual(copy_save_info.value.status, 200)
+                self._write_evidence_json(
+                    "state-compat/http/copy-draft.json",
+                    {
+                        "http_status": copy_response.status,
+                        "ok": copy_payload.get("ok"),
+                        "draft": {
+                            "draft_status": (copy_payload.get("draft") or {}).get("draft_status"),
+                            "generator": (copy_payload.get("draft") or {}).get("generator"),
+                        },
+                        "editor_state_http_status": copy_save_info.value.status,
+                    },
+                )
+                page.wait_for_function(
+                    "() => document.querySelector('#save-state')?.classList.contains('is-saved') && document.querySelector('#save-state')?.textContent.includes('已儲存')",
+                    timeout=90_000,
+                )
+                state_after_copy, _manifest_after_copy = self._read_state_manifest()
+                self.assertEqual(
+                    state_after_copy.get("publishing", {}).get("generator"),
+                    "deterministic-transcript-draft-v1",
+                )
+                self._write_evidence_json(
+                    "state-compat/publishing-after-copy.json",
+                    {
+                        "generator": state_after_copy.get("publishing", {}).get("generator"),
+                        "draft_status": state_after_copy.get("publishing", {}).get("draft_status"),
+                        "title": state_after_copy.get("publishing", {}).get("title"),
+                    },
+                )
+
+                stage("state-compat-install-pending-candidate")
+                pending_fixture = self._put_pending_semantic_candidate_fixture(page)
+                self._write_evidence_json(
+                    "state-compat/http/pending-candidate-fixture.json",
+                    {
+                        "http_status": pending_fixture["status"],
+                        "ok": pending_fixture["body"].get("ok"),
+                        "caption_original": pending_fixture.get("original"),
+                    },
+                )
+                page.reload(wait_until="domcontentloaded", timeout=90_000)
+                self._wait_initialized(page)
+                pending_state, _pending_manifest = self._read_state_manifest()
+                pending_caption = next(
+                    item
+                    for item in pending_state.get("overlays", [])
+                    if item.get("type") == "caption"
+                )
+                self.assertEqual(
+                    pending_caption.get("semantic_review", {}).get("status"),
+                    "pending",
+                )
+
+                stage("state-compat-edit-semantic-via-ui")
+                caption_row = page.locator(".layer-row").filter(has_text="字幕").first
+                caption_row.wait_for(timeout=30_000)
+                caption_row.click()
+                caption_input = page.locator("#overlay-text")
+                caption_input.wait_for(timeout=30_000)
+                self.assertEqual(caption_input.input_value(), "P7 synthetic source A")
+                with page.expect_response(
+                    lambda response: response.request.method == "PUT"
+                    and response.url.endswith("/api/editor-state")
+                    and response.status == 200,
+                    timeout=90_000,
+                ) as semantic_save_info:
+                    caption_input.fill("P7 semantic corrected")
+                self.assertEqual(semantic_save_info.value.status, 200)
+                page.wait_for_function(
+                    "() => document.querySelector('#save-state')?.classList.contains('is-saved') && document.querySelector('#save-state')?.textContent.includes('已儲存')",
+                    timeout=90_000,
+                )
+                compatibility_state, _compatibility_manifest = self._read_state_manifest()
+                compatibility_caption = next(
+                    item
+                    for item in compatibility_state.get("overlays", [])
+                    if item.get("type") == "caption"
+                )
+                compatibility_semantic = compatibility_caption.get("semantic_review") or {}
+                self.assertEqual(compatibility_caption.get("text"), "P7 semantic corrected")
+                self.assertEqual(compatibility_semantic.get("status"), "resolved_manual")
+                self.assertEqual(compatibility_semantic.get("candidates"), [])
+                self.assertTrue(compatibility_semantic.get("resolved_at"))
+                self.assertEqual(
+                    compatibility_state.get("publishing", {}).get("generator"),
+                    "deterministic-transcript-draft-v1",
+                )
+                self._write_evidence_json(
+                    "state-compat/state-before-version.json",
+                    {
+                        "caption": {
+                            "text": compatibility_caption.get("text"),
+                            "semantic_review": compatibility_semantic,
+                        },
+                        "publishing": {
+                            "generator": compatibility_state.get("publishing", {}).get("generator"),
+                            "draft_status": compatibility_state.get("publishing", {}).get("draft_status"),
+                        },
+                    },
+                )
+
+                stage("state-compat-save-named-version")
+                compat_listing = self._open_versions(page)
+                self._write_evidence_json(
+                    "state-compat/http/list-before-save.json",
+                    compat_listing,
+                )
+                page.locator("#project-version-name").fill("P7 State Compatibility")
+                with page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and response.url.endswith("/api/project-versions"),
+                    timeout=90_000,
+                ) as compat_save_info:
+                    page.locator("#project-version-save").click()
+                compat_save_response = compat_save_info.value
+                compat_save_payload = compat_save_response.json()
+                compat_save_safe = {
+                    "http_status": compat_save_response.status,
+                    "ok": compat_save_payload.get("ok"),
+                    "reason": compat_save_payload.get("reason"),
+                    "code": compat_save_payload.get("code"),
+                    "error": compat_save_payload.get("error"),
+                    "version": compat_save_payload.get("version"),
+                }
+                self._write_evidence_json(
+                    "state-compat/http/save-version.json",
+                    compat_save_safe,
+                )
+                self.assertEqual(compat_save_response.status, 201, compat_save_safe)
+                self.assertTrue(compat_save_payload.get("ok"), compat_save_safe)
+                compatibility_version = compat_save_payload.get("version") or {}
+                compatibility_version_id = compatibility_version.get("version_id")
+                self.assertRegex(str(compatibility_version_id), r"^pv_[0-9a-f]{32}$")
+                page.wait_for_function(
+                    "() => document.querySelector('#project-versions-status')?.textContent.includes('版本已儲存')",
+                    timeout=30_000,
+                )
+
+                records_dir = self.project / "working/project_versions/records"
+                records_before_compat_edit = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in sorted(records_dir.glob("pv_*.json"))
+                ]
+                compatibility_record = next(
+                    record
+                    for record in records_before_compat_edit
+                    if record.get("version_id") == compatibility_version_id
+                )
+                saved_snapshot = compatibility_record.get("snapshot_state") or {}
+                saved_caption = next(
+                    item
+                    for item in saved_snapshot.get("overlays", [])
+                    if item.get("type") == "caption"
+                )
+                self.assertEqual(
+                    saved_snapshot.get("publishing", {}).get("generator"),
+                    "deterministic-transcript-draft-v1",
+                )
+                self.assertEqual(
+                    (saved_caption.get("semantic_review") or {}).get("status"),
+                    "resolved_manual",
+                )
+                self.assertTrue((saved_caption.get("semantic_review") or {}).get("resolved_at"))
+                self._write_evidence_json(
+                    "state-compat/disk/saved-record.json",
+                    {
+                        "version_id": compatibility_record.get("version_id"),
+                        "kind": compatibility_record.get("kind"),
+                        "publishing_generator": saved_snapshot.get("publishing", {}).get("generator"),
+                        "caption_semantic_review": saved_caption.get("semantic_review"),
+                    },
+                )
+
+                stage("state-compat-edit-after-save")
+                page.locator("#project-versions-close").click()
+                page.locator("#project-versions-dialog").wait_for(state="hidden", timeout=30_000)
+                caption_row = page.locator(".layer-row").filter(has_text="字幕").first
+                caption_row.click()
+                caption_input = page.locator("#overlay-text")
+                with page.expect_response(
+                    lambda response: response.request.method == "PUT"
+                    and response.url.endswith("/api/editor-state")
+                    and response.status == 200,
+                    timeout=90_000,
+                ):
+                    caption_input.fill("P7 compatibility changed after save")
+                page.wait_for_function(
+                    "() => document.querySelector('#save-state')?.classList.contains('is-saved') && document.querySelector('#save-state')?.textContent.includes('已儲存')",
+                    timeout=90_000,
+                )
+                compatibility_changed_state, _compatibility_changed_manifest = self._read_state_manifest()
+                changed_caption = next(
+                    item
+                    for item in compatibility_changed_state.get("overlays", [])
+                    if item.get("type") == "caption"
+                )
+                self.assertEqual(changed_caption.get("text"), "P7 compatibility changed after save")
+
+                stage("state-compat-restore-and-remained-cleared")
+                compat_listing_before_restore = self._open_versions(page)
+                auto_before_compat = sum(
+                    item.get("kind") == "auto_before_restore"
+                    for item in [
+                        json.loads(path.read_text(encoding="utf-8"))
+                        for path in sorted(records_dir.glob("pv_*.json"))
+                    ]
+                )
+                compat_row = page.locator(".project-version-row").filter(
+                    has_text="P7 State Compatibility"
+                ).first
+                compat_row.wait_for(timeout=30_000)
+                with page.expect_response(
+                    lambda response: response.request.method == "GET"
+                    and response.url.endswith(f"/api/project-versions/{compatibility_version_id}"),
+                    timeout=90_000,
+                ):
+                    compat_row.click()
+                page.locator("#project-version-detail").get_by_role(
+                    "button", name="還原此版本"
+                ).click()
+                page.locator("#project-version-restore-dialog[open]").wait_for(timeout=30_000)
+                compat_restore_capture_key = "p7-state-compat-restore-capture"
+                page.evaluate(
+                    """
+                    ([captureKey, expectedPath]) => {
+                      const nativeFetch = window.fetch.bind(window);
+                      window.fetch = async (...args) => {
+                        const response = await nativeFetch(...args);
+                        const request = args[0];
+                        const options = args[1] || {};
+                        const url = typeof request === 'string' ? request : request.url;
+                        const method = String(options.method || request?.method || 'GET').toUpperCase();
+                        const target = new URL(url, window.location.href);
+                        if (
+                          method === 'POST'
+                          && target.origin === window.location.origin
+                          && target.pathname === expectedPath
+                        ) {
+                          const payload = await response.clone().json();
+                          sessionStorage.setItem(captureKey, JSON.stringify({
+                            http_status: response.status,
+                            payload: {
+                              ok: payload?.ok,
+                              automatic_backup: payload?.automatic_backup,
+                              reload_required: payload?.reload_required,
+                            },
+                          }));
+                        }
+                        return response;
+                      };
+                    }
+                    """,
+                    [
+                        compat_restore_capture_key,
+                        f"/api/project-versions/{compatibility_version_id}/restore",
+                    ],
+                )
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=90_000):
+                    with page.expect_response(
+                        lambda response: response.request.method == "POST"
+                        and response.url.endswith(f"/api/project-versions/{compatibility_version_id}/restore"),
+                        timeout=90_000,
+                    ) as compat_restore_info:
+                        page.locator("#project-version-restore-confirm").click()
+                compat_restore_response = compat_restore_info.value
+                compat_restore_capture = page.evaluate(
+                    """
+                    captureKey => {
+                      const raw = sessionStorage.getItem(captureKey);
+                      sessionStorage.removeItem(captureKey);
+                      return raw ? JSON.parse(raw) : null;
+                    }
+                    """,
+                    compat_restore_capture_key,
+                )
+                self.assertIsInstance(compat_restore_capture, dict)
+                self.assertEqual(
+                    compat_restore_capture.get("http_status"),
+                    compat_restore_response.status,
+                    compat_restore_capture,
+                )
+                compat_restore_payload = compat_restore_capture.get("payload") or {}
+                self.assertEqual(compat_restore_response.status, 200, compat_restore_payload)
+                self.assertTrue(compat_restore_payload.get("ok"), compat_restore_payload)
+                self.assertTrue(compat_restore_payload.get("reload_required"), compat_restore_payload)
+                compat_backup = compat_restore_payload.get("automatic_backup") or {}
+                self.assertEqual(compat_backup.get("kind"), "auto_before_restore")
+                self.assertRegex(str(compat_backup.get("version_id")), r"^pv_[0-9a-f]{32}$")
+                self._wait_initialized(page)
+                compatibility_state_restored, compatibility_manifest_restored = self._read_state_manifest()
+                restored_caption = next(
+                    item
+                    for item in compatibility_state_restored.get("overlays", [])
+                    if item.get("type") == "caption"
+                )
+                self.assertEqual(restored_caption.get("text"), "P7 semantic corrected")
+                self.assertEqual(
+                    (restored_caption.get("semantic_review") or {}).get("status"),
+                    "resolved_manual",
+                )
+                self.assertTrue((restored_caption.get("semantic_review") or {}).get("resolved_at"))
+                self.assertEqual(
+                    compatibility_state_restored.get("publishing", {}).get("generator"),
+                    "deterministic-transcript-draft-v1",
+                )
+                # The earlier response-loss restore already cleared authority;
+                # this flow proves the compatibility restore does not resurrect it.
+                self.assertFalse((compatibility_state_restored.get("rights") or {}).get("asserted"))
+                self.assertTrue(
+                    all(
+                        not approval.get("approved")
+                        for approval in compatibility_manifest_restored.get("approvals", {}).values()
+                        if isinstance(approval, dict)
+                    )
+                )
+                compatibility_rights = json.loads(
+                    (self.project / "working/rights_assertion.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(compatibility_rights.get("items"), [])
+                records_after_compat_restore = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in sorted(records_dir.glob("pv_*.json"))
+                ]
+                auto_after_compat = [
+                    record
+                    for record in records_after_compat_restore
+                    if record.get("kind") == "auto_before_restore"
+                ]
+                self.assertEqual(len(auto_after_compat), auto_before_compat + 1)
+                compatibility_backup_record = next(
+                    record
+                    for record in auto_after_compat
+                    if record.get("version_id") == compat_backup.get("version_id")
+                )
+                self.assertEqual(
+                    (compatibility_backup_record.get("snapshot_state") or {})
+                    .get("publishing", {})
+                    .get("generator"),
+                    "deterministic-transcript-draft-v1",
+                )
+                self._write_evidence_json(
+                    "state-compat/result.json",
+                    {
+                        "outcome": "CONFIRMED_STATE_COMPATIBILITY_UI",
+                        "copy_generator_persisted": True,
+                        "resolved_manual_persisted": True,
+                        "named_version_saved": compatibility_version_id,
+                        "restore_http_status": compat_restore_response.status,
+                        "automatic_backup": compat_backup.get("version_id"),
+                        "rights_and_approvals_remained_cleared": True,
                     },
                 )
                 stage("confirmed")
