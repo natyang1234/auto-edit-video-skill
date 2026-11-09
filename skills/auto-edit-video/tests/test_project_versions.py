@@ -205,6 +205,175 @@ class ProjectVersionUnitTests(unittest.TestCase):
         self.assertEqual(store.list_records(), [])
         self.assertEqual(list(store.records_dir.iterdir()), [])
 
+    def test_new_owned_files_are_0600_under_restrictive_umask(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        store.records_dir.mkdir(parents=True, mode=0o700)
+        store.records_dir.chmod(0o700)
+        journal = self.project / project_versions.JOURNAL_REL
+        restore_target = self.project / "working/restrictive-target.json"
+
+        previous_umask = os.umask(0o277)
+        try:
+            project_versions._atomic_replace_exact(journal, b'{"phase":"synthetic"}\n')
+            project_versions._atomic_replace_exact(
+                restore_target, b'{"target":"synthetic"}\n'
+            )
+            record = self.create_record(store)
+        finally:
+            os.umask(previous_umask)
+
+        record_path = store.records_dir / f"{record['version_id']}.json"
+        modes = {
+            "record": record_path.stat().st_mode & 0o777,
+            "journal": journal.stat().st_mode & 0o777,
+            "restore_target": restore_target.stat().st_mode & 0o777,
+        }
+        print(
+            "P7_UMASK existing="
+            + json.dumps({key: f"{value:04o}" for key, value in modes.items()}, sort_keys=True),
+            flush=True,
+        )
+        self.assertEqual(modes, {"record": 0o600, "journal": 0o600, "restore_target": 0o600})
+        self.assertEqual(store.load(record["version_id"]), record)
+
+    def test_first_create_makes_only_new_owned_directories_exact_0700(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        version_root = self.project / "working/project_versions"
+        self.assertFalse(version_root.exists())
+
+        previous_umask = os.umask(0o277)
+        try:
+            record = self.create_record(store)
+        finally:
+            os.umask(previous_umask)
+
+        record_path = store.records_dir / f"{record['version_id']}.json"
+        modes = {
+            "version_root": version_root.stat().st_mode & 0o777,
+            "records": store.records_dir.stat().st_mode & 0o777,
+            "record": record_path.stat().st_mode & 0o777,
+        }
+        print(
+            "P7_UMASK new_store="
+            + json.dumps({key: f"{value:04o}" for key, value in modes.items()}, sort_keys=True),
+            flush=True,
+        )
+        self.assertEqual(modes, {"version_root": 0o700, "records": 0o700, "record": 0o600})
+        self.assertEqual(store.load(record["version_id"]), record)
+
+    def test_standard_owner_only_umask_keeps_exact_modes(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        previous_umask = os.umask(0o077)
+        try:
+            record = self.create_record(store)
+        finally:
+            os.umask(previous_umask)
+        record_path = store.records_dir / f"{record['version_id']}.json"
+        self.assertEqual((self.project / "working/project_versions").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(store.records_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(record_path.stat().st_mode & 0o777, 0o600)
+
+    def test_owner_bits_cleared_files_are_repaired_but_new_directory_fails_closed(self) -> None:
+        existing_store = project_versions.ProjectVersionStore(self.project)
+        existing_store.records_dir.mkdir(parents=True, mode=0o700)
+        existing_store.records_dir.chmod(0o700)
+        target = self.project / "working/owner-bits-cleared.json"
+        previous_umask = os.umask(0o777)
+        try:
+            project_versions._atomic_replace_exact(target, b"synthetic\n")
+            record = self.create_record(existing_store)
+        finally:
+            os.umask(previous_umask)
+        record_path = existing_store.records_dir / f"{record['version_id']}.json"
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(record_path.stat().st_mode & 0o777, 0o600)
+
+        blocked_project = Path(self.temp.name) / "owner-bits-cleared-new-store"
+        (blocked_project / "working").mkdir(parents=True)
+        blocked_store = project_versions.ProjectVersionStore(blocked_project)
+        previous_umask = os.umask(0o777)
+        try:
+            with self.assertRaises(OSError):
+                self.create_record(blocked_store)
+        finally:
+            os.umask(previous_umask)
+        self.assertFalse((blocked_project / "working/project_versions").exists())
+
+    def test_fchmod_failures_never_publish_or_replace(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        store.records_dir.mkdir(parents=True, mode=0o700)
+        store.records_dir.chmod(0o700)
+        with patch.object(
+            project_versions.os,
+            "fchmod",
+            side_effect=OSError("synthetic file fchmod failure"),
+        ):
+            with self.assertRaises(OSError):
+                self.create_record(store)
+        self.assertEqual(list(store.records_dir.iterdir()), [])
+
+        target = self.project / "working/existing-target.json"
+        original = b'{"original":true}\n'
+        target.write_bytes(original)
+        target.chmod(0o600)
+        with patch.object(
+            project_versions.os,
+            "fchmod",
+            side_effect=OSError("synthetic atomic fchmod failure"),
+        ):
+            with self.assertRaises(OSError):
+                project_versions._atomic_replace_exact(target, b'{"replacement":true}\n')
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            [path for path in target.parent.iterdir() if path.name.startswith(f".{target.name}.")],
+            [],
+        )
+
+    def test_new_directory_fchmod_failure_cleans_only_created_identity(self) -> None:
+        store = project_versions.ProjectVersionStore(self.project)
+        resolved_project = self.project.resolve()
+        version_root = resolved_project / "working/project_versions"
+        with patch.object(
+            project_versions.os,
+            "fchmod",
+            side_effect=OSError("synthetic directory fchmod failure"),
+        ):
+            with self.assertRaises(OSError):
+                self.create_record(store)
+        self.assertFalse(version_root.exists())
+
+        version_root.mkdir(mode=0o750)
+        records = version_root / "records"
+        records.mkdir(mode=0o750)
+        before = {
+            version_root: version_root.stat().st_mode & 0o777,
+            records: records.stat().st_mode & 0o777,
+        }
+        project_versions._assert_owned_parents(
+            resolved_project,
+            records / "placeholder.json",
+            create=True,
+        )
+        self.assertEqual(
+            {path: path.stat().st_mode & 0o777 for path in before},
+            before,
+        )
+
+        records.rmdir()
+        version_root.rmdir()
+        external = Path(self.temp.name) / "external-records"
+        external.mkdir()
+        version_root.symlink_to(external, target_is_directory=True)
+        with self.assertRaises(OSError):
+            project_versions._assert_owned_parents(
+                resolved_project,
+                version_root / "records/placeholder.json",
+                create=True,
+            )
+        self.assertTrue(version_root.is_symlink())
+        self.assertEqual(list(external.iterdir()), [])
+
     def test_leftover_temp_is_cleaned_but_corrupt_final_record_is_not_hidden(self) -> None:
         store = project_versions.ProjectVersionStore(self.project)
         store.records_dir.mkdir(parents=True)

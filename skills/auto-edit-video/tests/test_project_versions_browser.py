@@ -282,6 +282,16 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
               document.querySelector('#project-version-name').dispatchEvent(event);
               return event.defaultPrevented;
             }"""))
+            whitespace_posts = len(posts)
+            page.locator("#project-version-name").fill("   ")
+            page.locator("#project-version-save").click()
+            page.wait_for_timeout(100)
+            whitespace_status = page.locator("#project-versions-status")
+            self.assertIn("請輸入版本名稱", whitespace_status.inner_text())
+            self.assertTrue(whitespace_status.evaluate("el => el.classList.contains('is-error')"))
+            self.assertEqual(len(posts), whitespace_posts)
+            self.assertEqual(page.evaluate("() => document.activeElement.id"), "project-version-name")
+            print(f"P7_EMPTY_NAME status={whitespace_status.inner_text()!r} posts={len(posts)} focus={page.evaluate('() => document.activeElement.id')!r}", flush=True)
             page.locator("#project-version-name").fill("錯誤版本")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('版本名稱規則')")
