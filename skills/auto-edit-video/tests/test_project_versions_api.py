@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import http.client
@@ -248,6 +249,91 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertEqual(status, 200, saved)
         self.wait_for_caption_quiescence()
         return json.loads((self.project / "working/editor_state.json").read_text())
+
+    def restore_version(self, version_id: str) -> tuple[int, dict[str, object]]:
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        current = listing["current"]
+        return self.request(
+            "POST",
+            f"/api/project-versions/{version_id}/restore",
+            {
+                "expected_state_digest": current["state_digest"],
+                "expected_render_revision": current["render_revision"],
+                "expected_manifest_digest": current["manifest_digest"],
+                "confirm_restore": True,
+            },
+        )
+
+    def mixed_audio_state(self) -> tuple[dict[str, object], dict[str, object], str]:
+        state = json.loads((self.project / "working/editor_state.json").read_text())
+        state["highlights"] = [
+            {
+                "id": "highlight-1",
+                "plan_item_id": "highlight-1",
+                "start": 0.0,
+                "end": 0.8,
+                "title": "Approved source highlight",
+                "review_status": "approved",
+            },
+            {
+                "id": "highlight-2",
+                "plan_item_id": "highlight-2",
+                "start": 0.9,
+                "end": 1.4,
+                "title": "Second approved source highlight",
+                "review_status": "approved",
+            },
+            {
+                "id": "highlight-3",
+                "plan_item_id": "highlight-3",
+                "start": 1.5,
+                "end": 1.9,
+                "title": "Already pending highlight",
+                "review_status": "pending",
+            },
+        ]
+        state["active_highlight_id"] = "highlight-1"
+        self.plan["items"] = [
+            {
+                "id": item["plan_item_id"],
+                "start": item["start"],
+                "end": item["end"],
+                "title": item["title"],
+                "review_status": item["review_status"],
+            }
+            for item in state["highlights"]
+        ]
+        self.write_json("working/highlight_plan.json", self.plan)
+        editor_server.upgrade_video_template_state(state)
+        plan = json.loads(
+            (SKILL_DIR / "contracts/fixtures/audio_event_plan/valid_v2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        source_revision = editor_server.editor_base_state_revision(state)
+        plan["timeline_revision"] = source_revision
+        plan_hash = editor_server.contract_registry.canonical_hash(plan)
+        source_event = plan["events"][0]
+        edits = {
+            "schema_version": 1,
+            "source_render_id": "version-audio-source",
+            "source_plan_sha256": plan_hash,
+            "source_timeline_revision": source_revision,
+            "events": [
+                {
+                    "id": source_event["id"],
+                    "source_event_sha256": editor_server.contract_registry.canonical_hash(
+                        source_event
+                    ),
+                    "event_start_sample": source_event["event_start_sample"],
+                    "gain_db": -18,
+                }
+            ],
+        }
+        state["audio_event_edits"] = edits
+        state["revision"] = editor_server.editor_state_revision(state)
+        return state, plan, plan_hash
 
     def exercise_stock_state_shape(
         self,
@@ -1773,6 +1859,391 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertNotIn("journal retained", diagnostic.lower())
         self.assertNotIn("Traceback", diagnostic)
         self.assertNotIn(str(self.project), diagnostic)
+
+    def test_audio_versions_rebind_only_the_unique_sanitized_approval_subset(self) -> None:
+        live, plan, plan_hash = self.mixed_audio_state()
+        edits = copy.deepcopy(live["audio_event_edits"])
+        self.write_json("working/editor_state.json", live)
+
+        with patch.object(
+            editor_server,
+            "_finalized_audio_plan",
+            return_value=(plan, plan_hash),
+        ):
+            saved = self.create_version("audio approval downgrade")
+            version_id = saved["version"]["version_id"]
+
+            current = json.loads(
+                (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+            )
+            current["editing_brief"] = "current audio state before restore"
+            current["revision"] = editor_server.editor_state_revision(current)
+            self.write_json("working/editor_state.json", current)
+
+            status, restored = self.restore_version(version_id)
+            self.assertEqual(status, 200, restored)
+            self.assertEqual(restored["automatic_backup"]["kind"], "auto_before_restore")
+            restored_state = json.loads(
+                (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["review_status"] for item in restored_state["highlights"]],
+                ["pending", "pending", "pending"],
+            )
+            self.assertEqual(restored_state["audio_event_edits"], edits)
+
+            status, project = self.request("GET", "/api/project")
+            self.assertEqual(status, 200, project)
+            self.assertTrue(project["audio_event_timeline"]["editable"], project)
+            self.assertEqual(project["audio_event_timeline"]["events"][0]["gain_db"], -18)
+
+            status, rejected = self.request(
+                "POST",
+                "/api/render",
+                {
+                    "quality": "final",
+                    "expected_revision": project["state"]["revision"],
+                },
+            )
+            self.assertEqual(status, 409, rejected)
+
+            correct = copy.deepcopy(restored_state)
+            correct["highlights"][0]["review_status"] = "approved"
+            correct["highlights"][1]["review_status"] = "approved"
+            render_id, resolved, resolved_hash = editor_server.resolve_audio_event_source(
+                self.project, correct
+            )
+            self.assertEqual((render_id, resolved_hash), ("version-audio-source", plan_hash))
+            self.assertEqual(resolved, plan)
+            self.assertEqual(
+                editor_server.resolve_studio_audio_plan(plan, edits)["studio_edits"], edits
+            )
+
+            partial = copy.deepcopy(restored_state)
+            partial["highlights"][0]["review_status"] = "approved"
+            editor_server.resolve_audio_event_source(self.project, partial)
+            partial = self.put_state(partial)
+            status, destructive = self.request(
+                "POST",
+                "/api/approve",
+                {
+                    "gate": "destructive_edit",
+                    "expected_revision": editor_server.gate_revision(
+                        self.project, "destructive_edit", partial
+                    ),
+                },
+            )
+            self.assertEqual(status, 200, destructive)
+            status, highlight_approval = self.request(
+                "POST",
+                "/api/approve",
+                {
+                    "gate": "highlight_selection",
+                    "expected_revision": editor_server.gate_revision(
+                        self.project, "highlight_selection", partial
+                    ),
+                },
+            )
+            self.assertEqual(status, 200, highlight_approval)
+            jobs_before = copy.deepcopy(self.server.fx_preview_jobs._jobs)
+            render_before = copy.deepcopy(self.server.render_status)
+            status, timeline_blocked = self.request(
+                "POST",
+                "/api/approve",
+                {
+                    "gate": "timeline",
+                    "expected_revision": editor_server.gate_revision(
+                        self.project, "timeline", partial
+                    ),
+                },
+            )
+            self.assertEqual(status, 409, timeline_blocked)
+            self.assertIn("Second approved source highlight", timeline_blocked["error"])
+            self.assertIn("highlight-2", timeline_blocked["error"])
+            self.assertNotIn("Already pending highlight", timeline_blocked["error"])
+            self.assertNotIn("highlight-3", timeline_blocked["error"])
+            self.assertEqual(self.server.fx_preview_jobs._jobs, jobs_before)
+            self.assertEqual(self.server.render_status, render_before)
+
+            status, render_blocked = self.request(
+                "POST",
+                "/api/render",
+                {
+                    "quality": "final",
+                    "expected_revision": partial["revision"],
+                },
+            )
+            self.assertEqual(status, 409, render_blocked)
+            self.assertIn("Second approved source highlight", render_blocked["error"])
+            self.assertNotIn("highlight-3", render_blocked["error"])
+            self.assertEqual(self.server.fx_preview_jobs._jobs, jobs_before)
+            self.assertEqual(self.server.render_status, render_before)
+
+            manifest = json.loads(
+                (self.project / "project.json").read_text(encoding="utf-8")
+            )
+            manifest["approvals"]["timeline"] = {
+                "approved": True,
+                "state_revision": editor_server.gate_revision(
+                    self.project, "timeline", partial
+                ),
+            }
+            with patch.object(editor_server, "delivery_qa_errors", return_value=[]):
+                self.assertEqual(
+                    editor_server.approval_prerequisite_errors(
+                        self.project, manifest, partial, "final"
+                    )[0],
+                    timeline_blocked["error"],
+                )
+            partial_plan = copy.deepcopy(plan)
+            partial_plan["timeline_revision"] = editor_server.editor_base_state_revision(
+                partial
+            )
+            with self.assertRaisesRegex(
+                editor_server.AudioEventEditError,
+                "source_timeline_revision.*does not match plan timeline",
+            ):
+                editor_server.resolve_studio_audio_plan(partial_plan, edits)
+
+            complete = copy.deepcopy(partial)
+            complete["highlights"][1]["review_status"] = "approved"
+            complete = self.put_state(complete)
+            status, highlight_approval = self.request(
+                "POST",
+                "/api/approve",
+                {
+                    "gate": "highlight_selection",
+                    "expected_revision": editor_server.gate_revision(
+                        self.project, "highlight_selection", complete
+                    ),
+                },
+            )
+            self.assertEqual(status, 200, highlight_approval)
+            status, timeline_approval = self.request(
+                "POST",
+                "/api/approve",
+                {
+                    "gate": "timeline",
+                    "expected_revision": editor_server.gate_revision(
+                        self.project, "timeline", complete
+                    ),
+                },
+            )
+            self.assertEqual(status, 200, timeline_approval)
+            self.assertEqual(
+                editor_server.resolve_studio_audio_plan(plan, edits)["studio_edits"], edits
+            )
+
+            wrong = copy.deepcopy(restored_state)
+            wrong["highlights"][2]["review_status"] = "approved"
+            with self.assertRaisesRegex(
+                editor_server.AudioEventEditError, "stale for current visual state"
+            ):
+                editor_server.resolve_audio_event_source(self.project, wrong)
+
+            for label, mutate in (
+                ("title", lambda state: state["highlights"][0].update(title="drift")),
+                ("timing", lambda state: state["highlights"][0].update(end=0.7)),
+            ):
+                stale = copy.deepcopy(restored_state)
+                mutate(stale)
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    editor_server.AudioEventEditError, "stale for current visual state"
+                ):
+                    editor_server.resolve_audio_event_source(self.project, stale)
+                readiness = editor_server.audio_event_producer_readiness_errors(
+                    self.project, stale
+                )
+                self.assertEqual(len(readiness), 1)
+                self.assertIn("不一致", readiness[0])
+
+            changed_hash = copy.deepcopy(restored_state)
+            changed_hash["audio_event_edits"]["source_plan_sha256"] = "f" * 64
+            with self.assertRaisesRegex(editor_server.AudioEventEditError, "plan hash changed"):
+                editor_server.resolve_audio_event_source(self.project, changed_hash)
+            changed_hash_readiness = editor_server.audio_event_producer_readiness_errors(
+                self.project, changed_hash
+            )
+            self.assertEqual(len(changed_hash_readiness), 1)
+            self.assertIn("不一致", changed_hash_readiness[0])
+
+            changed_timeline = copy.deepcopy(plan)
+            changed_timeline["timeline_revision"] = "e" * 64
+            with patch.object(
+                editor_server,
+                "_finalized_audio_plan",
+                return_value=(changed_timeline, plan_hash),
+            ), self.assertRaisesRegex(
+                editor_server.AudioEventEditError, "timeline binding changed"
+            ):
+                editor_server.resolve_audio_event_source(self.project, restored_state)
+
+            malformed = copy.deepcopy(restored_state)
+            malformed["highlights"] = "not-a-list"
+            with self.assertRaisesRegex(editor_server.AudioEventEditError, "highlights"):
+                editor_server.resolve_audio_event_source(self.project, malformed)
+
+            too_many = copy.deepcopy(restored_state)
+            too_many["highlights"] = [
+                {
+                    "id": f"highlight-{index}",
+                    "start": 0.0,
+                    "end": 0.1,
+                    "title": str(index),
+                    "review_status": "pending",
+                }
+                for index in range(11)
+            ]
+            with self.assertRaisesRegex(editor_server.AudioEventEditError, "10"):
+                editor_server.resolve_audio_event_source(self.project, too_many)
+
+    def test_project_font_dependencies_are_stable_but_bytes_and_receipts_are_bound(self) -> None:
+        font_a = "font-google-fonts-0123456789abcdef-0123456789abcdef"
+        font_b = "font-fontsource-1123456789abcdef-1123456789abcdef"
+        font_c = "font-github-fonts-2123456789abcdef-2123456789abcdef"
+        bindings: dict[str, dict[str, object]] = {}
+        dynamic_nonce = "initial"
+
+        def make_binding(asset_id: str, marker: str) -> dict[str, object]:
+            return {
+                "asset_id": asset_id,
+                "path": f"assets/providers/fonts/{asset_id}.ttf",
+                "sha256": hashlib.sha256(f"font-bytes-{marker}".encode()).hexdigest(),
+                "provider_id": "google-fonts",
+                "license_spdx": "OFL-1.1",
+                "receipt": {"schema_version": 3, "identity": f"receipt-{marker}"},
+                "validation_receipt": {"required_coverage_sha256": dynamic_nonce},
+                "coverage": {"required_coverage_sha256": dynamic_nonce},
+            }
+
+        bindings.update(
+            {
+                font_a: make_binding(font_a, "a"),
+                font_b: make_binding(font_b, "b"),
+                font_c: make_binding(font_c, "c"),
+            }
+        )
+
+        def resolve_font(_project: Path, asset_id: str, required_text: str = ""):
+            del required_text
+            if asset_id not in bindings:
+                raise editor_server.asset_registry.AssetRegistryError("font missing")
+            value = copy.deepcopy(bindings[asset_id])
+            value["validation_receipt"]["required_coverage_sha256"] = dynamic_nonce
+            value["coverage"]["required_coverage_sha256"] = dynamic_nonce
+            return value
+
+        target = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        target["caption_defaults"]["font_asset_id"] = font_a
+        target["overlays"][0]["style"]["font_asset_id"] = font_b
+        target["revision"] = editor_server.editor_state_revision(target)
+        self.write_json("working/editor_state.json", target)
+
+        with patch.object(
+            editor_server.asset_registry,
+            "resolve_project_font",
+            side_effect=resolve_font,
+        ):
+            saved = self.create_version("font dependency target")
+            version_id = saved["version"]["version_id"]
+            record = project_versions.ProjectVersionStore(self.project).load(version_id)
+            self.assertEqual(
+                {
+                    key
+                    for key in record["dependency_bindings"]
+                    if key.startswith("project-font:")
+                },
+                {f"project-font:{font_a}", f"project-font:{font_b}"},
+            )
+
+            current = copy.deepcopy(target)
+            current["editing_brief"] = "current uses a distinct overlay font"
+            current["overlays"][0]["text"] = "Normal caption text change"
+            current["overlays"][0]["style"]["font_asset_id"] = font_c
+            current["revision"] = editor_server.editor_state_revision(current)
+            self.write_json("working/editor_state.json", current)
+
+            original_b = copy.deepcopy(bindings[font_b])
+            del bindings[font_b]
+            status, missing = self.restore_version(version_id)
+            self.assertEqual((status, missing["reason"]), (409, "asset_changed"))
+
+            bindings[font_b] = copy.deepcopy(original_b)
+            bindings[font_b]["sha256"] = "f" * 64
+            status, changed_bytes = self.restore_version(version_id)
+            self.assertEqual((status, changed_bytes["reason"]), (409, "dependency_changed"))
+
+            bindings[font_b] = copy.deepcopy(original_b)
+            bindings[font_b]["receipt"]["identity"] = "receipt-drift"
+            status, changed_receipt = self.restore_version(version_id)
+            self.assertEqual((status, changed_receipt["reason"]), (409, "dependency_changed"))
+
+            bindings[font_b] = copy.deepcopy(original_b)
+            dynamic_nonce = "text-dependent-validation-change"
+            status, restored = self.restore_version(version_id)
+            self.assertEqual(status, 200, restored)
+            restored_state = json.loads(
+                (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                restored_state["overlays"][0]["style"]["font_asset_id"], font_b
+            )
+            automatic_id = restored["automatic_backup"]["version_id"]
+            automatic = project_versions.ProjectVersionStore(self.project).load(automatic_id)
+            self.assertIn(f"project-font:{font_c}", automatic["dependency_bindings"])
+            self.assertNotIn(f"project-font:{font_b}", automatic["dependency_bindings"])
+
+    def test_fx_preview_is_blocked_by_version_journal_and_process_latch(self) -> None:
+        manager = self.server.fx_preview_jobs
+
+        def storage_snapshot() -> dict[str, object]:
+            return {
+                "jobs": copy.deepcopy(manager._jobs),
+                "active": manager._active_job_id,
+                "cache": sorted(
+                    path.relative_to(manager.root).as_posix()
+                    for path in manager.root.rglob("*")
+                    if path.is_file()
+                ),
+            }
+
+        before = storage_snapshot()
+        journal = self.project / project_versions.JOURNAL_REL
+        journal.write_text("{}\n", encoding="utf-8")
+        body = {
+            "schema_version": 1,
+            "expected_revision": self.state["revision"],
+            "candidate": {
+                "code": "T3",
+                "window": {"start_s": 0.0, "duration_s": 0.5},
+                "values": {},
+                "placement": "",
+                "scheme": "",
+                "font_ids": {},
+            },
+        }
+        status, blocked = self.request("POST", "/api/fx-previews", body)
+        self.assertEqual((status, blocked["reason"]), (503, "version_recovery_required"))
+        self.assertTrue(self.server.project_version_recovery_latched)
+        self.assertEqual(storage_snapshot(), before)
+
+        journal.unlink()
+        status, latched = self.request("POST", "/api/fx-previews", body)
+        self.assertEqual((status, latched["reason"]), (503, "version_recovery_required"))
+        self.assertEqual(storage_snapshot(), before)
+
+        self.server.project_version_recovery_latched = False
+        healthy = self.server.fx_preview_context()
+        self.assertEqual(healthy["state_revision"], self.state["revision"])
+        with patch.object(
+            editor_server,
+            "ensure_caption_preset_mutation_ready",
+            side_effect=editor_server.CaptionPresetRecoveryError("caption journal"),
+        ), self.assertRaisesRegex(editor_server.FxPreviewJobError, "字幕預設交易") as raised:
+            self.server.fx_preview_context()
+        self.assertEqual(raised.exception.code, "transaction_recovery_required")
 
     def test_invalid_opaque_id_returns_json_not_found(self) -> None:
         status, payload = self.request("GET", "/api/project-versions/not-an-id")
