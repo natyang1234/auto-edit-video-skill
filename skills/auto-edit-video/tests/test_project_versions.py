@@ -99,6 +99,84 @@ class ProjectVersionUnitTests(unittest.TestCase):
         self.assertIsNone(snapshot["publishing"]["cover"]["output"])
         self.assertEqual(snapshot["rights"], {"asserted": False, "assertion_revision": None})
 
+    def test_sanitize_accepts_stock_non_authoritative_producer_metadata(self) -> None:
+        state = self.state()
+        state["publishing"]["generator"] = "deterministic-transcript-draft-v1"
+        state["overlays"][0]["semantic_review"] = {
+            "status": "pending",
+            "unit_id": "unit-1",
+            "candidates": [{"source": "錯字", "replacement": "正字"}],
+            "resolved_at": None,
+        }
+        snapshot = project_versions.sanitize_state(state)
+        self.assertEqual(
+            snapshot["publishing"]["generator"],
+            "deterministic-transcript-draft-v1",
+        )
+        self.assertEqual(snapshot["publishing"]["draft_status"], "local_draft_requires_review")
+        self.assertEqual(snapshot["overlays"][0]["semantic_review"]["status"], "pending")
+        self.assertIsNone(snapshot["overlays"][0]["semantic_review"]["resolved_at"])
+
+        state["publishing"].update({"title": "", "body": "", "hashtags": []})
+        snapshot = project_versions.sanitize_state(state)
+        self.assertEqual(snapshot["publishing"]["draft_status"], "not_generated")
+        self.assertEqual(
+            snapshot["publishing"]["generator"],
+            "deterministic-transcript-draft-v1",
+        )
+
+        state["overlays"][0]["semantic_review"] = {
+            "status": "resolved_manual",
+            "unit_id": "unit-1",
+            "candidates": [],
+            "resolved_at": "2026-11-09T01:24:03.795Z",
+        }
+        snapshot = project_versions.sanitize_state(state)
+        self.assertEqual(
+            snapshot["overlays"][0]["semantic_review"],
+            state["overlays"][0]["semantic_review"],
+        )
+
+    def test_sanitize_rejects_unknown_or_malformed_producer_metadata(self) -> None:
+        for generator in ("future-copy-generator-v2", 7):
+            with self.subTest(generator=generator):
+                state = self.state()
+                state["publishing"]["generator"] = generator
+                with self.assertRaises(project_versions.ProjectVersionError) as caught:
+                    project_versions.sanitize_state(state)
+                self.assertEqual(caught.exception.code, "unsupported_snapshot")
+
+        for semantic in (
+            {
+                "status": "future_manual_status",
+                "unit_id": "unit-1",
+                "candidates": [],
+            },
+            {
+                "status": ["pending"],
+                "unit_id": "unit-1",
+                "candidates": [],
+            },
+            {
+                "status": "resolved_manual",
+                "unit_id": "unit-1",
+                "candidates": [],
+                "resolved_at": 7,
+            },
+            {
+                "status": "resolved_manual",
+                "unit_id": "unit-1",
+                "candidates": [],
+                "resolved_at": "not-an-iso-timestamp",
+            },
+        ):
+            with self.subTest(semantic=semantic):
+                state = self.state()
+                state["overlays"][0]["semantic_review"] = semantic
+                with self.assertRaises(project_versions.ProjectVersionError) as caught:
+                    project_versions.sanitize_state(state)
+                self.assertEqual(caught.exception.code, "unsupported_snapshot")
+
     def test_sanitize_manifest_reports_only_actually_approved_variant_maps(self) -> None:
         timestamp = "2026-11-09T00:00:00Z"
         manifest = {

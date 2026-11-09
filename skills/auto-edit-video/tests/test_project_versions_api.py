@@ -9,7 +9,9 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -228,6 +230,131 @@ class ProjectVersionsApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 201, saved)
         return saved
+
+    def wait_for_caption_quiescence(self) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with self.server.caption_job_lock:
+                if self.server.caption_job.get("state") != "rendering":
+                    return
+            time.sleep(0.02)
+        self.fail(f"caption worker did not quiesce: {self.server.caption_job}")
+
+    def put_state(self, state: dict[str, object]) -> dict[str, object]:
+        payload = json.loads(json.dumps(state))
+        payload["x_expected_revision"] = state["revision"]
+        status, saved = self.request("PUT", "/api/editor-state", payload)
+        self.assertEqual(status, 200, saved)
+        self.wait_for_caption_quiescence()
+        return json.loads((self.project / "working/editor_state.json").read_text())
+
+    def exercise_stock_state_shape(
+        self,
+        mutate: Callable[[dict[str, object]], None],
+        assert_preserved: Callable[[dict[str, object]], None],
+    ) -> None:
+        target = json.loads((self.project / "working/editor_state.json").read_text())
+        mutate(target)
+        target["editing_brief"] = "stock producer target"
+        target = self.put_state(target)
+        saved = self.create_version("stock producer target")
+
+        current = json.loads((self.project / "working/editor_state.json").read_text())
+        current["editing_brief"] = "stock producer current before restore"
+        current = self.put_state(current)
+
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        status, restored = self.request(
+            "POST",
+            f"/api/project-versions/{saved['version']['version_id']}/restore",
+            {
+                "expected_state_digest": listing["current"]["state_digest"],
+                "expected_render_revision": listing["current"]["render_revision"],
+                "expected_manifest_digest": listing["current"]["manifest_digest"],
+                "confirm_restore": True,
+            },
+        )
+        self.assertEqual(status, 200, restored)
+        restored_target = json.loads((self.project / "working/editor_state.json").read_text())
+        self.assertEqual(restored_target["editing_brief"], "stock producer target")
+        assert_preserved(restored_target)
+        manifest = json.loads((self.project / "project.json").read_text())
+        rights = json.loads((self.project / "working/rights_assertion.json").read_text())
+        self.assertNotIn("timeline_by_variant", manifest["approvals"])
+        self.assertNotIn("final_by_variant", manifest["approvals"])
+        self.assertTrue(all(not item["approved"] for item in manifest["approvals"].values()))
+        self.assertEqual(rights["items"], [])
+
+        status, listing = self.request("GET", "/api/project-versions")
+        self.assertEqual(status, 200, listing)
+        automatic = next(item for item in listing["versions"] if item["kind"] == "auto_before_restore")
+        status, restored_backup = self.request(
+            "POST",
+            f"/api/project-versions/{automatic['version_id']}/restore",
+            {
+                "expected_state_digest": listing["current"]["state_digest"],
+                "expected_render_revision": listing["current"]["render_revision"],
+                "expected_manifest_digest": listing["current"]["manifest_digest"],
+                "confirm_restore": True,
+            },
+        )
+        self.assertEqual(status, 200, restored_backup)
+        restored_current = json.loads((self.project / "working/editor_state.json").read_text())
+        self.assertEqual(restored_current["editing_brief"], "stock producer current before restore")
+        assert_preserved(restored_current)
+
+    def test_copy_draft_generator_round_trips_named_and_automatic_versions(self) -> None:
+        def mutate(state: dict[str, object]) -> None:
+            publishing = state["publishing"]
+            publishing.update(
+                editor_server.copy_draft(
+                    "instagram-reels", "這是一段用來產生本機發布文案草稿的逐字稿"
+                )
+            )
+            publishing["platform_id"] = "instagram-reels"
+
+        def assert_preserved(state: dict[str, object]) -> None:
+            publishing = state["publishing"]
+            self.assertEqual(publishing["generator"], "deterministic-transcript-draft-v1")
+            self.assertEqual(publishing["draft_status"], "local_draft_requires_review")
+            self.assertIsNone(publishing["cover"]["output"])
+
+        self.exercise_stock_state_shape(mutate, assert_preserved)
+
+    def test_pending_resolved_at_null_round_trips_named_and_automatic_versions(self) -> None:
+        def mutate(state: dict[str, object]) -> None:
+            state["overlays"][0]["semantic_review"] = {
+                "status": "pending",
+                "unit_id": "unit-1",
+                "candidates": [{"source": "錯字", "replacement": "正字"}],
+                "resolved_at": None,
+            }
+
+        def assert_preserved(state: dict[str, object]) -> None:
+            semantic = state["overlays"][0]["semantic_review"]
+            self.assertEqual(semantic["status"], "pending")
+            self.assertEqual(semantic["candidates"], [{"source": "錯字", "replacement": "正字"}])
+            self.assertIsNone(semantic["resolved_at"])
+
+        self.exercise_stock_state_shape(mutate, assert_preserved)
+
+    def test_resolved_manual_round_trips_named_and_automatic_versions(self) -> None:
+        def mutate(state: dict[str, object]) -> None:
+            state["overlays"][0]["semantic_review"] = {
+                "status": "resolved_manual",
+                "unit_id": "unit-1",
+                "candidates": [],
+                "resolved_at": "2026-11-09T01:24:03.795Z",
+            }
+
+        def assert_preserved(state: dict[str, object]) -> None:
+            semantic = state["overlays"][0]["semantic_review"]
+            self.assertEqual(semantic["status"], "resolved_manual")
+            self.assertEqual(semantic["candidates"], [])
+            self.assertEqual(semantic["resolved_at"], "2026-11-09T01:24:03.795Z")
+
+        self.exercise_stock_state_shape(mutate, assert_preserved)
 
     def restore_with_post_commit_cleanup_failure(
         self, *, fail_marker_rebuild: bool
