@@ -130,6 +130,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/state/overlays/2/semantic_reviewable/status", "kind": "changed", "saved_preview": '"saved review"', "current_preview": '"current review"'},
                         {"path": "/state/canvas/width", "kind": "changed", "saved_preview": "1080", "current_preview": "720"},
                         {"path": "/state/review/selected_overlay_id", "kind": "changed", "saved_preview": '"caption-a"', "current_preview": '"caption-b"'},
+                        {"path": "/state/review/warnings_acknowledged/0", "kind": "changed", "saved_preview": '"warning-saved"', "current_preview": '"warning-current"'},
                         {"path": "/state/custom/setting", "kind": "changed", "saved_preview": "null", "current_preview": "true"},
                         {"path": "/state/segments/1/id", "kind": "changed", "saved_preview": '"segment-0000a002"', "current_preview": '"segment-0000b002"'},
                         {"path": "/state/segments/1/source_start", "kind": "changed", "saved_preview": "1.05", "current_preview": "1.15"},
@@ -268,25 +269,38 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             semantic_similar_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：current review → 還原為：saved review'
             ).inner_text()
+            warning_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：warning-current → 還原為：warning-saved'
+            ).inner_text()
             canvas_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：720 → 還原為：1080'
             ).inner_text()
-            approval_change = page.locator(".project-version-content-changes li").filter(
+            selected_overlay_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：caption-b → 還原為：caption-a'
+            ).inner_text()
+            approval_status_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：已核可 → 還原為：待確認'
             ).inner_text()
             self.assertIn("發布平台", platform_change)
             self.assertIn("發佈文案", publishing_change)
             self.assertNotIn("發布平台", publishing_similar_change)
             self.assertNotIn("字幕修正紀錄", semantic_similar_change)
+            self.assertIn("其他編輯設定", semantic_similar_change)
+            self.assertNotIn("人工核可狀態", semantic_similar_change)
             self.assertIn("字幕修正紀錄", semantic_change)
+            self.assertIn("提醒確認紀錄", warning_change)
+            self.assertNotIn("人工核可狀態", warning_change)
             self.assertIn("輸出尺寸", canvas_change)
-            self.assertIn("人工核可狀態", approval_change)
+            self.assertIn("目前選取圖層", selected_overlay_change)
+            self.assertNotIn("人工核可狀態", selected_overlay_change)
+            self.assertIn("人工核可狀態", approval_status_change)
             print(
                 "P7_DIFF_LABELS "
                 f"platform={platform_change!r} publishing={publishing_change!r} "
                 f"publishing_similar={publishing_similar_change!r} "
                 f"semantic={semantic_change!r} semantic_similar={semantic_similar_change!r} "
-                f"canvas={canvas_change!r} approval={approval_change!r}",
+                f"warning={warning_change!r} canvas={canvas_change!r} "
+                f"selected_overlay={selected_overlay_change!r} approval_status={approval_status_change!r}",
                 flush=True,
             )
             self.assertTrue(page.locator(".project-version-row").nth(1).get_attribute("aria-pressed") == "true")

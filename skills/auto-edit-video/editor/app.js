@@ -367,6 +367,9 @@ function projectVersionChangeLabel(path) {
   if (/^\/publishing\/platform_id$/.test(value)) return "發布平台";
   if (/^\/publishing(?:\/|$)/.test(value)) return "發佈文案";
   if (/^\/overlays\/\d+\/semantic_review(?:\/|$)/.test(value)) return "字幕修正紀錄";
+  if (/^\/review\/selected_overlay_id$/.test(value)) return "目前選取圖層";
+  if (/^\/review\/warnings_acknowledged(?:\/|$)/.test(value)) return "提醒確認紀錄";
+  if (/^\/highlights\/\d+\/review_status$/.test(value)) return "人工核可狀態";
   const segmentTime = value.match(/^\/segments\/(\d+)\/(source_start|source_end)$/);
   if (segmentTime) return `第${Number(segmentTime[1]) + 1}段${segmentTime[2] === "source_start" ? "開始時間" : "結束時間"}`;
   if (/^\/overlays\/\d+\/(text|content)$/.test(value)) return "圖層文字";
@@ -377,7 +380,6 @@ function projectVersionChangeLabel(path) {
   if (/canvas|width|height|platform/i.test(value)) return "輸出尺寸";
   if (/publish|title|hashtags|cover/i.test(value)) return "發佈文案";
   if (/asset|rights|license/i.test(value)) return "素材權利";
-  if (/approval|approved|review/i.test(value)) return "人工核可狀態";
   return "其他編輯設定";
 }
 
