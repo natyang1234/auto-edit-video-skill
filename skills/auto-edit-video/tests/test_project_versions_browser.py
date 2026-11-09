@@ -128,6 +128,11 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/state/publishing_extra/format", "kind": "changed", "saved_preview": '"saved format"', "current_preview": '"current format"'},
                         {"path": "/state/overlays/2/semantic_review/candidates/a~1b", "kind": "changed", "saved_preview": '"saved candidate"', "current_preview": '"current candidate"'},
                         {"path": "/state/overlays/2/semantic_reviewable/status", "kind": "changed", "saved_preview": '"saved review"', "current_preview": '"current review"'},
+                        {"path": "/state/overlays/2/values/title", "kind": "changed", "saved_preview": '"saved fx title"', "current_preview": '"current fx title"'},
+                        {"path": "/state/video_template/frame/width", "kind": "changed", "saved_preview": "80", "current_preview": "75"},
+                        {"path": "/state/video_template/subject/x", "kind": "changed", "saved_preview": "42", "current_preview": "55"},
+                        {"path": "/state/overlays/2/material/asset_id", "kind": "changed", "saved_preview": '"asset-saved"', "current_preview": '"asset-current"'},
+                        {"path": "/state/overlays/2/spotlight_path/keyframes/0/x", "kind": "changed", "saved_preview": "0.2", "current_preview": "0.8"},
                         {"path": "/state/canvas/width", "kind": "changed", "saved_preview": "1080", "current_preview": "720"},
                         {"path": "/state/review/selected_overlay_id", "kind": "changed", "saved_preview": '"caption-a"', "current_preview": '"caption-b"'},
                         {"path": "/state/review/warnings_acknowledged/0", "kind": "changed", "saved_preview": '"warning-saved"', "current_preview": '"warning-current"'},
@@ -269,6 +274,21 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             semantic_similar_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：current review → 還原為：saved review'
             ).inner_text()
+            fx_values_title_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current fx title → 還原為：saved fx title'
+            ).inner_text()
+            template_frame_width_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：75 → 還原為：80'
+            ).inner_text()
+            template_subject_x_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：55 → 還原為：42'
+            ).inner_text()
+            material_asset_id_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：asset-current → 還原為：asset-saved'
+            ).inner_text()
+            spotlight_path_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：0.8 → 還原為：0.2'
+            ).inner_text()
             warning_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：warning-current → 還原為：warning-saved'
             ).inner_text()
@@ -284,10 +304,21 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertIn("發布平台", platform_change)
             self.assertIn("發佈文案", publishing_change)
             self.assertNotIn("發布平台", publishing_similar_change)
+            self.assertIn("其他編輯設定", publishing_similar_change)
+            self.assertNotIn("發佈文案", publishing_similar_change)
             self.assertNotIn("字幕修正紀錄", semantic_similar_change)
             self.assertIn("其他編輯設定", semantic_similar_change)
             self.assertNotIn("人工核可狀態", semantic_similar_change)
             self.assertIn("字幕修正紀錄", semantic_change)
+            self.assertIn("其他編輯設定", fx_values_title_change)
+            self.assertNotIn("發佈文案", fx_values_title_change)
+            self.assertIn("其他編輯設定", template_frame_width_change)
+            self.assertNotIn("輸出尺寸", template_frame_width_change)
+            self.assertIn("其他編輯設定", template_subject_x_change)
+            self.assertNotIn("聚光燈位置", template_subject_x_change)
+            self.assertIn("其他編輯設定", material_asset_id_change)
+            self.assertNotIn("素材權利", material_asset_id_change)
+            self.assertIn("聚光燈位置", spotlight_path_change)
             self.assertIn("提醒確認紀錄", warning_change)
             self.assertNotIn("人工核可狀態", warning_change)
             self.assertIn("輸出尺寸", canvas_change)
@@ -299,6 +330,9 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 f"platform={platform_change!r} publishing={publishing_change!r} "
                 f"publishing_similar={publishing_similar_change!r} "
                 f"semantic={semantic_change!r} semantic_similar={semantic_similar_change!r} "
+                f"fx_values_title={fx_values_title_change!r} template_frame_width={template_frame_width_change!r} "
+                f"template_subject_x={template_subject_x_change!r} material_asset_id={material_asset_id_change!r} "
+                f"spotlight_path={spotlight_path_change!r} "
                 f"warning={warning_change!r} canvas={canvas_change!r} "
                 f"selected_overlay={selected_overlay_change!r} approval_status={approval_status_change!r}",
                 flush=True,

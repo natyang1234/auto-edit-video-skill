@@ -373,13 +373,13 @@ function projectVersionChangeLabel(path) {
   const segmentTime = value.match(/^\/segments\/(\d+)\/(source_start|source_end)$/);
   if (segmentTime) return `第${Number(segmentTime[1]) + 1}段${segmentTime[2] === "source_start" ? "開始時間" : "結束時間"}`;
   if (/^\/overlays\/\d+\/(text|content)$/.test(value)) return "圖層文字";
-  if (/^\/overlays\/\d+\/(style|layout)/.test(value)) return "圖層樣式與位置";
-  if (/spotlight|subject.*(?:x|y)|manual_path/i.test(value)) return "聚光燈位置";
-  if (/caption|subtitle|effect_span/i.test(value)) return "字幕樣式";
-  if (/highlight|segment|clip/i.test(value)) return "片段設定";
-  if (/canvas|width|height|platform/i.test(value)) return "輸出尺寸";
-  if (/publish|title|hashtags|cover/i.test(value)) return "發佈文案";
-  if (/asset|rights|license/i.test(value)) return "素材權利";
+  if (/^\/overlays\/\d+\/(?:style|layout)(?:\/|$)/.test(value)) return "圖層樣式與位置";
+  if (/^\/overlays\/\d+\/spotlight_path(?:\/|$)/.test(value)) return "聚光燈位置";
+  if (/^\/(?:caption_generation|caption_defaults|caption_delivery)(?:\/|$)/.test(value)
+    || /^\/overlays\/\d+\/effect_spans(?:\/|$)/.test(value)) return "字幕樣式";
+  if (/^\/segments\/\d+(?:\/|$)/.test(value) || /^\/highlights\/\d+(?:\/|$)/.test(value)) return "片段設定";
+  if (/^\/canvas(?:\/|$)/.test(value)) return "輸出尺寸";
+  if (/^\/rights(?:\/|$)/.test(value)) return "素材權利";
   return "其他編輯設定";
 }
 

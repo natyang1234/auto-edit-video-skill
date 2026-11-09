@@ -9406,6 +9406,22 @@ def main() -> int:
         return 2
     try:
         server = EditorServer((args.host, args.port), project_dir)
+    except project_versions.ProjectVersionRecoveryError as exc:
+        print(
+            "Editor was not started because a project version restore transaction "
+            "could not be recovered safely.\n"
+            "Recovery journal path (preserve it if present): "
+            f"{project_versions.JOURNAL_REL}\n"
+            "Safe recovery requires any journal still present and the complete "
+            "automatic backup record it references. Do not delete or modify either "
+            "one. Fix the project disk space or file permissions, then restart the "
+            "editor. If the backup record is missing or corrupt, contact support "
+            "with an intact project backup; do not remove the journal to force "
+            "startup.\n"
+            f"Recovery detail: {exc}",
+            file=sys.stderr,
+        )
+        return 3
     except CaptionPresetRecoveryError as exc:
         journal = project_dir / CAPTION_PRESET_TXN_JOURNAL_REL
         print(

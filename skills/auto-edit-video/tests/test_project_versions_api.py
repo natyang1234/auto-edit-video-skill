@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import http.client
+import io
 import json
 import os
 import shutil
@@ -1654,6 +1655,124 @@ class ProjectVersionsApiTests(unittest.TestCase):
         with self.assertRaises(project_versions.ProjectVersionRecoveryError):
             EditorServer(("127.0.0.1", 0), missing_backup_project)
         self.assertTrue((missing_backup_project / project_versions.JOURNAL_REL).exists())
+
+    def test_main_reports_version_restore_journal_without_binding(self) -> None:
+        saved = self.create_version("CLI recovery fixture")
+        source_store = project_versions.ProjectVersionStore(self.project)
+        source_record = source_store.load(saved["version"]["version_id"])
+        cli_project = Path(self.temp.name) / "cli-recovery-project"
+        shutil.copytree(self.project, cli_project)
+        cli_store = project_versions.ProjectVersionStore(cli_project)
+        automatic = cli_store.create(
+            name="automatic recovery fixture",
+            kind="auto_before_restore",
+            state=source_record["snapshot_state"],
+            captured_render_revision=source_record["captured_render_revision"],
+            snapshot_state=source_record["snapshot_state"],
+            snapshot_render_revision=source_record["snapshot_render_revision"],
+            source_binding=source_record["source_binding"],
+            asset_bindings=source_record["asset_bindings"],
+            dependency_bindings=source_record["dependency_bindings"],
+        )
+        targets = {
+            relative: (cli_project / relative).read_bytes()
+            for relative in project_versions.TARGET_ORDER
+        }
+        journal = project_versions._journal_payload(automatic, targets)
+        first_target = project_versions.TARGET_ORDER[0]
+        journal["targets"][first_target]["data_base64"] = "AA=="
+        journal_path = cli_project / project_versions.JOURNAL_REL
+        project_versions._atomic_replace_exact(
+            journal_path, project_versions.json_bytes(journal)
+        )
+        backup_path = (
+            cli_project
+            / project_versions.RECORDS_REL
+            / f"{automatic['version_id']}.json"
+        )
+        journal_before = journal_path.read_bytes()
+        backup_before = backup_path.read_bytes()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "editor_server.py",
+                    "--project-dir",
+                    str(cli_project),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                ],
+            ),
+            patch.object(sys, "stderr", stderr),
+            patch.object(
+                editor_server.ThreadingHTTPServer,
+                "__init__",
+                side_effect=AssertionError("listener was bound"),
+            ) as bind_listener,
+        ):
+            result = editor_server.main()
+
+        diagnostic = stderr.getvalue()
+        self.assertEqual(result, 3)
+        bind_listener.assert_not_called()
+        self.assertIn(".project-version-restore-journal.json", diagnostic)
+        self.assertIn("preserve it if present", diagnostic)
+        self.assertIn("complete automatic backup record", diagnostic)
+        self.assertIn("Do not delete or modify", diagnostic)
+        self.assertNotIn("journal retained", diagnostic.lower())
+        self.assertNotIn("Traceback", diagnostic)
+        self.assertNotIn(str(cli_project), diagnostic)
+        self.assertNotIn(automatic["version_id"], diagnostic)
+        self.assertEqual(journal_path.read_bytes(), journal_before)
+        self.assertEqual(backup_path.read_bytes(), backup_before)
+
+    def test_main_reports_marker_rebuild_loss_without_claiming_journal_retained(self) -> None:
+        stderr = io.StringIO()
+        recovery_error = project_versions.ProjectVersionRecoveryError(
+            "committed restore journal cleanup failed and marker rebuild failed"
+        )
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "editor_server.py",
+                    "--project-dir",
+                    str(self.project),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                ],
+            ),
+            patch.object(sys, "stderr", stderr),
+            patch.object(
+                project_versions,
+                "recover_restore_transaction",
+                side_effect=recovery_error,
+            ),
+            patch.object(
+                editor_server.ThreadingHTTPServer,
+                "__init__",
+                side_effect=AssertionError("listener was bound"),
+            ) as bind_listener,
+        ):
+            result = editor_server.main()
+
+        diagnostic = stderr.getvalue()
+        self.assertEqual(result, 3)
+        bind_listener.assert_not_called()
+        self.assertIn("preserve it if present", diagnostic)
+        self.assertIn("complete automatic backup record", diagnostic)
+        self.assertNotIn("journal retained", diagnostic.lower())
+        self.assertNotIn("Traceback", diagnostic)
+        self.assertNotIn(str(self.project), diagnostic)
 
     def test_invalid_opaque_id_returns_json_not_found(self) -> None:
         status, payload = self.request("GET", "/api/project-versions/not-an-id")
