@@ -8,7 +8,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_editor_browser as base
@@ -54,15 +54,24 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
         saved_refresh = {"hold": False}
         list_modes = ["hold", "normal"]
         detail_mode = {"b": "full"}
+        variant_reset_mode = {"b": "none"}
         detail_requests = []
         list_requests = []
         list_faults = []
+        list_current_overrides = []
+        restore_modes = []
+        recovery_boot_hold = {"enabled": False}
+        held_recovery_boot = []
         capacity = {"used": 2, "max": 100, "named_save_available": True, "restore_backup_available": True}
         versions = [
             {"version_id": "a/b", "name": "A very long version name " * 8, "kind": "named", "created_at": "2026-11-09T01:02:03Z", "state_digest": "state-a", "render_revision": "render-a"},
             {"version_id": "b", "name": "Version B", "kind": "auto_before_restore", "created_at": "2026-11-09T01:03:03Z", "state_digest": "state-b", "render_revision": "render-b"},
         ]
-        current = {"state_digest": "state-now", "render_revision": "render-now", "manifest_digest": "manifest-now"}
+        current = {
+            "state_digest": "1" * 64,
+            "render_revision": "2" * 64,
+            "manifest_digest": "3" * 64,
+        }
         with sync_playwright() as p:
             browser = p.chromium.launch(executable_path=str(CHROME), headless=True, args=["--mute-audio"])
             page = browser.new_page(viewport={"width": 1440, "height": 1100})
@@ -101,11 +110,16 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     if saved_refresh["hold"]:
                         saved_refresh["hold"] = False
                         held_saved_refresh.append(route); return
+                    if recovery_boot_hold["enabled"]:
+                        recovery_boot_hold["enabled"] = False
+                        held_recovery_boot.append(route); return
                     if list_faults:
                         route.fulfill(status=list_faults.pop(0), json={"ok": False, "error": "list_unavailable", "error_code": "list_unavailable"}); return
-                    route.fulfill(json={"ok": True, "versions": versions, "current": current, "capacity": capacity}); return
+                    listed_current = list_current_overrides.pop(0) if list_current_overrides else current
+                    route.fulfill(json={"ok": True, "versions": versions, "current": listed_current, "capacity": capacity}); return
                 if request.method == "GET":
-                    version = versions[0] if path.endswith("a%2Fb") else versions[1]
+                    requested_version_id = unquote(path.rsplit("/", 1)[-1])
+                    version = next(item for item in versions if item["version_id"] == requested_version_id)
                     content_changes = [
                         {"path": "/state/overlays/0/text", "kind": "changed", "saved_preview": f"{version['version_id']}-saved", "current_preview": "current"},
                         {"path": "/state/overlays/1/text", "kind": "changed", "saved_preview": '"true"', "current_preview": '"caption B"'},
@@ -131,7 +145,12 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     if detail_mode.get(version["version_id"]) == "metadata_only":
                         changes = reset_changes[:1]
                         truncated = True
-                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": ["timeline"], "rights_assertion_reset": detail_mode.get(version["version_id"]) != "metadata_only", "changes": changes}}
+                    approval_resets = ["timeline"]
+                    if variant_reset_mode.get(version["version_id"]) == "present":
+                        approval_resets.extend(["timeline_by_variant", "final_by_variant", "unknown_variant_a", "unknown_variant_b"])
+                        changes = reset_changes
+                        truncated = False
+                    payload = {"ok": True, "version": version, "current": current, "diff": {"changed": True, "total_changes": len(changes), "truncated": truncated, "approval_resets": approval_resets, "rights_assertion_reset": detail_mode.get(version["version_id"]) != "metadata_only", "changes": changes}}
                     if version["version_id"] == "a/b":
                         held_details.setdefault("a", (route, payload)); return
                     route.fulfill(json=payload); return
@@ -139,6 +158,18 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 posts.append((path, body))
                 if path.endswith("/restore"):
                     restore_attempts.append(body)
+                    if restore_modes:
+                        mode = restore_modes.pop(0)
+                        if mode == "refresh_fail":
+                            list_faults.append(503)
+                        elif mode == "refresh_and_boot_fail":
+                            list_faults.extend((503, 503))
+                        elif mode == "invalid_current":
+                            list_current_overrides.append({"state_digest": "invalid", "manifest_digest": "", "render_revision": "2" * 64})
+                        elif mode == "changed_current":
+                            list_current_overrides.append({"state_digest": "4" * 64, "manifest_digest": "5" * 64, "render_revision": "2" * 64})
+                        route.fulfill(status=409, json={"ok": False, "error": "source_changed", "error_code": "source_changed"})
+                        return
                     held_restore.append(route)
                     return
                 if body.get("name") == "錯誤版本":
@@ -216,6 +247,27 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertLess(detail_text.index("剪輯內容"), detail_text.index("重新確認"))
             self.assertIn("目前顯示 80 項剪輯內容", detail_text)
             self.assertTrue(page.locator(".project-version-row").nth(1).get_attribute("aria-pressed") == "true")
+            variant_reset_mode["b"] = "present"
+            page.locator(".project-version-row").nth(1).click()
+            page.wait_for_function("() => document.querySelector('#project-version-detail').textContent.includes('重新確認提醒')")
+            variant_detail_text = page.locator("#project-version-detail").inner_text()
+            self.assertIn("另有 5 項重新確認提醒", variant_detail_text)
+            self.assertIn("各版型時間軸", variant_detail_text)
+            self.assertIn("各版型輸出", variant_detail_text)
+            self.assertEqual(variant_detail_text.count("各版型時間軸"), 1)
+            self.assertEqual(variant_detail_text.count("各版型輸出"), 1)
+            self.assertEqual(variant_detail_text.count("其他核可"), 1)
+            print(f"P7_VARIANTS present={variant_detail_text!r}", flush=True)
+            variant_reset_mode["b"] = "none"
+            page.locator(".project-version-row").nth(1).click()
+            page.wait_for_function("() => document.querySelector('#project-version-detail').textContent.includes('素材權利需重新確認')")
+            no_variant_detail_text = page.locator("#project-version-detail").inner_text()
+            self.assertNotIn("各版型時間軸", no_variant_detail_text)
+            self.assertNotIn("各版型輸出", no_variant_detail_text)
+            self.assertIn("時間軸／素材權利需重新確認", no_variant_detail_text)
+            no_variant_has_labels = any(label in no_variant_detail_text for label in ("各版型時間軸", "各版型輸出"))
+            no_variant_keeps_timeline_rights = "時間軸／素材權利需重新確認" in no_variant_detail_text
+            print(f"P7_VARIANTS none={{'has_variant_labels': {no_variant_has_labels}, 'keeps_timeline_rights': {no_variant_keeps_timeline_rights}}}", flush=True)
             stage("detail")
             page.locator("#project-version-name").focus()
             page.keyboard.type("版本 A")
@@ -265,7 +317,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertFalse(page.locator("#project-version-save").is_disabled())
             assert_stable_project_versions_focus("success_save")
             save = next(body for path, body in posts if path == "/api/project-versions")
-            self.assertEqual(save["expected_manifest_digest"], "manifest-now")
+            self.assertEqual(save["expected_manifest_digest"], current["manifest_digest"])
             page.locator("#project-version-name").fill("版本 B")
             page.locator("#project-version-save").click()
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('已儲存')")
@@ -283,7 +335,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             capacity.update({"used": 3})
             page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('來源影片已變更')")
             self.assertEqual(len(restore_attempts), 1)
-            self.assertEqual(restore_attempts[0]["expected_state_digest"], "state-now")
+            self.assertEqual(restore_attempts[0]["expected_state_digest"], current["state_digest"])
             self.assertFalse(page.locator("#project-version-restore-dialog").evaluate("el => el.open"))
             self.assertTrue(page.locator("#project-versions-dialog[open]").is_visible())
             self.assertIn("還原前自動備份", page.locator("#project-versions-list").inner_text())
@@ -374,5 +426,83 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertTrue(page.locator("#project-version-detail").is_hidden())
             self.assertEqual(page.locator("#project-version-detail").get_by_role("button", name="還原此版本").count(), 0)
             assert_stable_project_versions_focus("mutation_list_failure")
+
+            def prepare_uncertain_restore():
+                if page.locator("#project-versions-dialog").evaluate("el => el.open"):
+                    page.locator("#project-versions-close").click()
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_function("() => document.querySelector('#project-name')?.textContent !== '讀取專案中'")
+                page.locator("#project-versions-open").click()
+                version_b = page.locator(".project-version-row").filter(has_text="Version B").first
+                version_b.wait_for()
+                version_b.click()
+                page.locator("#project-version-detail").get_by_role("button", name="還原此版本").wait_for()
+                page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
+                page.locator("#project-version-restore-dialog[open]").wait_for()
+
+            def assert_uncertain_restore_reloads(mode, *, storage_available=True, boot_list_failure=False):
+                prepare_uncertain_restore()
+                if not storage_available:
+                    page.evaluate("""() => {
+                      const originalSetItem = Storage.prototype.setItem;
+                      Storage.prototype.setItem = function (key, value) {
+                        Storage.prototype.setItem = originalSetItem;
+                        throw new DOMException('synthetic storage unavailable', 'QuotaExceededError');
+                      };
+                    }""")
+                before_restore_posts = len(restore_attempts)
+                restore_modes.append(mode)
+                with page.expect_navigation(wait_until="domcontentloaded"):
+                    page.locator("#project-version-restore-confirm").click()
+                page.wait_for_function("() => document.querySelector('#project-name')?.textContent !== '讀取專案中'")
+                self.assertEqual(len(restore_attempts), before_restore_posts + 1)
+                if storage_available:
+                    page.locator("#project-versions-dialog[open]").wait_for()
+                    page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。')")
+                    self.assertIn(
+                        "還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。",
+                        page.locator("#project-versions-status").inner_text(),
+                    )
+                    if boot_list_failure:
+                        self.assertIn(
+                            "版本清單目前無法讀取，請稍後關閉後重新開啟。",
+                            page.locator("#project-versions-status").inner_text(),
+                        )
+                    page.locator("#project-versions-close").click()
+                else:
+                    self.assertFalse(page.locator("#project-versions-dialog").evaluate("el => el.open"))
+
+            assert_uncertain_restore_reloads("refresh_fail")
+            # The message is one-shot: an ordinary reload must not reopen it.
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_function("() => document.querySelector('#project-name')?.textContent !== '讀取專案中'")
+            self.assertFalse(page.locator("#project-versions-dialog").evaluate("el => el.open"))
+            assert_uncertain_restore_reloads("invalid_current")
+            assert_uncertain_restore_reloads("refresh_and_boot_fail", boot_list_failure=True)
+            assert_uncertain_restore_reloads("changed_current", storage_available=False)
+
+            # Reproduce a late recovery-list response crossing a close/reopen
+            # boundary. It must not overwrite the newer dialog's status.
+            page.evaluate("""projectId => {
+              const key = `auto-edit:project-version-restore-recovery:v1:${encodeURIComponent(location.pathname)}:${encodeURIComponent(projectId)}`;
+              sessionStorage.setItem(key, JSON.stringify({expires_at: Date.now() + 120000}));
+            }""", "browser-smoke")
+            recovery_boot_hold["enabled"] = True
+            page.reload(wait_until="domcontentloaded")
+            page.locator("#project-versions-dialog[open]").wait_for()
+            self.assertEqual(len(held_recovery_boot), 1)
+            page.locator("#project-versions-close").click()
+            page.locator("#project-versions-open").click()
+            page.locator(".project-version-row").first.wait_for()
+            self.assertEqual(page.locator("#project-versions-status").inner_text(), "")
+            held_recovery_boot[0].fulfill(
+                status=503,
+                json={"ok": False, "error": "late_recovery_list_failure", "error_code": "late_recovery_list_failure"},
+            )
+            page.wait_for_timeout(100)
+            self.assertNotIn(
+                "還原回應未完整收到",
+                page.locator("#project-versions-status").inner_text(),
+            )
             stage("done")
             browser.close()

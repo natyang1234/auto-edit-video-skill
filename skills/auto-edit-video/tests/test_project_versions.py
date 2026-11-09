@@ -99,6 +99,50 @@ class ProjectVersionUnitTests(unittest.TestCase):
         self.assertIsNone(snapshot["publishing"]["cover"]["output"])
         self.assertEqual(snapshot["rights"], {"asserted": False, "assertion_revision": None})
 
+    def test_sanitize_manifest_reports_only_actually_approved_variant_maps(self) -> None:
+        timestamp = "2026-11-09T00:00:00Z"
+        manifest = {
+            "approvals": {
+                "highlight_selection": {"approved": True},
+                "timeline": {"approved": False},
+                "timeline_by_variant": {
+                    "vertical": {"approved": True, "state_revision": "a" * 64},
+                },
+                "final_by_variant": {
+                    "vertical": {"approved": False, "state_revision": "b" * 64},
+                    "square": {"approved": True, "state_revision": "c" * 64},
+                },
+                "preview_by_variant": {
+                    "vertical": {"approved": False, "at": timestamp},
+                },
+                "empty_by_variant": {},
+                "metadata_by_variant": {
+                    "schema_version": 1,
+                    "note": "not a variant approval slot",
+                    "future": {"approved": "true"},
+                },
+            },
+            "stages": {"render": "complete", "qa": "complete"},
+        }
+
+        sanitized, invalidated = project_versions.sanitize_manifest(
+            manifest,
+            ("highlight_selection", "timeline", "final"),
+            timestamp=timestamp,
+        )
+
+        self.assertEqual(
+            invalidated,
+            ["final_by_variant", "highlight_selection", "timeline_by_variant"],
+        )
+        self.assertEqual(
+            set(sanitized["approvals"]),
+            {"highlight_selection", "timeline", "final"},
+        )
+        self.assertTrue(all(not entry["approved"] for entry in sanitized["approvals"].values()))
+        self.assertEqual(sanitized["stages"]["render"], "pending")
+        self.assertEqual(sanitized["stages"]["qa"], "pending")
+
     def test_unknown_state_field_is_rejected_instead_of_silently_dropped(self) -> None:
         state = self.state()
         state["future_authority"] = True

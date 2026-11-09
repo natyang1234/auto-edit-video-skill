@@ -328,6 +328,55 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
         self.assertTrue(result["body"].get("ok"), result)
         return result
 
+    def _put_same_render_nonrender_state(
+        self,
+        page: Any,
+        *,
+        label: str,
+        asserted: bool,
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        """Persist only fields excluded from editor_state_revision through the real API."""
+        result = page.evaluate(
+            """
+            async ({label, asserted, warnings}) => {
+              const projectResponse = await fetch('/api/project', {cache: 'no-store'});
+              const project = await projectResponse.json();
+              const state = project.state;
+              const beforeRevision = state.revision;
+              state.editing_brief = `Response-safe ${label} brief`;
+              state.publishing = state.publishing || {};
+              state.publishing.draft_status = 'local_draft_requires_review';
+              state.publishing.title = `Response-safe ${label} title`;
+              state.publishing.body = `Response-safe ${label} body`;
+              state.review = state.review || {};
+              state.review.warnings_acknowledged = warnings;
+              state.rights = {
+                asserted,
+                assertion_revision: asserted ? 'c'.repeat(64) : null,
+              };
+              state.x_expected_revision = beforeRevision;
+              const response = await fetch('/api/editor-state', {
+                method: 'PUT',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Auto-Edit-CSRF': project.csrf_token,
+                },
+                body: JSON.stringify(state),
+              });
+              return {
+                status: response.status,
+                body: await response.json(),
+                before_revision: beforeRevision,
+              };
+            }
+            """,
+            {"label": label, "asserted": asserted, "warnings": warnings},
+        )
+        self.assertEqual(result["status"], 200, result)
+        self.assertTrue(result["body"].get("ok"), result)
+        return result
+
     def _assert_manual_p5_ui(self, page: Any, expected_x: str) -> None:
         row = page.locator(".layer-row").filter(has_text="手動聚光燈路徑")
         row.click()
@@ -977,6 +1026,278 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                         },
                         "source_unchanged": self._fingerprint_source() == self._source_before,
                         "rights_and_approvals_reset": True,
+                    },
+                )
+
+                stage("response-loss-same-render-setup-a")
+                page.locator("#project-versions-close").click()
+                self._put_same_render_nonrender_state(
+                    page,
+                    label="A",
+                    asserted=False,
+                    warnings=[],
+                )
+                page.reload(wait_until="domcontentloaded", timeout=90_000)
+                self._wait_initialized(page)
+                self._open_versions(page)
+                loss_save_a, loss_version_a = self._save_named_version(
+                    page, "P7 Response Loss A"
+                )
+                self._write_evidence_json(
+                    "response-loss/http/save-A.json", loss_save_a
+                )
+                page.locator("#project-versions-close").click()
+
+                stage("response-loss-same-render-setup-b")
+                loss_edit_b = self._put_same_render_nonrender_state(
+                    page,
+                    label="B",
+                    asserted=True,
+                    warnings=["stale-B-warning"],
+                )
+                self._write_evidence_json(
+                    "response-loss/http/editor-state-B.json",
+                    {
+                        "http_status": loss_edit_b["status"],
+                        "ok": loss_edit_b["body"].get("ok"),
+                        "revision": loss_edit_b["body"].get("revision"),
+                        "before_revision": loss_edit_b["before_revision"],
+                    },
+                )
+                page.reload(wait_until="domcontentloaded", timeout=90_000)
+                self._wait_initialized(page)
+                self.assertEqual(
+                    page.locator("#editing-brief").input_value(),
+                    "Response-safe B brief",
+                )
+                loss_listing_b = self._open_versions(page)
+                self.assertEqual(
+                    loss_listing_b["current"]["render_revision"],
+                    loss_version_a["render_revision"],
+                    loss_listing_b,
+                )
+                self.assertNotEqual(
+                    loss_listing_b["current"]["state_digest"],
+                    loss_version_a["state_digest"],
+                    loss_listing_b,
+                )
+                loss_row_a = page.locator(".project-version-row").filter(
+                    has_text="P7 Response Loss A"
+                ).first
+                with page.expect_response(
+                    lambda response: response.request.method == "GET"
+                    and response.url.endswith(
+                        f"/api/project-versions/{loss_version_a['version_id']}"
+                    ),
+                    timeout=90_000,
+                ):
+                    loss_row_a.click()
+                page.locator("#project-version-detail").get_by_role(
+                    "button", name="還原此版本"
+                ).click()
+                page.locator("#project-version-restore-dialog[open]").wait_for(
+                    timeout=30_000
+                )
+
+                records_before_loss = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in sorted(records_dir.glob("pv_*.json"))
+                ]
+                auto_before_loss = sum(
+                    record.get("kind") == "auto_before_restore"
+                    for record in records_before_loss
+                )
+                loss_restore_requests: list[str] = []
+                page.on(
+                    "request",
+                    lambda request: loss_restore_requests.append(request.url)
+                    if request.method == "POST"
+                    and request.url.endswith(
+                        f"/api/project-versions/{loss_version_a['version_id']}/restore"
+                    )
+                    else None,
+                )
+                loss_capture_key = "p7-response-loss-safe-restore-capture"
+                page.evaluate(
+                    """
+                    ([expectedPath, captureKey]) => {
+                      const nativeFetch = window.fetch.bind(window);
+                      window.fetch = async (...args) => {
+                        const response = await nativeFetch(...args);
+                        const request = args[0];
+                        const options = args[1] || {};
+                        const url = typeof request === 'string' ? request : request.url;
+                        const method = String(options.method || request?.method || 'GET').toUpperCase();
+                        const target = new URL(url, window.location.href);
+                        if (
+                          method === 'POST'
+                          && target.origin === window.location.origin
+                          && target.pathname === expectedPath
+                        ) {
+                          const payload = await response.clone().json();
+                          sessionStorage.setItem(captureKey, JSON.stringify({
+                            http_status: response.status,
+                            reload_required: payload?.reload_required,
+                            automatic_backup: payload?.automatic_backup,
+                          }));
+                          throw new TypeError('synthetic restore response lost after commit');
+                        }
+                        return response;
+                      };
+                    }
+                    """,
+                    [
+                        f"/api/project-versions/{loss_version_a['version_id']}/restore",
+                        loss_capture_key,
+                    ],
+                )
+
+                stage("response-loss-commit-and-drop-response")
+                with page.expect_navigation(
+                    wait_until="domcontentloaded", timeout=15_000
+                ):
+                    with page.expect_response(
+                        lambda response: response.request.method == "POST"
+                        and response.url.endswith(
+                            f"/api/project-versions/{loss_version_a['version_id']}/restore"
+                        ),
+                        timeout=90_000,
+                    ) as loss_restore_info:
+                        page.locator("#project-version-restore-confirm").click()
+                loss_restore_response = loss_restore_info.value
+                loss_restore_capture = page.evaluate(
+                    """
+                    captureKey => {
+                      const raw = sessionStorage.getItem(captureKey);
+                      sessionStorage.removeItem(captureKey);
+                      return raw ? JSON.parse(raw) : null;
+                    }
+                    """,
+                    loss_capture_key,
+                )
+                self.assertIsInstance(loss_restore_capture, dict)
+                self.assertEqual(loss_restore_response.status, 200, loss_restore_capture)
+                self.assertTrue(
+                    loss_restore_capture.get("reload_required"), loss_restore_capture
+                )
+                self.assertEqual(len(loss_restore_requests), 1, loss_restore_requests)
+
+                stage("response-loss-reloaded-a")
+                self._wait_initialized(page)
+                page.locator("#project-versions-dialog[open]").wait_for(timeout=30_000)
+                page.wait_for_function(
+                    "() => document.querySelector('#project-versions-status')?.textContent.includes('還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。')",
+                    timeout=30_000,
+                )
+                self.assertEqual(
+                    page.locator("#editing-brief").input_value(),
+                    "Response-safe A brief",
+                )
+                restored_loss_state, restored_loss_manifest = self._read_state_manifest()
+                self.assertEqual(
+                    restored_loss_state["publishing"]["title"],
+                    "Response-safe A title",
+                )
+                self.assertEqual(
+                    restored_loss_state["review"]["warnings_acknowledged"], []
+                )
+                self.assertFalse(restored_loss_state["rights"]["asserted"])
+                self.assertTrue(
+                    all(
+                        not approval.get("approved")
+                        for approval in restored_loss_manifest["approvals"].values()
+                        if isinstance(approval, dict)
+                    )
+                )
+                restored_loss_rights = json.loads(
+                    (self.project / "working/rights_assertion.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(restored_loss_rights.get("items"), [])
+                records_after_loss = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in sorted(records_dir.glob("pv_*.json"))
+                ]
+                auto_after_loss = [
+                    record
+                    for record in records_after_loss
+                    if record.get("kind") == "auto_before_restore"
+                ]
+                self.assertEqual(len(auto_after_loss), auto_before_loss + 1)
+                loss_backup = next(
+                    record
+                    for record in auto_after_loss
+                    if record.get("version_id")
+                    == loss_restore_capture["automatic_backup"]["version_id"]
+                )
+                self.assertEqual(
+                    loss_backup["snapshot_state"]["editing_brief"],
+                    "Response-safe B brief",
+                )
+                self.assertEqual(
+                    loss_backup["snapshot_state"]["publishing"]["title"],
+                    "Response-safe B title",
+                )
+
+                stage("response-loss-edit-autosave-and-undo")
+                page.locator("#project-versions-close").click()
+                title_count_before = page.locator(".layer-row").filter(
+                    has_text="影片標題"
+                ).count()
+                with page.expect_response(
+                    lambda response: response.request.method == "PUT"
+                    and response.url.endswith("/api/editor-state")
+                    and response.status == 200,
+                    timeout=90_000,
+                ):
+                    page.locator("[data-add-type='title']").click()
+                state_after_loss_edit, _ = self._read_state_manifest()
+                self.assertEqual(
+                    state_after_loss_edit["editing_brief"],
+                    "Response-safe A brief",
+                )
+                self.assertEqual(
+                    state_after_loss_edit["publishing"]["title"],
+                    "Response-safe A title",
+                )
+                with page.expect_response(
+                    lambda response: response.request.method == "PUT"
+                    and response.url.endswith("/api/editor-state")
+                    and response.status == 200,
+                    timeout=90_000,
+                ):
+                    page.keyboard.press("Meta+Z")
+                self.assertEqual(
+                    page.locator(".layer-row").filter(has_text="影片標題").count(),
+                    title_count_before,
+                )
+                state_after_loss_undo, _ = self._read_state_manifest()
+                self.assertEqual(
+                    state_after_loss_undo["editing_brief"],
+                    "Response-safe A brief",
+                )
+                self.assertEqual(
+                    state_after_loss_undo["publishing"]["title"],
+                    "Response-safe A title",
+                )
+                self.assertNotEqual(
+                    state_after_loss_undo["editing_brief"],
+                    "Response-safe B brief",
+                )
+                self._write_evidence_json(
+                    "response-loss/result.json",
+                    {
+                        "outcome": "CONFIRMED_RESPONSE_LOSS_RESYNC",
+                        "restore_http_status": loss_restore_response.status,
+                        "restore_post_count": len(loss_restore_requests),
+                        "same_render_revision": True,
+                        "different_full_state_digest": True,
+                        "reloaded_nonrender_state": "A",
+                        "automatic_backup_count_delta": len(auto_after_loss)
+                        - auto_before_loss,
+                        "authority_reset": True,
+                        "post_reload_edit_and_undo_preserved_a": True,
                     },
                 )
                 stage("confirmed")

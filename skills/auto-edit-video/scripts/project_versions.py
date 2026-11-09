@@ -335,11 +335,19 @@ def sanitize_manifest(
 ) -> tuple[dict[str, Any], list[str]]:
     target = copy.deepcopy(manifest)
     old = manifest.get("approvals") if isinstance(manifest.get("approvals"), dict) else {}
+
+    def was_approved(key: Any, value: Any) -> bool:
+        if str(key).endswith("_by_variant"):
+            return isinstance(value, dict) and any(
+                isinstance(slot, dict) and slot.get("approved") is True
+                for slot in value.values()
+            )
+        return isinstance(value, dict) and bool(value.get("approved"))
+
     invalidated = sorted(
         str(key)
         for key, value in old.items()
-        if (isinstance(value, dict) and value.get("approved"))
-        or (str(key).endswith("_by_variant") and bool(value))
+        if was_approved(key, value)
     )
     target["approvals"] = {
         gate: {

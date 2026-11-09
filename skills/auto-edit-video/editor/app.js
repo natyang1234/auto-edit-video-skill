@@ -38,9 +38,12 @@ let presetSaveInFlight = 0;
 let projectVersionsGeneration = 0;
 let projectVersionsDetailGeneration = 0;
 let projectVersionsMutationInFlight = false;
+let projectVersionsNavigationPending = false;
 let projectVersionsTrigger = null;
 let projectVersionsSelected = null;
 let projectVersionsPendingRestore = null;
+const PROJECT_VERSION_RESTORE_RECOVERY_NOTICE = "還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。";
+const PROJECT_VERSION_RESTORE_RECOVERY_TTL_MS = 2 * 60 * 1000;
 // FX previews are deliberately local drafts. They never touch editor state
 // until the server compare-and-swap confirm succeeds.
 let fxPreviewDraft = null;
@@ -281,6 +284,46 @@ function versionTokens(value) {
   };
 }
 
+function validProjectVersionDigest(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function projectVersionRestoreRecoveryKey() {
+  const projectId = String(projectPayload?.manifest?.project_id || "");
+  if (!projectId) return "";
+  return `auto-edit:project-version-restore-recovery:v1:${encodeURIComponent(location.pathname)}:${encodeURIComponent(projectId)}`;
+}
+
+function rememberProjectVersionRestoreRecovery() {
+  const key = projectVersionRestoreRecoveryKey();
+  if (!key) return;
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ expires_at: Date.now() + PROJECT_VERSION_RESTORE_RECOVERY_TTL_MS }));
+  } catch (_error) {
+    // Storage is only for the one-shot explanation. Safety comes from reload.
+  }
+}
+
+function consumeProjectVersionRestoreRecovery() {
+  const key = projectVersionRestoreRecoveryKey();
+  if (!key) return false;
+  try {
+    const raw = sessionStorage.getItem(key);
+    sessionStorage.removeItem(key);
+    if (!raw) return false;
+    const value = JSON.parse(raw);
+    return Number.isFinite(value?.expires_at) && value.expires_at >= Date.now();
+  } catch (_error) {
+    return false;
+  }
+}
+
+function reloadProjectAfterVersionRestore({ uncertain = false } = {}) {
+  projectVersionsNavigationPending = true;
+  if (uncertain) rememberProjectVersionRestoreRecovery();
+  window.location.replace(window.location.href);
+}
+
 function projectVersionsBusy() {
   return stateDirty || !lastSaveSucceeded || presetSaveInFlight > 0 || pipelineBusy || renderBusy
     || fxCompareActive || Boolean(fxPreviewDraft) || Boolean(elements["fx-preview-dialog"]?.open);
@@ -373,9 +416,11 @@ function projectVersionResetLabels(approvalResets) {
     destructive_edit: "剪接",
     highlight_selection: "精華片段",
     timeline: "時間軸",
+    timeline_by_variant: "各版型時間軸",
     final: "輸出",
+    final_by_variant: "各版型輸出",
   };
-  return Array.from(approvalResets, (gate) => labels[gate] || "其他核可");
+  return Array.from(new Set(Array.from(approvalResets, (gate) => labels[gate] || "其他核可")));
 }
 
 function setProjectVersionSelection(versionId) {
@@ -595,19 +640,70 @@ async function refreshProjectVersionsAfterFailure(message, { restore = false } =
     }
   }
 }
+
+async function recoverAfterUncertainProjectVersionRestore(error, submittedTokens) {
+  const generation = ++projectVersionsGeneration;
+  if (elements["project-version-restore-dialog"].open) elements["project-version-restore-dialog"].close();
+  clearProjectVersionsView();
+  let payload;
+  try {
+    payload = await request("/api/project-versions");
+  } catch (_refreshError) {
+    reloadProjectAfterVersionRestore({ uncertain: true });
+    return;
+  }
+  const current = payload?.current || {};
+  const submittedState = submittedTokens?.expected_state_digest;
+  const submittedManifest = submittedTokens?.expected_manifest_digest;
+  const currentState = current.state_digest;
+  const currentManifest = current.manifest_digest;
+  const definitelyUnchanged = [submittedState, submittedManifest, currentState, currentManifest]
+    .every(validProjectVersionDigest)
+    && submittedState === currentState
+    && submittedManifest === currentManifest;
+  if (!definitelyUnchanged) {
+    reloadProjectAfterVersionRestore({ uncertain: true });
+    return;
+  }
+  if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) {
+    reloadProjectAfterVersionRestore({ uncertain: true });
+    return;
+  }
+  renderProjectVersions(payload);
+  setProjectVersionsStatus(projectVersionErrorMessage(error, "還原版本"), true);
+}
+
 async function restoreProjectVersion() {
   if (!projectVersionsPendingRestore || projectVersionsMutationInFlight) return;
   const refreshGeneration = projectVersionsGeneration + 1;
+  const pendingRestore = projectVersionsPendingRestore;
   projectVersionsMutationInFlight = true; const dialog = elements["project-version-restore-dialog"]; dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
-  try { const result = await request(`/api/project-versions/${encodeURIComponent(projectVersionsPendingRestore.version.version_id)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...projectVersionsPendingRestore.tokens, confirm_restore: true }) }); if (!result?.reload_required) throw new Error("伺服器未確認還原完成"); window.location.replace(window.location.href); }
+  try { const result = await request(`/api/project-versions/${encodeURIComponent(pendingRestore.version.version_id)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...pendingRestore.tokens, confirm_restore: true }) }); if (!result?.reload_required) throw new Error("伺服器未確認還原完成"); reloadProjectAfterVersionRestore(); }
   catch (error) {
-    await refreshProjectVersionsAfterFailure(projectVersionErrorMessage(error, "還原版本"), { restore: true });
+    await recoverAfterUncertainProjectVersionRestore(error, pendingRestore.tokens);
   }
   finally {
-    projectVersionsMutationInFlight = false;
-    if (elements["project-versions-dialog"].open && projectVersionsPayload) renderProjectVersions(projectVersionsPayload);
-    repairProjectVersionsFocus(refreshGeneration);
+    if (!projectVersionsNavigationPending) {
+      projectVersionsMutationInFlight = false;
+      if (elements["project-versions-dialog"].open && projectVersionsPayload) renderProjectVersions(projectVersionsPayload);
+      repairProjectVersionsFocus(refreshGeneration);
+    }
   }
+}
+
+async function reopenProjectVersionsAfterRestoreRecovery() {
+  if (!consumeProjectVersionRestoreRecovery()) return;
+  projectVersionsTrigger = elements["project-versions-open"];
+  elements["project-versions-dialog"].showModal();
+  const refreshGeneration = projectVersionsGeneration + 1;
+  const loaded = await loadProjectVersions();
+  if (refreshGeneration !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return;
+  setProjectVersionsStatus(
+    loaded
+      ? PROJECT_VERSION_RESTORE_RECOVERY_NOTICE
+      : `${PROJECT_VERSION_RESTORE_RECOVERY_NOTICE}；版本清單目前無法讀取，請稍後關閉後重新開啟。`,
+    true
+  );
 }
 
 function setSaveState(label, mode = "dirty") {
@@ -7342,6 +7438,7 @@ async function initialize() {
       pollRenderStatus(isBatch ? "batch" : "single");
     }
     if (PIPELINE_BUSY_STATES.includes(projectPayload.pipeline_status?.state)) pollPipelineStatus();
+    await reopenProjectVersionsAfterRestoreRecovery();
   } catch (error) {
     elements["stage-empty"].innerHTML = "";
     const message = document.createElement("p");
