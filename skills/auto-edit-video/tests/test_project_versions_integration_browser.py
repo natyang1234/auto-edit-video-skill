@@ -483,7 +483,9 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
         )
         page.evaluate("""async () => { if (document.fonts?.ready) await document.fonts.ready;
           await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))); }""")
-        detail = page.locator("#project-version-detail")
+        # The child div holds the rendered detail content, but the surrounding
+        # section is the actual max-height/overflow scroller.
+        detail = page.locator("section.project-version-detail")
         caption_row = detail.locator("li").filter(has_text="圖層文字").first
         reset_summary = detail.locator(".project-version-reset-summary")
         target_locator = caption_row if target == "caption" else reset_summary
@@ -496,34 +498,87 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
             () => {
               const rect = (node) => node && Object.fromEntries(['top', 'right', 'bottom', 'left', 'width', 'height']
                 .map((key) => [key, node.getBoundingClientRect()[key]]));
+              const clientRect = (node) => {
+                if (!node) return null;
+                const bounds = node.getBoundingClientRect();
+                return {
+                  top: bounds.top + node.clientTop,
+                  left: bounds.left + node.clientLeft,
+                  right: bounds.left + node.clientLeft + node.clientWidth,
+                  bottom: bounds.top + node.clientTop + node.clientHeight,
+                  width: node.clientWidth,
+                  height: node.clientHeight,
+                };
+              };
               const includes = (outer, inner) => Boolean(outer && inner && inner.top >= outer.top
                 && inner.bottom <= outer.bottom && inner.left >= outer.left && inner.right <= outer.right);
               const dialogNodes = document.querySelectorAll('#project-versions-dialog');
               const dialog = dialogNodes[0] || null;
-              const detail = document.querySelector('#project-version-detail');
-              const caption = [...(detail?.querySelectorAll('li') || [])].find((item) =>
+              const detail = document.querySelector('section.project-version-detail');
+              const detailContent = document.querySelector('#project-version-detail');
+              const caption = [...(detailContent?.querySelectorAll('li') || [])].find((item) =>
                 item.querySelector('strong')?.textContent?.includes('圖層文字')
               ) || null;
-              const reset = detail?.querySelector('.project-version-reset-summary') || null;
+              const reset = detailContent?.querySelector('.project-version-reset-summary') || null;
               const viewport = {top: 0, left: 0, right: window.innerWidth, bottom: window.innerHeight};
-              const dialogBounds = rect(dialog), detailBounds = rect(detail);
+              const dialogBounds = clientRect(dialog), detailBounds = rect(detail);
+              const detailClientBounds = clientRect(detail);
               const captionBounds = rect(caption), resetBounds = rect(reset);
+              let negativeClippingProbe = null;
+              if (detail && reset) {
+                const before = detail.scrollTop;
+                const outer = clientRect(detail);
+                const target = rect(reset);
+                const maxScrollTop = Math.max(0, detail.scrollHeight - detail.clientHeight);
+                const candidates = [
+                  before - Math.max(1, outer.bottom - target.bottom + 1),
+                  before + Math.max(1, target.top - outer.top + 1),
+                ];
+                for (const candidate of candidates) {
+                  if (candidate < 0 || candidate > maxScrollTop) continue;
+                  detail.scrollTop = candidate;
+                  const clippedOuter = clientRect(detail);
+                  const clippedTarget = rect(reset);
+                  const inViewport = includes(viewport, clippedTarget);
+                  const inDetail = includes(clippedOuter, clippedTarget);
+                  if (inViewport && !inDetail) {
+                    negativeClippingProbe = {
+                      target: 'reset',
+                      scroll_top_before: before,
+                      scroll_top_candidate: detail.scrollTop,
+                      target_bounds: clippedTarget,
+                      detail_client_bounds: clippedOuter,
+                      target_in_viewport: inViewport,
+                      target_in_detail: inDetail,
+                    };
+                    break;
+                  }
+                }
+                detail.scrollTop = before;
+                if (negativeClippingProbe) {
+                  negativeClippingProbe.restored_scroll_top = detail.scrollTop;
+                }
+              }
               return {
                 dialog_count: dialogNodes.length,
                 dialog_open: Boolean(dialog?.open),
                 dialog_bounds: dialogBounds,
                 detail_bounds: detailBounds,
+                detail_client_bounds: detailClientBounds,
+                detail_content_bounds: rect(detailContent),
                 caption_bounds: captionBounds,
                 reset_bounds: resetBounds,
                 detail_scroll_top: detail?.scrollTop ?? null,
+                detail_content_scroll_top: detailContent?.scrollTop ?? null,
                 window_scroll_y: window.scrollY,
                 viewport: {width: window.innerWidth, height: window.innerHeight},
                 caption_in_viewport: includes(viewport, captionBounds),
-                caption_in_detail: includes(detailBounds, captionBounds),
+                caption_in_detail: includes(detailClientBounds, captionBounds),
                 caption_in_dialog: includes(dialogBounds, captionBounds),
                 reset_in_viewport: includes(viewport, resetBounds),
-                reset_in_detail: includes(detailBounds, resetBounds),
+                reset_in_detail: includes(detailClientBounds, resetBounds),
                 reset_in_dialog: includes(dialogBounds, resetBounds),
+                negative_clipping_probe: negativeClippingProbe,
               };
             }
             """
@@ -534,6 +589,12 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
         self.assertTrue(diagnostics[f"{target}_in_viewport"], diagnostics)
         self.assertTrue(diagnostics[f"{target}_in_detail"], diagnostics)
         self.assertTrue(diagnostics[f"{target}_in_dialog"], diagnostics)
+        if target == "reset":
+            negative = diagnostics["negative_clipping_probe"]
+            self.assertIsNotNone(negative, diagnostics)
+            self.assertTrue(negative["target_in_viewport"], diagnostics)
+            self.assertFalse(negative["target_in_detail"], diagnostics)
+            self.assertEqual(negative["restored_scroll_top"], diagnostics["detail_scroll_top"], diagnostics)
         capture_name = f"detail-A-current-B-{width}x{height}-{target}-viewport"
         self._write_evidence_json(f"ui/{capture_name}.json", diagnostics)
         page.screenshot(path=str(self.evidence_dir / f"screenshots/{capture_name}-page.png"), full_page=False)
@@ -850,6 +911,9 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                 self.assertNotRegex(detail_text, r"\b[a-f0-9]{64}\b")
                 self._capture_version_detail_viewport(
                     page, width=1440, height=1000, target="caption"
+                )
+                self._capture_version_detail_viewport(
+                    page, width=1100, height=900, target="caption"
                 )
                 self._capture_version_detail_viewport(
                     page, width=390, height=900, target="caption"
