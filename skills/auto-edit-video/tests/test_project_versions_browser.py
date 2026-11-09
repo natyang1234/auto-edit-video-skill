@@ -123,6 +123,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     content_changes = [
                         {"path": "/state/overlays/0/text", "kind": "changed", "saved_preview": f"{version['version_id']}-saved", "current_preview": "current"},
                         {"path": "/state/overlays/1/text", "kind": "changed", "saved_preview": '"true"', "current_preview": '"caption B"'},
+                        {"path": "/state/publishing/platform_id", "kind": "changed", "saved_preview": '"instagram-reels"', "current_preview": '"youtube-shorts"'},
+                        {"path": "/state/publishing/title", "kind": "changed", "saved_preview": '"saved title"', "current_preview": '"current title"'},
+                        {"path": "/state/publishing_extra/format", "kind": "changed", "saved_preview": '"saved format"', "current_preview": '"current format"'},
+                        {"path": "/state/overlays/2/semantic_review/candidates/a~1b", "kind": "changed", "saved_preview": '"saved candidate"', "current_preview": '"current candidate"'},
+                        {"path": "/state/overlays/2/semantic_reviewable/status", "kind": "changed", "saved_preview": '"saved review"', "current_preview": '"current review"'},
+                        {"path": "/state/canvas/width", "kind": "changed", "saved_preview": "1080", "current_preview": "720"},
+                        {"path": "/state/review/selected_overlay_id", "kind": "changed", "saved_preview": '"caption-a"', "current_preview": '"caption-b"'},
                         {"path": "/state/custom/setting", "kind": "changed", "saved_preview": "null", "current_preview": "true"},
                         {"path": "/state/segments/1/id", "kind": "changed", "saved_preview": '"segment-0000a002"', "current_preview": '"segment-0000b002"'},
                         {"path": "/state/segments/1/source_start", "kind": "changed", "saved_preview": "1.05", "current_preview": "1.15"},
@@ -246,6 +253,42 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertNotIn("a" * 64, detail_text)
             self.assertLess(detail_text.index("剪輯內容"), detail_text.index("重新確認"))
             self.assertIn("目前顯示 80 項剪輯內容", detail_text)
+            platform_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：youtube-shorts → 還原為：instagram-reels'
+            ).inner_text()
+            publishing_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current title → 還原為：saved title'
+            ).inner_text()
+            publishing_similar_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current format → 還原為：saved format'
+            ).inner_text()
+            semantic_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current candidate → 還原為：saved candidate'
+            ).inner_text()
+            semantic_similar_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current review → 還原為：saved review'
+            ).inner_text()
+            canvas_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：720 → 還原為：1080'
+            ).inner_text()
+            approval_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：caption-b → 還原為：caption-a'
+            ).inner_text()
+            self.assertIn("發布平台", platform_change)
+            self.assertIn("發佈文案", publishing_change)
+            self.assertNotIn("發布平台", publishing_similar_change)
+            self.assertNotIn("字幕修正紀錄", semantic_similar_change)
+            self.assertIn("字幕修正紀錄", semantic_change)
+            self.assertIn("輸出尺寸", canvas_change)
+            self.assertIn("人工核可狀態", approval_change)
+            print(
+                "P7_DIFF_LABELS "
+                f"platform={platform_change!r} publishing={publishing_change!r} "
+                f"publishing_similar={publishing_similar_change!r} "
+                f"semantic={semantic_change!r} semantic_similar={semantic_similar_change!r} "
+                f"canvas={canvas_change!r} approval={approval_change!r}",
+                flush=True,
+            )
             self.assertTrue(page.locator(".project-version-row").nth(1).get_attribute("aria-pressed") == "true")
             variant_reset_mode["b"] = "present"
             page.locator(".project-version-row").nth(1).click()
