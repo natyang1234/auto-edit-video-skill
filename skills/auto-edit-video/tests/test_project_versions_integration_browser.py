@@ -778,7 +778,7 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                     and response.url.endswith("/api/project"),
                     timeout=90_000,
                 ) as project_info:
-                    page.goto(f"http://{host}:{port}/", wait_until="domcontentloaded")
+                    page.goto(f"http://{host}:{port}/#preview-workspace", wait_until="domcontentloaded")
                 project_response = project_info.value
                 self.assertEqual(project_response.status, 200)
                 project_payload = project_response.json()
@@ -934,6 +934,13 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                 restore_dialog = page.locator("#project-version-restore-dialog[open]")
                 restore_dialog.wait_for(timeout=30_000)
                 self.assertIn("P7 Version A", page.locator("#project-version-restore-name").inner_text())
+                document_marker = page.evaluate(
+                    """() => {
+                      const marker = crypto.randomUUID();
+                      window.__p7DocumentLifetimeMarker = marker;
+                      return marker;
+                    }"""
+                )
                 restore_capture_key = "p7-real-ui-safe-restore-response"
                 page.evaluate(
                     """
@@ -1012,9 +1019,22 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                         "reload_required": restore_payload.get("reload_required"),
                     },
                 )
-                # The UI's same-page navigation has completed before the
+                # The UI's full reload navigation has completed before the
                 # captured, explicitly whitelisted response fields are read.
                 self._wait_initialized(page)
+                reload_proof = page.evaluate(
+                    """expected => ({
+                      marker_before: expected,
+                      marker_after: window.__p7DocumentLifetimeMarker || null,
+                      navigation_type: performance.getEntriesByType('navigation')[0]?.type || null,
+                      url: window.location.href,
+                    })""",
+                    document_marker,
+                )
+                self._write_evidence_json("ui/restore-reload-proof.json", reload_proof)
+                self.assertIsNone(reload_proof["marker_after"], reload_proof)
+                self.assertEqual(reload_proof["navigation_type"], "reload", reload_proof)
+                self.assertTrue(reload_proof["url"].endswith("#preview-workspace"), reload_proof)
                 self.assertEqual(page.locator("#overlay-text").input_value(), "P7 synthetic source A")
                 self.assertNotEqual(page.locator("#overlay-text").input_value(), "P7 synthetic source B")
                 self._save_state_manifest_evidence("restored-A", "P7 synthetic source A")
@@ -1200,6 +1220,13 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                         refusal_capture_key,
                     ],
                 )
+                refusal_document_marker = page.evaluate(
+                    """() => {
+                      const marker = crypto.randomUUID();
+                      window.__p7DocumentLifetimeMarker = marker;
+                      return marker;
+                    }"""
+                )
                 with page.expect_navigation(
                     wait_until="domcontentloaded", timeout=90_000
                 ):
@@ -1228,6 +1255,19 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                     refusal_payload,
                 )
                 self._wait_initialized(page)
+                refusal_reload_proof = page.evaluate(
+                    """expected => ({
+                      marker_before: expected,
+                      marker_after: window.__p7DocumentLifetimeMarker || null,
+                      navigation_type: performance.getEntriesByType('navigation')[0]?.type || null,
+                      url: window.location.href,
+                    })""",
+                    refusal_document_marker,
+                )
+                self._write_evidence_json("ui/restore-409-reload-proof.json", refusal_reload_proof)
+                self.assertIsNone(refusal_reload_proof["marker_after"], refusal_reload_proof)
+                self.assertEqual(refusal_reload_proof["navigation_type"], "reload", refusal_reload_proof)
+                self.assertTrue(refusal_reload_proof["url"].endswith("#preview-workspace"), refusal_reload_proof)
                 page.locator("#project-versions-dialog[open]").wait_for(timeout=30_000)
                 refusal_notice = page.locator("#project-versions-status").inner_text()
                 self.assertIn("專案內容已變更", refusal_notice)
@@ -1389,6 +1429,13 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                         loss_capture_key,
                     ],
                 )
+                response_loss_document_marker = page.evaluate(
+                    """() => {
+                      const marker = crypto.randomUUID();
+                      window.__p7DocumentLifetimeMarker = marker;
+                      return marker;
+                    }"""
+                )
 
                 stage("response-loss-commit-and-drop-response")
                 with page.expect_navigation(
@@ -1422,6 +1469,19 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
 
                 stage("response-loss-reloaded-a")
                 self._wait_initialized(page)
+                response_loss_reload_proof = page.evaluate(
+                    """expected => ({
+                      marker_before: expected,
+                      marker_after: window.__p7DocumentLifetimeMarker || null,
+                      navigation_type: performance.getEntriesByType('navigation')[0]?.type || null,
+                      url: window.location.href,
+                    })""",
+                    response_loss_document_marker,
+                )
+                self._write_evidence_json("response-loss/ui/restore-reload-proof.json", response_loss_reload_proof)
+                self.assertIsNone(response_loss_reload_proof["marker_after"], response_loss_reload_proof)
+                self.assertEqual(response_loss_reload_proof["navigation_type"], "reload", response_loss_reload_proof)
+                self.assertTrue(response_loss_reload_proof["url"].endswith("#preview-workspace"), response_loss_reload_proof)
                 page.locator("#project-versions-dialog[open]").wait_for(timeout=30_000)
                 page.wait_for_function(
                     "() => document.querySelector('#project-versions-status')?.textContent.includes('還原結果尚無法確認，已重新載入目前專案，請確認內容後再繼續。')",
