@@ -193,6 +193,10 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                     restore_attempts.append(body)
                     if restore_modes:
                         mode = restore_modes.pop(0)
+                        if mode == "missing_reload":
+                            list_current_overrides.append({"state_digest": "4" * 64, "manifest_digest": "5" * 64, "render_revision": "2" * 64})
+                            route.fulfill(status=200, json={"ok": True})
+                            return
                         if mode == "refresh_fail":
                             list_faults.append(503)
                         elif mode == "refresh_and_boot_fail":
@@ -201,7 +205,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                             list_current_overrides.append({"state_digest": "invalid", "manifest_digest": "", "render_revision": "2" * 64})
                         elif mode == "changed_current":
                             list_current_overrides.append({"state_digest": "4" * 64, "manifest_digest": "5" * 64, "render_revision": "2" * 64})
-                        route.fulfill(status=409, json={"ok": False, "error": "source_changed", "error_code": "source_changed"})
+                        route.fulfill(status=409, json={"ok": False, "error": "revision_conflict", "error_code": "revision_conflict"})
                         return
                     held_restore.append(route)
                     return
@@ -673,7 +677,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 page.locator("#project-version-detail").get_by_role("button", name="還原此版本").click()
                 page.locator("#project-version-restore-dialog[open]").wait_for()
 
-            def assert_uncertain_restore_reloads(mode, *, storage_available=True, boot_list_failure=False):
+            def assert_uncertain_restore_reloads(
+                mode,
+                *,
+                expected_notice="還原結果尚無法確認，已重新載入目前專案，請確認內容後再繼續。",
+                storage_available=True,
+                boot_list_failure=False,
+            ):
                 prepare_uncertain_restore()
                 if not storage_available:
                     page.evaluate("""() => {
@@ -691,9 +701,16 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 self.assertEqual(len(restore_attempts), before_restore_posts + 1)
                 if storage_available:
                     page.locator("#project-versions-dialog[open]").wait_for()
-                    page.wait_for_function("() => document.querySelector('#project-versions-status').textContent.includes('還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。')")
+                    page.wait_for_function(
+                        "expected => document.querySelector('#project-versions-status').textContent.includes(expected)",
+                        arg=expected_notice,
+                    )
                     self.assertIn(
-                        "還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。",
+                        expected_notice,
+                        page.locator("#project-versions-status").inner_text(),
+                    )
+                    self.assertNotIn(
+                        "還原回應未完整收到",
                         page.locator("#project-versions-status").inner_text(),
                     )
                     if boot_list_failure:
@@ -705,14 +722,27 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 else:
                     self.assertFalse(page.locator("#project-versions-dialog").evaluate("el => el.open"))
 
-            assert_uncertain_restore_reloads("refresh_fail")
+            specific_refusal_notice = (
+                "專案內容已變更，請關閉後重新查看差異。"
+                "已重新載入目前專案，請確認內容後再繼續。"
+            )
+            assert_uncertain_restore_reloads(
+                "refresh_fail", expected_notice=specific_refusal_notice
+            )
             # The message is one-shot: an ordinary reload must not reopen it.
             page.reload(wait_until="domcontentloaded")
             page.wait_for_function("() => document.querySelector('#project-name')?.textContent !== '讀取專案中'")
             self.assertFalse(page.locator("#project-versions-dialog").evaluate("el => el.open"))
-            assert_uncertain_restore_reloads("invalid_current")
-            assert_uncertain_restore_reloads("refresh_and_boot_fail", boot_list_failure=True)
+            assert_uncertain_restore_reloads(
+                "invalid_current", expected_notice=specific_refusal_notice
+            )
+            assert_uncertain_restore_reloads(
+                "refresh_and_boot_fail",
+                expected_notice=specific_refusal_notice,
+                boot_list_failure=True,
+            )
             assert_uncertain_restore_reloads("changed_current", storage_available=False)
+            assert_uncertain_restore_reloads("missing_reload")
 
             # Reproduce a late recovery-list response crossing a close/reopen
             # boundary. It must not overwrite the newer dialog's status.
@@ -737,5 +767,46 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 "還原回應未完整收到",
                 page.locator("#project-versions-status").inner_text(),
             )
+
+            recovery_key = page.evaluate("""projectId =>
+              `auto-edit:project-version-restore-recovery:v1:${encodeURIComponent(location.pathname)}:${encodeURIComponent(projectId)}`
+            """, "browser-smoke")
+            invalid_recovery_records = {
+                "expired": {"expires_at": 1},
+                "unknown_reason": {"expires_at": "future", "reason": "server_supplied_text"},
+                "extra_field": {"expires_at": "future", "raw_message": "private-path"},
+                "wrong_reason_type": {"expires_at": "future", "reason": ["revision_conflict"]},
+                "not_object": ["future"],
+            }
+            for label, record in invalid_recovery_records.items():
+                page.evaluate(
+                    """([key, record]) => {
+                      const copy = structuredClone(record);
+                      if (copy && typeof copy === 'object' && !Array.isArray(copy) && copy.expires_at === 'future') {
+                        copy.expires_at = Date.now() + 120000;
+                      }
+                      sessionStorage.setItem(key, JSON.stringify(copy));
+                    }""",
+                    [recovery_key, record],
+                )
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_function("() => document.querySelector('#project-name')?.textContent !== '讀取專案中'")
+                self.assertFalse(page.locator("#project-versions-dialog").evaluate("el => el.open"), label)
+                self.assertIsNone(page.evaluate("key => sessionStorage.getItem(key)", recovery_key), label)
+
+            page.evaluate(
+                """key => sessionStorage.setItem(key, JSON.stringify({
+                  expires_at: Date.now() + 120000,
+                  reason: 'version_recovery_required',
+                }))""",
+                recovery_key,
+            )
+            page.reload(wait_until="domcontentloaded")
+            page.locator("#project-versions-dialog[open]").wait_for()
+            recovery_required_notice = page.locator("#project-versions-status").inner_text()
+            self.assertIn("版本紀錄需要安全復原", recovery_required_notice)
+            self.assertIn("已重新載入目前專案", recovery_required_notice)
+            self.assertNotIn("還原回應未完整收到", recovery_required_notice)
+            page.locator("#project-versions-close").click()
             stage("done")
             browser.close()
