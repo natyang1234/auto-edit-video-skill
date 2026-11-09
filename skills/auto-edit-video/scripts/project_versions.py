@@ -399,6 +399,56 @@ def _ensure_directory(path: Path) -> None:
         raise ProjectVersionError(503, "version_recovery_required", "版本儲存區格式不安全")
 
 
+def _remove_created_directory_if_unchanged(
+    path: Path, identity: tuple[int, int]
+) -> None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or (info.st_dev, info.st_ino) != identity
+    ):
+        return
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _create_owned_directory_exact(path: Path) -> tuple[int, int]:
+    os.mkdir(path, 0o700)
+    descriptor = -1
+    identity: tuple[int, int] | None = None
+    try:
+        path_info = path.lstat()
+        if not stat.S_ISDIR(path_info.st_mode):
+            raise OSError("new owned path is not a directory")
+        identity = (path_info.st_dev, path_info.st_ino)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptor_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(descriptor_info.st_mode)
+            or (descriptor_info.st_dev, descriptor_info.st_ino) != identity
+        ):
+            raise OSError("new owned directory identity changed")
+        os.fchmod(descriptor, 0o700)
+        return identity
+    except BaseException:
+        if identity is not None:
+            _remove_created_directory_if_unchanged(path, identity)
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _assert_owned_parents(project_dir: Path, path: Path, *, create: bool) -> None:
     root = project_dir.resolve()
     try:
@@ -406,15 +456,22 @@ def _assert_owned_parents(project_dir: Path, path: Path, *, create: bool) -> Non
     except ValueError as exc:
         raise OSError("target escapes project") from exc
     cursor = root
-    for part in relative.parts[:-1]:
-        cursor = cursor / part
-        if not os.path.lexists(cursor):
-            if not create:
-                raise OSError("target parent is missing")
-            cursor.mkdir(mode=0o700)
-        info = cursor.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise OSError("target parent is not an owned directory")
+    created_directories: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for part in relative.parts[:-1]:
+            cursor = cursor / part
+            if not os.path.lexists(cursor):
+                if not create:
+                    raise OSError("target parent is missing")
+                identity = _create_owned_directory_exact(cursor)
+                created_directories.append((cursor, identity))
+            info = cursor.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError("target parent is not an owned directory")
+    except BaseException:
+        for created_path, identity in reversed(created_directories):
+            _remove_created_directory_if_unchanged(created_path, identity)
+        raise
 
 
 def _read_regular(path: Path, maximum: int) -> bytes:
@@ -470,6 +527,7 @@ def _atomic_replace_exact(path: Path, raw: bytes) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
+        os.fchmod(descriptor, 0o600)
         view = memoryview(raw)
         while view:
             written = os.write(descriptor, view)
@@ -786,6 +844,7 @@ class ProjectVersionStore:
                     0o600,
                 )
                 temporary_created = True
+                os.fchmod(descriptor, 0o600)
                 view = memoryview(raw)
                 while view:
                     written = os.write(descriptor, view)

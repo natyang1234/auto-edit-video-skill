@@ -594,7 +594,12 @@ function openProjectVersionRestore(response) {
 async function saveProjectVersion(event) {
   event.preventDefault();
   if (projectVersionsBusy()) { setProjectVersionsStatus(projectVersionsBusyMessage(), true); return; }
-  const name = elements["project-version-name"].value.trim(); if (!name) return;
+  const name = elements["project-version-name"].value.trim();
+  if (!name) {
+    setProjectVersionsStatus("請輸入版本名稱", true);
+    elements["project-version-name"].focus();
+    return;
+  }
   const refreshGeneration = projectVersionsGeneration + 1;
   projectVersionsMutationInFlight = true;
   elements["project-version-save"].disabled = true;
