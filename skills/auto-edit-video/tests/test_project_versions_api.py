@@ -26,6 +26,8 @@ if str(SCRIPTS_DIR) not in sys.path:
 import editor_server  # noqa: E402
 import project_versions  # noqa: E402
 from editor_server import EditorServer  # noqa: E402
+from font_security import validate_font_bytes  # noqa: E402
+from tests.font_test_fixture import build_ttf  # noqa: E402
 
 
 class ProjectVersionsApiTests(unittest.TestCase):
@@ -334,6 +336,88 @@ class ProjectVersionsApiTests(unittest.TestCase):
         state["audio_event_edits"] = edits
         state["revision"] = editor_server.editor_state_revision(state)
         return state, plan, plan_hash
+
+    def publish_real_coverage_font(self) -> tuple[dict[str, object], dict[str, object]]:
+        registry = editor_server.asset_registry
+        raw = build_ttf(cmap={0x0020: "space", 0x0041: "A"})
+        result = validate_font_bytes(
+            raw,
+            "A",
+            license_spdx="OFL-1.1",
+            declared_mime="font/ttf",
+        )
+        blob_sha = hashlib.sha1(
+            f"blob {len(raw)}\0".encode("ascii") + raw,
+            usedforsecurity=False,
+        ).hexdigest()
+        candidate_id = f"{blob_sha}:PhaseTwo.ttf"
+        candidate_hash = hashlib.sha256(candidate_id.encode()).hexdigest()[:16]
+        item: dict[str, object] = {
+            "asset_id": f"font-google-fonts-{candidate_hash}-{result.sha256[:16]}",
+            "path": f"assets/fonts/{result.sha256}.ttf",
+            "sha256": result.sha256,
+            "origin": "provider",
+            "provider_id": "google-fonts",
+            "source_url": (
+                "https://github.com/google/fonts/blob/"
+                "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/"
+                "ofl/phasetwotest/PhaseTwo.ttf"
+            ),
+            "license": {
+                "spdx": "OFL-1.1",
+                "evidence_url": (
+                    "https://raw.githubusercontent.com/google/fonts/"
+                    "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/"
+                    "ofl/phasetwotest/OFL.txt"
+                ),
+                "attribution_required": True,
+                "attribution_text": "Phase Two Test - OFL-1.1",
+                "verified_at": "2026-11-09T00:00:00Z",
+            },
+            "review_status": "approved",
+        }
+        license_raw = (SKILL_DIR / "contracts/licenses/OFL-1.1.txt").read_bytes()
+        normalized, normalized_sha = registry.validate_font_license_text(
+            license_raw, "OFL-1.1"
+        )
+        self.assertTrue(normalized)
+        license_sha = hashlib.sha256(license_raw).hexdigest()
+        for relative, payload in (
+            (str(item["path"]), raw),
+            (f"licenses/{license_sha}.txt", license_raw),
+        ):
+            path = self.project / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        receipt = registry.save_font_provider_receipt(
+            self.project,
+            item,
+            candidate_id=candidate_id,
+            query="ofl/phasetwotest",
+            download_url=(
+                "https://raw.githubusercontent.com/google/fonts/"
+                "2796410152d4f9524b68ed46e69c1b60f8e0f7c3/"
+                "ofl/phasetwotest/PhaseTwo.ttf"
+            ),
+            license_download_url=str(item["license"]["evidence_url"]),
+            candidate_metadata={
+                "family": "phasetwotest",
+                "style": "",
+                "weight": None,
+                "subset": "",
+                "unicode_range": "",
+                "version": "2796410152d4f9524b68ed46e69c1b60f8e0f7c3",
+                "source_url": item["source_url"],
+            },
+            font_result=result,
+            license_path=f"licenses/{license_sha}.txt",
+            license_sha256=license_sha,
+            license_normalized_sha256=normalized_sha,
+            license_size=len(license_raw),
+            capability_identity=registry._font_capability_identity(),
+        )
+        registry.upsert_item(self.project, item)
+        return item, receipt
 
     def exercise_stock_state_shape(
         self,
@@ -2143,7 +2227,7 @@ class ProjectVersionsApiTests(unittest.TestCase):
 
         with patch.object(
             editor_server.asset_registry,
-            "resolve_project_font",
+            "resolve_project_font_identity",
             side_effect=resolve_font,
         ):
             saved = self.create_version("font dependency target")
@@ -2194,6 +2278,103 @@ class ProjectVersionsApiTests(unittest.TestCase):
             automatic = project_versions.ProjectVersionStore(self.project).load(automatic_id)
             self.assertIn(f"project-font:{font_c}", automatic["dependency_bindings"])
             self.assertNotIn(f"project-font:{font_b}", automatic["dependency_bindings"])
+
+    def test_font_coverage_does_not_block_restore_but_identity_drift_does(self) -> None:
+        item, receipt = self.publish_real_coverage_font()
+        asset_id = str(item["asset_id"])
+        font_path = self.project / str(item["path"])
+        receipt_path = (
+            self.project
+            / editor_server.asset_registry.PROVIDER_RECEIPTS_REL
+            / f"{hashlib.sha256(asset_id.encode()).hexdigest()}.json"
+        )
+        license_path = self.project / str(receipt["license"]["path"])
+        original_font = font_path.read_bytes()
+        original_receipt = receipt_path.read_bytes()
+        original_license = license_path.read_bytes()
+
+        state_a = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state_a["overlays"][0]["text"] = "A"
+        state_a["overlays"][0]["style"]["font_asset_id"] = asset_id
+        state_a["revision"] = editor_server.editor_state_revision(state_a)
+        self.write_json("working/editor_state.json", state_a)
+        editor_server.asset_registry.resolve_project_font(self.project, asset_id)
+        saved_a = self.create_version("supported font version A")
+        version_a = str(saved_a["version"]["version_id"])
+
+        state_b = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        state_b["overlays"][0]["text"] = "A\U0001f600"
+        state_b = self.put_state(state_b)
+        with self.assertRaisesRegex(
+            editor_server.asset_registry.AssetRegistryError, "glyph coverage"
+        ):
+            editor_server.asset_registry.resolve_project_font(self.project, asset_id)
+
+        status, restored_a = self.restore_version(version_a)
+        self.assertEqual(status, 200, restored_a)
+        automatic_b = str(restored_a["automatic_backup"]["version_id"])
+        automatic_record = project_versions.ProjectVersionStore(self.project).load(
+            automatic_b
+        )
+        self.assertEqual(automatic_record["kind"], "auto_before_restore")
+        self.assertEqual(
+            automatic_record["snapshot_state"]["overlays"][0]["text"], "A\U0001f600"
+        )
+        self.assertIn(
+            f"project-font:{asset_id}", automatic_record["dependency_bindings"]
+        )
+        restored_state_a = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(restored_state_a["overlays"][0]["text"], "A")
+        editor_server.asset_registry.resolve_project_font(self.project, asset_id)
+
+        status, restored_b = self.restore_version(automatic_b)
+        self.assertEqual(status, 200, restored_b)
+        restored_state_b = json.loads(
+            (self.project / "working/editor_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(restored_state_b["overlays"][0]["text"], "A\U0001f600")
+        with self.assertRaisesRegex(
+            editor_server.asset_registry.AssetRegistryError, "glyph coverage"
+        ):
+            editor_server.asset_registry.resolve_project_font(self.project, asset_id)
+        import render_editor_timeline
+
+        with self.assertRaisesRegex(ValueError, "glyph coverage"):
+            render_editor_timeline.project_font_binding(
+                self.project,
+                restored_state_b,
+                asset_id,
+                required_text="",
+            )
+
+        drifted_receipt = copy.deepcopy(receipt)
+        drifted_receipt["decision"] = "rejected"
+        drift_cases = (
+            ("font", font_path, original_font + b"drift", original_font),
+            (
+                "receipt",
+                receipt_path,
+                project_versions.json_bytes(drifted_receipt),
+                original_receipt,
+            ),
+            ("license", license_path, original_license + b"drift", original_license),
+        )
+        for label, path, drifted, original in drift_cases:
+            with self.subTest(label=label):
+                self.assertNotEqual(drifted, original)
+                path.write_bytes(drifted)
+                try:
+                    status, rejected = self.restore_version(version_a)
+                    self.assertEqual(status, 409, rejected)
+                    self.assertEqual(rejected["reason"], "asset_changed")
+                finally:
+                    path.write_bytes(original)
 
     def test_fx_preview_is_blocked_by_version_journal_and_process_latch(self) -> None:
         manager = self.server.fx_preview_jobs
