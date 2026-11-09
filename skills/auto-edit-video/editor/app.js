@@ -353,7 +353,7 @@ function consumeProjectVersionRestoreRecovery() {
 function reloadProjectAfterVersionRestore({ uncertain = false, reason = "" } = {}) {
   projectVersionsNavigationPending = true;
   if (uncertain) rememberProjectVersionRestoreRecovery(reason);
-  window.location.replace(window.location.href);
+  window.location.reload();
 }
 
 function projectVersionsBusy() {
