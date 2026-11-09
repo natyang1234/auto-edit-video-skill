@@ -365,20 +365,33 @@ function projectVersionErrorMessage(error, action) {
 function projectVersionChangeLabel(path) {
   const value = String(path || "").replace(/^\/state(?=\/|$)/, "");
   if (/^\/publishing\/platform_id$/.test(value)) return "發布平台";
-  if (/^\/publishing(?:\/|$)/.test(value)) return "發佈文案";
+  if (/^\/publishing\/(?:title|body|hashtags)(?:\/|$)/.test(value)) return "發佈文案";
+  if (/^\/publishing\/cover(?:\/|$)/.test(value)) return "封面設定";
+  if (/^\/publishing\/draft_status$/.test(value)) return "文案草稿狀態";
+  if (/^\/publishing\/generator$/.test(value)) return "文案產生紀錄";
+  if (value === "/publishing") return "發佈設定";
+  if (/^\/publishing(?:\/|$)/.test(value)) return "其他編輯設定";
   if (/^\/overlays\/\d+\/semantic_review(?:\/|$)/.test(value)) return "字幕修正紀錄";
   if (/^\/review\/selected_overlay_id$/.test(value)) return "目前選取圖層";
   if (/^\/review\/warnings_acknowledged(?:\/|$)/.test(value)) return "提醒確認紀錄";
   if (/^\/highlights\/\d+\/review_status$/.test(value)) return "人工核可狀態";
   const segmentTime = value.match(/^\/segments\/(\d+)\/(source_start|source_end)$/);
   if (segmentTime) return `第${Number(segmentTime[1]) + 1}段${segmentTime[2] === "source_start" ? "開始時間" : "結束時間"}`;
-  if (/^\/overlays\/\d+\/(text|content)$/.test(value)) return "圖層文字";
+  if (/^\/overlays\/\d+\/text$/.test(value)) return "圖層文字";
+  if (/^\/overlays\/\d+\/content$/.test(value)) return "圖層內容";
   if (/^\/overlays\/\d+\/(?:style|layout)(?:\/|$)/.test(value)) return "圖層樣式與位置";
-  if (/^\/overlays\/\d+\/spotlight_path(?:\/|$)/.test(value)) return "聚光燈位置";
-  if (/^\/(?:caption_generation|caption_defaults|caption_delivery)(?:\/|$)/.test(value)
-    || /^\/overlays\/\d+\/effect_spans(?:\/|$)/.test(value)) return "字幕樣式";
+  if (/^\/overlays\/\d+\/spotlight_path(?:\/|$)/.test(value)) return "聚光燈追蹤設定";
+  if (/^\/caption_defaults(?:\/|$)/.test(value)) return "字幕樣式";
+  if (/^\/caption_generation(?:\/|$)/.test(value)) return "字幕產生設定";
+  if (/^\/caption_delivery(?:\/|$)/.test(value)) return "字幕交付資訊";
+  if (/^\/overlays\/\d+\/effect_spans(?:\/|$)/.test(value)) return "圖層效果";
   if (/^\/segments\/\d+(?:\/|$)/.test(value) || /^\/highlights\/\d+(?:\/|$)/.test(value)) return "片段設定";
-  if (/^\/canvas(?:\/|$)/.test(value)) return "輸出尺寸";
+  if (/^\/canvas\/platform_id$/.test(value)) return "輸出平台";
+  if (/^\/canvas\/(?:width|height)$/.test(value)) return "輸出尺寸";
+  if (/^\/canvas\/fps$/.test(value)) return "影格率";
+  if (/^\/canvas\/fit$/.test(value)) return "畫面填滿方式";
+  if (/^\/canvas\/show_safe_zones$/.test(value)) return "安全框顯示";
+  if (value === "/canvas") return "畫面設定";
   if (/^\/rights(?:\/|$)/.test(value)) return "素材權利";
   return "其他編輯設定";
 }

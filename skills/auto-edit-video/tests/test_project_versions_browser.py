@@ -125,6 +125,13 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/state/overlays/1/text", "kind": "changed", "saved_preview": '"true"', "current_preview": '"caption B"'},
                         {"path": "/state/publishing/platform_id", "kind": "changed", "saved_preview": '"instagram-reels"', "current_preview": '"youtube-shorts"'},
                         {"path": "/state/publishing/title", "kind": "changed", "saved_preview": '"saved title"', "current_preview": '"current title"'},
+                        {"path": "/state/publishing/body", "kind": "changed", "saved_preview": '"saved body"', "current_preview": '"current body"'},
+                        {"path": "/state/publishing/hashtags/0", "kind": "changed", "saved_preview": '"saved-tag"', "current_preview": '"current-tag"'},
+                        {"path": "/state/publishing/cover/text", "kind": "changed", "saved_preview": '"saved cover"', "current_preview": '"current cover"'},
+                        {"path": "/state/publishing/draft_status", "kind": "changed", "saved_preview": '"generated"', "current_preview": '"not_generated"'},
+                        {"path": "/state/publishing/generator", "kind": "changed", "saved_preview": '"draft.generator"', "current_preview": '"manual"'},
+                        {"path": "/state/publishing", "kind": "changed", "saved_preview": '"saved publishing"', "current_preview": '"current publishing"'},
+                        {"path": "/state/publishing/custom_note", "kind": "changed", "saved_preview": '"saved note"', "current_preview": '"current note"'},
                         {"path": "/state/publishing_extra/format", "kind": "changed", "saved_preview": '"saved format"', "current_preview": '"current format"'},
                         {"path": "/state/overlays/2/semantic_review/candidates/a~1b", "kind": "changed", "saved_preview": '"saved candidate"', "current_preview": '"current candidate"'},
                         {"path": "/state/overlays/2/semantic_reviewable/status", "kind": "changed", "saved_preview": '"saved review"', "current_preview": '"current review"'},
@@ -133,7 +140,19 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/state/video_template/subject/x", "kind": "changed", "saved_preview": "42", "current_preview": "55"},
                         {"path": "/state/overlays/2/material/asset_id", "kind": "changed", "saved_preview": '"asset-saved"', "current_preview": '"asset-current"'},
                         {"path": "/state/overlays/2/spotlight_path/keyframes/0/x", "kind": "changed", "saved_preview": "0.2", "current_preview": "0.8"},
+                        {"path": "/state/canvas/platform_id", "kind": "changed", "saved_preview": '"instagram-reels"', "current_preview": '"youtube-shorts"'},
                         {"path": "/state/canvas/width", "kind": "changed", "saved_preview": "1080", "current_preview": "720"},
+                        {"path": "/state/canvas/height", "kind": "changed", "saved_preview": "1920", "current_preview": "1280"},
+                        {"path": "/state/canvas/fps", "kind": "changed", "saved_preview": "30", "current_preview": "24"},
+                        {"path": "/state/canvas/fit", "kind": "changed", "saved_preview": '"contain"', "current_preview": '"cover"'},
+                        {"path": "/state/canvas/show_safe_zones", "kind": "changed", "saved_preview": "true", "current_preview": "false"},
+                        {"path": "/state/canvas", "kind": "changed", "saved_preview": '"saved canvas"', "current_preview": '"current canvas"'},
+                        {"path": "/state/canvas/width_extra", "kind": "changed", "saved_preview": "81", "current_preview": "79"},
+                        {"path": "/state/canvas_extra/width", "kind": "changed", "saved_preview": "81", "current_preview": "79"},
+                        {"path": "/state/caption_defaults/font_size", "kind": "changed", "saved_preview": "58", "current_preview": "52"},
+                        {"path": "/state/caption_generation/enabled", "kind": "changed", "saved_preview": "true", "current_preview": "false"},
+                        {"path": "/state/caption_delivery/mode", "kind": "changed", "saved_preview": '"burned"', "current_preview": '"sidecar"'},
+                        {"path": "/state/overlays/2/effect_spans/0/style", "kind": "changed", "saved_preview": '"saved effect"', "current_preview": '"current effect"'},
                         {"path": "/state/review/selected_overlay_id", "kind": "changed", "saved_preview": '"caption-a"', "current_preview": '"caption-b"'},
                         {"path": "/state/review/warnings_acknowledged/0", "kind": "changed", "saved_preview": '"warning-saved"', "current_preview": '"warning-current"'},
                         {"path": "/state/custom/setting", "kind": "changed", "saved_preview": "null", "current_preview": "true"},
@@ -141,6 +160,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                         {"path": "/state/segments/1/source_start", "kind": "changed", "saved_preview": "1.05", "current_preview": "1.15"},
                         {"path": "/state/segments/1/source_end", "kind": "changed", "saved_preview": "1.9", "current_preview": "1.95"},
                         {"path": "/state/overlays/2/text", "kind": "changed", "saved_preview": '"segment-0000a002"', "current_preview": '"user caption"'},
+                        {"path": "/state/overlays/2/content", "kind": "changed", "saved_preview": '"saved content"', "current_preview": '"current content"'},
                         {"path": "/state/highlights/0/review_status", "kind": "changed", "saved_preview": '"pending"', "current_preview": '"approved"'},
                     ] + [
                         {"path": f"/state/overlays/{index + 2}/text", "kind": "changed", "saved_preview": f'"saved {index}"', "current_preview": f'"current {index}"'}
@@ -261,12 +281,33 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertIn("目前顯示 80 項剪輯內容", detail_text)
             platform_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：youtube-shorts → 還原為：instagram-reels'
-            ).inner_text()
+            ).nth(0).inner_text()
             publishing_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：current title → 還原為：saved title'
             ).inner_text()
             publishing_similar_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：current format → 還原為：saved format'
+            ).inner_text()
+            publishing_body_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current body → 還原為：saved body'
+            ).inner_text()
+            publishing_hashtags_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current-tag → 還原為：saved-tag'
+            ).inner_text()
+            publishing_cover_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current cover → 還原為：saved cover'
+            ).inner_text()
+            publishing_draft_status_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：not_generated → 還原為：generated'
+            ).inner_text()
+            publishing_generator_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：manual → 還原為：draft.generator'
+            ).inner_text()
+            publishing_root_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current publishing → 還原為：saved publishing'
+            ).inner_text()
+            publishing_unknown_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current note → 還原為：saved note'
             ).inner_text()
             semantic_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：current candidate → 還原為：saved candidate'
@@ -289,6 +330,45 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             spotlight_path_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：0.8 → 還原為：0.2'
             ).inner_text()
+            overlay_content_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current content → 還原為：saved content'
+            ).inner_text()
+            canvas_platform_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：youtube-shorts → 還原為：instagram-reels'
+            ).nth(1).inner_text()
+            canvas_height_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：1280 → 還原為：1920'
+            ).inner_text()
+            canvas_fps_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：24 → 還原為：30'
+            ).inner_text()
+            canvas_fit_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：cover → 還原為：contain'
+            ).inner_text()
+            canvas_safe_zones_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：關閉 → 還原為：啟用'
+            ).nth(0).inner_text()
+            canvas_root_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current canvas → 還原為：saved canvas'
+            ).inner_text()
+            canvas_width_extra_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：79 → 還原為：81'
+            ).nth(0).inner_text()
+            canvas_extra_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：79 → 還原為：81'
+            ).nth(1).inner_text()
+            caption_defaults_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：52 → 還原為：58'
+            ).inner_text()
+            caption_generation_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：關閉 → 還原為：啟用'
+            ).nth(1).inner_text()
+            caption_delivery_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：sidecar → 還原為：burned'
+            ).inner_text()
+            effect_spans_change = page.locator(".project-version-content-changes li").filter(
+                has_text='目前：current effect → 還原為：saved effect'
+            ).inner_text()
             warning_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：warning-current → 還原為：warning-saved'
             ).inner_text()
@@ -301,6 +381,19 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             approval_status_change = page.locator(".project-version-content-changes li").filter(
                 has_text='目前：已核可 → 還原為：待確認'
             ).inner_text()
+            print(
+                "P7_R4_DOM_LABELS "
+                f"spotlight={spotlight_path_change!r} overlay_content={overlay_content_change!r} "
+                f"publishing_body={publishing_body_change!r} publishing_cover={publishing_cover_change!r} "
+                f"publishing_generator={publishing_generator_change!r} publishing_draft_status={publishing_draft_status_change!r} "
+                f"canvas_platform={canvas_platform_change!r} canvas_height={canvas_height_change!r} "
+                f"canvas_fps={canvas_fps_change!r} canvas_fit={canvas_fit_change!r} "
+                f"canvas_safe_zones={canvas_safe_zones_change!r} canvas_root={canvas_root_change!r} "
+                f"canvas_width_extra={canvas_width_extra_change!r} canvas_extra={canvas_extra_change!r} "
+                f"caption_defaults={caption_defaults_change!r} caption_generation={caption_generation_change!r} "
+                f"caption_delivery={caption_delivery_change!r} effect_spans={effect_spans_change!r}",
+                flush=True,
+            )
             self.assertIn("發布平台", platform_change)
             self.assertIn("發佈文案", publishing_change)
             self.assertNotIn("發布平台", publishing_similar_change)
@@ -318,13 +411,41 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             self.assertNotIn("聚光燈位置", template_subject_x_change)
             self.assertIn("其他編輯設定", material_asset_id_change)
             self.assertNotIn("素材權利", material_asset_id_change)
-            self.assertIn("聚光燈位置", spotlight_path_change)
+            self.assertIn("聚光燈追蹤設定", spotlight_path_change)
+            self.assertIn("圖層內容", overlay_content_change)
+            self.assertNotIn("圖層文字", overlay_content_change)
             self.assertIn("提醒確認紀錄", warning_change)
             self.assertNotIn("人工核可狀態", warning_change)
             self.assertIn("輸出尺寸", canvas_change)
             self.assertIn("目前選取圖層", selected_overlay_change)
             self.assertNotIn("人工核可狀態", selected_overlay_change)
             self.assertIn("人工核可狀態", approval_status_change)
+            self.assertIn("發佈文案", publishing_body_change)
+            self.assertIn("發佈文案", publishing_hashtags_change)
+            self.assertIn("封面設定", publishing_cover_change)
+            self.assertNotIn("發佈文案", publishing_cover_change)
+            self.assertIn("文案草稿狀態", publishing_draft_status_change)
+            self.assertIn("文案產生紀錄", publishing_generator_change)
+            self.assertIn("發佈設定", publishing_root_change)
+            self.assertIn("其他編輯設定", publishing_unknown_change)
+            self.assertNotIn("發佈文案", publishing_unknown_change)
+            self.assertIn("輸出平台", canvas_platform_change)
+            self.assertIn("輸出尺寸", canvas_height_change)
+            self.assertIn("影格率", canvas_fps_change)
+            self.assertIn("畫面填滿方式", canvas_fit_change)
+            self.assertIn("安全框顯示", canvas_safe_zones_change)
+            self.assertIn("畫面設定", canvas_root_change)
+            self.assertIn("其他編輯設定", canvas_width_extra_change)
+            self.assertNotIn("輸出尺寸", canvas_width_extra_change)
+            self.assertIn("其他編輯設定", canvas_extra_change)
+            self.assertNotIn("輸出尺寸", canvas_extra_change)
+            self.assertIn("字幕樣式", caption_defaults_change)
+            self.assertIn("字幕產生設定", caption_generation_change)
+            self.assertNotIn("字幕樣式", caption_generation_change)
+            self.assertIn("字幕交付資訊", caption_delivery_change)
+            self.assertNotIn("字幕樣式", caption_delivery_change)
+            self.assertIn("圖層效果", effect_spans_change)
+            self.assertNotIn("字幕樣式", effect_spans_change)
             print(
                 "P7_DIFF_LABELS "
                 f"platform={platform_change!r} publishing={publishing_change!r} "
@@ -333,7 +454,18 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
                 f"fx_values_title={fx_values_title_change!r} template_frame_width={template_frame_width_change!r} "
                 f"template_subject_x={template_subject_x_change!r} material_asset_id={material_asset_id_change!r} "
                 f"spotlight_path={spotlight_path_change!r} "
+                f"overlay_content={overlay_content_change!r} "
                 f"warning={warning_change!r} canvas={canvas_change!r} "
+                f"publishing_body={publishing_body_change!r} publishing_hashtags={publishing_hashtags_change!r} "
+                f"publishing_cover={publishing_cover_change!r} publishing_draft_status={publishing_draft_status_change!r} "
+                f"publishing_generator={publishing_generator_change!r} publishing_root={publishing_root_change!r} "
+                f"publishing_unknown={publishing_unknown_change!r} "
+                f"canvas_platform={canvas_platform_change!r} canvas_height={canvas_height_change!r} "
+                f"canvas_fps={canvas_fps_change!r} canvas_fit={canvas_fit_change!r} "
+                f"canvas_safe_zones={canvas_safe_zones_change!r} canvas_root={canvas_root_change!r} "
+                f"canvas_width_extra={canvas_width_extra_change!r} canvas_extra={canvas_extra_change!r} "
+                f"caption_defaults={caption_defaults_change!r} caption_generation={caption_generation_change!r} "
+                f"caption_delivery={caption_delivery_change!r} effect_spans={effect_spans_change!r} "
                 f"selected_overlay={selected_overlay_change!r} approval_status={approval_status_change!r}",
                 flush=True,
             )
