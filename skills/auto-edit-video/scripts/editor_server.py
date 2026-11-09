@@ -1496,7 +1496,9 @@ def _project_font_dependency_bindings(
     bindings: dict[str, Any] = {}
     for asset_id in sorted(selected):
         try:
-            resolved = asset_registry.resolve_project_font(project_dir, asset_id)
+            resolved = asset_registry.resolve_project_font_identity(
+                project_dir, asset_id
+            )
         except asset_registry.AssetRegistryError as exc:
             raise project_versions.ProjectVersionError(
                 409, "asset_changed", "版本引用的專案字型已變更或遺失"

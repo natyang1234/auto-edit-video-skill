@@ -621,7 +621,7 @@ async function saveProjectVersion(event) {
   const refreshGeneration = projectVersionsGeneration + 1;
   projectVersionsMutationInFlight = true;
   elements["project-version-save"].disabled = true;
-  setProjectVersionsStatus("正在儲存命名版本…");
+  setProjectVersionsStatus("正在核對原始影片並儲存版本…大型影片可能需要較長時間，請稍候。");
   try {
     await request("/api/project-versions", {
       method: "POST",
@@ -701,6 +701,7 @@ async function restoreProjectVersion() {
   const refreshGeneration = projectVersionsGeneration + 1;
   const pendingRestore = projectVersionsPendingRestore;
   projectVersionsMutationInFlight = true; const dialog = elements["project-version-restore-dialog"]; dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  elements["project-version-restore-status"].textContent = "正在核對原始影片、備份目前內容並還原…大型影片可能需要較長時間，請稍候。";
   try { const result = await request(`/api/project-versions/${encodeURIComponent(pendingRestore.version.version_id)}/restore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...pendingRestore.tokens, confirm_restore: true }) }); if (!result?.reload_required) throw new Error("伺服器未確認還原完成"); reloadProjectAfterVersionRestore(); }
   catch (error) {
     await recoverAfterUncertainProjectVersionRestore(error, pendingRestore.tokens);

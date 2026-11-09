@@ -859,6 +859,7 @@
           <button class="icon-button" id="project-versions-close" type="button" aria-label="關閉專案版本">×</button>
         </header>
         <p class="project-versions-intro">保存目前已儲存的剪輯內容。還原前會先自動備份目前版本，且既有核可將需要重新確認。</p>
+        <p>儲存與還原會完整核對原始影片；影片越大，等待時間可能越長。核對期間，此專案的其他操作也可能需要等待。</p>
         <p id="project-versions-status" class="project-versions-status" role="status" aria-live="polite"></p>
         <form id="project-version-save-form" class="project-version-save-form">
           <label class="field"><span>版本名稱</span><input id="project-version-name" maxlength="80" required autocomplete="off" placeholder="例如：開頭節奏確認版"></label>
@@ -874,6 +875,7 @@
     <dialog id="project-version-restore-dialog" class="project-version-restore-dialog" aria-labelledby="project-version-restore-title">
       <h2 id="project-version-restore-title">確認還原版本</h2>
       <p>將先自動備份目前內容，然後才還原選取版本。現有核可將失效並需要重新確認。</p>
+      <p>儲存與還原會完整核對原始影片；影片越大，等待時間可能越長。核對期間，此專案的其他操作也可能需要等待。</p>
       <p id="project-version-restore-name"></p>
       <p id="project-version-restore-status" role="status" aria-live="polite"></p>
       <div class="project-version-dialog-actions"><button class="button button-secondary" id="project-version-restore-cancel" type="button">取消</button><button class="button button-primary" id="project-version-restore-confirm" type="button">確認還原</button></div>

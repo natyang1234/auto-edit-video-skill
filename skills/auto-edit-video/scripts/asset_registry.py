@@ -1989,7 +1989,12 @@ def _load_font_provider_receipt(project_dir: Path, asset_id: str) -> dict:
 
 
 def _font_receipt_consistency_errors(
-    project_dir: Path, item: dict, receipt: dict, *, required_text: str = ""
+    project_dir: Path,
+    item: dict,
+    receipt: dict,
+    *,
+    required_text: str = "",
+    validate_project_text: bool = True,
 ) -> tuple[list[str], Any | None]:
     """Recompute v3 evidence, then validate current authoritative text."""
     if _font_receipt_shape_errors(receipt):
@@ -2081,6 +2086,8 @@ def _font_receipt_consistency_errors(
         )
         if _font_validation_snapshot(import_result) != receipt["validator"]:
             return ["font validation evidence does not recompute"], None
+        if not validate_project_text:
+            return [], import_result
         authority = project_required_font_text(Path(project_dir), item.get("asset_id"))
         if not isinstance(required_text, str):
             return ["font required text is invalid"], None
@@ -2100,10 +2107,13 @@ def _font_receipt_consistency_errors(
     return [], current_result
 
 
-def resolve_project_font(
-    project_dir: Path, asset_id: str, required_text: str = ""
+def _resolve_project_font(
+    project_dir: Path,
+    asset_id: str,
+    *,
+    required_text: str,
+    validate_project_text: bool,
 ) -> dict[str, Any]:
-    """Resolve one physically current v3 font; caller text can only expand coverage."""
     if not isinstance(asset_id, str) or re.fullmatch(
         r"font-(?:google-fonts|fontsource|github-fonts)-[0-9a-f]{16}-[0-9a-f]{16}", asset_id
     ) is None:
@@ -2118,7 +2128,11 @@ def resolve_project_font(
         raise AssetRegistryError("font provider item is invalid: " + "; ".join(static_errors))
     receipt = _load_font_provider_receipt(Path(project_dir), asset_id)
     errors, result = _font_receipt_consistency_errors(
-        Path(project_dir), item, receipt, required_text=required_text
+        Path(project_dir),
+        item,
+        receipt,
+        required_text=required_text,
+        validate_project_text=validate_project_text,
     )
     if errors or result is None:
         raise AssetRegistryError("font provider item is not current: " + "; ".join(errors))
@@ -2143,6 +2157,36 @@ def resolve_project_font(
         "required_glyphs": [dict(value) for value in result.required_glyphs],
         "ignored_characters": [dict(value) for value in result.ignored_characters],
     }
+
+
+def resolve_project_font(
+    project_dir: Path, asset_id: str, required_text: str = ""
+) -> dict[str, Any]:
+    """Resolve one physically current v3 font; caller text can only expand coverage."""
+    return _resolve_project_font(
+        Path(project_dir),
+        asset_id,
+        required_text=required_text,
+        validate_project_text=True,
+    )
+
+
+def resolve_project_font_identity(
+    project_dir: Path, asset_id: str
+) -> dict[str, Any]:
+    """Verify durable font identity for project-version dependencies only.
+
+    This preserves the complete provider, receipt, path, blob, license, byte,
+    and import-validation chain, but deliberately does not authorize rendering:
+    callers that render or preview must use ``resolve_project_font`` so current
+    project text still passes glyph-coverage validation.
+    """
+    return _resolve_project_font(
+        Path(project_dir),
+        asset_id,
+        required_text="",
+        validate_project_text=False,
+    )
 
 
 def list_project_fonts(project_dir: Path) -> list[dict[str, Any]]:
@@ -2466,4 +2510,5 @@ __all__ = [
     "upsert_item",
     "validate_font_license_text",
     "resolve_project_font",
+    "resolve_project_font_identity",
 ]
