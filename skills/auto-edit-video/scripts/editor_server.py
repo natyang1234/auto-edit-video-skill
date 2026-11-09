@@ -515,6 +515,59 @@ def editor_base_state_revision(state: dict[str, Any]) -> str:
     )
 
 
+def _audio_source_revision_matches_sanitized_highlights(
+    state: dict[str, Any], expected_revision: Any
+) -> tuple[int, ...] | None:
+    """Prove one bounded approved-to-pending snapshot downgrade in memory.
+
+    Project versions intentionally remove highlight approvals.  A finalized
+    audio plan may still bind the otherwise identical pre-sanitization visual
+    state.  Build the closed revision payload once, then try only the finite
+    set of current pending highlights promoted back to approved.  No state is
+    mutated and ambiguity remains fail-closed.
+    """
+    if not isinstance(expected_revision, str) or _AUDIO_EDIT_SHA256.fullmatch(
+        expected_revision
+    ) is None:
+        raise AudioEventEditError("audio event source timeline binding is invalid")
+    payload = _editor_render_revision_payload(
+        state, include_audio_event_edits=False
+    )
+    if _hash_editor_render_revision_payload(payload) == expected_revision:
+        return ()
+    highlights = payload.get("highlights")
+    if type(highlights) is not list:
+        raise AudioEventEditError("audio event source highlights must be an array")
+    if len(highlights) > 10:
+        raise AudioEventEditError("audio event source highlights cannot exceed 10 items")
+    pending_indexes: list[int] = []
+    for index, highlight in enumerate(highlights):
+        if type(highlight) is not dict:
+            raise AudioEventEditError(
+                f"audio event source highlight {index} must be an object"
+            )
+        status = highlight.get("review_status")
+        if status not in {"pending", "approved", "rejected"}:
+            raise AudioEventEditError(
+                f"audio event source highlight {index} review status is invalid"
+            )
+        if status == "pending":
+            pending_indexes.append(index)
+    matches: list[tuple[int, ...]] = []
+    for mask in range(1, 1 << len(pending_indexes)):
+        candidate_highlights = copy.deepcopy(highlights)
+        promoted: list[int] = []
+        for bit, index in enumerate(pending_indexes):
+            if mask & (1 << bit):
+                candidate_highlights[index]["review_status"] = "approved"
+                promoted.append(index)
+        candidate = dict(payload)
+        candidate["highlights"] = candidate_highlights
+        if _hash_editor_render_revision_payload(candidate) == expected_revision:
+            matches.append(tuple(promoted))
+    return matches[0] if len(matches) == 1 else None
+
+
 def editor_state_revision(state: dict[str, Any]) -> str:
     """Hash all fields that can change the rendered video."""
     return _hash_editor_render_revision_payload(
@@ -1426,7 +1479,75 @@ def project_version_source_binding(
     return binding
 
 
-def project_version_dependency_bindings(project_dir: Path) -> dict[str, Any]:
+def _project_font_dependency_bindings(
+    project_dir: Path, state: dict[str, Any]
+) -> dict[str, Any]:
+    selected: set[str] = set()
+    defaults = state.get("caption_defaults")
+    if isinstance(defaults, dict) and defaults.get("font_asset_id"):
+        selected.add(str(defaults["font_asset_id"]))
+    overlays = state.get("overlays")
+    if isinstance(overlays, list):
+        for overlay in overlays:
+            style = overlay.get("style") if isinstance(overlay, dict) else None
+            if isinstance(style, dict) and style.get("font_asset_id"):
+                selected.add(str(style["font_asset_id"]))
+
+    bindings: dict[str, Any] = {}
+    for asset_id in sorted(selected):
+        try:
+            resolved = asset_registry.resolve_project_font(project_dir, asset_id)
+        except asset_registry.AssetRegistryError as exc:
+            raise project_versions.ProjectVersionError(
+                409, "asset_changed", "版本引用的專案字型已變更或遺失"
+            ) from exc
+        path = resolved.get("path")
+        sha256 = resolved.get("sha256")
+        provider_id = resolved.get("provider_id")
+        license_spdx = resolved.get("license_spdx")
+        receipt = resolved.get("receipt")
+        if (
+            resolved.get("asset_id") != asset_id
+            or not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            or not path.startswith("assets/")
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or not isinstance(provider_id, str)
+            or not provider_id
+            or not isinstance(license_spdx, str)
+            or not license_spdx
+            or type(receipt) is not dict
+        ):
+            raise project_versions.ProjectVersionError(
+                409, "asset_changed", "版本引用的專案字型無法驗證"
+            )
+        stable_identity = {
+            "asset_id": asset_id,
+            "path": path,
+            "sha256": sha256,
+            "provider_id": provider_id,
+            "license_spdx": license_spdx,
+            "receipt": receipt,
+        }
+        try:
+            digest = project_versions.canonical_digest(stable_identity)
+        except (TypeError, ValueError) as exc:
+            raise project_versions.ProjectVersionError(
+                409, "asset_changed", "版本引用的專案字型無法驗證"
+            ) from exc
+        bindings[f"project-font:{asset_id}"] = {
+            "exists": True,
+            "sha256": digest,
+        }
+    return bindings
+
+
+def project_version_dependency_bindings(
+    project_dir: Path, state: dict[str, Any]
+) -> dict[str, Any]:
     bindings: dict[str, Any] = {}
     for relative in PROJECT_VERSION_DEPENDENCIES:
         entry = project_dir / relative
@@ -1460,6 +1581,7 @@ def project_version_dependency_bindings(project_dir: Path) -> dict[str, Any]:
             "exists": True,
             "sha256": project_versions.canonical_digest(payload),
         }
+    bindings.update(_project_font_dependency_bindings(project_dir, state))
     return bindings
 
 
@@ -1566,7 +1688,7 @@ def project_version_snapshot(
                 409, "dependency_changed", "版本使用的聲音事件計畫已變更"
             ) from exc
     render_revision = editor_state_revision(snapshot_for_revision)
-    dependencies = project_version_dependency_bindings(project_dir)
+    dependencies = project_version_dependency_bindings(project_dir, snapshot)
     return snapshot, render_revision, source_binding, assets, dependencies
 
 
@@ -2093,6 +2215,46 @@ def effect_span_final_errors(
     ]
 
 
+def audio_event_producer_readiness_errors(
+    project_dir: Path, state: dict[str, Any]
+) -> list[str]:
+    """Explain the bounded user review still needed by the strict producer."""
+    edits = state.get("audio_event_edits")
+    if not isinstance(edits, dict):
+        return []
+    try:
+        _render_id, _plan, _plan_hash, required_indexes = (
+            _resolve_bound_audio_event_source(project_dir, state, edits)
+        )
+    except AudioEventEditError:
+        return [
+            "聲音事件來源已與目前畫面狀態不一致；請重新建立或重新套用聲音事件編輯後再核可輸出"
+        ]
+    if not required_indexes:
+        return []
+    highlights = state.get("highlights")
+    if not isinstance(highlights, list):
+        return ["聲音事件綁定的精華片段無法驗證；請重新載入專案後再核可輸出"]
+    labels: list[str] = []
+    for index in required_indexes:
+        if index >= len(highlights) or not isinstance(highlights[index], dict):
+            return ["聲音事件綁定的精華片段無法驗證；請重新載入專案後再核可輸出"]
+        highlight = highlights[index]
+        highlight_id = str(highlight.get("id") or "未命名")[:80]
+        title = re.sub(
+            r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+",
+            " ",
+            str(highlight.get("title") or ""),
+        )
+        title = " ".join(title.split())[:80]
+        labels.append(f"{title}（{highlight_id}）" if title else highlight_id)
+    return [
+        "聲音事件編輯仍綁定還原前的精華核可；輸出前請由使用者重新核可原片段："
+        + "、".join(labels)
+        + "。系統不會自動變更片段核可狀態"
+    ]
+
+
 def approval_prerequisite_errors(
     project_dir: Path,
     manifest: dict[str, Any],
@@ -2147,6 +2309,7 @@ def approval_prerequisite_errors(
             errors.append("at least one highlight must be marked approved")
         return errors
 
+    errors.extend(audio_event_producer_readiness_errors(project_dir, state))
     if highlights and not approval_is_current(
         project_dir, manifest, "highlight_selection", state
     ):
@@ -3696,23 +3859,36 @@ def _finalized_audio_plan(
     return plan, plan_snapshot.sha256
 
 
+def _resolve_bound_audio_event_source(
+    project_dir: Path, state: dict[str, Any], edits: dict[str, Any]
+) -> tuple[str, dict[str, Any], str, tuple[int, ...]]:
+    """Resolve exact finalized audio authority plus any review projection."""
+    render_id = str(edits.get("source_render_id") or "")
+    plan, plan_hash = _finalized_audio_plan(project_dir, render_id)
+    if plan_hash != edits.get("source_plan_sha256"):
+        raise AudioEventEditError("audio event source plan hash changed")
+    if plan.get("timeline_revision") != edits.get("source_timeline_revision"):
+        raise AudioEventEditError("audio event source timeline binding changed")
+    required_indexes = _audio_source_revision_matches_sanitized_highlights(
+        state, edits.get("source_timeline_revision")
+    )
+    if required_indexes is None:
+        raise AudioEventEditError("audio event edits are stale for current visual state")
+    return render_id, plan, plan_hash, required_indexes
+
+
 def resolve_audio_event_source(
     project_dir: Path, state: dict[str, Any]
 ) -> tuple[str, dict[str, Any], str]:
     """Resolve one unambiguous finalized base plan for current visual state."""
     edits = state.get("audio_event_edits")
-    base_revision = editor_base_state_revision(state)
     if isinstance(edits, dict):
-        render_id = str(edits.get("source_render_id") or "")
-        plan, plan_hash = _finalized_audio_plan(project_dir, render_id)
-        if plan_hash != edits.get("source_plan_sha256"):
-            raise AudioEventEditError("audio event source plan hash changed")
-        if plan.get("timeline_revision") != edits.get("source_timeline_revision"):
-            raise AudioEventEditError("audio event source timeline binding changed")
-        if edits.get("source_timeline_revision") != base_revision:
-            raise AudioEventEditError("audio event edits are stale for current visual state")
+        render_id, plan, plan_hash, _required_indexes = (
+            _resolve_bound_audio_event_source(project_dir, state, edits)
+        )
         return render_id, plan, plan_hash
 
+    base_revision = editor_base_state_revision(state)
     envelope_dir = project_dir / "working/delivery_envelopes"
     try:
         metadata = envelope_dir.lstat()
@@ -4322,9 +4498,28 @@ class EditorServer(ThreadingHTTPServer):
                 )
             return projected
 
+    def ensure_fx_preview_version_ready(self) -> None:
+        """Fail closed before preview job/cache state can be touched."""
+        if self.project_version_recovery_latched:
+            raise FxPreviewJobError(
+                503,
+                "version_recovery_required",
+                "專案版本還原尚未安全完成；請重新啟動編輯器",
+            )
+        try:
+            project_versions.ensure_restore_ready(self.project_dir)
+        except project_versions.ProjectVersionRecoveryError as exc:
+            self.project_version_recovery_latched = True
+            raise FxPreviewJobError(
+                503,
+                "version_recovery_required",
+                "專案版本還原尚未安全完成；請重新啟動編輯器",
+            ) from exc
+
     def fx_preview_context(self) -> dict[str, Any]:
         """Return a read-only, revision-bound snapshot for the preview manager."""
         with self.project_lock:
+            self.ensure_fx_preview_version_ready()
             try:
                 ensure_caption_preset_mutation_ready(self.project_dir)
             except CaptionPresetRecoveryError as exc:
@@ -5899,6 +6094,11 @@ class EditorHandler(BaseHTTPRequestHandler):
         # project state through context_provider, so taking render_lock first
         # creates an AB-BA cycle with full-render reservation.
         with self.server.project_lock:
+            try:
+                self.server.ensure_fx_preview_version_ready()
+            except FxPreviewJobError as exc:
+                self.send_fx_preview_error(exc)
+                return
             if not self.server.render_lock.acquire(blocking=False):
                 self.send_fx_preview_error(
                     FxPreviewJobError(409, "render_busy", "目前已有影片輸出正在執行")
