@@ -1134,6 +1134,139 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                     },
                 )
 
+                stage("real-409-refusal-after-retained-snapshots")
+                records_before_refusal = list(records_dir.glob("pv_*.json"))
+                refusal_restore_requests: list[str] = []
+                page.on(
+                    "request",
+                    lambda request: refusal_restore_requests.append(request.url)
+                    if request.method == "POST"
+                    and request.url.endswith(
+                        f"/api/project-versions/{version_a['version_id']}/restore"
+                    )
+                    else None,
+                )
+                refusal_row_a = page.locator(".project-version-row").filter(
+                    has_text="P7 Version A"
+                ).first
+                with page.expect_response(
+                    lambda response: response.request.method == "GET"
+                    and response.url.endswith(
+                        f"/api/project-versions/{version_a['version_id']}"
+                    ),
+                    timeout=90_000,
+                ):
+                    refusal_row_a.click()
+                page.locator("#project-version-detail").get_by_role(
+                    "button", name="還原此版本"
+                ).click()
+                page.locator("#project-version-restore-dialog[open]").wait_for(
+                    timeout=30_000
+                )
+                refusal_edit = self._put_same_render_nonrender_state(
+                    page,
+                    label="409-latest",
+                    asserted=False,
+                    warnings=[],
+                )
+                self.assertEqual(refusal_edit["status"], 200, refusal_edit)
+                refusal_capture_key = "p7-real-409-refusal-capture"
+                page.evaluate(
+                    """
+                    ([expectedPath, captureKey]) => {
+                      const nativeFetch = window.fetch.bind(window);
+                      window.fetch = async (...args) => {
+                        const response = await nativeFetch(...args);
+                        const request = args[0];
+                        const options = args[1] || {};
+                        const url = typeof request === 'string' ? request : request.url;
+                        const method = String(options.method || request?.method || 'GET').toUpperCase();
+                        const target = new URL(url, window.location.href);
+                        if (method === 'POST' && target.origin === window.location.origin
+                            && target.pathname === expectedPath) {
+                          const payload = await response.clone().json();
+                          sessionStorage.setItem(captureKey, JSON.stringify({
+                            http_status: response.status,
+                            reason: payload?.reason,
+                            error_code: payload?.error_code,
+                          }));
+                        }
+                        return response;
+                      };
+                    }
+                    """,
+                    [
+                        f"/api/project-versions/{version_a['version_id']}/restore",
+                        refusal_capture_key,
+                    ],
+                )
+                with page.expect_navigation(
+                    wait_until="domcontentloaded", timeout=90_000
+                ):
+                    with page.expect_response(
+                        lambda response: response.request.method == "POST"
+                        and response.url.endswith(
+                            f"/api/project-versions/{version_a['version_id']}/restore"
+                        ),
+                        timeout=90_000,
+                    ) as refusal_info:
+                        page.locator("#project-version-restore-confirm").click()
+                refusal_response = refusal_info.value
+                refusal_payload = page.evaluate(
+                    """captureKey => {
+                      const raw = sessionStorage.getItem(captureKey);
+                      sessionStorage.removeItem(captureKey);
+                      return raw ? JSON.parse(raw) : null;
+                    }""",
+                    refusal_capture_key,
+                )
+                self.assertIsInstance(refusal_payload, dict)
+                self.assertEqual(refusal_response.status, 409, refusal_payload)
+                self.assertEqual(
+                    refusal_payload.get("reason") or refusal_payload.get("error_code"),
+                    "revision_conflict",
+                    refusal_payload,
+                )
+                self._wait_initialized(page)
+                page.locator("#project-versions-dialog[open]").wait_for(timeout=30_000)
+                refusal_notice = page.locator("#project-versions-status").inner_text()
+                self.assertIn("專案內容已變更", refusal_notice)
+                self.assertIn("已重新載入目前專案", refusal_notice)
+                self.assertNotIn("還原回應未完整收到", refusal_notice)
+                self.assertEqual(len(refusal_restore_requests), 1, refusal_restore_requests)
+                self.assertEqual(
+                    len(list(records_dir.glob("pv_*.json"))),
+                    len(records_before_refusal),
+                )
+                self.assertEqual(
+                    page.locator("#editing-brief").input_value(),
+                    "Response-safe 409-latest brief",
+                )
+                page.locator("#project-versions-close").click()
+                with page.expect_response(
+                    lambda response: response.request.method == "PUT"
+                    and response.url.endswith("/api/editor-state")
+                    and response.status == 200,
+                    timeout=90_000,
+                ):
+                    page.locator("#editing-brief").fill(
+                        "Response-safe 409-latest remains editable"
+                    )
+                self._open_versions(page)
+                self._write_evidence_json(
+                    "restore-refusal/result.json",
+                    {
+                        "http_status": refusal_response.status,
+                        "reason": refusal_payload.get("reason")
+                        or refusal_payload.get("error_code"),
+                        "restore_post_count": len(refusal_restore_requests),
+                        "record_count_delta": len(list(records_dir.glob("pv_*.json")))
+                        - len(records_before_refusal),
+                        "specific_notice": refusal_notice,
+                        "latest_state_editable": True,
+                    },
+                )
+
                 stage("response-loss-same-render-setup-a")
                 page.locator("#project-versions-close").click()
                 self._put_same_render_nonrender_state(
@@ -1291,7 +1424,7 @@ class ProjectVersionsRealBrowserIntegrationTests(unittest.TestCase):
                 self._wait_initialized(page)
                 page.locator("#project-versions-dialog[open]").wait_for(timeout=30_000)
                 page.wait_for_function(
-                    "() => document.querySelector('#project-versions-status')?.textContent.includes('還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。')",
+                    "() => document.querySelector('#project-versions-status')?.textContent.includes('還原結果尚無法確認，已重新載入目前專案，請確認內容後再繼續。')",
                     timeout=30_000,
                 )
                 self.assertEqual(

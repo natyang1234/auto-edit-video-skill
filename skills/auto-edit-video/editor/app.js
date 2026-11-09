@@ -42,8 +42,24 @@ let projectVersionsNavigationPending = false;
 let projectVersionsTrigger = null;
 let projectVersionsSelected = null;
 let projectVersionsPendingRestore = null;
-const PROJECT_VERSION_RESTORE_RECOVERY_NOTICE = "還原回應未完整收到，已重新載入目前專案，請確認內容後再繼續。";
+const PROJECT_VERSION_RESTORE_RECOVERY_NOTICE = "還原結果尚無法確認，已重新載入目前專案，請確認內容後再繼續。";
 const PROJECT_VERSION_RESTORE_RECOVERY_TTL_MS = 2 * 60 * 1000;
+const PROJECT_VERSION_ERROR_MESSAGES = Object.freeze({
+  source_changed: "來源影片已變更，請確認目前專案內容後重新查看版本。",
+  asset_changed: "引用素材已變更，請確認素材後重新查看版本。",
+  dependency_changed: "必要依賴已變更，請確認專案內容後重新查看版本。",
+  revision_conflict: "專案內容已變更，請關閉後重新查看差異。",
+  project_busy: "專案正在處理中，完成後再試。",
+  validation_error: "輸入內容不符合版本名稱規則，請檢查後再試。",
+  unsupported_snapshot: "此版本包含目前無法安全還原的專案內容，請保留版本並檢查專案設定。",
+  version_not_found: "找不到這個版本；請重新讀取版本清單後選擇仍存在的版本。",
+  version_capacity_reserved: "版本容量已保留給還原前備份，目前不能新增命名版本。",
+  version_capacity_exhausted: "版本容量已滿，無法執行此操作。系統不會自動清理版本。",
+  version_storage_unavailable: "版本資料目前無法安全讀寫，請先重新讀取版本清單再試。",
+  version_storage_unsupported: "目前位置不支援必要的安全版本存檔。請將完整專案移到本機支援的位置後再試。",
+  version_permissions_repair_required: "版本檔案的分享權限已變更。請在專案資料夾的 working/project_versions/records 中，將該版本檔設為僅本人可讀寫，再重新讀取清單。請勿刪除版本。",
+  version_recovery_required: "版本紀錄需要安全復原，請先處理後再試。",
+});
 // FX previews are deliberately local drafts. They never touch editor state
 // until the server compare-and-swap confirm succeeds.
 let fxPreviewDraft = null;
@@ -294,11 +310,17 @@ function projectVersionRestoreRecoveryKey() {
   return `auto-edit:project-version-restore-recovery:v1:${encodeURIComponent(location.pathname)}:${encodeURIComponent(projectId)}`;
 }
 
-function rememberProjectVersionRestoreRecovery() {
+function rememberProjectVersionRestoreRecovery(reason = "") {
   const key = projectVersionRestoreRecoveryKey();
   if (!key) return;
+  const safeReason = typeof reason === "string"
+    && Object.prototype.hasOwnProperty.call(PROJECT_VERSION_ERROR_MESSAGES, reason)
+    ? reason
+    : "";
+  const record = { expires_at: Date.now() + PROJECT_VERSION_RESTORE_RECOVERY_TTL_MS };
+  if (safeReason) record.reason = safeReason;
   try {
-    sessionStorage.setItem(key, JSON.stringify({ expires_at: Date.now() + PROJECT_VERSION_RESTORE_RECOVERY_TTL_MS }));
+    sessionStorage.setItem(key, JSON.stringify(record));
   } catch (_error) {
     // Storage is only for the one-shot explanation. Safety comes from reload.
   }
@@ -306,21 +328,31 @@ function rememberProjectVersionRestoreRecovery() {
 
 function consumeProjectVersionRestoreRecovery() {
   const key = projectVersionRestoreRecoveryKey();
-  if (!key) return false;
+  if (!key) return null;
   try {
     const raw = sessionStorage.getItem(key);
     sessionStorage.removeItem(key);
-    if (!raw) return false;
+    if (!raw) return null;
     const value = JSON.parse(raw);
-    return Number.isFinite(value?.expires_at) && value.expires_at >= Date.now();
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const keys = Object.keys(value);
+    if (!keys.every((name) => name === "expires_at" || name === "reason")
+      || !keys.includes("expires_at") || keys.length > 2) return null;
+    const now = Date.now();
+    if (!Number.isFinite(value.expires_at) || value.expires_at < now
+      || value.expires_at > now + PROJECT_VERSION_RESTORE_RECOVERY_TTL_MS) return null;
+    if (value.reason === undefined) return { reason: "" };
+    if (typeof value.reason !== "string"
+      || !Object.prototype.hasOwnProperty.call(PROJECT_VERSION_ERROR_MESSAGES, value.reason)) return null;
+    return { reason: value.reason };
   } catch (_error) {
-    return false;
+    return null;
   }
 }
 
-function reloadProjectAfterVersionRestore({ uncertain = false } = {}) {
+function reloadProjectAfterVersionRestore({ uncertain = false, reason = "" } = {}) {
   projectVersionsNavigationPending = true;
-  if (uncertain) rememberProjectVersionRestoreRecovery();
+  if (uncertain) rememberProjectVersionRestoreRecovery(reason);
   window.location.replace(window.location.href);
 }
 
@@ -343,23 +375,20 @@ function setProjectVersionsStatus(message = "", error = false) {
 
 function projectVersionErrorMessage(error, action) {
   const code = String(error?.code || error?.reason || "").toLowerCase();
-  const messages = {
-    source_changed: "來源影片已變更，請確認目前專案內容後重新查看版本。",
-    asset_changed: "引用素材已變更，請確認素材後重新查看版本。",
-    dependency_changed: "必要依賴已變更，請確認專案內容後重新查看版本。",
-    revision_conflict: "專案內容已變更，請關閉後重新查看差異。",
-    project_busy: "專案正在處理中，完成後再試。",
-    validation_error: "輸入內容不符合版本名稱規則，請檢查後再試。",
-    unsupported_snapshot: "此版本包含目前無法安全還原的專案內容，請保留版本並檢查專案設定。",
-    version_not_found: "找不到這個版本；請重新讀取版本清單後選擇仍存在的版本。",
-    version_capacity_reserved: "版本容量已保留給還原前備份，目前不能新增命名版本。",
-    version_capacity_exhausted: "版本容量已滿，無法執行此操作。系統不會自動清理版本。",
-    version_storage_unavailable: "版本資料目前無法安全讀寫，請先重新讀取版本清單再試。",
-    version_storage_unsupported: "目前位置不支援必要的安全版本存檔。請將完整專案移到本機支援的位置後再試。",
-    version_permissions_repair_required: "版本檔案的分享權限已變更。請在專案資料夾的 working/project_versions/records 中，將該版本檔設為僅本人可讀寫，再重新讀取清單。請勿刪除版本。",
-    version_recovery_required: "版本紀錄需要安全復原，請先處理後再試。",
-  };
-  return messages[code] || `${action}失敗，請稍後重新查看版本。`;
+  return Object.prototype.hasOwnProperty.call(PROJECT_VERSION_ERROR_MESSAGES, code)
+    ? PROJECT_VERSION_ERROR_MESSAGES[code]
+    : `${action}失敗，請稍後重新查看版本。`;
+}
+
+function knownProjectVersionErrorCode(error) {
+  const status = Number(error?.status);
+  if (!Number.isInteger(status) || status < 400 || status > 599) return "";
+  for (const candidate of [error?.code, error?.reason]) {
+    if (typeof candidate !== "string") continue;
+    const code = candidate.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(PROJECT_VERSION_ERROR_MESSAGES, code)) return code;
+  }
+  return "";
 }
 
 function projectVersionChangeLabel(path) {
@@ -665,6 +694,7 @@ async function refreshProjectVersionsAfterFailure(message, { restore = false } =
 }
 
 async function recoverAfterUncertainProjectVersionRestore(error, submittedTokens) {
+  const knownReason = knownProjectVersionErrorCode(error);
   const generation = ++projectVersionsGeneration;
   if (elements["project-version-restore-dialog"].open) elements["project-version-restore-dialog"].close();
   clearProjectVersionsView();
@@ -672,7 +702,7 @@ async function recoverAfterUncertainProjectVersionRestore(error, submittedTokens
   try {
     payload = await request("/api/project-versions");
   } catch (_refreshError) {
-    reloadProjectAfterVersionRestore({ uncertain: true });
+    reloadProjectAfterVersionRestore({ uncertain: true, reason: knownReason });
     return;
   }
   const current = payload?.current || {};
@@ -685,11 +715,11 @@ async function recoverAfterUncertainProjectVersionRestore(error, submittedTokens
     && submittedState === currentState
     && submittedManifest === currentManifest;
   if (!definitelyUnchanged) {
-    reloadProjectAfterVersionRestore({ uncertain: true });
+    reloadProjectAfterVersionRestore({ uncertain: true, reason: knownReason });
     return;
   }
   if (generation !== projectVersionsGeneration || !elements["project-versions-dialog"].open) {
-    reloadProjectAfterVersionRestore({ uncertain: true });
+    reloadProjectAfterVersionRestore({ uncertain: true, reason: knownReason });
     return;
   }
   renderProjectVersions(payload);
@@ -716,7 +746,8 @@ async function restoreProjectVersion() {
 }
 
 async function reopenProjectVersionsAfterRestoreRecovery() {
-  if (!consumeProjectVersionRestoreRecovery()) return;
+  const recovery = consumeProjectVersionRestoreRecovery();
+  if (!recovery) return;
   projectVersionsTrigger = elements["project-versions-open"];
   elements["project-versions-dialog"].showModal();
   const refreshGeneration = projectVersionsGeneration + 1;
@@ -724,8 +755,10 @@ async function reopenProjectVersionsAfterRestoreRecovery() {
   if (refreshGeneration !== projectVersionsGeneration || !elements["project-versions-dialog"].open) return;
   setProjectVersionsStatus(
     loaded
-      ? PROJECT_VERSION_RESTORE_RECOVERY_NOTICE
-      : `${PROJECT_VERSION_RESTORE_RECOVERY_NOTICE}；版本清單目前無法讀取，請稍後關閉後重新開啟。`,
+      ? recovery.reason
+        ? `${PROJECT_VERSION_ERROR_MESSAGES[recovery.reason]}已重新載入目前專案，請確認內容後再繼續。`
+        : PROJECT_VERSION_RESTORE_RECOVERY_NOTICE
+      : `${recovery.reason ? `${PROJECT_VERSION_ERROR_MESSAGES[recovery.reason]}已重新載入目前專案，請確認內容後再繼續。` : PROJECT_VERSION_RESTORE_RECOVERY_NOTICE}；版本清單目前無法讀取，請稍後關閉後重新開啟。`,
     true
   );
 }
