@@ -1,44 +1,25 @@
 <!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#211c18">
-  <title>Auto Edit Studio｜導入 A 卷</title>
-  <link rel="stylesheet" href="/styles.css">
-  <script src="/import.js" defer></script>
-</head>
+<html lang="zh-Hant"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light"><meta name="theme-color" content="#f0f1f2">
+<title>Auto Edit Studio｜建立剪輯專案</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke='%23007d83' stroke-width='3'%3E%3Ccircle cx='11' cy='12' r='7'/%3E%3Ccircle cx='23' cy='21' r='7'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css"><script src="/import.js" defer></script></head>
 <body class="studio-import-page">
-  <header class="topbar import-topbar">
-    <div class="brand-block">
-      <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
-      <div>
-        <p class="eyebrow">AUTO EDIT STUDIO</p>
-        <div class="project-context">
-          <span>建立新專案</span>
-          <h1>導入 A 卷</h1>
-        </div>
-      </div>
-    </div>
-    <div class="studio-local-badge"><i aria-hidden="true"></i>僅在這台 Mac 處理</div>
-  </header>
-
-  <main class="import-workspace">
-    <section class="import-intro" aria-labelledby="import-title">
-      <p class="eyebrow">NEW PROJECT</p>
-      <h2 id="import-title">把原始影片交給剪輯工作站</h2>
-      <p>影片會串流複製到獨立專案；原檔不會被修改，也不會上傳到外部服務。</p>
-      <ol class="import-steps" aria-label="處理步驟">
-        <li class="is-current"><span>1</span>導入影片</li>
-        <li><span>2</span>本機轉錄</li>
-        <li><span>3</span>精華提案</li>
-        <li><span>4</span>人工確認</li>
-      </ol>
-    </section>
-
-    <section class="import-card" aria-label="影片導入設定">
-      <div class="import-dropzone" id="import-dropzone" tabindex="0" role="button" aria-describedby="dropzone-note">
+<a class="skip-link" href="#studio-main">跳到工作區</a>
+<header class="studio-mobile-bar"><button id="studio-nav-toggle" aria-expanded="false" aria-controls="studio-navigation" type="button" aria-label="開啟導覽"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button><span class="brand-mark" aria-hidden="true"><span></span><span></span></span><span>Auto Edit Studio</span></header>
+<aside class="studio-sidebar">
+<a class="studio-brand" href="#start"><span class="brand-mark" aria-hidden="true"><span></span><span></span></span><strong>Auto Edit Studio</strong></a>
+<nav id="studio-navigation" aria-label="工作站導覽"><a href="#start" data-studio-nav="start"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7z"/></svg>開始剪輯</a><a href="#workflow" data-studio-nav="workflow"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h1M3 12h1M3 18h1"/></svg>剪輯流程</a><a href="#styles" data-studio-nav="styles"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/></svg>風格與特效</a><a href="#sources" data-studio-nav="sources"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 3h9v12H3z"/></svg>素材來源</a><a href="#recipes" data-studio-nav="recipes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v15M12 5C8 2 3 4 3 4v15s5-2 9 1c4-3 9-1 9-1V4s-5-2-9 1z"/></svg>教學配方</a></nav>
+<div class="studio-sidebar-note"><strong>本機處理・原片保留</strong><p>影片複製到獨立專案，<br>不會上傳到外部服務。</p></div>
+</aside>
+<main id="studio-main" class="import-workspace" tabindex="-1">
+<section data-studio-view="start" aria-labelledby="import-title">
+<header class="studio-page-heading"><h1 id="import-title">建立剪輯專案</h1><p>先選影片，再決定這支片要留下什麼。</p></header>
+<ol class="import-steps" aria-label="剪輯流程指南"><li class="is-current"><span>1</span>接件</li><li class=""><span>2</span>粗剪</li><li class=""><span>3</span>分鏡</li><li class=""><span>4</span>補素材</li><li class=""><span>5</span>畫面</li><li class=""><span>6</span>聲音</li><li class=""><span>7</span>輸出</li><li class=""><span>8</span>驗收</li></ol>
+<p class="studio-step-note">八階段是工作指南；實際處理進度會顯示在匯入區。</p>
+<div class="studio-import-layout">
+<div class="studio-source-column"><section class="studio-source-card" aria-label="選擇原始影片"><div class="import-dropzone" id="import-dropzone" tabindex="0" role="button" aria-describedby="dropzone-note">
         <input id="source-video-input" type="file" accept="video/mp4,video/quicktime,video/x-m4v,video/webm" hidden>
         <div class="import-reel-icon" aria-hidden="true"><span></span></div>
         <strong id="dropzone-title">拖入影片，或點一下選檔</strong>
@@ -55,13 +36,18 @@
         <button class="text-button" id="replace-video" type="button">更換</button>
       </div>
 
-      <div class="import-settings">
-        <label>
+      <p class="studio-source-note">原片保留，在本機建立專案副本。</p></section>
+<details class="studio-folder-entry"><summary>匯入整個素材資料夾</summary><p>包含主影片、圖片、音效或字幕時可用此入口；以最長影片作為主片。</p><input id="folder-input" type="file" webkitdirectory multiple hidden>
+      <button id="choose-folder" class="secondary" type="button">選擇資料夾</button>
+      <div id="folder-summary" hidden>
+        <strong id="folder-name">—</strong>
+        <span id="folder-count">—</span>
+      </div>
+      <button id="start-folder-import" type="button" disabled>匯入資料夾</button></details></div>
+<section class="import-settings" aria-label="專案設定"><label>
           <span>專案名稱</span>
           <input id="import-project-name" type="text" maxlength="120" placeholder="例如：Crystal 訪談精華">
-        </label>
-        <div class="import-setting-grid">
-          <label>
+        </label><div class="import-setting-grid"><label>
             <span>影片語言</span>
             <select id="import-language">
               <option value="auto">自動判斷</option>
@@ -70,8 +56,7 @@
               <option value="zh-CN">簡體中文</option>
               <option value="en-US">英文</option>
             </select>
-          </label>
-          <label>
+          </label><label>
             <span>主要平台</span>
             <select id="import-platform">
               <option value="auto">之後再選</option>
@@ -81,8 +66,7 @@
               <option value="xiaohongshu-full">小紅書 9:16</option>
               <option value="youtube-landscape">YouTube 16:9</option>
             </select>
-          </label>
-          <label>
+          </label><label>
             <span>精華長度</span>
             <select id="import-duration">
               <option value="auto">自動安排</option>
@@ -91,46 +75,40 @@
               <option value="long">長版</option>
               <option value="full">完整清理</option>
             </select>
-          </label>
-          <label>
+          </label><label>
             <span>基礎剪法</span>
             <select id="import-preset">
               <option value="balanced">平衡</option>
               <option value="conservative">保守</option>
               <option value="aggressive">緊湊</option>
             </select>
-          </label>
-          <label>
+          </label></div><label>
+          <span>這支片想保留什麼？（選填）</span>
+          <textarea id="import-brief" maxlength="2000" rows="4" placeholder="例如：保留 Crystal 談創業失敗與轉折的段落，節奏俐落但不要過度聳動。"></textarea>
+        </label><details class="studio-advanced"><summary>字幕與進階設定</summary><div class="studio-advanced-content"><label>
             <span>導演 Agent</span>
             <select id="import-director">
               <option value="" selected disabled>載入導演設定…</option>
             </select>
           </label>
-        </div>
-        <label>
+<label>
           <span>英文術語與專有名詞（選填）</span>
           <input id="import-transcription-glossary" type="text" maxlength="1200" placeholder="例如：It; to V; cigar; cigarette">
           <small>用分號分隔；轉錄時會保留英文拼寫，不做中文音譯。</small>
         </label>
-        <label>
+<label>
           <span>字幕正字校準（選填）</span>
           <input id="import-transcription-calibration" type="text" maxlength="2400" placeholder="例如：複數=富數；It is=意思；例句=音譽句">
           <small>格式為「正確寫法=可能誤字」，兩邊可不同長度，多個誤字用 | 分隔；校準會保留來源時間範圍並留下稽核紀錄。</small>
-        </label>
-        <div class="import-semantic-option">
+        </label><div class="import-semantic-option">
           <label>
             <input id="import-contextual-semantic" type="checkbox" checked>
             <span>全文上下文語意校準（本機）</span>
           </label>
           <small>逐句參照前後文檢查整份字幕；高信心錯字才自動套用，其餘保留為待確認，不會上傳逐字稿。</small>
-        </div>
-        <label>
-          <span>想強調的風格與重點（選填）</span>
-          <textarea id="import-brief" maxlength="2000" rows="4" placeholder="例如：保留 Crystal 談創業失敗與轉折的段落，節奏俐落但不要過度聳動。"></textarea>
-        </label>
-      </div>
-
-      <div class="import-progress" id="import-progress" hidden aria-live="polite">
+        </div></div></details>
+</section></div>
+<div class="studio-submit-area"><div class="import-progress" id="import-progress" hidden aria-live="polite">
         <div class="import-progress-copy">
           <strong id="import-progress-title">準備導入…</strong>
           <span id="import-progress-value">0%</span>
@@ -139,22 +117,11 @@
         <p id="import-progress-note">請保持這個視窗開啟。</p>
       </div>
 
-      <p class="import-error" id="import-error" role="alert" hidden></p>
-      <button class="primary-button import-submit" id="start-import" type="button" disabled>建立剪輯專案</button>
-      <p class="import-privacy">Studio 不接受本機路徑，只讀取你在瀏覽器明確選擇的檔案內容。</p>
-    </section>
-
-    <section class="import-card" aria-label="資料夾匯入（Phase 1a）">
-      <h2>或匯入整個素材資料夾</h2>
-      <p>選擇含主影片與素材（圖片、GIF、B-roll、字型、字幕）的資料夾；Studio 會自動判定最長的影片為主片並建立專案。</p>
-      <input id="folder-input" type="file" webkitdirectory multiple hidden>
-      <button id="choose-folder" class="secondary" type="button">選擇資料夾</button>
-      <div id="folder-summary" hidden>
-        <strong id="folder-name">—</strong>
-        <span id="folder-count">—</span>
-      </div>
-      <button id="start-folder-import" type="button" disabled>匯入資料夾</button>
-    </section>
-  </main>
-</body>
-</html>
+      <p class="import-error" id="import-error" role="alert" hidden></p><div class="studio-submit-row"><p id="studio-start-hint">選擇影片後即可開始</p><button class="primary-button import-submit" id="start-import" type="button" disabled>開始處理</button></div><p class="import-privacy">只讀取你明確選擇的檔案；原片不會被修改。</p></div>
+</section>
+<section data-studio-view="workflow" hidden aria-labelledby="workflow-title"><header class="studio-page-heading"><h1 id="workflow-title">剪輯流程</h1><p>依片種與目標挑需要的步驟；改稿或驗收時，也能回到前面補齊。</p></header><div id="studio-workflow-content" class="studio-guide-list"></div></section>
+<section data-studio-view="styles" hidden aria-labelledby="styles-title"><header class="studio-page-heading"><h1 id="styles-title">風格與特效</h1><p>先描述想要的方向，再確認分鏡與效果。加入剪輯重點會填入需求，尚未套用效果。</p></header><div id="studio-style-content" class="studio-content-grid"></div><div class="studio-guide-note"><h2>搭配原則</h2><p>一支片選一個主色組，最多一個輔助色組。字卡、字幕與畫面維持一致；需要特效或設計字卡時，先確認分鏡與開場方向。</p><p>建立專案後，可在剪輯工作區安排效果與時間位置。</p></div></section>
+<section data-studio-view="sources" hidden aria-labelledby="sources-title"><header class="studio-page-heading"><h1 id="sources-title">素材來源</h1><p>先查自有素材，再按缺口挑來源。以下連結開啟網站，不會自動下載或匯入。</p></header><div class="studio-guide-note"><h2>補素材怎麼走？</h2><p>接件、分鏡、改稿與驗收都可發現缺口。剪輯助手會先盤點本機，再選少量相關來源搜尋候選；最後選片、入片和音效安排沿用原有審查。</p><p>找到候選 → 下載 → 放入時間線 → 核實內容與授權，每一步分別記錄。網站收藏不代表素材已可用；來源頁、作者、用途與當次授權仍需確認。</p></div><div id="studio-source-content" class="studio-content-grid"></div></section>
+<section data-studio-view="recipes" hidden aria-labelledby="recipes-title"><header class="studio-page-heading"><h1 id="recipes-title">教學配方</h1><p>遇到剪點、構圖或聲音問題時按需選用。這些是決策參考，加入需求後仍需依素材規劃。</p></header><div id="studio-recipe-content" class="studio-content-grid"></div></section>
+<p id="studio-action-status" class="sr-only" role="status" aria-live="polite"></p>
+</main></body></html>

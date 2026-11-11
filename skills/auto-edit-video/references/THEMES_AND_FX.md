@@ -1,5 +1,18 @@
 # Colour themes and effect layers
 
+## Semantic talking-head effect planning (2026-11-01)
+
+When adding effects to a talking-head edit, or when asked for the Convra-style
+eight-effect workflow, read
+`~/.claude/skills/edit-style-profiles/references/semantic-talking-head-fx.md`.
+The agent selects effects from the corrected transcript and source-time cues;
+the user does not need to prepare JSON. Follow the recipe's capability table,
+source-grounded text/data rules, asset-gap route, and existing storyboard gates.
+Do not automatically insert all eight effects or treat the menu's evenly spaced
+preset placement as semantic selection. This route uses existing effect layers;
+it does not add an automatic detector, a data-driven chart renderer, or a paid
+B-roll generator. Verify actual rendered pixels before claiming an effect works.
+
 Moved verbatim from SKILL.md (Local Studio GUI section). `$SKILL` is the installed skill directory.
 
 Colour themes (2026-10-21): besides the three base style packs, palette-catalog

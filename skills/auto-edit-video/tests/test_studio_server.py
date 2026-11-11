@@ -241,7 +241,7 @@ class StudioServerTests(StudioHarness):
     def test_import_creates_owned_project_and_launches_scoped_editor(self) -> None:
         html_status, _headers, html = self.request("GET", "/")
         self.assertEqual(html_status, 200)
-        self.assertIn("導入影片", html.decode("utf-8"))
+        self.assertIn("建立剪輯專案", html.decode("utf-8"))
         self.assertIn('id="import-director"', html.decode("utf-8"))
         self.assertIn('id="import-brief"', html.decode("utf-8"))
         self.assertIn('id="import-contextual-semantic"', html.decode("utf-8"))
