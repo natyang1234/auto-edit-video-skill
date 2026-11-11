@@ -12,6 +12,38 @@ their absence must not block the standalone core.
 
 ## Agent-first mode (default)
 
+### 八階段流程索引
+流程、skill 路由與既有審查點見 [剪輯工作流程](references/EDITING_WORKFLOW.zh-TW.md)。
+技能文件可讀不代表 runtime 或 UI 已驗收。
+
+### Story and rhythm route
+
+When the request specifically calls for story-first structure, pacing repair
+(too fast, too dense, or emotion not landing), or documentary sound design, read
+the matching recipe in `~/.claude/skills/story-rhythm-sound/SKILL.md` and use only
+the requested recipe. Keep conservative cut-only cleanup and transcoding on the
+existing path; do not force a three-act structure on dialogue-free music videos.
+If the optional skill is absent, continue the existing workflow.
+
+### Optional filmcraft references
+
+For a creative edit that needs shot choice, composition, grading, motivated edit points, slide speed ramps, or explicitly requested cinematic sound, consult the relevant item in `~/.claude/skills/edit-style-profiles/references/filmcraft-foundations/README.md` on this workstation; open only the required recipe. Put the selected source timecodes, decision and clip scope in `working/filmcraft-decisions.md`, with unperformed checks marked `PENDING`. This route contributes planning guidance only; keep this package’s current renderer, cut, asset and approval gates intact. Cut-only and transcode jobs do not acquire a creative checkpoint.
+
+### Automatic asset-gap sourcing (nat, 2026-10-29)
+
+At edit intake, storyboarding, revisions, and final QA, check whether the requested
+edit lacks footage, stills, SFX, BGM, templates, or grading assets. If a gap exists,
+read the installed `edit-style-profiles/references/asset-gap-sourcing.md`
+(on this workstation: `~/.claude/skills/edit-style-profiles/references/asset-gap-sourcing.md`)
+and execute its local-first, category-specific search workflow automatically.
+Record actual queries, candidates, provenance, placement, and unresolved gaps in
+`working/asset-gaps.md`; don't stop at suggesting websites. No gaps or cut-only
+cleanup means no external sourcing. Preserve all applicable storyboard, asset
+import, cue, timeline, and final-review gates; searching itself needs no repeated
+permission. This is an agent workflow, not a background downloader or Studio
+provider implementation. If the optional reference is absent, report that routing
+is unavailable and continue the standalone core without inventing sources.
+
 Read [references/AGENT_FIRST.zh-TW.md](references/AGENT_FIRST.zh-TW.md). The
 user-facing contract has one required input: a local video file that the agent
 can read. The agent owns every internal artifact and must return an edited MP4,
@@ -328,6 +360,9 @@ Use `video-autopilot-macos` Path 1 only when discovered and selected. Use
 where the user wants premium occlusion/VFX captions; follow its identity gate.
 
 ### 6. Match visuals to meaning
+
+Run the automatic asset-gap sourcing workflow above before assembling visual
+assets; use it again when a revision or QA reveals a missing or unsuitable asset.
 
 Storyboard gate (nat, 2026-10-21): before adding effects or designed cards, draft
 `storyboard.md` with `edit-style-profiles/tools/storyboard.py init` (effect codes,
