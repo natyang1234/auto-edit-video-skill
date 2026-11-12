@@ -529,7 +529,7 @@ class ProjectVersionsBrowserTests(unittest.TestCase):
             permission_text = page.locator("#project-versions-status").inner_text()
             self.assertIn("working/project_versions/records", permission_text)
             self.assertIn("請勿刪除版本", permission_text)
-            self.assertNotIn("/Users/", permission_text)
+            self.assertNotIn("/Users" + "/", permission_text)
             for name, expected in (
                 ("不支援快照", "無法安全還原"),
                 ("遺失版本", "找不到這個版本"),
