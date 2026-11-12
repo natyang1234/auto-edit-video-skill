@@ -19,14 +19,17 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
 
 import style_presets  # noqa: E402
 import editor_server  # noqa: E402
 import studio_server  # noqa: E402
 import asset_registry  # noqa: E402
 from font_security import validate_font_bytes  # noqa: E402
-from tests.font_test_fixture import build_ttf  # noqa: E402
-from tests import test_fx_preview_api as fx_api_test  # noqa: E402
+from font_test_fixture import build_ttf  # noqa: E402
+import test_fx_preview_api as fx_api_test  # noqa: E402
 
 
 OFL_LICENSE = (Path(__file__).resolve().parents[1] / "contracts/licenses/OFL-1.1.txt").read_bytes()
@@ -1546,7 +1549,7 @@ class StylePresetApiTests(unittest.TestCase):
         )
 
     def test_single_render_journal_gate_precedes_all_publication(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -1602,7 +1605,7 @@ class StylePresetApiTests(unittest.TestCase):
             case.doCleanups()
 
     def test_batch_second_member_gate_rolls_back_first_member_auxiliary_records(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -1658,7 +1661,7 @@ class StylePresetApiTests(unittest.TestCase):
             case.doCleanups()
 
     def test_batch_auxiliary_rollback_restores_preexisting_exact_bytes(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -1722,7 +1725,7 @@ class StylePresetApiTests(unittest.TestCase):
             case.doCleanups()
 
     def test_batch_auxiliary_cas_mismatch_is_reported_and_not_deleted(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -1771,7 +1774,7 @@ class StylePresetApiTests(unittest.TestCase):
             case.doCleanups()
 
     def test_batch_member_auxiliary_write_failure_rolls_back_both_records(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -1825,7 +1828,7 @@ class StylePresetApiTests(unittest.TestCase):
             case.doCleanups()
 
     def test_batch_auxiliary_restore_and_unlink_io_failures_are_unclean(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         for mode in ("restore", "unlink"):
             with self.subTest(mode=mode):
@@ -1918,7 +1921,7 @@ class StylePresetApiTests(unittest.TestCase):
                     case.doCleanups()
 
     def test_batch_post_commit_failure_keeps_member_auxiliary_records(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -1962,7 +1965,7 @@ class StylePresetApiTests(unittest.TestCase):
             case.doCleanups()
 
     def test_batch_cleanup_failure_keeps_original_root_cause_and_classification(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()
@@ -2563,7 +2566,7 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(tracker.live_fds, {})
 
     def test_preview_failure_after_replace_reports_publication_truthfully(self) -> None:
-        from tests.test_editor_server import EditorServerTests
+        from test_editor_server import EditorServerTests
 
         case = EditorServerTests(methodName="runTest")
         case.setUp()

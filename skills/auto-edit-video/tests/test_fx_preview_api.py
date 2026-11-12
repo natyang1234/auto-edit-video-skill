@@ -26,6 +26,12 @@ import fx_preview_contract  # noqa: E402
 import fx_preview_jobs  # noqa: E402
 from editor_server import EditorServer  # noqa: E402
 
+# These tests resolve a real FX code (T3, B1, …) through the optional
+# edit-style-profiles catalog; without it every request is effect_unavailable.
+requires_fx_catalog = unittest.skipUnless(
+    fx_overlay.available(), "needs the edit-style-profiles FX catalog"
+)
+
 
 FAST_RENDERER = r'''#!/usr/bin/env python3
 import argparse, hashlib, json, os
@@ -317,6 +323,7 @@ class FxPreviewApiTests(unittest.TestCase):
         except ProcessLookupError:
             pass
 
+    @requires_fx_catalog
     def test_preview_is_non_mutating_then_confirm_uses_cas(self) -> None:
         state_path = self.project / "working/editor_state.json"
         manifest_path = self.project / "project.json"
@@ -370,6 +377,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertTrue(cached["job"]["cache_hit"])
         self.assertEqual(cached["job"]["text_layout"], terminal["job"]["text_layout"])
 
+    @requires_fx_catalog
     def test_opacity_is_strict_cached_and_frozen_through_confirm(self) -> None:
         default_request = self._candidate()
         status, default_created = self._json_request(
@@ -478,6 +486,7 @@ class FxPreviewApiTests(unittest.TestCase):
                 self.assertEqual(status, 422, rejected)
                 self.assertEqual(rejected["reason"], "opacity_invalid")
 
+    @requires_fx_catalog
     def test_b1_unknown_fields_and_nan_fail_closed(self) -> None:
         status, rejected = self._json_request("POST", "/api/fx-previews", self._candidate("B1"))
         self.assertEqual(status, 422, rejected)
@@ -499,6 +508,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(status, 422, raw)
         self.assertEqual(json.loads(raw)["reason"], "window_invalid")
 
+    @requires_fx_catalog
     def test_short_sample_confirms_the_full_apply_window(self) -> None:
         request = self._candidate()
         request["candidate"]["window"] = {"start_s": 2.0, "duration_s": 2.0}
@@ -527,6 +537,7 @@ class FxPreviewApiTests(unittest.TestCase):
             (0.0, 8.0),
         )
 
+    @requires_fx_catalog
     def test_same_visual_add_then_replace_hits_single_preview_cache(self) -> None:
         candidate = self._candidate()
         status, created = self._json_request("POST", "/api/fx-previews", candidate)
@@ -545,6 +556,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(status, 200, cached)
         self.assertTrue(cached["job"]["cache_hit"], cached)
 
+    @requires_fx_catalog
     def test_preview_options_and_subject_change_the_cache_identity(self) -> None:
         baseline = self._candidate()
         status, first = self._json_request("POST", "/api/fx-previews", baseline)
@@ -589,6 +601,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertFalse(fifth["job"]["cache_hit"])
         self.assertEqual(self._wait_terminal(fifth["job"]["id"])["job"]["state"], "ready")
 
+    @requires_fx_catalog
     def test_b1_uses_only_opaque_owned_asset_binding_and_rights_gate(self) -> None:
         uploaded = self._upload_asset("material.png")
         status, library = self._json_request("GET", "/api/assets/library")
@@ -641,6 +654,7 @@ class FxPreviewApiTests(unittest.TestCase):
             rejected,
         )
 
+    @requires_fx_catalog
     def test_timeline_b1_freezes_candidate_asset_and_registry_authority(self) -> None:
         uploaded = self._upload_asset("timeline-material.png")
         request = self._candidate("B1")
@@ -662,6 +676,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(dependencies["asset_digests"][relative], uploaded["sha256"])
         self.assertIn("assets/provenance.json", dependencies["provenance_digests"])
 
+    @requires_fx_catalog
     def test_timeline_b1_across_cut_preview_confirms_and_persists(self) -> None:
         status, current = self._json_request("GET", "/api/project")
         self.assertEqual(status, 200, current)
@@ -716,6 +731,7 @@ class FxPreviewApiTests(unittest.TestCase):
             [(0.0, 5.0), (6.0, 8.0)],
         )
 
+    @requires_fx_catalog
     def test_timeline_t3_preview_confirms_and_persists(self) -> None:
         request = self._candidate("T3")
         request["preview_options"] = {"mode": "timeline", "quality": "draft"}
@@ -731,6 +747,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(status, 200, confirmed)
         self.assertEqual(confirmed["state"]["overlays"][-1]["code"], "T3")
 
+    @requires_fx_catalog
     def test_timeline_b1_confirm_rejects_asset_registry_and_code_drift(self) -> None:
         uploaded = self._upload_asset("timeline-drift.png")
         request = self._candidate("B1")
@@ -786,6 +803,7 @@ class FxPreviewApiTests(unittest.TestCase):
         finally:
             self.fast_renderer.write_bytes(renderer_before)
 
+    @requires_fx_catalog
     def test_b1_rejects_client_paths_and_asset_changes_before_confirm(self) -> None:
         uploaded = self._upload_asset("material.png")
         malicious = self._candidate("B1")
@@ -837,6 +855,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertNotIn("assets/font.ttf", paths)
         self.assertNotIn("assets/broken.png", paths)
 
+    @requires_fx_catalog
     def test_extreme_integer_window_fields_return_422_without_disconnect(self) -> None:
         for field in ("start_s", "duration_s"):
             with self.subTest(field=field):
@@ -1120,6 +1139,7 @@ class FxPreviewApiTests(unittest.TestCase):
             second = manager.cancel(job_id)
         self.assertEqual(second["state"], "cancelled")
 
+    @requires_fx_catalog
     def test_http_timing_lifecycle_and_sample_limits(self) -> None:
         # The worker is gated by a per-job file; the manager alone uses this
         # controllable monotonic clock. No ETA assertion relies on CPU speed.
@@ -1283,6 +1303,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(results["preview"][0], 409, results)
         self.assertEqual(results["preview"][1]["reason"], "render_busy")
 
+    @requires_fx_catalog
     def test_confirm_can_replace_only_the_frozen_existing_fx_layer(self) -> None:
         status, first = self._json_request("POST", "/api/fx-previews", self._candidate())
         self.assertEqual(status, 202, first)
@@ -1350,6 +1371,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(fx_layers[0]["metadata"], {"editor_note": "keep-me"})
         self.assertTrue(replaced["replaced"])
 
+    @requires_fx_catalog
     def test_replace_omitted_opacity_maps_invalid_existing_value_to_422(self) -> None:
         status, created = self._json_request(
             "POST", "/api/fx-previews", self._candidate()
@@ -1385,6 +1407,7 @@ class FxPreviewApiTests(unittest.TestCase):
                 status, health = self._json_request("GET", "/api/project")
                 self.assertEqual(status, 200, health)
 
+    @requires_fx_catalog
     def test_source_change_during_job_prevents_publication(self) -> None:
         self.server.fx_preview_jobs.renderer_script = self.slow_renderer.resolve()
         status, created = self._json_request("POST", "/api/fx-previews", self._candidate())
@@ -1395,6 +1418,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(terminal["job"]["error"]["code"], "preview_stale")
         self.assertNotIn("media_url", terminal["job"])
 
+    @requires_fx_catalog
     def test_cancel_terminates_worker_and_never_publishes_media(self) -> None:
         self.server.fx_preview_jobs.renderer_script = self.slow_renderer.resolve()
         status, created = self._json_request("POST", "/api/fx-previews", self._candidate())
@@ -1405,6 +1429,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(cancelled["job"]["state"], "cancelled")
         self.assertNotIn("media_url", cancelled["job"])
 
+    @requires_fx_catalog
     def test_worker_timeout_fails_without_publishing_media(self) -> None:
         self.server.fx_preview_jobs.renderer_script = self.slow_renderer.resolve()
         self.server.fx_preview_jobs.render_timeout_s = 0.1
@@ -1415,6 +1440,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(terminal["job"]["error"]["code"], "render_timeout")
         self.assertNotIn("media_url", terminal["job"])
 
+    @requires_fx_catalog
     def test_cancel_kills_term_ignoring_worker_grandchild(self) -> None:
         self.server.fx_preview_jobs.renderer_script = self.grandchild_renderer.resolve()
         status, created = self._json_request("POST", "/api/fx-previews", self._candidate())
@@ -1437,6 +1463,7 @@ class FxPreviewApiTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(self._pid_exists(child_pid), "worker grandchild survived cancellation")
 
+    @requires_fx_catalog
     def test_idle_cache_ttl_removes_only_preview_owned_artifacts(self) -> None:
         status, created = self._json_request("POST", "/api/fx-previews", self._candidate())
         self.assertEqual(status, 202, created)
@@ -1461,6 +1488,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(terminal["job"]["state"], "failed")
         self.assertEqual(terminal["job"]["error"]["code"], "cache_evicted")
 
+    @requires_fx_catalog
     def test_cache_byte_cap_evicts_oldest_ready_artifact(self) -> None:
         status, first = self._json_request("POST", "/api/fx-previews", self._candidate())
         self.assertEqual(status, 202, first)
@@ -1479,6 +1507,7 @@ class FxPreviewApiTests(unittest.TestCase):
         self.assertEqual(evicted["job"]["error"]["code"], "cache_evicted")
         self.assertEqual(len(list(self.server.fx_preview_jobs.cache_dir.glob("*.mp4"))), 1)
 
+    @requires_fx_catalog
     def test_csrf_busy_and_cache_hit_contracts(self) -> None:
         body = json.dumps(self._candidate()).encode()
         status, _headers, raw = self._request(

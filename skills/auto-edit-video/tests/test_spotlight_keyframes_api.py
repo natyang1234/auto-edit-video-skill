@@ -10,6 +10,14 @@ import test_fx_preview_api as _api_fixture
 import fx_preview_contract as contract
 
 
+# These tests resolve a real FX code through the optional edit-style-profiles
+# catalog; without it every request is effect_unavailable.
+requires_fx_catalog = pytest.mark.skipif(
+    not _api_fixture.fx_overlay.available(),
+    reason="needs the edit-style-profiles FX catalog",
+)
+
+
 def manual_path(*, x_end: float = 0.75) -> dict:
     return {
         "version": 1,
@@ -120,6 +128,7 @@ def test_spotlight_keyframe_stylesheet_has_a_same_origin_static_route(api) -> No
         },
     ],
 )
+@requires_fx_catalog
 def test_manual_path_rejected_at_http_trust_boundary(api, mutate) -> None:
     status, payload = api._json_request(
         "POST", "/api/fx-previews", _request(api, mutate(manual_path()))
@@ -128,6 +137,7 @@ def test_manual_path_rejected_at_http_trust_boundary(api, mutate) -> None:
     assert payload["reason"] == "spotlight_path_invalid"
 
 
+@requires_fx_catalog
 def test_manual_path_is_canonical_persisted_and_public_receipt_is_bounded(api) -> None:
     path = manual_path()
     path["keyframes"][0].update({"source_at": 1.0004, "x": -0.0})
@@ -175,6 +185,7 @@ def test_manual_path_is_canonical_persisted_and_public_receipt_is_bounded(api) -
     assert confirmed["revision"] != api.revision
 
 
+@requires_fx_catalog
 def test_distinct_paths_have_distinct_cache_and_selected_candidate_confirm(api) -> None:
     first = _submit_ready(api, _request(api, manual_path(x_end=0.7)))
     second_request = _request(
@@ -211,6 +222,7 @@ def test_distinct_paths_have_distinct_cache_and_selected_candidate_confirm(api) 
     assert status == 409 and stale["reason"] == "preview_stale"
 
 
+@requires_fx_catalog
 def test_timeline_snapshot_names_and_selects_only_the_manual_candidate(api) -> None:
     background = _submit_ready(api, api._candidate("T3"))
     status, confirmed = api._json_request(
@@ -237,6 +249,7 @@ def test_timeline_snapshot_names_and_selects_only_the_manual_candidate(api) -> N
     assert matches[0]["id"] != confirmed["overlay_id"]
 
 
+@requires_fx_catalog
 def test_identical_manual_request_reuses_cache_without_rendering(api) -> None:
     request = _request(api, manual_path())
     first = _submit_ready(api, request)
@@ -253,6 +266,7 @@ def test_identical_manual_request_reuses_cache_without_rendering(api) -> None:
     assert cached["job"]["subject_track"] == first["job"]["subject_track"]
 
 
+@requires_fx_catalog
 def test_identical_automatic_request_with_track_metadata_reuses_cache(api) -> None:
     request = api._candidate("P5")
     request["candidate"]["subject"] = {"x": 0.2, "y": 0.3}
@@ -283,6 +297,7 @@ def test_identical_automatic_request_with_track_metadata_reuses_cache(api) -> No
         ("keyframe_count", 3),
     ],
 )
+@requires_fx_catalog
 def test_manual_cache_receipt_mismatch_is_not_reused(api, field, bad) -> None:
     request = _request(api, manual_path())
     first = _submit_ready(api, request)
@@ -303,6 +318,7 @@ def test_manual_cache_receipt_mismatch_is_not_reused(api, field, bad) -> None:
     assert api._wait_terminal(created["job"]["id"])["job"]["state"] == "ready"
 
 
+@requires_fx_catalog
 def test_renderer_receipt_for_different_manual_path_fails_closed(api) -> None:
     api.fast_renderer.write_text(
         _manual_renderer().replace(
@@ -325,6 +341,7 @@ def test_renderer_receipt_for_different_manual_path_fails_closed(api) -> None:
     assert not (api.server.fx_preview_jobs.cache_dir / f"{cache_key}.json").exists()
 
 
+@requires_fx_catalog
 @pytest.mark.parametrize("replacement_code", ["P5", "T3"])
 def test_replacement_without_path_clears_inherited_manual_path(api, replacement_code) -> None:
     manual = _submit_ready(api, _request(api, manual_path()))
@@ -356,6 +373,7 @@ def test_replacement_without_path_clears_inherited_manual_path(api, replacement_
     assert "spotlight_path" not in saved
 
 
+@requires_fx_catalog
 def test_manual_replacement_clears_inherited_automatic_subject(api) -> None:
     automatic = api._candidate("P5")
     automatic["candidate"]["subject"] = {"x": 0.2, "y": 0.3}
@@ -379,6 +397,7 @@ def test_manual_replacement_clears_inherited_automatic_subject(api) -> None:
     assert overlay["spotlight_path"] == manual_path()
 
 
+@requires_fx_catalog
 def test_persisted_state_revalidates_path_and_invalidates_revision(api) -> None:
     manual = _submit_ready(api, _request(api, manual_path()))
     status, confirmed = api._json_request(
@@ -402,6 +421,7 @@ def test_persisted_state_revalidates_path_and_invalidates_revision(api) -> None:
     assert any("完整套用範圍" in item for item in invalid["errors"])
 
 
+@requires_fx_catalog
 def test_persisted_manual_huge_bound_returns_422_without_mutating_state(api) -> None:
     manual = _submit_ready(api, _request(api, manual_path()))
     status, confirmed = api._json_request(
