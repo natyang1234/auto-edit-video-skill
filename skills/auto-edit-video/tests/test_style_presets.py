@@ -24,11 +24,18 @@ if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
 import style_presets  # noqa: E402
+import fx_overlay  # noqa: E402
 import editor_server  # noqa: E402
 import studio_server  # noqa: E402
 import asset_registry  # noqa: E402
 from font_security import validate_font_bytes  # noqa: E402
 from font_test_fixture import build_ttf  # noqa: E402
+
+# These tests create FX presets from a real effect code, which resolves through
+# the optional edit-style-profiles catalog; without it they are effect_unavailable.
+requires_fx_catalog = unittest.skipUnless(
+    fx_overlay.available(), "needs the edit-style-profiles FX catalog"
+)
 import test_fx_preview_api as fx_api_test  # noqa: E402
 
 
@@ -329,6 +336,7 @@ class StylePresetStoreTests(unittest.TestCase):
         self.assertEqual(deleted["deleted_id"], updated["preset"]["id"])
         self.assertEqual(deleted["presets"], [])
 
+    @requires_fx_catalog
     def test_normalized_casefold_duplicate_and_kind_change_are_rejected(self) -> None:
         empty = self.store.collection()
         first = self.store.create(empty["revision"], "Élan", "caption", caption_settings())
@@ -363,6 +371,7 @@ class StylePresetStoreTests(unittest.TestCase):
         )
         self.assertEqual(normalized, {"style": {"color": "#123456"}, "font": None})
 
+    @requires_fx_catalog
     def test_fx_zero_and_half_are_canonical_and_text_is_not_path_interpreted(self) -> None:
         for opacity in (0, 0.5, 1):
             normalized = style_presets.normalize_fx_settings(
@@ -469,6 +478,7 @@ class StylePresetStoreTests(unittest.TestCase):
         self.assertEqual(process.wait(timeout=5), 0)
         self.assertEqual(len(self.store.collection()["presets"]), 2)
 
+    @requires_fx_catalog
     def test_fx_catalog_drift_is_per_record_and_does_not_change_revision(self) -> None:
         created = self.store.create(
             self.store.collection()["revision"], "FX drift", "fx", fx_settings()
@@ -563,6 +573,7 @@ class StylePresetStoreTests(unittest.TestCase):
             self.store.collection()
         self.assertEqual(corrupt.exception.code, "store_corrupt")
 
+    @requires_fx_catalog
     def test_fx_catalog_import_failure_is_recoverable_but_new_fx_write_fails_closed(self) -> None:
         created = self.store.create(
             self.store.collection()["revision"], "FX import drift", "fx", fx_settings()
@@ -594,6 +605,7 @@ class StylePresetStoreTests(unittest.TestCase):
             self.assertEqual(deleted["deleted_id"], created["preset"]["id"])
             self.assertEqual([item["kind"] for item in deleted["presets"]], ["caption"])
 
+    @requires_fx_catalog
     def test_fx_catalog_general_exceptions_are_typed_without_swallowing_base_exceptions(self) -> None:
         class CatalogProbeError(Exception):
             pass
@@ -795,6 +807,7 @@ class StylePresetApiTests(unittest.TestCase):
         self.assertEqual(status, 200, deleted)
         self.assertEqual(set(deleted), {"ok", "revision", "presets", "deleted_id"})
 
+    @requires_fx_catalog
     def test_http_fx_drift_metadata_allows_delete_without_revision_change(self) -> None:
         status, empty = self.request("GET", "/api/style-presets")
         self.assertEqual(status, 200, empty)
