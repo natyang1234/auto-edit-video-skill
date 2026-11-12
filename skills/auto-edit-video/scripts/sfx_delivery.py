@@ -90,8 +90,10 @@ DIALOGUE_PRIORITY_AUTHORITY = (
 # to clear a barely-active dialogue (a whisper at -44 dBFS still has to sit 6
 # dB above the effects under it) and bounded so a runaway measurement cannot
 # silently delete the sound design instead of ducking it. The margin absorbs
-# the difference between this integer bake and what the render's own
-# sidechain stage measures — which only ever attenuates further.
+# the difference between this bake and what the same-render evidence check
+# measures after encoding. (The render used to add a sidechain compressor on
+# top; it was removed because FFmpeg 8.0.1 could drop the whole stem, and the
+# "post-sidechain" names below are kept as stable evidence identifiers.)
 DIALOGUE_DUCK_FLOOR_DB = -36.0
 DIALOGUE_DUCK_MARGIN_DB = 1.0
 DIALOGUE_DUCK_MAX_ROUNDS = 8
@@ -2408,11 +2410,13 @@ def dialogue_priority_ducks(
 ) -> dict[str, float]:
     """Per-event attenuation that puts the stem under this cut's dialogue.
 
-    SPEC Phase 0d dialogue priority. The sidechain compressor in the render
-    graph shapes the duck; it does not promise a depth, and a real cut proved
-    it: two of four events came back 2.18 and 7.96 dB *over* the speech they
-    were supposed to sit under, and the delivery failed closed after the
-    render had already been paid for. So the depth is decided here, against
+    SPEC Phase 0d dialogue priority. This bake is the only duck: the render
+    graph used to add a sidechain compressor, which never promised a depth
+    (and was later removed for dropping the stem on FFmpeg 8.0.1). A real cut
+    proved the compressor alone was not enough: two of four events came
+    back 2.18 and 7.96 dB *over* the speech they were supposed to sit under,
+    and the delivery failed closed after the render had already been paid
+    for. So the depth is decided here, against
     the dialogue this cut actually carries, with the measurement the check
     itself uses.
 

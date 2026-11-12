@@ -964,6 +964,9 @@ class SfxCuesSurviveTheSegmentJoinTests(unittest.TestCase):
         return sorted(picked)
 
     def test_both_cues_land_where_the_plan_put_them(self) -> None:
+        # Also the guard for the FFmpeg 8.0.1 sidechaincompress race: with the
+        # compressor in the graph this failed on every ubuntu-26.04 CI run
+        # (the stem came out as silence), so it must keep running on Linux.
         state = {
             "canvas": {"width": 180, "height": 320, "fps": 30},
             "segments": [
