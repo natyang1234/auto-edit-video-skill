@@ -517,6 +517,7 @@ result_path.write_text(json.dumps({{
                         "relative": "source/source.mp4",
                         "sha256": hashlib.sha256(b"fixture").hexdigest(),
                         "bytes": len(b"fixture"),
+                        "duration_s": 2.0,
                     },
                     "cache_key": f"{index:064x}",
                     "process": None,
