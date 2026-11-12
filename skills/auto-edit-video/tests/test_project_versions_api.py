@@ -31,6 +31,12 @@ if str(SKILL_DIR / "tests") not in sys.path:
     sys.path.insert(0, str(SKILL_DIR / "tests"))
 from font_test_fixture import build_ttf  # noqa: E402
 
+# Snapshots that carry an FX overlay validate against the optional
+# edit-style-profiles catalog; without it they are unsupported_snapshot.
+requires_fx_catalog = unittest.skipUnless(
+    editor_server.fx_overlay.available(), "needs the edit-style-profiles FX catalog"
+)
+
 
 class ProjectVersionsApiTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -647,6 +653,7 @@ class ProjectVersionsApiTests(unittest.TestCase):
         self.assertEqual(status, 200, listing)
         self.assertEqual(len(listing["versions"]), 2)
 
+    @requires_fx_catalog
     def test_restore_preserves_segments_captions_and_manual_spotlight_path(self) -> None:
         original = json.loads((self.project / "working/editor_state.json").read_text())
         spotlight_path = {
