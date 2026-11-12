@@ -14,7 +14,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import math
 import shutil
 import subprocess
 import sys
@@ -932,10 +931,7 @@ class SfxCuesSurviveTheSegmentJoinTests(unittest.TestCase):
         for centre in (self.CLICK_BEFORE_S, self.CLICK_AFTER_S):
             start = int(round(centre * self.SAMPLE_RATE))
             for offset in range(int(0.004 * self.SAMPLE_RATE)):
-                # A 3 kHz burst: well inside any encoder/resampler passband. A
-                # Nyquist-rate (24 kHz) square was filtered out by the FFmpeg
-                # shipped on newer Ubuntu runners, so no click reached the file.
-                value = int(round(22000 * math.sin(2 * math.pi * 3000 * offset / self.SAMPLE_RATE)))
+                value = 22000 if offset % 2 == 0 else -22000
                 frames[(start + offset) * 2] = value
                 frames[(start + offset) * 2 + 1] = value
         with wave.open(str(path), "wb") as handle:
