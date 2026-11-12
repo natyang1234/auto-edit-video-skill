@@ -163,8 +163,9 @@ class Phase0eKineticIntegrationTests(unittest.TestCase):
     def _make_source(self) -> None:
         # Cross-platform active-window graph regression.  Event-bound voiced
         # pulses sit inside each 250 ms dialogue-policy window but outside the
-        # cue's primary active samples.  This isolates sidechain release/ratio
-        # behavior without pretending a pure tone is representative speech.
+        # cue's primary active samples.  This isolates the dialogue-priority
+        # window measurement (originally sidechain release/ratio behavior)
+        # without pretending a pure tone is representative speech.
         dialogue = self.root / "active-dialogue.wav"
         pcm = bytearray()
         pulse_ranges = ((200640, 202080), (388320, 389760))

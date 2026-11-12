@@ -2067,7 +2067,7 @@ class SfxDeliveryTests(unittest.TestCase):
     def test_cue_template_partial_correlation_tolerates_pipeline_lag(self) -> None:
         # A real render's published candidate can be delayed by a small,
         # uniform sample offset relative to the private pre-encode dialogue
-        # and post-sidechain SFX evidence stems (e.g. loudnorm/AAC encode
+        # and pre-amix SFX evidence stems (e.g. loudnorm/AAC encode
         # pipeline delay); those two private stems share one lag-free
         # timeline with each other. The dialogue sample used to regress out
         # private dialogue at a trial lag must stay at the *unshifted*
@@ -2469,9 +2469,9 @@ class DialoguePriorityDuckTests(unittest.TestCase):
     stem has to sit `DIALOGUE_PRIORITY_REQUIRED_REDUCTION_DB` below the
     dialogue in the window around every transient, or the render fails
     closed with `SFX is only 2.180225 dB below active dialogue` — which is
-    what a real 90-second cut did twice tonight, on two of four events. The
-    sidechain compressor in the graph is a shape, not a guarantee; the
-    guarantee is a per-event attenuation measured against the dialogue this
+    what a real 90-second cut did twice tonight, on two of four events. A
+    sidechain compressor in the graph was a shape, not a guarantee (it has
+    since been removed); the guarantee is a per-event attenuation measured against the dialogue this
     cut actually carries, before a single frame is rendered.
     """
 
