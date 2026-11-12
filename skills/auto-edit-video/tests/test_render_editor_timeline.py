@@ -444,7 +444,7 @@ class Phase0dRenderCommandTests(unittest.TestCase):
         self.assertIn("[2:a]", graph)
         self.assertIn("atrim=0:2.000000", graph)
         self.assertIn(
-            "[adialogue]asplit=3[adialogue_mix][adialogue_key][adialogue_evidence_raw]",
+            "[adialogue]asplit=2[adialogue_mix][adialogue_evidence_raw]",
             graph,
         )
         self.assertIn(
@@ -452,12 +452,11 @@ class Phase0dRenderCommandTests(unittest.TestCase):
             "[adialogue_evidence]",
             graph,
         )
-        self.assertIn(
-            "[asfx][adialogue_key]sidechaincompress="
-            "threshold=0.2:ratio=1.2:attack=5:release=250:makeup=1:"
-            "link=maximum:detection=rms[asfx_ducked]",
-            graph,
-        )
+        # Dialogue priority is baked into the stem; the FFmpeg 8.0.1
+        # sidechaincompress race dropped the whole stem, so it must stay out.
+        self.assertIn("[asfx]anull[asfx_ducked]", graph)
+        self.assertNotIn("sidechaincompress", graph)
+        self.assertNotIn("[adialogue_key]", graph)
         self.assertIn(
             "[asfx_ducked]apad=whole_len=96000,atrim=end_sample=96000"
             "[asfx_ducked_bounded]",
@@ -469,7 +468,6 @@ class Phase0dRenderCommandTests(unittest.TestCase):
             graph,
         )
         self.assertIn("[adialogue_mix][asfx_ducked_mix]amix=inputs=2:normalize=0", graph)
-        self.assertEqual(graph.count("sidechaincompress="), 1)
         self.assertEqual(graph.count("loudnorm="), 1)
         self.assertIn("LRA=11,aresample=48000[aout]", graph)
         self.assertEqual(" ".join(command).count("loudnorm="), 1)
@@ -519,10 +517,9 @@ class Phase0dRenderCommandTests(unittest.TestCase):
             "asetpts=PTS-STARTPTS[asfx]",
             graph,
         )
-        self.assertIn("[adialogue]asplit=2[adialogue_mix][adialogue_key]", graph)
-        self.assertIn(
-            "[asfx][adialogue_key]sidechaincompress=", graph
-        )
+        self.assertIn("[adialogue]anull[adialogue_mix]", graph)
+        self.assertIn("[asfx]anull[asfx_ducked]", graph)
+        self.assertNotIn("sidechaincompress", graph)
         self.assertIn("[adialogue_mix][asfx_ducked]amix=inputs=2:normalize=0", graph)
         self.assertEqual(graph.count("loudnorm="), 1)
         self.assertEqual(graph.count("concat=n=2"), 2)

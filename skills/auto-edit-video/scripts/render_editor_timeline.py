@@ -2385,16 +2385,19 @@ def build_render_command(
             raise ValueError("kinetic SFX delivery requires dialogue audio")
         filters.extend(dialogue_filter_chain(segments, duration))
         filters.append(f"[{sfx_input_index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[asfx]")
+        # No sidechaincompress here. Dialogue priority is baked into the stem
+        # (sfx_delivery.dialogue_priority_ducks, measured against this cut's
+        # dialogue with a margin) and checked fail-closed after the render.
+        # The compressor only ever shaped an extra sub-dB duck, and on FFmpeg
+        # 8.0.1 it raced: when the dialogue key arrived late it emitted the
+        # stem as silence, so a final could ship with every SFX missing.
+        # `[asfx_ducked]` keeps its name so the evidence wiring is unchanged.
         filters.append(
-            "[adialogue]asplit=3[adialogue_mix][adialogue_key][adialogue_evidence_raw]"
+            "[adialogue]asplit=2[adialogue_mix][adialogue_evidence_raw]"
             if evidence_mode else
-            "[adialogue]asplit=2[adialogue_mix][adialogue_key]"
+            "[adialogue]anull[adialogue_mix]"
         )
-        filters.append(
-            "[asfx][adialogue_key]sidechaincompress="
-            "threshold=0.2:ratio=1.2:attack=5:release=250:makeup=1:"
-            "link=maximum:detection=rms[asfx_ducked]"
-        )
+        filters.append("[asfx]anull[asfx_ducked]")
         if evidence_mode:
             evidence_sample_count = sfx_delivery.seconds_to_samples(f"{duration:.3f}")
             filters.append(
