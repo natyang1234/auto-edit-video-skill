@@ -31,24 +31,9 @@ For a creative edit that needs shot choice, composition, grading, motivated edit
 
 ### Automatic asset-gap sourcing (nat, 2026-10-29)
 
-At edit intake, storyboarding, revisions, and final QA, check whether the requested
-edit lacks footage, stills, SFX, BGM, templates, or grading assets. If a gap exists,
-read the installed `edit-style-profiles/references/asset-gap-sourcing.md`
-(on this workstation: `~/.claude/skills/edit-style-profiles/references/asset-gap-sourcing.md`)
-and execute its local-first, category-specific search workflow automatically.
-Record actual queries, candidates, provenance, placement, and unresolved gaps in
-`working/asset-gaps.md`; don't stop at suggesting websites. No gaps or cut-only
-cleanup means no external sourcing. Preserve all applicable storyboard, asset
-import, cue, timeline, and final-review gates; searching itself needs no repeated
-permission. This is an agent workflow, not a background downloader or Studio
-provider implementation. If the optional reference is absent, report that routing
-is unavailable and continue the standalone core without inventing sources.
+At edit intake, storyboarding, revisions, and final QA, check whether the requested edit lacks footage, stills, SFX, BGM, templates, or grading assets. If a gap exists, read the installed `edit-style-profiles/references/asset-gap-sourcing.md` (on this workstation: `~/.claude/skills/edit-style-profiles/references/asset-gap-sourcing.md`) and execute its local-first, category-specific search workflow automatically. Record actual queries, candidates, provenance, placement, and unresolved gaps in `working/asset-gaps.md`; don't stop at suggesting websites. No gaps or cut-only cleanup means no external sourcing. Preserve all applicable storyboard, asset import, cue, timeline, and final-review gates; searching itself needs no repeated permission. This is an agent workflow, not a background downloader or Studio provider implementation. If the optional reference is absent, report that routing is unavailable and continue the standalone core without inventing sources.
 
-Read [references/AGENT_FIRST.zh-TW.md](references/AGENT_FIRST.zh-TW.md). The
-user-facing contract has one required input: a local video file that the agent
-can read. The agent owns every internal artifact and must return an edited MP4,
-not instructions asking the user to prepare Whisper JSON, SRT, a manifest, or a
-browser preview.
+Read [references/AGENT_FIRST.zh-TW.md](references/AGENT_FIRST.zh-TW.md). The user-facing contract has one required input: a local video file that the agent can read. The agent owns every internal artifact and must return an edited MP4, not instructions asking the user to prepare Whisper JSON, SRT, a manifest, or a browser preview.
 
 Example user request:
 
@@ -56,23 +41,11 @@ Example user request:
 /auto-edit-video automatically edit /path/to/input.mp4 and return the MP4.
 ```
 
-Do not launch the page editor in this mode unless the user explicitly asks for
-an interface. Do not upload or deliver the result to another service unless that
-is a separate authorized request.
+Do not launch the page editor in this mode unless the user explicitly asks for an interface. Do not upload or deliver the result to another service unless that is a separate authorized request.
 
-Internally, run preflight, initialize a project, generate a local word-timed
-transcript with an installed Whisper-compatible engine, import it, analyze
-edits, write conservative decisions, record the user's auto-edit request as the
-low-risk destructive-edit authorization, render, and run QA. High-risk cuts
-default to keep.
+Internally, run preflight, initialize a project, generate a local word-timed transcript with an installed Whisper-compatible engine, import it, analyze edits, write conservative decisions, record the user's auto-edit request as the low-risk destructive-edit authorization, render, and run QA. High-risk cuts default to keep.
 
-If no highlight or length is requested, clean the full video conservatively.
-When the user selects a platform and `short`, `medium`, or `long`, use the
-platform matrix in the Agent-first specification. A user-specified number of
-seconds overrides the profile. Use `auto` only when the user asks the agent to
-choose: after transcription, select the smallest profile that preserves a
-complete idea. Never pad, stretch, or change playback speed merely to hit a
-target.
+If no highlight or length is requested, clean the full video conservatively. When the user selects a platform and `short`, `medium`, or `long`, use the platform matrix in the Agent-first specification. A user-specified number of seconds overrides the profile. Use `auto` only when the user asks the agent to choose: after transcription, select the smallest profile that preserves a complete idea. Never pad, stretch, or change playback speed merely to hit a target.
 
 ## Local Studio GUI (only when explicitly requested)
 
