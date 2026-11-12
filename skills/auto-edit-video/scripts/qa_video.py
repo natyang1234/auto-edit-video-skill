@@ -1328,7 +1328,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dialogue-priority-sfx",
-        help="private same-render post-sidechain pre-amix SFX evidence WAV",
+        help="private same-render pre-amix SFX evidence WAV (role post-sidechain_pre-amix_sfx)",
     )
     parser.add_argument(
         "--expected-timeline-revision",

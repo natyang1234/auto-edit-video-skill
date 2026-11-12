@@ -3916,8 +3916,9 @@ def _verify_multi_event_delivery(
         )
         failures.extend(priority_failures)
 
-    # The final candidate contains the post-sidechain SFX, so correlate against
-    # the exact private snapshot decoded above.  The canonical pre-duck stem
+    # The final candidate contains the same-render pre-amix SFX (the
+    # "post-sidechain" evidence; the graph no longer compresses it), so
+    # correlate against the exact private snapshot decoded above.  The canonical pre-duck stem
     # remains the independent rebuild/hash/transient authority earlier in this
     # verifier; using it here would reject genuine active-dialogue ducking.
     if candidate_audio is not None:
