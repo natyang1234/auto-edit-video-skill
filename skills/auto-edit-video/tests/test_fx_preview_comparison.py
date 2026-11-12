@@ -9,6 +9,14 @@ import pytest
 import test_fx_preview_api as _api_fixture
 
 
+# These tests resolve a real FX code through the optional edit-style-profiles
+# catalog; without it every request is effect_unavailable.
+requires_fx_catalog = pytest.mark.skipif(
+    not _api_fixture.fx_overlay.available(),
+    reason="needs the edit-style-profiles FX catalog",
+)
+
+
 @pytest.fixture
 def api() -> _api_fixture.FxPreviewApiTests:
     """Reuse the ordinary HTTP/task fixture without collecting its whole suite."""
@@ -44,6 +52,7 @@ def _assert_comparison_stale(
     return payload
 
 
+@requires_fx_catalog
 def test_unanchored_sequential_jobs_remain_independent(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -64,6 +73,7 @@ def test_unanchored_sequential_jobs_remain_independent(
     assert second["job"]["id"] != first["job"]["id"]
 
 
+@requires_fx_catalog
 def test_sequential_candidates_share_anchor_and_confirm_their_own_candidate(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -102,6 +112,7 @@ def test_sequential_candidates_share_anchor_and_confirm_their_own_candidate(
     assert stale["reason"] == "preview_stale"
 
 
+@requires_fx_catalog
 def test_anchor_rejects_context_source_and_window_drift_without_new_jobs(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -164,6 +175,7 @@ def test_anchor_rejects_context_source_and_window_drift_without_new_jobs(
     _assert_comparison_stale(api, changed_quality)
 
 
+@requires_fx_catalog
 def test_anchor_rejects_different_replace_target(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -184,6 +196,7 @@ def test_anchor_rejects_different_replace_target(
     _assert_comparison_stale(api, second_request)
 
 
+@requires_fx_catalog
 def test_timeline_anchor_binds_only_common_background_fx_dependencies(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -233,6 +246,7 @@ def test_timeline_anchor_binds_only_common_background_fx_dependencies(
     assert replacement_fp["renderer"]["timeline_fx_blocks"] == {}
 
 
+@requires_fx_catalog
 def test_failed_anchor_remains_usable_but_cancelled_anchor_fails_closed(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -264,6 +278,7 @@ def test_failed_anchor_remains_usable_but_cancelled_anchor_fails_closed(
     _assert_comparison_stale(api, cancelled_follow_up)
 
 
+@requires_fx_catalog
 def test_preview_stale_failed_anchor_cannot_be_reused_after_source_restore(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:

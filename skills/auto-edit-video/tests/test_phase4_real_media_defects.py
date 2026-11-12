@@ -987,8 +987,12 @@ class SfxCuesSurviveTheSegmentJoinTests(unittest.TestCase):
         expected_after = int(round(self.CLICK_AFTER_S * self.SAMPLE_RATE))
         # One window of slack either side, well inside the 3840-sample
         # alignment tolerance Phase 0d verifies cues against.
-        self.assertLess(abs(before - expected_before), 480)
-        self.assertLess(abs(after - expected_after), 480)
+        where = (
+            f"picked={before},{after} expected={expected_before},{expected_after} "
+            f"ffmpeg={renderer.ffmpeg_path()}"
+        )
+        self.assertLess(abs(before - expected_before), 480, where)
+        self.assertLess(abs(after - expected_after), 480, where)
         # The cue after the join did not drift relative to the one before it:
         # the join added no time and removed none.
         self.assertLess(

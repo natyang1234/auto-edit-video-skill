@@ -14,11 +14,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install FFmpeg and CJK font
         run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk
-      - name: Install pinned fontTools (matches the local python3.14 runtime)
-        run: python3 -m pip install --break-system-packages fonttools==4.62.1
+      - name: Install pinned test dependencies (match the local python3.14 runtime)
+        run: python3 -m pip install --break-system-packages fonttools==4.62.1 pytest==9.0.2
       - name: Validate package
         run: python3 scripts/validate_skill.py
       - name: Run unit tests
         run: python3 -m unittest discover -s skills/auto-edit-video/tests -p 'test_*.py'
+      - name: Run pytest-style tests
+        # unittest discovery imports these but cannot collect plain test functions.
+        run: python3 -m pytest -q -p no:cacheprovider $(grep -l '^import pytest' skills/auto-edit-video/tests/test_*.py)
       - name: Test universal installer
         run: bash tests/test_install.sh

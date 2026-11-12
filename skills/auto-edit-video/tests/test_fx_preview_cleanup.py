@@ -2,6 +2,7 @@
 """Cancellation ownership and timing-retention contracts for FX preview jobs."""
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import shutil
@@ -511,7 +512,12 @@ result_path.write_text(json.dumps({{
                     "replace_overlay_id": None,
                     "dependencies": dependencies,
                     "dependency_hash": jobs._canonical_sha256(dependencies),
-                    "source_identity": {"path": source},
+                    "source_identity": {
+                        "path": source,
+                        "relative": "source/source.mp4",
+                        "sha256": hashlib.sha256(b"fixture").hexdigest(),
+                        "bytes": len(b"fixture"),
+                    },
                     "cache_key": f"{index:064x}",
                     "process": None,
                     "cancel_requested": False,

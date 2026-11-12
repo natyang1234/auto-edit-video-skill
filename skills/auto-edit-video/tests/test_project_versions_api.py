@@ -27,7 +27,9 @@ import editor_server  # noqa: E402
 import project_versions  # noqa: E402
 from editor_server import EditorServer  # noqa: E402
 from font_security import validate_font_bytes  # noqa: E402
-from tests.font_test_fixture import build_ttf  # noqa: E402
+if str(SKILL_DIR / "tests") not in sys.path:
+    sys.path.insert(0, str(SKILL_DIR / "tests"))
+from font_test_fixture import build_ttf  # noqa: E402
 
 
 class ProjectVersionsApiTests(unittest.TestCase):

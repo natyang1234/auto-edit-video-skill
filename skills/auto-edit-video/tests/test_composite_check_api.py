@@ -12,6 +12,14 @@ import test_fx_preview_api as _api_fixture
 jobs = _api_fixture.fx_preview_jobs
 
 
+# These tests resolve a real FX code through the optional edit-style-profiles
+# catalog; without it every request is effect_unavailable.
+requires_fx_catalog = pytest.mark.skipif(
+    not _api_fixture.fx_overlay.available(),
+    reason="needs the edit-style-profiles FX catalog",
+)
+
+
 def _bound_receipt() -> tuple[dict, dict]:
     source_sha = "a" * 64
     media_sha = "b" * 64
@@ -269,6 +277,7 @@ def api() -> _api_fixture.FxPreviewApiTests:
         case.doCleanups()
 
 
+@requires_fx_catalog
 def test_missing_worker_diagnostic_is_public_unmeasured_and_cache_safe(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -317,6 +326,7 @@ def test_missing_worker_diagnostic_is_public_unmeasured_and_cache_safe(
     assert cached["job"]["composition_check"]["media_sha256"] != "f" * 64
 
 
+@requires_fx_catalog
 def test_cache_uses_canonical_render_duration_and_rejects_byte_forgery(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:
@@ -351,6 +361,7 @@ def test_cache_uses_canonical_render_duration_and_rejects_byte_forgery(
     assert terminal["job"]["cache_hit"] is False
 
 
+@requires_fx_catalog
 def test_composition_dependency_identity_includes_optional_code_and_native_versions(
     api: _api_fixture.FxPreviewApiTests,
 ) -> None:

@@ -748,12 +748,17 @@ class FxPreviewRequestTests(unittest.TestCase):
                 self.assertFalse(any(cache.glob("timeline-project-*")))
 
 
+@unittest.skipUnless(
+    worker.fx_overlay.available(), "needs the edit-style-profiles FX catalog"
+)
 class StrictSourceCatalogTests(unittest.TestCase):
-    def test_all_167_non_broll_blocks_have_only_seeded_literal_media(self):
+    def test_all_non_broll_blocks_have_only_seeded_literal_media(self):
         """A new literal demo filename cannot silently leak into strict preview."""
         compose = worker.fx_overlay._compose()
         effects, _ = compose.load_effects()
-        self.assertEqual(len(effects), 168)
+        # The catalog grows over time; check every effect it has, not a frozen count.
+        self.assertIn("B1", effects)
+        self.assertGreater(len(effects), 1)
         seeded = {"person.webm", "screen.jpg", "shot1.jpg", "shot2.jpg", "shot3.jpg", "shot4.jpg",
                   "shot5.jpg", "shot6.jpg", "talk.mp4", "talk2.mp4"}
         covered = []
@@ -769,7 +774,7 @@ class StrictSourceCatalogTests(unittest.TestCase):
             self.assertIsInstance(schema["images"], list, code)
             self.assertIsInstance(schema["clips"], list, code)
             covered.append(code)
-        self.assertEqual(len(covered), 167)
+        self.assertEqual(len(covered), len(effects) - 1)
 
 
 if __name__ == "__main__":

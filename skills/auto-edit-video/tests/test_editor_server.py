@@ -1074,7 +1074,13 @@ class EditorServerTests(unittest.TestCase):
             },
         )
 
-        status, _headers, body = self.request("GET", "/api/pipeline-status")
+        # A live pipeline owns the run; without one, "running" is projected
+        # as interrupted (crash recovery; see test_style_presets).
+        self.server.pipeline_active_owner = object()
+        try:
+            status, _headers, body = self.request("GET", "/api/pipeline-status")
+        finally:
+            self.server.pipeline_active_owner = None
         payload = json.loads(body.decode("utf-8"))
 
         self.assertEqual(status, 200)
